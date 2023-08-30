@@ -1,0 +1,18 @@
+[package]
+name = "polkavm-linux-sandbox"
+version.workspace = true
+authors.workspace = true
+license.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+description = "Sandbox implementation for PolkaVM (Linux-only)"
+
+[dependencies]
+log = { workspace = true }
+polkavm-common = { workspace = true, features = ["std"] }
+polkavm-linux-raw = { workspace = true, features = ["std"] }
+
+[dev-dependencies]
+env_logger = { workspace = true }
+polkavm-assembler = { workspace = true }

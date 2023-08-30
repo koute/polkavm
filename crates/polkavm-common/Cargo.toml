@@ -1,0 +1,21 @@
+[package]
+name = "polkavm-common"
+version.workspace = true
+authors.workspace = true
+license.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+description = "The common crate for PolkaVM"
+
+[dependencies]
+log = { workspace = true, optional = true }
+
+[features]
+default = []
+alloc = []
+std = ["alloc"]
+logging = ["dep:log"]
+
+[dev-dependencies]
+proptest = { workspace = true }

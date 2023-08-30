@@ -1,0 +1,15 @@
+[package]
+name = "polkavm-linux-raw"
+version.workspace = true
+authors.workspace = true
+license.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+description = "Raw bindings to Linux kernel APIs"
+
+[dependencies]
+
+[features]
+default = []
+std = []

@@ -1,0 +1,45 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/polkavm-derive",
+    "crates/polkavm-linker",
+    "crates/polkavm-assembler",
+    "crates/polkavm-common",
+    "crates/polkavm-linux-raw",
+    "crates/polkavm-linux-sandbox",
+    "crates/polkavm",
+
+    "tools/polkatool",
+    "tools/polkavm-linux-raw-generate",
+
+    "examples/hosts/hello-world",
+]
+
+[workspace.package]
+version = "0.1.1"
+authors = ["Jan Bujak <jan@parity.io>", "Parity Technologies <admin@parity.io>"]
+license = "MIT/Apache-2.0"
+edition = "2021"
+rust-version = "1.70.0"
+repository = "https://github.com/koute/polkavm"
+
+[workspace.dependencies]
+polkavm                 = { version = "0.1.1", path = "crates/polkavm" }
+polkavm-assembler       = { version = "0.1.1", path = "crates/polkavm-assembler" }
+polkavm-common          = { version = "0.1.1", path = "crates/polkavm-common" }
+polkavm-derive          = { version = "0.1.1", path = "crates/polkavm-derive" }
+polkavm-linker          = { version = "0.1.1", path = "crates/polkavm-linker" }
+polkavm-linux-raw       = { version = "0.1.1", path = "crates/polkavm-linux-raw" }
+polkavm-linux-sandbox   = { version = "0.1.1", path = "crates/polkavm-linux-sandbox" }
+
+clap = "4.4.1"
+env_logger = { version = "0.10.0", default-features = false }
+gimli = { version = "0.28.0", default-features = false }
+iced-x86 = "1.19.0"
+log = "0.4.20"
+object = { version = "0.32.0", default-features = false }
+proc-macro2 = "1.0.63"
+proptest = "1.2.0"
+quote = "1.0.29"
+rustc-demangle = "0.1.23"
+syn = "2.0.25"

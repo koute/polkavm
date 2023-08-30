@@ -1,0 +1,30 @@
+[package]
+name = "polkavm-zygote"
+version = "0.1.0"
+authors = ["Jan Bujak <jan@parity.io>", "Parity Technologies <admin@parity.io>"]
+license = "MIT/Apache-2.0"
+edition = "2021"
+publish = false
+
+[dependencies]
+polkavm-linux-raw = { path = "../polkavm-linux-raw" }
+polkavm-common = { path = "../polkavm-common" }
+
+[build-dependencies]
+polkavm-common = { path = "../polkavm-common" }
+
+[profile.dev]
+lto = "fat"
+panic = "abort"
+opt-level = 1
+
+[profile.release]
+lto = "fat"
+panic = "abort"
+opt-level = 3
+codegen-units = 1
+debug = false
+strip = true
+
+[workspace]
+resolver = "2"

@@ -1,0 +1,12 @@
+[package]
+name = "polkatool"
+version.workspace = true
+authors.workspace = true
+license.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+description = "A swiss knife toolkit for PolkaVM"
+
+[dependencies]
+clap = { workspace = true, features = ["derive"] }
+polkavm-linker = { workspace = true }

@@ -1,0 +1,9 @@
+[package]
+name = "hello-world-host"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[dependencies]
+env_logger = { version = "0.10.0", default-features = false }
+polkavm = { path = "../../../crates/polkavm" }

@@ -1,0 +1,12 @@
+[profile.release]
+lto = "fat"
+panic = "abort"
+opt-level = 3
+codegen-units = 1
+debug = true
+
+[workspace]
+resolver = "2"
+members = [
+    "hello-world"
+]

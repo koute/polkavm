@@ -1,0 +1,11 @@
+[build]
+target = "x86_64-unknown-linux-gnu"
+rustflags = [
+    "-C", "relocation-model=dynamic-no-pic",
+    "-C", "default-linker-libraries=no",
+    "-C", "linker-flavor=ld.lld",
+
+    # TODO: Enable this.
+    # https://doc.rust-lang.org/beta/unstable-book/compiler-flags/cf-protection.html
+    # "-Z", "cf-protection=branch",
+]

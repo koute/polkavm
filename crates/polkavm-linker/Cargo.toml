@@ -1,0 +1,17 @@
+[package]
+name = "polkavm-linker"
+version.workspace = true
+authors.workspace = true
+license.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+documentation = "https://docs.rs/polkavm-linker"
+description = "PolkaVM offline linker"
+
+[dependencies]
+log = { workspace = true }
+object = { workspace = true, features = ["std", "read_core", "elf", "unaligned"] }
+gimli = { workspace = true, features = ["std", "read", "endian-reader"] }
+polkavm-common = { workspace = true, features = ["alloc"] }
+rustc-demangle = { workspace = true }

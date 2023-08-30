@@ -1,0 +1,3 @@
+max_width = 140
+newline_style = "Unix"
+edition = "2021"

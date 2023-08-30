@@ -1,0 +1,15 @@
+[package]
+name = "polkavm-assembler"
+version.workspace = true
+authors.workspace = true
+license.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+description = "Runtime assembler for PolkaVM"
+
+[dependencies]
+log = { workspace = true }
+
+[dev-dependencies]
+iced-x86 = { workspace = true, features = ["code_asm"] }

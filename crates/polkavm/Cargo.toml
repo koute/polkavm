@@ -1,0 +1,19 @@
+[package]
+name = "polkavm"
+version.workspace = true
+authors.workspace = true
+license.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+readme = "../../README.md"
+documentation = "https://docs.rs/polkavm"
+description = "A fast and secure RISC-V based virtual machine"
+
+[dependencies]
+log = { workspace = true }
+polkavm-assembler = { workspace = true }
+polkavm-common = { workspace = true, features = ["alloc", "logging"] }
+
+[target.'cfg(all(target_arch = "x86_64", target_os = "linux"))'.dependencies]
+polkavm-linux-sandbox = { workspace = true }
