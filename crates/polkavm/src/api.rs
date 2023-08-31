@@ -714,7 +714,7 @@ macro_rules! impl_into_extern_fn {
                         access.set_reg(reg, value);
 
                         if let Some(tracer) = tracer {
-                            tracer.on_set_reg_in_hostcall(Reg::A0, value as u32);
+                            tracer.on_set_reg_in_hostcall(reg, value as u32);
                         }
 
                         reg_index += 1;
