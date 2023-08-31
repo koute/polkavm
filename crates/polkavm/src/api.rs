@@ -707,9 +707,16 @@ macro_rules! impl_into_extern_fn {
                 let result = impl_into_extern_fn!(@call caller, self.0, $($args),*)?;
 
                 let set_reg = {
+                    let tracer = &mut tracer;
                     let mut reg_index = 0;
                     move |value: u32| {
-                        access.set_reg(Reg::ARG_REGS[reg_index], value);
+                        let reg = Reg::ARG_REGS[reg_index];
+                        access.set_reg(reg, value);
+
+                        if let Some(tracer) = tracer {
+                            tracer.on_set_reg_in_hostcall(Reg::A0, value as u32);
+                        }
+
                         reg_index += 1;
                     }
                 };
