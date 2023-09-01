@@ -438,7 +438,6 @@ version = "0.1.1"
 dependencies = [
  "clap",
  "polkavm",
- "polkavm-common",
  "polkavm-linker",
 ]
 

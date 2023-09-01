@@ -11,4 +11,3 @@ description = "A swiss knife toolkit for PolkaVM"
 clap = { workspace = true, features = ["derive"] }
 polkavm-linker = { workspace = true }
 polkavm = { workspace = true }
-polkavm-common = {workspace = true}
