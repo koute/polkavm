@@ -51,9 +51,9 @@ fn main() {
                 eprintln!("ERROR: failed to write the program blob to {:?}: {}", output, error);
                 std::process::exit(1);
             }
-        },
+        }
 
-        Args::Disassemble {output, input} => {
+        Args::Disassemble { output, input } => {
             let config = polkavm::Config::default();
             let engine = polkavm::Engine::new(&config).unwrap();
             let data = match std::fs::read(&input) {
@@ -72,16 +72,18 @@ fn main() {
             };
             let module = match polkavm::Module::from_blob(&engine, &blob) {
                 Ok(m) => m,
-                Err(error) => { 
+                Err(error) => {
                     eprintln!("ERROR: failed to instantiate a Module from the blob {:?}: {}", input, error);
                     std::process::exit(1);
                 }
             };
-            let out = polkavm::Disassembler::from_module(&module).enumerate().map(|(nth, ri)|{
-                format!("{}: {}", nth, ri)
-            }).collect::<Vec<String>>().join("\n");    
-            
-            if let Err(error) = std::fs::write(&output, out) { 
+            let out = polkavm::Disassembler::from_module(&module)
+                .enumerate()
+                .map(|(nth, ri)| format!("{}: {}", nth, ri))
+                .collect::<Vec<String>>()
+                .join("\n");
+
+            if let Err(error) = std::fs::write(&output, out) {
                 eprintln!("ERROR: failed to write the bytecode to {:?}: {}", output, error);
                 std::process::exit(1);
             }

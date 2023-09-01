@@ -5,10 +5,10 @@ mod error;
 
 mod api;
 mod config;
+mod disassembler;
 mod interpreter;
 mod source_cache;
 mod tracer;
-mod disassembler;
 
 #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
 mod compiler;
