@@ -14,14 +14,13 @@ enum Args {
         input: PathBuf,
     },
 
-    /// Disassembles any .polkavmm blob into its equivelant bytecode.
+    /// Disassembles a .polkavmm blob into its human-readable assembly.
     Disassemble {
         /// The output file.
         #[clap(short = 'o', long)]
         output: PathBuf,
 
         /// The input file.
-        #[clap(short = 'p', long)]
         input: PathBuf,
     },
 }
