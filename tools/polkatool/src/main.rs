@@ -21,6 +21,7 @@ enum Args {
         output: PathBuf,
 
         /// The input file.
+        #[clap(short = 'p', long)]
         input: PathBuf,
     },
 }
@@ -76,7 +77,9 @@ fn main() {
                     std::process::exit(1);
                 }
             };
-            let out = module.display_instructions().join("\n");
+            let out = polkavm::Disassembler::from_module(&module).enumerate().map(|(nth, ri)|{
+                format!("{}: {}", nth, ri)
+            }).collect::<Vec<String>>().join("\n");    
             
             if let Err(error) = std::fs::write(&output, out) { 
                 eprintln!("ERROR: failed to write the bytecode to {:?}: {}", output, error);

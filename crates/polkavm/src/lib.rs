@@ -8,6 +8,7 @@ mod config;
 mod interpreter;
 mod source_cache;
 mod tracer;
+mod disassembler;
 
 #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
 mod compiler;
@@ -23,3 +24,4 @@ pub use polkavm_common::utils::AsUninitSliceMut;
 
 pub use crate::api::{Engine, FuncType, Instance, InstancePre, Linker, Module, Val, ValType};
 pub use crate::config::Config;
+pub use crate::disassembler::Disassembler;

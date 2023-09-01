@@ -91,12 +91,6 @@ struct ModulePrivate {
 pub struct Module(Arc<ModulePrivate>);
 
 impl Module {
-    pub fn display_instructions(&self) -> Vec<String> {
-        self.instructions().iter().enumerate().map(|(nth, i)|{
-            format!("{:?}: {:?}", nth, i)
-        }).collect::<Vec<String>>()
-    }
-
     pub(crate) fn is_debug_trace_execution_enabled(&self) -> bool {
         self.0.debug_trace_execution
     }
