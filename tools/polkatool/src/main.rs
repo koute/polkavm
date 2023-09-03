@@ -45,7 +45,7 @@ fn main() {
                     std::process::exit(1);
                 }
             };
-q/*  */
+            
             if let Err(error) = std::fs::write(&output, blob.as_bytes()) {
                 eprintln!("ERROR: failed to write the program blob to {:?}: {}", output, error);
                 std::process::exit(1);
@@ -90,3 +90,4 @@ q/*  */
         }
     }
 }
+`
