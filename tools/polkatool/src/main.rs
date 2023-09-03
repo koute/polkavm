@@ -45,7 +45,7 @@ fn main() {
                     std::process::exit(1);
                 }
             };
-
+q/*  */
             if let Err(error) = std::fs::write(&output, blob.as_bytes()) {
                 eprintln!("ERROR: failed to write the program blob to {:?}: {}", output, error);
                 std::process::exit(1);
@@ -53,8 +53,6 @@ fn main() {
         }
 
         Args::Disassemble { output, input } => {
-            let config = polkavm::Config::default();
-            let engine = polkavm::Engine::new(&config).unwrap();
             let data = match std::fs::read(&input) {
                 Ok(data) => data,
                 Err(error) => {
@@ -69,22 +67,25 @@ fn main() {
                     std::process::exit(1);
                 }
             };
-            let module = match polkavm::Module::from_blob(&engine, &blob) {
-                Ok(m) => m,
-                Err(error) => {
-                    eprintln!("ERROR: failed to instantiate a Module from the blob {:?}: {}", input, error);
-                    std::process::exit(1);
-                }
-            };
-            let out = polkavm::Disassembler::from_module(&module)
+            let out = blob
+                .instructions()
                 .enumerate()
-                .map(|(nth, ri)| format!("{}: {}", nth, ri))
+                .map(|(nth, maybe_ri)|{
+                    match maybe_ri {
+                        Ok(ri) => format!("{}: {}", nth, ri),
+                        Err(error) => {
+                            eprintln!("ERROR: failed to parse raw instruction from blob. {:?}: {}. nth:{} ", input, error, nth);
+                            std::process::exit(1);
+                        }
+                    }
+                })
                 .collect::<Vec<String>>()
                 .join("\n");
 
             if let Err(error) = std::fs::write(&output, out) {
                 eprintln!("ERROR: failed to write the bytecode to {:?}: {}", output, error);
                 std::process::exit(1);
+     
             }
         }
     }
