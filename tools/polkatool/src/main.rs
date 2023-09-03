@@ -45,7 +45,7 @@ fn main() {
                     std::process::exit(1);
                 }
             };
-            
+
             if let Err(error) = std::fs::write(&output, blob.as_bytes()) {
                 eprintln!("ERROR: failed to write the program blob to {:?}: {}", output, error);
                 std::process::exit(1);
@@ -70,13 +70,14 @@ fn main() {
             let out = blob
                 .instructions()
                 .enumerate()
-                .map(|(nth, maybe_ri)|{
-                    match maybe_ri {
-                        Ok(ri) => format!("{}: {}", nth, ri),
-                        Err(error) => {
-                            eprintln!("ERROR: failed to parse raw instruction from blob. {:?}: {}. nth:{} ", input, error, nth);
-                            std::process::exit(1);
-                        }
+                .map(|(nth, maybe_ri)| match maybe_ri {
+                    Ok(ri) => format!("{}: {}", nth, ri),
+                    Err(error) => {
+                        eprintln!(
+                            "ERROR: failed to parse raw instruction from blob. {:?}: {}. nth:{} ",
+                            input, error, nth
+                        );
+                        std::process::exit(1);
                     }
                 })
                 .collect::<Vec<String>>()
@@ -85,7 +86,6 @@ fn main() {
             if let Err(error) = std::fs::write(&output, out) {
                 eprintln!("ERROR: failed to write the bytecode to {:?}: {}", output, error);
                 std::process::exit(1);
-     
             }
         }
     }
