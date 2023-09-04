@@ -14,11 +14,11 @@ enum Args {
         input: PathBuf,
     },
 
-    /// Disassembles a .polkavmm blob into its human-readable assembly.
+    /// Disassembles a .polkavm blob into its human-readable assembly.
     Disassemble {
         /// The output file.
         #[clap(short = 'o', long)]
-        output: PathBuf,
+        output: Option<PathBuf>,
 
         /// The input file.
         input: PathBuf,
@@ -67,26 +67,29 @@ fn main() {
                     std::process::exit(1);
                 }
             };
-            let out = blob
-                .instructions()
-                .enumerate()
-                .map(|(nth, maybe_ri)| match maybe_ri {
+            
+            let fp = match File::open(output) {
+                Ok(fp) => fp,
+                Err(e) => {
+                    eprintln!("ERROR: failed to open output file {:?}: {}", output, error);
+                    std::process::exit(1);
+                },
+            };
+            
+            let mut fp = BufWriter::new(fp);
+            for (nth_instruction, maybe_instruction) in blob.instructions().enumerate() {
+                let instruction = match maybe_instruction {
                     Ok(ri) => format!("{}: {}", nth, ri),
                     Err(error) => {
                         eprintln!(
                             "ERROR: failed to parse raw instruction from blob. {:?}: {}. nth:{} ",
-                            input, error, nth
+                            input, error, nth_instruction
                         );
-                        std::process::exit(1);
                     }
-                })
-                .collect::<Vec<String>>()
-                .join("\n");
-
-            if let Err(error) = std::fs::write(&output, out) {
-                eprintln!("ERROR: failed to write the bytecode to {:?}: {}", output, error);
-                std::process::exit(1);
+                }
+                writeln!(&mut fp, instruction).unwrap();
             }
+
         }
     }
 }
