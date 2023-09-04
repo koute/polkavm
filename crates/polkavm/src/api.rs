@@ -1063,14 +1063,16 @@ enum InstanceBackend {
 }
 
 impl InstanceBackend {
-    fn call(&mut self, export_index: usize, on_hostcall: OnHostcall, args: &[u32]) -> Result<(), ExecutionError> {
+    fn call(
+        &mut self,
+        export_index: usize,
+        on_hostcall: OnHostcall,
+        args: &[u32],
+        reset_memory_after_execution: bool,
+    ) -> Result<(), ExecutionError> {
         match self {
-            InstanceBackend::Compiled(ref mut backend) => backend.call(export_index, on_hostcall, args),
-            InstanceBackend::Interpreted(ref mut backend) => {
-                let mut ctx = crate::interpreter::InterpreterContext::default();
-                ctx.set_on_hostcall(on_hostcall);
-                backend.call(export_index, ctx, args)
-            }
+            InstanceBackend::Compiled(ref mut backend) => backend.call(export_index, on_hostcall, args, reset_memory_after_execution),
+            InstanceBackend::Interpreted(ref mut backend) => backend.call(export_index, on_hostcall, args, reset_memory_after_execution),
         }
     }
 
@@ -1277,8 +1279,17 @@ fn on_hostcall<'a, T>(
 }
 
 impl<T> Func<T> {
-    /// Calls the function.
+    /// Calls the function. Doesn't reset the memory after the call.
     pub fn call(&self, user_data: &mut T, args: &[Val]) -> Result<Option<Val>, ExecutionError> {
+        self.call_impl(user_data, args, false)
+    }
+
+    /// Calls the function. Will reset the memory after the call.
+    pub fn call_and_reset_memory(&self, user_data: &mut T, args: &[Val]) -> Result<Option<Val>, ExecutionError> {
+        self.call_impl(user_data, args, true)
+    }
+
+    fn call_impl(&self, user_data: &mut T, args: &[Val], reset_memory_after_execution: bool) -> Result<Option<Val>, ExecutionError> {
         let instance_pre = &self.instance.0.instance_pre;
         let export = &instance_pre.0.module.0.exports[self.export_index];
         let prototype = export.prototype();
@@ -1347,16 +1358,26 @@ impl<T> Func<T> {
         let mutable = &mut *mutable;
         let mut tracer = mutable.tracer.as_mut();
         if let Some(ref mut tracer) = tracer {
-            tracer.on_call(self.export_index, export, arg_regs);
+            tracer.on_before_call(self.export_index, export, arg_regs, reset_memory_after_execution);
         }
 
         let mut on_hostcall = on_hostcall(
             user_data,
             &instance_pre.0.host_functions,
             instance_pre.0.fallback_handler.as_ref(),
-            tracer,
+            tracer.as_deref_mut(),
         );
-        match mutable.backend.call(self.export_index, &mut on_hostcall, arg_regs) {
+
+        let result = mutable
+            .backend
+            .call(self.export_index, &mut on_hostcall, arg_regs, reset_memory_after_execution);
+        core::mem::drop(on_hostcall);
+
+        if let Some(ref mut tracer) = tracer {
+            tracer.on_after_call();
+        }
+
+        match result {
             Ok(()) => {}
             Err(ExecutionError::Error(error)) => {
                 return Err(ExecutionError::Error(
@@ -1405,8 +1426,17 @@ where
     FnArgs: FuncArgs,
     FnResult: FuncResult,
 {
-    /// Calls the function.
+    /// Calls the function. Doesn't reset the memory after the call.
     pub fn call(&self, user_data: &mut T, args: FnArgs) -> Result<FnResult, ExecutionError> {
+        self.call_impl(user_data, args, false)
+    }
+
+    /// Calls the function. Will reset the memory after the call.
+    pub fn call_and_reset_memory(&self, user_data: &mut T, args: FnArgs) -> Result<FnResult, ExecutionError> {
+        self.call_impl(user_data, args, true)
+    }
+
+    fn call_impl(&self, user_data: &mut T, args: FnArgs, reset_memory_after_execution: bool) -> Result<FnResult, ExecutionError> {
         let instance_pre = &self.instance.0.instance_pre;
         let export = &instance_pre.0.module.0.exports[self.export_index];
 
@@ -1427,16 +1457,26 @@ where
         let mutable = &mut *mutable;
         let mut tracer = mutable.tracer.as_mut();
         if let Some(ref mut tracer) = tracer {
-            tracer.on_call(self.export_index, export, arg_regs);
+            tracer.on_before_call(self.export_index, export, arg_regs, reset_memory_after_execution);
         }
 
         let mut on_hostcall = on_hostcall(
             user_data,
             &instance_pre.0.host_functions,
             instance_pre.0.fallback_handler.as_ref(),
-            tracer,
+            tracer.as_deref_mut(),
         );
-        match mutable.backend.call(self.export_index, &mut on_hostcall, arg_regs) {
+
+        let result = mutable
+            .backend
+            .call(self.export_index, &mut on_hostcall, arg_regs, reset_memory_after_execution);
+        core::mem::drop(on_hostcall);
+
+        if let Some(ref mut tracer) = tracer {
+            tracer.on_after_call();
+        }
+
+        match result {
             Ok(()) => {}
             Err(ExecutionError::Error(error)) => {
                 return Err(ExecutionError::Error(

@@ -14,6 +14,7 @@ pub(crate) struct Tracer {
     crosscheck_reg: Option<(Reg, u32)>,
     crosscheck_store: Option<(u32, u32)>,
     crosscheck_store_bytes: [u8; 8],
+    crosscheck_reset_memory_after_execution: bool,
     current_function: Option<usize>,
     current_inline_stack: Vec<usize>,
 
@@ -33,6 +34,7 @@ impl Tracer {
             crosscheck_reg: None,
             crosscheck_store: None,
             crosscheck_store_bytes: Default::default(),
+            crosscheck_reset_memory_after_execution: false,
             current_function: None,
             current_inline_stack: Vec::new(),
 
@@ -41,7 +43,7 @@ impl Tracer {
         }
     }
 
-    pub fn on_call(&mut self, export_index: usize, export: &ProgramExport, args: &[u32]) {
+    pub fn on_before_call(&mut self, export_index: usize, export: &ProgramExport, args: &[u32], reset_memory_after_execution: bool) {
         let target = self
             .module
             .instruction_by_jump_target(export.address())
@@ -49,7 +51,16 @@ impl Tracer {
         log::trace!("Calling export: '{}' (at #{})", export.prototype().name(), target);
 
         if let Some(ref mut interpreter) = self.crosscheck_interpreter {
-            interpreter.prepare_for_execution(export_index, args);
+            self.crosscheck_reset_memory_after_execution = reset_memory_after_execution;
+            interpreter.prepare_for_call(export_index, args);
+        }
+    }
+
+    pub fn on_after_call(&mut self) {
+        if let Some(ref mut interpreter) = self.crosscheck_interpreter {
+            if self.crosscheck_reset_memory_after_execution {
+                interpreter.reset_memory();
+            }
         }
     }
 

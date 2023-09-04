@@ -173,15 +173,20 @@ enum InstExt {
 #[derive(Debug)]
 struct BasicBlock {
     source: AddressRange,
-    fallthrough_address: u32,
     ops: Vec<(AddressRange, InstExt)>,
     next: EndOfBlock,
+}
+
+impl BasicBlock {
+    fn new(source: AddressRange, ops: Vec<(AddressRange, InstExt)>, next: EndOfBlock) -> Self {
+        Self { source, ops, next }
+    }
 }
 
 struct Fn<'a> {
     name: Option<&'a str>,
     range: AddressRange,
-    body: Vec<BasicBlock>,
+    body: Vec<usize>,
 }
 
 #[derive(Clone)]
@@ -520,7 +525,7 @@ fn extract_functions<'a>(
     jump_targets: &mut HashSet<u32>,
     relocation_for_section: &HashMap<SectionIndex, i64>,
     mut instruction_overrides: HashMap<u64, Inst>,
-) -> Result<Vec<Fn<'a>>, ProgramFromElfError> {
+) -> Result<(Vec<Fn<'a>>, Vec<BasicBlock>), ProgramFromElfError> {
     let hostcall_by_hash: HashMap<[u8; 16], u32> = import_metadata.iter().map(|(index, metadata)| (metadata.hash, *index)).collect();
 
     let text_range = section_text.file_range().unwrap_or((0, 0));
@@ -584,6 +589,8 @@ fn extract_functions<'a>(
     let text_relocation_delta = *relocation_for_section
         .get(&section_text.index())
         .expect("internal error: no relocation offset for the '.text' section");
+
+    let mut blocks = Vec::new();
     for func in &mut functions {
         // The range of addresses for this function before relocation.
         let original_range = func.range.start as u64..func.range.end as u64;
@@ -714,6 +721,12 @@ fn extract_functions<'a>(
             }
 
             let op = match op {
+                Inst::LoadUpperImmediate { dst, value } => InstExt::Inst(Inst::RegImm {
+                    kind: RegImmKind::Add,
+                    dst,
+                    src: Reg::Zero,
+                    imm: value as i32,
+                }),
                 Inst::JumpAndLink { dst, target } => {
                     let target = (relocated_pc as i32 + target as i32) as u32;
                     if u64::from(target) >= section_text.size() {
@@ -755,7 +768,7 @@ fn extract_functions<'a>(
         }
 
         // Split the function into basic blocks.
-        let mut blocks = Vec::new();
+        let mut local_blocks = Vec::new();
         let mut current_block = Vec::new();
         let mut block_start = 0;
         for (source, op) in body {
@@ -764,12 +777,12 @@ fn extract_functions<'a>(
             }
 
             if !current_block.is_empty() && jump_targets.contains(&source.start) {
-                blocks.push(BasicBlock {
-                    source: (block_start..source.start).into(),
-                    fallthrough_address: source.start,
-                    ops: std::mem::take(&mut current_block),
-                    next: EndOfBlock::Fallthrough { target: source.start },
-                });
+                local_blocks.push(blocks.len());
+                blocks.push(BasicBlock::new(
+                    (block_start..source.start).into(),
+                    std::mem::take(&mut current_block),
+                    EndOfBlock::Fallthrough { target: source.start },
+                ));
                 block_start = source.start;
             }
 
@@ -785,12 +798,12 @@ fn extract_functions<'a>(
                     EndOfBlock::Jump { source, target }
                 };
 
-                blocks.push(BasicBlock {
-                    source: (block_start..source.end).into(),
-                    fallthrough_address: source.end,
-                    ops: std::mem::take(&mut current_block),
+                local_blocks.push(blocks.len());
+                blocks.push(BasicBlock::new(
+                    (block_start..source.end).into(),
+                    std::mem::take(&mut current_block),
                     next,
-                });
+                ));
                 block_start = source.start;
             } else if let InstExt::Inst(Inst::JumpAndLinkRegister { dst, base, value }) = op {
                 let next = if dst != Reg::Zero {
@@ -808,19 +821,20 @@ fn extract_functions<'a>(
                         offset: value,
                     }
                 };
-                blocks.push(BasicBlock {
-                    source: (block_start..source.end).into(),
-                    fallthrough_address: source.end,
-                    ops: std::mem::take(&mut current_block),
+
+                local_blocks.push(blocks.len());
+                blocks.push(BasicBlock::new(
+                    (block_start..source.end).into(),
+                    std::mem::take(&mut current_block),
                     next,
-                });
+                ));
                 block_start = source.start;
             } else if let InstExt::Inst(Inst::Branch { kind, src1, src2, target }) = op {
-                blocks.push(BasicBlock {
-                    source: (block_start..source.end).into(),
-                    fallthrough_address: source.end,
-                    ops: std::mem::take(&mut current_block),
-                    next: EndOfBlock::Branch {
+                local_blocks.push(blocks.len());
+                blocks.push(BasicBlock::new(
+                    (block_start..source.end).into(),
+                    std::mem::take(&mut current_block),
+                    EndOfBlock::Branch {
                         source,
                         kind,
                         src1,
@@ -828,15 +842,15 @@ fn extract_functions<'a>(
                         target_true: target,
                         target_false: source.end,
                     },
-                });
+                ));
                 block_start = source.start;
             } else if let InstExt::Inst(Inst::Unimplemented) = op {
-                blocks.push(BasicBlock {
-                    source: (block_start..source.end).into(),
-                    fallthrough_address: source.end,
-                    ops: std::mem::take(&mut current_block),
-                    next: EndOfBlock::Unimplemented { source },
-                });
+                local_blocks.push(blocks.len());
+                blocks.push(BasicBlock::new(
+                    (block_start..source.end).into(),
+                    std::mem::take(&mut current_block),
+                    EndOfBlock::Unimplemented { source },
+                ));
                 block_start = source.start;
             } else {
                 current_block.push((source, op));
@@ -854,14 +868,14 @@ fn extract_functions<'a>(
             ));
         }
 
-        func.body = blocks;
+        func.body = local_blocks;
     }
 
     if !instruction_overrides.is_empty() {
         return Err(ProgramFromElfError::other("internal error: instruction overrides map is not empty"));
     }
 
-    Ok(functions)
+    Ok((functions, blocks))
 }
 
 fn cast_reg(reg: Reg) -> PReg {
@@ -885,10 +899,15 @@ fn cast_reg(reg: Reg) -> PReg {
     }
 }
 
-fn emit_code(mut jump_targets: HashSet<u32>, functions: &[Fn]) -> Result<Vec<(AddressRange, RawInstruction)>, ProgramFromElfError> {
+fn emit_code(
+    mut jump_targets: HashSet<u32>,
+    functions: &[Fn],
+    blocks: &[BasicBlock],
+) -> Result<Vec<(AddressRange, RawInstruction)>, ProgramFromElfError> {
     for func in functions {
-        jump_targets.insert(func.body[0].source.start);
-        for block in &func.body {
+        jump_targets.insert(blocks[func.body[0]].source.start);
+        for &block_index in &func.body {
+            let block = &blocks[block_index];
             match block.next {
                 EndOfBlock::Fallthrough { .. } => {}
                 EndOfBlock::Jump { target, .. } => {
@@ -914,7 +933,8 @@ fn emit_code(mut jump_targets: HashSet<u32>, functions: &[Fn]) -> Result<Vec<(Ad
 
     let mut code: Vec<(AddressRange, RawInstruction)> = Vec::new();
     for func in functions {
-        for block in &func.body {
+        for &block_index in &func.body {
+            let block = &blocks[block_index];
             if jump_targets.contains(&block.source.start) {
                 assert_eq!(block.source.start % 4, 0);
                 code.push((
@@ -925,9 +945,6 @@ fn emit_code(mut jump_targets: HashSet<u32>, functions: &[Fn]) -> Result<Vec<(Ad
 
             for &(source, op) in &block.ops {
                 let op = match op {
-                    InstExt::Inst(Inst::LoadUpperImmediate { dst, value }) => {
-                        RawInstruction::new_with_regs2_imm(Opcode::add_imm, cast_reg(dst), cast_reg(Reg::Zero), value)
-                    }
                     InstExt::Inst(Inst::Load { kind, dst, base, offset }) => {
                         use crate::riscv::LoadKind;
                         let kind = match kind {
@@ -998,6 +1015,7 @@ fn emit_code(mut jump_targets: HashSet<u32>, functions: &[Fn]) -> Result<Vec<(Ad
                     | InstExt::Inst(Inst::JumpAndLinkRegister { .. })
                     | InstExt::Inst(Inst::Branch { .. })
                     | InstExt::Inst(Inst::AddUpperImmediateToPc { .. })
+                    | InstExt::Inst(Inst::LoadUpperImmediate { .. })
                     | InstExt::Inst(Inst::Unimplemented)
                     | InstExt::Inst(Inst::Ecall) => unreachable!(),
                 };
@@ -1007,7 +1025,7 @@ fn emit_code(mut jump_targets: HashSet<u32>, functions: &[Fn]) -> Result<Vec<(Ad
 
             match block.next {
                 EndOfBlock::Fallthrough { target } => {
-                    assert_eq!(target, block.fallthrough_address);
+                    assert_eq!(target, block.source.end);
                 }
                 EndOfBlock::Jump { source, target } => {
                     if target % 4 != 0 {
@@ -1036,7 +1054,7 @@ fn emit_code(mut jump_targets: HashSet<u32>, functions: &[Fn]) -> Result<Vec<(Ad
                         source,
                         RawInstruction::new_with_regs2_imm(Opcode::jump_and_link_register, cast_reg(ra), cast_reg(Reg::Zero), target / 4),
                     ));
-                    assert_eq!(return_address, block.fallthrough_address);
+                    assert_eq!(return_address, block.source.end);
                 }
                 EndOfBlock::JumpIndirect { source, base, offset } => {
                     if offset % 4 != 0 {
@@ -1070,7 +1088,7 @@ fn emit_code(mut jump_targets: HashSet<u32>, functions: &[Fn]) -> Result<Vec<(Ad
                         source,
                         RawInstruction::new_with_regs2_imm(Opcode::jump_and_link_register, cast_reg(ra), cast_reg(base), offset as u32 / 4),
                     ));
-                    assert_eq!(return_address, block.fallthrough_address);
+                    assert_eq!(return_address, block.source.end);
                 }
                 EndOfBlock::Branch {
                     source,
@@ -1095,7 +1113,7 @@ fn emit_code(mut jump_targets: HashSet<u32>, functions: &[Fn]) -> Result<Vec<(Ad
                         source,
                         RawInstruction::new_with_regs2_imm(kind, cast_reg(src1), cast_reg(src2), target_true / 4),
                     ));
-                    assert_eq!(target_false, block.fallthrough_address);
+                    assert_eq!(target_false, block.source.end);
                 }
                 EndOfBlock::Unimplemented { source } => {
                     code.push((source, RawInstruction::new_argless(Opcode::trap)));
@@ -1870,7 +1888,7 @@ pub fn program_from_elf(_config: Config, data: &[u8]) -> Result<ProgramBlob, Pro
 
     let dwarf = crate::dwarf::load_dwarf(&elf, &data)?;
 
-    let functions = extract_functions(
+    let (functions, blocks) = extract_functions(
         &data,
         &elf,
         section_text,
@@ -1880,7 +1898,7 @@ pub fn program_from_elf(_config: Config, data: &[u8]) -> Result<ProgramBlob, Pro
         instruction_overrides,
     )?;
 
-    let code = emit_code(jump_targets, &functions)?;
+    let code = emit_code(jump_targets, &functions, &blocks)?;
 
     #[derive(Default)]
     struct Writer {
@@ -2140,7 +2158,7 @@ pub fn program_from_elf(_config: Config, data: &[u8]) -> Result<ProgramBlob, Pro
     //
     // This can happen for e.g. the symbols from the standard library, if the standard library wasn't recompiled.
     for func in &functions {
-        let source = func.body[0].source;
+        let source = blocks[func.body[0]].source;
         if addresses_with_dwarf_info.contains(&source.start) {
             continue;
         }

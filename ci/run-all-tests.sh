@@ -5,8 +5,8 @@ set -euo pipefail
 cd ..
 
 cargo test --all
-cargo run -p hello-world-host
-cargo run --target=i686-unknown-linux-musl -p hello-world-host
+POLKAVM_TRACE_EXECUTION=1 POLKAVM_ALLOW_INSECURE=1 cargo run -p hello-world-host
+POLKAVM_TRACE_EXECUTION=1 POLKAVM_ALLOW_INSECURE=1 cargo run --target=i686-unknown-linux-musl -p hello-world-host
 
 cd crates/polkavm-zygote
 cargo build --release
