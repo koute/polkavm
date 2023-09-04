@@ -1,5 +1,8 @@
 use clap::Parser;
-use std::path::PathBuf;
+use std::{
+    path::PathBuf,
+    io::Write,
+};
 
 #[derive(Parser, Debug)]
 #[clap(version)]
@@ -67,29 +70,37 @@ fn main() {
                     std::process::exit(1);
                 }
             };
-            
-            let fp = match File::open(output) {
-                Ok(fp) => fp,
-                Err(e) => {
-                    eprintln!("ERROR: failed to open output file {:?}: {}", output, error);
-                    std::process::exit(1);
+
+            let std_out = std::io::stdout();
+            let mut bw: Box<dyn Write> = match output {
+                Some(out) => {
+                    let fp = match std::fs::File::create(&out) {
+                        Ok(fp) => fp,
+                        Err(error) => {
+                            eprintln!("ERROR: failed to open output file {:?}: {}", out, error);
+                            std::process::exit(1);
+                        },
+                    };
+                    Box::new(std::io::BufWriter::new(fp))
                 },
+                None => {
+                    Box::new(std::io::BufWriter::new(std_out))
+                }
             };
-            
-            let mut fp = BufWriter::new(fp);
+
             for (nth_instruction, maybe_instruction) in blob.instructions().enumerate() {
                 let instruction = match maybe_instruction {
-                    Ok(ri) => format!("{}: {}", nth, ri),
+                    Ok(instruction) => format!("{}: {}", nth_instruction, instruction),
                     Err(error) => {
                         eprintln!(
                             "ERROR: failed to parse raw instruction from blob. {:?}: {}. nth:{} ",
                             input, error, nth_instruction
                         );
+                        std::process::exit(1);
                     }
-                }
-                writeln!(&mut fp, instruction).unwrap();
+                };
+                writeln!(&mut bw, "{}", instruction).unwrap();
             }
-
         }
     }
 }
