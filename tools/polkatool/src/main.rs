@@ -1,8 +1,5 @@
 use clap::Parser;
-use std::{
-    path::PathBuf,
-    io::Write,
-};
+use std::{io::Write, path::PathBuf};
 
 #[derive(Parser, Debug)]
 #[clap(version)]
@@ -79,13 +76,11 @@ fn main() {
                         Err(error) => {
                             eprintln!("ERROR: failed to create output file {:?}: {}", out, error);
                             std::process::exit(1);
-                        },
+                        }
                     };
                     Box::new(std::io::BufWriter::new(fp))
-                },
-                None => {
-                    Box::new(std::io::BufWriter::new(std_out))
                 }
+                None => Box::new(std::io::BufWriter::new(std_out)),
             };
 
             for (nth_instruction, maybe_instruction) in blob.instructions().enumerate() {
@@ -100,10 +95,7 @@ fn main() {
                     }
                 };
                 if let Err(error) = writeln!(&mut bw, "{}", instruction) {
-                    eprintln!(
-                        "ERROR: failed to write instruction from buffer. {:?} {}.",
-                        error, instruction 
-                    );
+                    eprintln!("ERROR: failed to write instruction from buffer. {:?} {}.", error, instruction);
                     std::process::exit(1);
                 }
             }
