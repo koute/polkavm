@@ -2,6 +2,7 @@
 #![allow(clippy::collapsible_else_if)]
 #![allow(clippy::len_without_is_empty)]
 #![allow(clippy::manual_range_contains)]
+#![cfg(all(target_os = "linux", target_arch = "x86_64"))]
 
 extern crate polkavm_linux_raw as linux_raw;
 
