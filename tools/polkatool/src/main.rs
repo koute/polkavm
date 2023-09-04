@@ -77,7 +77,7 @@ fn main() {
                     let fp = match std::fs::File::create(&out) {
                         Ok(fp) => fp,
                         Err(error) => {
-                            eprintln!("ERROR: failed to open output file {:?}: {}", out, error);
+                            eprintln!("ERROR: failed to create output file {:?}: {}", out, error);
                             std::process::exit(1);
                         },
                     };
@@ -99,8 +99,15 @@ fn main() {
                         std::process::exit(1);
                     }
                 };
-                writeln!(&mut bw, "{}", instruction).unwrap();
+                if let Err(error) = writeln!(&mut bw, "{}", instruction) {
+                    eprintln!(
+                        "ERROR: failed to write instruction from buffer. {:?} {}.",
+                        error, instruction 
+                    );
+                    std::process::exit(1);
+                }
             }
+            bw.flush().unwrap();
         }
     }
 }
