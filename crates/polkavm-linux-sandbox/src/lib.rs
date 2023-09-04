@@ -703,7 +703,30 @@ fn get_message(vmctx: &VmCtx) -> Option<String> {
     // The message is in shared memory, so clone it first to make sure
     // it doesn't change under us and violate string's invariants.
     let message = message.to_vec();
-    String::from_utf8(message).ok()
+    match String::from_utf8(message) {
+        Ok(message) => Some(message),
+        Err(error) => {
+            let message = error.into_bytes();
+            Some(String::from_utf8_lossy(&message).into_owned())
+        }
+    }
+}
+
+unsafe fn set_message(vmctx: &VmCtx, message: core::fmt::Arguments) {
+    struct Adapter<'a>(std::io::Cursor<&'a mut [u8]>);
+    impl<'a> core::fmt::Write for Adapter<'a> {
+        fn write_str(&mut self, string: &str) -> Result<(), core::fmt::Error> {
+            use std::io::Write;
+            self.0.write_all(string.as_bytes()).map_err(|_| core::fmt::Error)
+        }
+    }
+
+    let buffer: &mut [u8] = &mut *vmctx.message_buffer.get();
+    let mut cursor = Adapter(std::io::Cursor::new(buffer));
+    let _ = core::fmt::write(&mut cursor, message);
+    let length = cursor.0.position() as usize;
+
+    *vmctx.message_length.get() = length as u32;
 }
 
 pub type OnHostcall<'a> = &'a mut dyn for<'r> FnMut(u64, SandboxAccess<'r>) -> Result<(), Trap>;
@@ -805,8 +828,10 @@ impl Sandbox {
                         // This is impossible.
                         abort();
                     }
-                    Err(_) => {
-                        // TODO: We should display this error somehow.
+                    Err(error) => {
+                        let vmctx = &*vmctx_mmap.as_ptr().cast::<VmCtx>();
+                        set_message(vmctx, format_args!("fatal error while spawning child: {error}"));
+
                         abort();
                     }
                 }
@@ -909,7 +934,15 @@ impl Sandbox {
         let vmctx = unsafe { &*vmctx_mmap.as_ptr().cast::<VmCtx>() };
 
         // Send the vmctx memfd to the child process.
-        linux_raw::sendfd(socket.borrow(), vmctx_memfd.borrow())?;
+        if let Err(error) = linux_raw::sendfd(socket.borrow(), vmctx_memfd.borrow()) {
+            let message = get_message(vmctx);
+            if let Some(message) = message {
+                let error = Error::from(format!("failed to initialize sandbox process: {error} (root cause: {message})"));
+                return Err(error);
+            }
+
+            return Err(error);
+        }
 
         // Wait until the child process receives the vmctx memfd.
         wait_for_futex(vmctx, &mut child, VMCTX_FUTEX_BUSY, VMCTX_FUTEX_INIT)?;
