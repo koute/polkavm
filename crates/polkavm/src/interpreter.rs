@@ -79,15 +79,31 @@ impl InterpretedInstance {
             return_to_host: true,
         };
 
-        interpreter.reset();
+        interpreter.reset_memory();
         Ok(interpreter)
     }
 
-    pub fn call(&mut self, export_index: usize, ctx: InterpreterContext, args: &[u32]) -> Result<(), ExecutionError<Error>> {
-        self.prepare_for_execution(export_index, args);
+    pub fn call(
+        &mut self,
+        export_index: usize,
+        on_hostcall: OnHostcall,
+        args: &[u32],
+        reset_memory_after_execution: bool,
+    ) -> Result<(), ExecutionError<Error>> {
+        let mut ctx = InterpreterContext::default();
+        ctx.set_on_hostcall(on_hostcall);
+        self.prepare_for_call(export_index, args);
 
+        let result = self.run(ctx);
+        if reset_memory_after_execution {
+            self.reset_memory();
+        }
+
+        result
+    }
+
+    pub fn run(&mut self, ctx: InterpreterContext) -> Result<(), ExecutionError<Error>> {
         let mut visitor = Visitor { inner: self, ctx };
-
         loop {
             let Some(instruction) = visitor.inner.module.instructions().get(visitor.inner.pc as usize).copied() else {
                 return Err(ExecutionError::Trap(Default::default()));
@@ -109,11 +125,14 @@ impl InterpretedInstance {
         Ok(())
     }
 
-    pub fn reset(&mut self) {
-        let interpreted_module = self.module.interpreted_module().unwrap();
+    fn reset_regs(&mut self) {
         self.return_to_host = false;
         self.pc = 0;
         self.regs.fill(0);
+    }
+
+    pub fn reset_memory(&mut self) {
+        let interpreted_module = self.module.interpreted_module().unwrap();
         self.heap.clear();
         self.heap.extend_from_slice(&interpreted_module.rw_data);
         self.heap.resize(interpreted_module.config.heap_size() as usize, 0);
@@ -121,7 +140,7 @@ impl InterpretedInstance {
         self.stack.resize(interpreted_module.config.stack_size() as usize, 0);
     }
 
-    pub fn prepare_for_execution(&mut self, export_index: usize, args: &[u32]) {
+    pub fn prepare_for_call(&mut self, export_index: usize, args: &[u32]) {
         // TODO: If this function becomes public then this needs to return an error.
         let address = self
             .module
@@ -132,7 +151,7 @@ impl InterpretedInstance {
             .module
             .instruction_by_jump_target(address)
             .expect("internal error: invalid export address");
-        self.reset();
+        self.reset_regs();
         self.access().set_reg(Reg::SP, VM_ADDR_USER_STACK_HIGH);
         self.access().set_reg(Reg::RA, VM_ADDR_RETURN_TO_HOST);
 

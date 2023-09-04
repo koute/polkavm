@@ -302,14 +302,22 @@ impl CompiledInstance {
         Ok(CompiledInstance { module, sandbox })
     }
 
-    pub fn call(&mut self, export_index: usize, on_hostcall: OnHostcall, args: &[u32]) -> Result<(), ExecutionError<Error>> {
+    pub fn call(
+        &mut self,
+        export_index: usize,
+        on_hostcall: OnHostcall,
+        args: &[u32],
+        reset_memory_after_execution: bool,
+    ) -> Result<(), ExecutionError<Error>> {
         let compiled_module = self
             .module
             .compiled_module()
             .expect("internal error: tried to call into a compiled instance without a compiled module");
         let address = compiled_module.export_trampolines[export_index];
         let mut exec_args = ExecuteArgs::new();
-        exec_args.set_reset_memory_after_execution();
+        if reset_memory_after_execution {
+            exec_args.set_reset_memory_after_execution();
+        }
         exec_args.set_call(address);
         exec_args.set_args(args);
         let mut on_hostcall = move |hostcall: u64, access: SandboxAccess| -> Result<(), Trap> {
