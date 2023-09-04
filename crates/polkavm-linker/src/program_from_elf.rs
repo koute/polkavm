@@ -716,6 +716,12 @@ fn extract_functions<'a>(
             }
 
             let op = match op {
+                Inst::LoadUpperImmediate { dst, value } => InstExt::Inst(Inst::RegImm {
+                    kind: RegImmKind::Add,
+                    dst,
+                    src: Reg::Zero,
+                    imm: value as i32,
+                }),
                 Inst::JumpAndLink { dst, target } => {
                     let target = (relocated_pc as i32 + target as i32) as u32;
                     if u64::from(target) >= section_text.size() {
@@ -939,9 +945,6 @@ fn emit_code(
 
             for &(source, op) in &block.ops {
                 let op = match op {
-                    InstExt::Inst(Inst::LoadUpperImmediate { dst, value }) => {
-                        RawInstruction::new_with_regs2_imm(Opcode::add_imm, cast_reg(dst), cast_reg(Reg::Zero), value)
-                    }
                     InstExt::Inst(Inst::Load { kind, dst, base, offset }) => {
                         use crate::riscv::LoadKind;
                         let kind = match kind {
@@ -1012,6 +1015,7 @@ fn emit_code(
                     | InstExt::Inst(Inst::JumpAndLinkRegister { .. })
                     | InstExt::Inst(Inst::Branch { .. })
                     | InstExt::Inst(Inst::AddUpperImmediateToPc { .. })
+                    | InstExt::Inst(Inst::LoadUpperImmediate { .. })
                     | InstExt::Inst(Inst::Unimplemented)
                     | InstExt::Inst(Inst::Ecall) => unreachable!(),
                 };
