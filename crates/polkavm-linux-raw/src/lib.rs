@@ -90,15 +90,6 @@ pub use crate::arch_amd64_bindings::{
     SIG_SETMASK, SIG_UNBLOCK, WEXITED, WNOHANG, _LINUX_CAPABILITY_VERSION_3, __WALL,
 };
 
-// impl core::ops::Deref for siginfo_t {
-//     type Target = crate::arch_amd64_bindings::siginfo__bindgen_ty_1__bindgen_ty_1;
-//     fn deref(&self) -> &Self::Target {
-//         unsafe {
-//             &self.__bindgen_anon_1.__bindgen_anon_1
-//         }
-//     }
-// }
-
 impl siginfo_t {
     pub unsafe fn si_signo(&self) -> c_int {
         self.__bindgen_anon_1.__bindgen_anon_1.si_signo
