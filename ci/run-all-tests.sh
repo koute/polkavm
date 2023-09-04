@@ -1,27 +1,19 @@
 #!/bin/bash
 
 set -euo pipefail
-
+cd -- "$(dirname -- "${BASH_SOURCE[0]}")"
 cd ..
 
-cargo test --all
-POLKAVM_TRACE_EXECUTION=1 POLKAVM_ALLOW_INSECURE=1 cargo run -p hello-world-host
-POLKAVM_TRACE_EXECUTION=1 POLKAVM_ALLOW_INSECURE=1 cargo run --target=i686-unknown-linux-musl -p hello-world-host
+./ci/jobs/build-and-test.sh
 
-cd crates/polkavm-zygote
-cargo build --release
-RUSTFLAGS='-D warnings' cargo clippy --all
-cargo fmt --check --all
-cd ../..
+case "$OSTYPE" in
+  linux*)
+    ./ci/jobs/build-and-test-linux.sh
+esac
 
-cd examples/guests
-cargo build
-RUSTFLAGS='-D warnings' cargo clippy --all
-cargo fmt --check --all
-cd ../..
-
-RUSTFLAGS='-D warnings' cargo clippy --all
-cargo fmt --check --all
+./ci/jobs/build-guests.sh
+./ci/jobs/clippy.sh
+./ci/jobs/rustfmt.sh
 
 echo "----------------------------------------"
 echo "All tests finished!"
