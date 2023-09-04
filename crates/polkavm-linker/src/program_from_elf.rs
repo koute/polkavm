@@ -173,7 +173,6 @@ enum InstExt {
 #[derive(Debug)]
 struct BasicBlock {
     source: AddressRange,
-    fallthrough_address: u32,
     ops: Vec<(AddressRange, InstExt)>,
     next: EndOfBlock,
 }
@@ -775,7 +774,6 @@ fn extract_functions<'a>(
                 local_blocks.push(blocks.len());
                 blocks.push(BasicBlock {
                     source: (block_start..source.start).into(),
-                    fallthrough_address: source.start,
                     ops: std::mem::take(&mut current_block),
                     next: EndOfBlock::Fallthrough { target: source.start },
                 });
@@ -797,7 +795,6 @@ fn extract_functions<'a>(
                 local_blocks.push(blocks.len());
                 blocks.push(BasicBlock {
                     source: (block_start..source.end).into(),
-                    fallthrough_address: source.end,
                     ops: std::mem::take(&mut current_block),
                     next,
                 });
@@ -822,7 +819,6 @@ fn extract_functions<'a>(
                 local_blocks.push(blocks.len());
                 blocks.push(BasicBlock {
                     source: (block_start..source.end).into(),
-                    fallthrough_address: source.end,
                     ops: std::mem::take(&mut current_block),
                     next,
                 });
@@ -831,7 +827,6 @@ fn extract_functions<'a>(
                 local_blocks.push(blocks.len());
                 blocks.push(BasicBlock {
                     source: (block_start..source.end).into(),
-                    fallthrough_address: source.end,
                     ops: std::mem::take(&mut current_block),
                     next: EndOfBlock::Branch {
                         source,
@@ -847,7 +842,6 @@ fn extract_functions<'a>(
                 local_blocks.push(blocks.len());
                 blocks.push(BasicBlock {
                     source: (block_start..source.end).into(),
-                    fallthrough_address: source.end,
                     ops: std::mem::take(&mut current_block),
                     next: EndOfBlock::Unimplemented { source },
                 });
@@ -1025,7 +1019,7 @@ fn emit_code(
 
             match block.next {
                 EndOfBlock::Fallthrough { target } => {
-                    assert_eq!(target, block.fallthrough_address);
+                    assert_eq!(target, block.source.end);
                 }
                 EndOfBlock::Jump { source, target } => {
                     if target % 4 != 0 {
@@ -1054,7 +1048,7 @@ fn emit_code(
                         source,
                         RawInstruction::new_with_regs2_imm(Opcode::jump_and_link_register, cast_reg(ra), cast_reg(Reg::Zero), target / 4),
                     ));
-                    assert_eq!(return_address, block.fallthrough_address);
+                    assert_eq!(return_address, block.source.end);
                 }
                 EndOfBlock::JumpIndirect { source, base, offset } => {
                     if offset % 4 != 0 {
@@ -1088,7 +1082,7 @@ fn emit_code(
                         source,
                         RawInstruction::new_with_regs2_imm(Opcode::jump_and_link_register, cast_reg(ra), cast_reg(base), offset as u32 / 4),
                     ));
-                    assert_eq!(return_address, block.fallthrough_address);
+                    assert_eq!(return_address, block.source.end);
                 }
                 EndOfBlock::Branch {
                     source,
@@ -1113,7 +1107,7 @@ fn emit_code(
                         source,
                         RawInstruction::new_with_regs2_imm(kind, cast_reg(src1), cast_reg(src2), target_true / 4),
                     ));
-                    assert_eq!(target_false, block.fallthrough_address);
+                    assert_eq!(target_false, block.source.end);
                 }
                 EndOfBlock::Unimplemented { source } => {
                     code.push((source, RawInstruction::new_argless(Opcode::trap)));
