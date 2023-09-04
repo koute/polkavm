@@ -181,7 +181,7 @@ struct BasicBlock {
 struct Fn<'a> {
     name: Option<&'a str>,
     range: AddressRange,
-    body: Vec<BasicBlock>,
+    body: Vec<usize>,
 }
 
 #[derive(Clone)]
@@ -520,7 +520,7 @@ fn extract_functions<'a>(
     jump_targets: &mut HashSet<u32>,
     relocation_for_section: &HashMap<SectionIndex, i64>,
     mut instruction_overrides: HashMap<u64, Inst>,
-) -> Result<Vec<Fn<'a>>, ProgramFromElfError> {
+) -> Result<(Vec<Fn<'a>>, Vec<BasicBlock>), ProgramFromElfError> {
     let hostcall_by_hash: HashMap<[u8; 16], u32> = import_metadata.iter().map(|(index, metadata)| (metadata.hash, *index)).collect();
 
     let text_range = section_text.file_range().unwrap_or((0, 0));
@@ -584,6 +584,8 @@ fn extract_functions<'a>(
     let text_relocation_delta = *relocation_for_section
         .get(&section_text.index())
         .expect("internal error: no relocation offset for the '.text' section");
+
+    let mut blocks = Vec::new();
     for func in &mut functions {
         // The range of addresses for this function before relocation.
         let original_range = func.range.start as u64..func.range.end as u64;
@@ -755,7 +757,7 @@ fn extract_functions<'a>(
         }
 
         // Split the function into basic blocks.
-        let mut blocks = Vec::new();
+        let mut local_blocks = Vec::new();
         let mut current_block = Vec::new();
         let mut block_start = 0;
         for (source, op) in body {
@@ -764,6 +766,7 @@ fn extract_functions<'a>(
             }
 
             if !current_block.is_empty() && jump_targets.contains(&source.start) {
+                local_blocks.push(blocks.len());
                 blocks.push(BasicBlock {
                     source: (block_start..source.start).into(),
                     fallthrough_address: source.start,
@@ -785,6 +788,7 @@ fn extract_functions<'a>(
                     EndOfBlock::Jump { source, target }
                 };
 
+                local_blocks.push(blocks.len());
                 blocks.push(BasicBlock {
                     source: (block_start..source.end).into(),
                     fallthrough_address: source.end,
@@ -808,6 +812,8 @@ fn extract_functions<'a>(
                         offset: value,
                     }
                 };
+
+                local_blocks.push(blocks.len());
                 blocks.push(BasicBlock {
                     source: (block_start..source.end).into(),
                     fallthrough_address: source.end,
@@ -816,6 +822,7 @@ fn extract_functions<'a>(
                 });
                 block_start = source.start;
             } else if let InstExt::Inst(Inst::Branch { kind, src1, src2, target }) = op {
+                local_blocks.push(blocks.len());
                 blocks.push(BasicBlock {
                     source: (block_start..source.end).into(),
                     fallthrough_address: source.end,
@@ -831,6 +838,7 @@ fn extract_functions<'a>(
                 });
                 block_start = source.start;
             } else if let InstExt::Inst(Inst::Unimplemented) = op {
+                local_blocks.push(blocks.len());
                 blocks.push(BasicBlock {
                     source: (block_start..source.end).into(),
                     fallthrough_address: source.end,
@@ -854,14 +862,14 @@ fn extract_functions<'a>(
             ));
         }
 
-        func.body = blocks;
+        func.body = local_blocks;
     }
 
     if !instruction_overrides.is_empty() {
         return Err(ProgramFromElfError::other("internal error: instruction overrides map is not empty"));
     }
 
-    Ok(functions)
+    Ok((functions, blocks))
 }
 
 fn cast_reg(reg: Reg) -> PReg {
@@ -885,10 +893,15 @@ fn cast_reg(reg: Reg) -> PReg {
     }
 }
 
-fn emit_code(mut jump_targets: HashSet<u32>, functions: &[Fn]) -> Result<Vec<(AddressRange, RawInstruction)>, ProgramFromElfError> {
+fn emit_code(
+    mut jump_targets: HashSet<u32>,
+    functions: &[Fn],
+    blocks: &[BasicBlock],
+) -> Result<Vec<(AddressRange, RawInstruction)>, ProgramFromElfError> {
     for func in functions {
-        jump_targets.insert(func.body[0].source.start);
-        for block in &func.body {
+        jump_targets.insert(blocks[func.body[0]].source.start);
+        for &block_index in &func.body {
+            let block = &blocks[block_index];
             match block.next {
                 EndOfBlock::Fallthrough { .. } => {}
                 EndOfBlock::Jump { target, .. } => {
@@ -914,7 +927,8 @@ fn emit_code(mut jump_targets: HashSet<u32>, functions: &[Fn]) -> Result<Vec<(Ad
 
     let mut code: Vec<(AddressRange, RawInstruction)> = Vec::new();
     for func in functions {
-        for block in &func.body {
+        for &block_index in &func.body {
+            let block = &blocks[block_index];
             if jump_targets.contains(&block.source.start) {
                 assert_eq!(block.source.start % 4, 0);
                 code.push((
@@ -1870,7 +1884,7 @@ pub fn program_from_elf(_config: Config, data: &[u8]) -> Result<ProgramBlob, Pro
 
     let dwarf = crate::dwarf::load_dwarf(&elf, &data)?;
 
-    let functions = extract_functions(
+    let (functions, blocks) = extract_functions(
         &data,
         &elf,
         section_text,
@@ -1880,7 +1894,7 @@ pub fn program_from_elf(_config: Config, data: &[u8]) -> Result<ProgramBlob, Pro
         instruction_overrides,
     )?;
 
-    let code = emit_code(jump_targets, &functions)?;
+    let code = emit_code(jump_targets, &functions, &blocks)?;
 
     #[derive(Default)]
     struct Writer {
@@ -2140,7 +2154,7 @@ pub fn program_from_elf(_config: Config, data: &[u8]) -> Result<ProgramBlob, Pro
     //
     // This can happen for e.g. the symbols from the standard library, if the standard library wasn't recompiled.
     for func in &functions {
-        let source = func.body[0].source;
+        let source = blocks[func.body[0]].source;
         if addresses_with_dwarf_info.contains(&source.start) {
             continue;
         }
