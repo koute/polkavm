@@ -1124,7 +1124,7 @@ pub fn sys_prctl_set_name(name: &[u8; 16]) -> Result<(), Error> {
     Error::from_syscall("prctl(PR_SET_NAME)", result)
 }
 
-pub fn sys_capset(header: &__user_cap_header_struct, data: &__user_cap_data_struct) -> Result<(), Error> {
+pub fn sys_capset(header: &__user_cap_header_struct, data: &[__user_cap_data_struct; 2]) -> Result<(), Error> {
     let result = unsafe {
         syscall_readonly!(
             SYS_capset,
@@ -1140,11 +1140,11 @@ pub fn sys_capset_drop_all() -> Result<(), Error> {
         version: _LINUX_CAPABILITY_VERSION_3,
         pid: 0,
     };
-    let cap_user_data = __user_cap_data_struct {
+    let cap_user_data = [__user_cap_data_struct {
         effective: 0,
         inheritable: 0,
         permitted: 0,
-    };
+    }; 2];
 
     sys_capset(&cap_user_header, &cap_user_data)
 }
