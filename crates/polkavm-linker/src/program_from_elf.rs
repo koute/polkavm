@@ -177,6 +177,12 @@ struct BasicBlock {
     next: EndOfBlock,
 }
 
+impl BasicBlock {
+    fn new(source: AddressRange, ops: Vec<(AddressRange, InstExt)>, next: EndOfBlock) -> Self {
+        Self { source, ops, next }
+    }
+}
+
 struct Fn<'a> {
     name: Option<&'a str>,
     range: AddressRange,
@@ -772,11 +778,11 @@ fn extract_functions<'a>(
 
             if !current_block.is_empty() && jump_targets.contains(&source.start) {
                 local_blocks.push(blocks.len());
-                blocks.push(BasicBlock {
-                    source: (block_start..source.start).into(),
-                    ops: std::mem::take(&mut current_block),
-                    next: EndOfBlock::Fallthrough { target: source.start },
-                });
+                blocks.push(BasicBlock::new(
+                    (block_start..source.start).into(),
+                    std::mem::take(&mut current_block),
+                    EndOfBlock::Fallthrough { target: source.start },
+                ));
                 block_start = source.start;
             }
 
@@ -793,11 +799,11 @@ fn extract_functions<'a>(
                 };
 
                 local_blocks.push(blocks.len());
-                blocks.push(BasicBlock {
-                    source: (block_start..source.end).into(),
-                    ops: std::mem::take(&mut current_block),
+                blocks.push(BasicBlock::new(
+                    (block_start..source.end).into(),
+                    std::mem::take(&mut current_block),
                     next,
-                });
+                ));
                 block_start = source.start;
             } else if let InstExt::Inst(Inst::JumpAndLinkRegister { dst, base, value }) = op {
                 let next = if dst != Reg::Zero {
@@ -817,18 +823,18 @@ fn extract_functions<'a>(
                 };
 
                 local_blocks.push(blocks.len());
-                blocks.push(BasicBlock {
-                    source: (block_start..source.end).into(),
-                    ops: std::mem::take(&mut current_block),
+                blocks.push(BasicBlock::new(
+                    (block_start..source.end).into(),
+                    std::mem::take(&mut current_block),
                     next,
-                });
+                ));
                 block_start = source.start;
             } else if let InstExt::Inst(Inst::Branch { kind, src1, src2, target }) = op {
                 local_blocks.push(blocks.len());
-                blocks.push(BasicBlock {
-                    source: (block_start..source.end).into(),
-                    ops: std::mem::take(&mut current_block),
-                    next: EndOfBlock::Branch {
+                blocks.push(BasicBlock::new(
+                    (block_start..source.end).into(),
+                    std::mem::take(&mut current_block),
+                    EndOfBlock::Branch {
                         source,
                         kind,
                         src1,
@@ -836,15 +842,15 @@ fn extract_functions<'a>(
                         target_true: target,
                         target_false: source.end,
                     },
-                });
+                ));
                 block_start = source.start;
             } else if let InstExt::Inst(Inst::Unimplemented) = op {
                 local_blocks.push(blocks.len());
-                blocks.push(BasicBlock {
-                    source: (block_start..source.end).into(),
-                    ops: std::mem::take(&mut current_block),
-                    next: EndOfBlock::Unimplemented { source },
-                });
+                blocks.push(BasicBlock::new(
+                    (block_start..source.end).into(),
+                    std::mem::take(&mut current_block),
+                    EndOfBlock::Unimplemented { source },
+                ));
                 block_start = source.start;
             } else {
                 current_block.push((source, op));
