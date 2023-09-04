@@ -10,12 +10,7 @@
 #![allow(clippy::manual_range_contains)]
 // This crate mostly contains syscall wrappers. If you use them you should know what you're doing.
 #![allow(clippy::missing_safety_doc)]
-
-#[cfg(not(target_os = "linux"))]
-compile_error!("unsupported operating system");
-
-#[cfg(not(target_arch = "x86_64"))]
-compile_error!("unsupported architecture");
+#![cfg(all(target_os = "linux", target_arch = "x86_64"))]
 
 #[cfg(feature = "std")]
 extern crate std;
