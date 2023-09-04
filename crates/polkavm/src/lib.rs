@@ -21,5 +21,5 @@ use compiler_dummy as compiler;
 pub use polkavm_common::program::ProgramBlob;
 pub use polkavm_common::utils::AsUninitSliceMut;
 
-pub use crate::api::{Engine, FuncType, Instance, InstancePre, Linker, Module, Val, ValType};
+pub use crate::api::{Caller, Engine, FuncType, Instance, InstancePre, IntoExternFn, Linker, Module, Val, ValType};
 pub use crate::config::Config;
