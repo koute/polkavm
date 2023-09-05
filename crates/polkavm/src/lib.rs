@@ -21,7 +21,7 @@ mod compiler_dummy;
 use compiler_dummy as compiler;
 
 pub use polkavm_common::{
-    error::Trap,
+    error::{ExecutionError, Trap},
     program::{ProgramBlob, Reg},
     utils::AsUninitSliceMut,
 };
