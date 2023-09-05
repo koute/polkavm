@@ -1313,9 +1313,7 @@ impl<T> Func<T> {
                 ));
             }
             Err(ExecutionError::Trap(trap)) => {
-                return Err(ExecutionError::Error(
-                    format!("execution trapped while calling '{}': {}", export.prototype().name(), trap).into(),
-                ));
+                return Err(ExecutionError::Trap(trap));
             }
         }
 
@@ -1411,9 +1409,7 @@ where
                 ));
             }
             Err(ExecutionError::Trap(trap)) => {
-                return Err(ExecutionError::Error(
-                    format!("execution trapped while calling '{}': {}", export.prototype().name(), trap).into(),
-                ));
+                return Err(ExecutionError::Trap(trap));
             }
         }
 

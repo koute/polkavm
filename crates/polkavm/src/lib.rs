@@ -33,7 +33,7 @@ pub use crate::error::Error;
 
 #[cfg(test)]
 mod tests {
-    use crate::{Caller, CallerRef, Config, Engine, Linker, Module, ProgramBlob, Reg, Trap};
+    use crate::{Caller, CallerRef, Config, Engine, ExecutionError, Linker, Module, ProgramBlob, Reg, Trap, Val};
     use std::cell::RefCell;
     use std::rc::Rc;
 
@@ -86,5 +86,55 @@ mod tests {
         let caller = state.illegal_contraband.borrow_mut().take().unwrap();
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| caller.get_reg(Reg::A0)));
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn trapping_from_hostcall_handler_works() {
+        let blob = ProgramBlob::parse(RAW_BLOB).unwrap();
+        let config = Config::default();
+        let engine = Engine::new(&config).unwrap();
+        let module = Module::from_blob(&engine, &blob).unwrap();
+        let mut linker = Linker::new(&engine);
+
+        enum Kind {
+            Ok,
+            Trap,
+        }
+
+        linker
+            .func_wrap("get_third_number", move |caller: Caller<Kind>| -> Result<u32, Trap> {
+                match *caller.data() {
+                    Kind::Ok => Ok(100),
+                    Kind::Trap => Err(Trap::default()),
+                }
+            })
+            .unwrap();
+
+        let instance_pre = linker.instantiate_pre(&module).unwrap();
+        let instance = instance_pre.instantiate().unwrap();
+
+        let result = instance
+            .get_typed_func::<(u32, u32), u32>("add_numbers")
+            .unwrap()
+            .call(&mut Kind::Ok, (1, 10));
+        assert!(matches!(result, Ok(111)));
+
+        let result = instance
+            .get_typed_func::<(u32, u32), u32>("add_numbers")
+            .unwrap()
+            .call(&mut Kind::Trap, (1, 10));
+        assert!(matches!(result, Err(ExecutionError::Trap(..))));
+
+        let result = instance
+            .get_func("add_numbers")
+            .unwrap()
+            .call(&mut Kind::Ok, &[Val::from(1), Val::from(10)]);
+        assert!(matches!(result, Ok(Some(Val::I32(111)))));
+
+        let result = instance
+            .get_func("add_numbers")
+            .unwrap()
+            .call(&mut Kind::Trap, &[Val::from(1), Val::from(10)]);
+        assert!(matches!(result, Err(ExecutionError::Trap(..))));
     }
 }
