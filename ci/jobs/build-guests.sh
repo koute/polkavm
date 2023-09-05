@@ -7,6 +7,6 @@ cd ../..
 if [ "${CI_RV32E_TOOLCHAIN_AVAILABLE:-}" == 1 ]; then
     echo ">> cargo build (example guests)"
     cd examples/guests
-    cargo build --all
+    ./build-all.sh
     cd ../..
 fi
