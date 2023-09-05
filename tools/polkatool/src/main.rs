@@ -16,6 +16,8 @@ enum Args {
 }
 
 fn main() {
+    env_logger::init();
+
     let args = Args::parse();
     match args {
         Args::Link { output, input } => {
