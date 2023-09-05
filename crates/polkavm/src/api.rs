@@ -1,7 +1,6 @@
 use std::collections::BTreeMap;
 use std::collections::HashMap;
-use std::sync::Arc;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 use polkavm_common::abi::{
     GuestMemoryConfig, VM_MAXIMUM_EXPORT_COUNT, VM_MAXIMUM_EXTERN_ARG_COUNT, VM_MAXIMUM_IMPORT_COUNT, VM_MAXIMUM_INSTRUCTION_COUNT,
@@ -13,6 +12,7 @@ use polkavm_common::program::{ExternFnPrototype, ExternTy, ProgramBlob, ProgramE
 use polkavm_common::program::{Opcode, RawInstruction, Reg};
 use polkavm_common::utils::{Access, AsUninitSliceMut};
 
+use crate::caller::{Caller, CallerRaw};
 use crate::compiler::{CompiledAccess, CompiledInstance, CompiledModule};
 use crate::config::{Backend, Config};
 use crate::error::{bail, Error, ExecutionError};
@@ -286,75 +286,6 @@ impl Module {
     }
 }
 
-/// A handle used to access the execution context.
-pub struct Caller<'a, 'b, T> {
-    user_data: &'a mut T,
-    access: &'a mut BackendAccess<'b>,
-    tracer: Option<&'a mut Tracer>,
-}
-
-impl<'a, 'b, T> Caller<'a, 'b, T> {
-    pub fn data(&self) -> &T {
-        self.user_data
-    }
-
-    pub fn data_mut(&mut self) -> &mut T {
-        self.user_data
-    }
-
-    pub fn get_reg(&self, reg: Reg) -> u32 {
-        let value = self.access.get_reg(reg);
-        log::trace!("Getting register (during hostcall): {reg} = 0x{value:x}");
-        value
-    }
-
-    pub fn set_reg(&mut self, reg: Reg, value: u32) {
-        log::trace!("Setting register (during hostcall): {reg} = 0x{value:x}");
-        self.access.set_reg(reg, value);
-        if let Some(ref mut tracer) = self.tracer {
-            tracer.on_set_reg_in_hostcall(reg, value);
-        }
-    }
-
-    pub fn read_memory_into_slice<'slice, B>(&self, address: u32, buffer: &'slice mut B) -> Result<&'slice mut [u8], Trap>
-    where
-        B: ?Sized + AsUninitSliceMut,
-    {
-        log::trace!(
-            "Reading memory (during hostcall): 0x{:x}-0x{:x} ({} bytes)",
-            address,
-            (address as usize + buffer.as_uninit_slice_mut().len()) as u32,
-            buffer.as_uninit_slice_mut().len()
-        );
-        self.access.read_memory_into_slice(address, buffer)
-    }
-
-    pub fn read_memory_into_new_vec(&self, address: u32, length: u32) -> Result<Vec<u8>, Trap> {
-        log::trace!(
-            "Reading memory (during hostcall): 0x{:x}-0x{:x} ({} bytes)",
-            address,
-            address.wrapping_add(length),
-            length
-        );
-        self.access.read_memory_into_new_vec(address, length)
-    }
-
-    pub fn write_memory(&mut self, address: u32, data: &[u8]) -> Result<(), Trap> {
-        log::trace!(
-            "Writing memory (during hostcall): 0x{:x}-0x{:x} ({} bytes)",
-            address,
-            (address as usize + data.len()) as u32,
-            data.len()
-        );
-        let result = self.access.write_memory(address, data);
-        if let Some(ref mut tracer) = self.tracer {
-            tracer.on_memory_write_in_hostcall(address, data, result.is_ok())?;
-        }
-
-        result
-    }
-}
-
 #[derive(Clone)]
 pub enum ValType {
     I32,
@@ -449,7 +380,7 @@ impl FuncType {
 }
 
 trait ExternFn<T> {
-    fn call(&self, user_data: &mut T, access: BackendAccess, tracer: Option<&mut Tracer>) -> Result<(), Trap>;
+    fn call(&self, user_data: &mut T, access: BackendAccess, raw: &mut CallerRaw) -> Result<(), Trap>;
     fn typecheck(&self, prototype: &ExternFnPrototype) -> Result<(), Error>;
 }
 
@@ -619,9 +550,9 @@ macro_rules! impl_into_extern_fn {
 
     (@get_reg $caller:expr) => {{
         let mut reg_index = 0;
-        let access = &mut *$caller.access;
+        let caller = &mut $caller;
         move || -> u32 {
-            let value = access.get_reg(Reg::ARG_REGS[reg_index]);
+            let value = caller.get_reg(Reg::ARG_REGS[reg_index]);
             reg_index += 1;
             value
         }
@@ -693,27 +624,23 @@ macro_rules! impl_into_extern_fn {
     ($arg_count:tt $($args:ident)*) => {
         impl<T, F, $($args,)* R> ExternFn<T> for (F, core::marker::PhantomData<(R, $($args),*)>)
             where
-            F: Fn(Caller<'_, '_, T>, $($args),*) -> R + Send + Sync + 'static,
+            F: Fn(Caller<'_, T>, $($args),*) -> R + Send + Sync + 'static,
             $($args: AbiTy,)*
             R: ReturnTy,
         {
-            fn call(&self, user_data: &mut T, mut access: BackendAccess, mut tracer: Option<&mut Tracer>) -> Result<(), Trap> {
-                let caller = Caller {
-                    user_data,
-                    access: &mut access,
-                    tracer: tracer.as_deref_mut(),
-                };
-
-                let result = impl_into_extern_fn!(@call caller, self.0, $($args),*)?;
+            fn call(&self, user_data: &mut T, mut access: BackendAccess, raw: &mut CallerRaw) -> Result<(), Trap> {
+                #[allow(unused_mut)]
+                let result = Caller::wrap(user_data, &mut access, raw, move |mut caller| {
+                    impl_into_extern_fn!(@call caller, self.0, $($args),*)
+                })?;
 
                 let set_reg = {
-                    let tracer = &mut tracer;
                     let mut reg_index = 0;
                     move |value: u32| {
                         let reg = Reg::ARG_REGS[reg_index];
                         access.set_reg(reg, value);
 
-                        if let Some(tracer) = tracer {
+                        if let Some(ref mut tracer) = raw.tracer() {
                             tracer.on_set_reg_in_hostcall(reg, value as u32);
                         }
 
@@ -752,9 +679,9 @@ macro_rules! impl_into_extern_fn {
             }
         }
 
-        impl<T, F, $($args,)* R> IntoExternFn<T, (Caller<'_, '_, T>, $($args,)*), R> for F
+        impl<T, F, $($args,)* R> IntoExternFn<T, (Caller<'_, T>, $($args,)*), R> for F
         where
-            F: Fn(Caller<'_, '_, T>, $($args),*) -> R + Send + Sync + 'static,
+            F: Fn(Caller<'_, T>, $($args),*) -> R + Send + Sync + 'static,
             $($args: AbiTy,)*
             R: ReturnTy,
         {
@@ -812,10 +739,10 @@ fn catch_hostcall_panic<R>(callback: impl FnOnce() -> R) -> Result<R, Trap> {
 
 impl<T, F> ExternFn<T> for DynamicFn<T, F>
 where
-    F: Fn(Caller<'_, '_, T>, &[Val], Option<&mut Val>) -> Result<(), Trap> + Send + Sync + 'static,
+    F: Fn(Caller<'_, T>, &[Val], Option<&mut Val>) -> Result<(), Trap> + Send + Sync + 'static,
     T: 'static,
 {
-    fn call(&self, user_data: &mut T, mut access: BackendAccess, mut tracer: Option<&mut Tracer>) -> Result<(), Trap> {
+    fn call(&self, user_data: &mut T, mut access: BackendAccess, raw: &mut CallerRaw) -> Result<(), Trap> {
         const DEFAULT: Val = Val::I64(0);
         let mut args = [DEFAULT; VM_MAXIMUM_EXTERN_ARG_COUNT];
         let args = &mut args[..self.args.len()];
@@ -854,13 +781,12 @@ where
             ExternTy::I64 => Val::I64(0),
         };
 
-        let caller = Caller {
-            user_data,
-            access: &mut access,
-            tracer: tracer.as_deref_mut(),
-        };
-
-        catch_hostcall_panic(|| (self.callback)(caller, args, self.return_ty.map(|_| &mut return_value)))??;
+        {
+            let return_value = self.return_ty.map(|_| &mut return_value);
+            Caller::wrap(user_data, &mut access, raw, move |caller| {
+                catch_hostcall_panic(|| (self.callback)(caller, args, return_value))
+            })??;
+        }
 
         if let Some(return_ty) = self.return_ty {
             match return_value {
@@ -875,7 +801,7 @@ where
                     }
 
                     access.set_reg(Reg::A0, value as u32);
-                    if let Some(tracer) = tracer {
+                    if let Some(tracer) = raw.tracer() {
                         tracer.on_set_reg_in_hostcall(Reg::A0, value as u32);
                     }
                 }
@@ -892,7 +818,7 @@ where
                     access.set_reg(Reg::A0, value as u32);
                     access.set_reg(Reg::A1, (value >> 32) as u32);
 
-                    if let Some(tracer) = tracer {
+                    if let Some(tracer) = raw.tracer() {
                         tracer.on_set_reg_in_hostcall(Reg::A0, value as u32);
                         tracer.on_set_reg_in_hostcall(Reg::A1, (value >> 32) as u32);
                     }
@@ -927,7 +853,7 @@ where
     }
 }
 
-type FallbackHandlerArc<T> = Arc<dyn Fn(Caller<'_, '_, T>, u32) -> Result<(), Trap> + Send + Sync + 'static>;
+type FallbackHandlerArc<T> = Arc<dyn Fn(Caller<'_, T>, u32) -> Result<(), Trap> + Send + Sync + 'static>;
 
 pub struct Linker<T> {
     host_functions: HashMap<String, ExternFnArc<T>>,
@@ -946,7 +872,7 @@ impl<T> Linker<T> {
     }
 
     /// Defines a fallback external call handler, in case no other registered functions match.
-    pub fn func_fallback(&mut self, func: impl Fn(Caller<'_, '_, T>, u32) -> Result<(), Trap> + Send + Sync + 'static) {
+    pub fn func_fallback(&mut self, func: impl Fn(Caller<'_, T>, u32) -> Result<(), Trap> + Send + Sync + 'static) {
         self.fallback_handler = Some(Arc::new(func));
     }
 
@@ -955,7 +881,7 @@ impl<T> Linker<T> {
         &mut self,
         name: &str,
         ty: FuncType,
-        func: impl Fn(Caller<'_, '_, T>, &[Val], Option<&mut Val>) -> Result<(), Trap> + Send + Sync + 'static,
+        func: impl Fn(Caller<'_, T>, &[Val], Option<&mut Val>) -> Result<(), Trap> + Send + Sync + 'static,
     ) -> Result<&mut Self, Error>
     where
         T: 'static,
@@ -1052,7 +978,10 @@ impl<T> InstancePre<T> {
 
         Ok(Instance(Arc::new(InstancePrivate {
             instance_pre: self.clone(),
-            mutable: Mutex::new(InstancePrivateMut { backend, tracer }),
+            mutable: Mutex::new(InstancePrivateMut {
+                backend,
+                raw: CallerRaw::new(tracer),
+            }),
         })))
     }
 }
@@ -1141,7 +1070,13 @@ impl<'a> Access<'a> for BackendAccess<'a> {
 
 struct InstancePrivateMut {
     backend: InstanceBackend,
-    tracer: Option<Tracer>,
+    raw: CallerRaw,
+}
+
+impl InstancePrivateMut {
+    fn tracer(&mut self) -> Option<&mut Tracer> {
+        self.raw.tracer()
+    }
 }
 
 struct InstancePrivate<T> {
@@ -1233,12 +1168,12 @@ fn on_hostcall<'a, T>(
     user_data: &'a mut T,
     host_functions: &'a [ExternFnArc<T>],
     fallback_handler: Option<&'a FallbackHandlerArc<T>>,
-    mut tracer: Option<&'a mut Tracer>,
+    raw: &'a mut CallerRaw,
 ) -> impl for<'r> FnMut(u64, BackendAccess<'r>) -> Result<(), Trap> + 'a {
     move |hostcall: u64, mut access: BackendAccess| -> Result<(), Trap> {
         if hostcall > u32::MAX as u64 {
             if hostcall == polkavm_common::zygote::HOSTCALL_TRACE {
-                if let Some(tracer) = tracer.as_mut() {
+                if let Some(tracer) = raw.tracer() {
                     return tracer.on_trace(&mut access);
                 }
 
@@ -1254,13 +1189,7 @@ fn on_hostcall<'a, T>(
             Some(host_fn) => host_fn,
             None => {
                 if let Some(fallback_handler) = fallback_handler {
-                    let caller = Caller {
-                        user_data,
-                        access: &mut access,
-                        tracer: tracer.as_deref_mut(),
-                    };
-
-                    return fallback_handler(caller, hostcall as u32);
+                    return Caller::wrap(user_data, &mut access, raw, move |caller| fallback_handler(caller, hostcall as u32));
                 }
 
                 // This should never happen.
@@ -1269,7 +1198,7 @@ fn on_hostcall<'a, T>(
             }
         };
 
-        if let Err(trap) = host_fn.0.call(user_data, access, tracer.as_deref_mut()) {
+        if let Err(trap) = host_fn.0.call(user_data, access, raw) {
             log::debug!("hostcall failed: {}", trap);
             return Err(trap);
         }
@@ -1356,8 +1285,7 @@ impl<T> Func<T> {
         };
 
         let mutable = &mut *mutable;
-        let mut tracer = mutable.tracer.as_mut();
-        if let Some(ref mut tracer) = tracer {
+        if let Some(ref mut tracer) = mutable.tracer() {
             tracer.on_before_call(self.export_index, export, arg_regs, reset_memory_after_execution);
         }
 
@@ -1365,7 +1293,7 @@ impl<T> Func<T> {
             user_data,
             &instance_pre.0.host_functions,
             instance_pre.0.fallback_handler.as_ref(),
-            tracer.as_deref_mut(),
+            &mut mutable.raw,
         );
 
         let result = mutable
@@ -1373,7 +1301,7 @@ impl<T> Func<T> {
             .call(self.export_index, &mut on_hostcall, arg_regs, reset_memory_after_execution);
         core::mem::drop(on_hostcall);
 
-        if let Some(ref mut tracer) = tracer {
+        if let Some(ref mut tracer) = mutable.tracer() {
             tracer.on_after_call();
         }
 
@@ -1455,8 +1383,7 @@ where
         };
 
         let mutable = &mut *mutable;
-        let mut tracer = mutable.tracer.as_mut();
-        if let Some(ref mut tracer) = tracer {
+        if let Some(ref mut tracer) = mutable.tracer() {
             tracer.on_before_call(self.export_index, export, arg_regs, reset_memory_after_execution);
         }
 
@@ -1464,7 +1391,7 @@ where
             user_data,
             &instance_pre.0.host_functions,
             instance_pre.0.fallback_handler.as_ref(),
-            tracer.as_deref_mut(),
+            &mut mutable.raw,
         );
 
         let result = mutable
@@ -1472,7 +1399,7 @@ where
             .call(self.export_index, &mut on_hostcall, arg_regs, reset_memory_after_execution);
         core::mem::drop(on_hostcall);
 
-        if let Some(ref mut tracer) = tracer {
+        if let Some(ref mut tracer) = mutable.tracer() {
             tracer.on_after_call();
         }
 
