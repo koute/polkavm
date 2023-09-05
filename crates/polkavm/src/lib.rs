@@ -56,17 +56,12 @@ mod tests {
         linker
             .func_wrap("get_third_number", move |caller: Caller<State>| -> Result<u32, Trap> {
                 {
-                    let mut buffer = [0_u8; 4];
-                    caller.read_memory_into_slice(polkavm_common::abi::VM_ADDR_USER_STACK_HIGH - 4, &mut buffer)?;
-                    let value = u32::from_le_bytes([buffer[0], buffer[1], buffer[2], buffer[3]]);
+                    let value = caller.read_u32(polkavm_common::abi::VM_ADDR_USER_STACK_HIGH - 4)?;
                     assert_eq!(value, polkavm_common::abi::VM_ADDR_RETURN_TO_HOST);
                 }
                 {
                     let caller = caller.into_ref();
-
-                    let mut buffer = [0_u8; 4];
-                    caller.read_memory_into_slice(polkavm_common::abi::VM_ADDR_USER_STACK_HIGH - 4, &mut buffer)?;
-                    let value = u32::from_le_bytes([buffer[0], buffer[1], buffer[2], buffer[3]]);
+                    let value = caller.read_u32(polkavm_common::abi::VM_ADDR_USER_STACK_HIGH - 4)?;
                     assert_eq!(value, polkavm_common::abi::VM_ADDR_RETURN_TO_HOST);
 
                     let illegal_contraband = caller.data().illegal_contraband.clone();

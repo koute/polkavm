@@ -1,5 +1,6 @@
 use crate::api::BackendAccess;
 use crate::tracer::Tracer;
+use core::mem::MaybeUninit;
 use polkavm_common::error::Trap;
 use polkavm_common::program::Reg;
 use polkavm_common::utils::{Access, AsUninitSliceMut};
@@ -88,6 +89,15 @@ impl CallerRaw {
 
         // SAFETY: The caller will make sure that the invariants hold.
         unsafe { self.access() }.read_memory_into_new_vec(address, length)
+    }
+
+    unsafe fn read_u32(&self, address: u32) -> Result<u32, Trap> {
+        let mut buffer: MaybeUninit<[u8; 4]> = MaybeUninit::uninit();
+
+        // SAFETY: The caller will make sure that the invariants hold.
+        let slice = unsafe { self.read_memory_into_slice(address, &mut buffer) }?;
+        let value = u32::from_le_bytes([slice[0], slice[1], slice[2], slice[3]]);
+        Ok(value)
     }
 
     unsafe fn write_memory(&mut self, address: u32, data: &[u8]) -> Result<(), Trap> {
@@ -192,6 +202,11 @@ impl<'a, T> Caller<'a, T> {
         unsafe { self.raw.read_memory_into_new_vec(address, length) }
     }
 
+    pub fn read_u32(&self, address: u32) -> Result<u32, Trap> {
+        // SAFETY: This can only be called from inside of `Caller::wrap` so this is always valid.
+        unsafe { self.raw.read_u32(address) }
+    }
+
     pub fn write_memory(&mut self, address: u32, data: &[u8]) -> Result<(), Trap> {
         // SAFETY: This can only be called from inside of `Caller::wrap` so this is always valid.
         unsafe { self.raw.write_memory(address, data) }
@@ -256,6 +271,13 @@ impl<T> CallerRef<T> {
 
         // SAFETY: We've made sure the lifetime is valid.
         unsafe { (*self.raw).read_memory_into_new_vec(address, length) }
+    }
+
+    pub fn read_u32(&self, address: u32) -> Result<u32, Trap> {
+        self.check_lifetime_or_panic();
+
+        // SAFETY: We've made sure the lifetime is valid.
+        unsafe { (*self.raw).read_u32(address) }
     }
 
     pub fn write_memory(&mut self, address: u32, data: &[u8]) -> Result<(), Trap> {
