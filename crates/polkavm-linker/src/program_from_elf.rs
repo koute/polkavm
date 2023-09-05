@@ -1,4 +1,4 @@
-use polkavm_common::abi::{VM_ADDR_USER_MEMORY, VM_MAXIMUM_MEMORY_SIZE, VM_PAGE_SIZE};
+use polkavm_common::abi::{GuestMemoryConfig, VM_ADDR_USER_MEMORY, VM_PAGE_SIZE};
 use polkavm_common::elf::{ExportMetadata, FnMetadata, ImportMetadata, INSTRUCTION_ECALLI};
 use polkavm_common::program::Reg as PReg;
 use polkavm_common::program::{self, Opcode, ProgramBlob, RawInstruction};
@@ -195,6 +195,15 @@ enum RangeOrPadding {
     Padding(usize),
 }
 
+impl RangeOrPadding {
+    fn size(&self) -> usize {
+        match self {
+            RangeOrPadding::Range(range) => range.len(),
+            RangeOrPadding::Padding(size) => *size,
+        }
+    }
+}
+
 impl From<Range<usize>> for RangeOrPadding {
     fn from(range: Range<usize>) -> Self {
         RangeOrPadding::Range(range)
@@ -203,7 +212,7 @@ impl From<Range<usize>> for RangeOrPadding {
 
 struct MemoryConfig {
     ro_data: Vec<RangeOrPadding>,
-    rw_data: Option<Range<usize>>,
+    rw_data: Vec<RangeOrPadding>,
     bss_size: u32,
     stack_size: u32,
 }
@@ -211,128 +220,172 @@ struct MemoryConfig {
 #[allow(clippy::too_many_arguments)]
 fn extract_memory_config(
     data: &[u8],
-    section_rodata: Option<&ElfSection>,
-    section_data: Option<&ElfSection>,
-    section_data_rel_ro: Option<&ElfSection>,
-    section_bss: Option<&ElfSection>,
-    section_got: Option<&ElfSection>,
+    sections_ro_data: &[&ElfSection],
+    sections_rw_data: &[&ElfSection],
+    sections_bss: &[&ElfSection],
     relocation_for_section: &mut HashMap<SectionIndex, i64>,
 ) -> Result<MemoryConfig, ProgramFromElfError> {
     let mut memory_end = VM_ADDR_USER_MEMORY as u64;
     let mut ro_data = Vec::new();
     let mut ro_data_size = 0;
-    let mut rw_data = None;
-    let mut rw_data_size = 0;
-    let mut bss_size_implicit = 0;
-    let mut bss_size = 0;
-    let stack_size = VM_PAGE_SIZE as u64;
+
+    fn get_padding(memory_end: u64, section: &ElfSection) -> Option<u64> {
+        let misalignment = memory_end % section.align();
+        if misalignment == 0 {
+            None
+        } else {
+            Some(section.align() - misalignment)
+        }
+    }
+
+    fn align_if_necessary(memory_end: &mut u64, output_size: &mut u64, output_chunks: &mut Vec<RangeOrPadding>, section: &ElfSection) {
+        if let Some(padding) = get_padding(*memory_end, section) {
+            *memory_end += padding;
+            *output_size += padding;
+            output_chunks.push(RangeOrPadding::Padding(padding as usize));
+        }
+    }
 
     assert_eq!(memory_end % VM_PAGE_SIZE as u64, 0);
-    for section in [section_rodata, section_data_rel_ro, section_got].into_iter().flatten() {
+
+    let ro_data_address = memory_end;
+    for section in sections_ro_data.iter() {
+        align_if_necessary(&mut memory_end, &mut ro_data_size, &mut ro_data, section);
+
         let section_name = section.name().expect("failed to get section name");
-        if section.address() != memory_end {
-            // TODO: Lift this requirement.
-            return Err(ProgramFromElfError::other(format!(
-                "the '{section_name}' section doesn't start at 0x{memory_end:x}"
-            )));
-        }
+        let relocation_offset = (memory_end as i64).wrapping_sub(section.address() as i64);
+        relocation_for_section.insert(section.index(), relocation_offset);
 
-        assert_eq!(section.address() % 4, 0);
-
-        relocation_for_section.insert(section.index(), (memory_end as i64).wrapping_sub(section.address() as i64));
-
+        let initial_ro_data_size = ro_data_size;
         let section_range = get_section_range(data, section)?;
         memory_end += section_range.len() as u64;
         ro_data.push(section_range.clone().into());
         ro_data_size += section_range.len() as u64;
 
-        // If the section's size is not aligned then pad it.
-        let padding = if section_range.len() % 4 != 0 {
-            4 - (section_range.len() & 0b11)
-        } else {
-            0
-        };
         log::trace!(
-            "Found read-only section: '{}', address = 0x{:x}, size = 0x{:x}, extra padding = {}",
+            "Found read-only section: '{}', address = 0x{:x}..0x{:x} (relocated to: 0x{:x}..0x{:x}), size = 0x{:x}",
             section_name,
             section.address(),
+            section.address() + section_range.len() as u64,
+            section.address() as i64 + relocation_offset,
+            section.address() as i64 + relocation_offset + (ro_data_size - initial_ro_data_size) as i64,
             section_range.len(),
-            padding
         );
-        if padding > 0 {
-            memory_end += padding as u64;
-            ro_data_size += padding as u64;
-            ro_data.push(RangeOrPadding::Padding(padding));
+
+        if section.size() > (ro_data_size - initial_ro_data_size) {
+            // Technically we can work around this, but until something actually hits this let's not bother.
+            return Err(ProgramFromElfError::other(format!(
+                "internal error: size of section '{section_name}' covers more than what the file contains"
+            )));
         }
     }
 
-    let ro_data_size_unaligned = ro_data_size;
-    ro_data_size = align_to_next_page_u64(VM_PAGE_SIZE as u64, ro_data_size)
-        .ok_or(ProgramFromElfError::other("out of range size for read-only sections"))?;
-    memory_end += ro_data_size - ro_data_size_unaligned;
+    {
+        let ro_data_size_unaligned = ro_data_size;
 
-    if let Some(section) = section_data {
-        assert_eq!(memory_end % VM_PAGE_SIZE as u64, 0);
-        if section.address() != memory_end {
-            // TODO: Lift this requirement.
-            return Err(ProgramFromElfError::other(format!(
-                "the '.data' section doesn't start at 0x{:x}",
-                memory_end
-            )));
-        }
+        assert_eq!(ro_data_address % VM_PAGE_SIZE as u64, 0);
+        ro_data_size = align_to_next_page_u64(VM_PAGE_SIZE as u64, ro_data_size)
+            .ok_or(ProgramFromElfError::other("out of range size for read-only sections"))?;
 
-        relocation_for_section.insert(section.index(), (memory_end as i64).wrapping_sub(section.address() as i64));
+        memory_end += ro_data_size - ro_data_size_unaligned;
+    }
 
+    assert_eq!(memory_end % VM_PAGE_SIZE as u64, 0);
+
+    let mut rw_data = Vec::new();
+    let mut rw_data_size = 0;
+    let rw_data_address = memory_end;
+    for section in sections_rw_data.iter() {
+        align_if_necessary(&mut memory_end, &mut rw_data_size, &mut rw_data, section);
+
+        let section_name = section.name().expect("failed to get section name");
+        let relocation_offset = (memory_end as i64).wrapping_sub(section.address() as i64);
+        relocation_for_section.insert(section.index(), relocation_offset);
+
+        let initial_rw_data_size = rw_data_size;
         let section_range = get_section_range(data, section)?;
         memory_end += section_range.len() as u64;
-        rw_data = Some(section_range.clone());
-        rw_data_size = align_to_next_page_u64(VM_PAGE_SIZE as u64, section_range.len() as u64)
-            .ok_or(ProgramFromElfError::other("out of range size for '.data' section"))?;
-        bss_size_implicit = rw_data_size - section_range.len() as u64;
-    }
+        rw_data.push(section_range.clone().into());
+        rw_data_size += section_range.len() as u64;
 
-    if let Some(section) = section_bss {
-        if section.address() != memory_end {
-            // TODO: Lift this requirement.
+        log::trace!(
+            "Found read-write section: '{}', address = 0x{:x}..0x{:x} (relocated to: 0x{:x}..0x{:x}), size = 0x{:x}",
+            section_name,
+            section.address(),
+            section.address() + section_range.len() as u64,
+            section.address() as i64 + relocation_offset,
+            section.address() as i64 + relocation_offset + (rw_data_size - initial_rw_data_size) as i64,
+            section_range.len(),
+        );
+
+        if section.size() > (rw_data_size - initial_rw_data_size) {
             return Err(ProgramFromElfError::other(format!(
-                "the '.bss' section doesn't start at 0x{:x}",
-                memory_end
+                "internal error: size of section '{section_name}' covers more than what the file contains"
             )));
         }
+    }
 
-        relocation_for_section.insert(section.index(), (memory_end as i64).wrapping_sub(section.address() as i64));
+    let bss_explicit_address = {
+        let rw_data_size_unaligned = rw_data_size;
 
-        let section_size = section.size();
-        if section_size > bss_size_implicit {
-            bss_size = align_to_next_page_u64(VM_PAGE_SIZE as u64, section_size - bss_size_implicit)
-                .ok_or(ProgramFromElfError::other("out of range size for '.bss' section"))?;
+        assert_eq!(rw_data_address % VM_PAGE_SIZE as u64, 0);
+        rw_data_size = align_to_next_page_u64(VM_PAGE_SIZE as u64, rw_data_size)
+            .ok_or(ProgramFromElfError::other("out of range size for read-write sections"))?;
+
+        memory_end + (rw_data_size - rw_data_size_unaligned)
+    };
+
+    for section in sections_bss {
+        if let Some(padding) = get_padding(memory_end, section) {
+            memory_end += padding;
         }
+
+        let section_name = section.name().expect("failed to get section name");
+        let relocation_offset = (memory_end as i64).wrapping_sub(section.address() as i64);
+        relocation_for_section.insert(section.index(), relocation_offset);
+
+        log::trace!(
+            "Found BSS section: '{}', address = 0x{:x}..0x{:x} (relocated to: 0x{:x}..0x{:x}), size = 0x{:x}",
+            section_name,
+            section.address(),
+            section.address() + section.size(),
+            section.address() as i64 + relocation_offset,
+            section.address() as i64 + relocation_offset + section.size() as i64,
+            section.size(),
+        );
+
+        memory_end += section.size();
     }
 
-    if ro_data_size > VM_MAXIMUM_MEMORY_SIZE as u64 {
-        return Err(ProgramFromElfError::other(
-            "size of read-only sections exceeded the maximum memory size",
-        ));
-    }
+    let mut bss_size = if memory_end > bss_explicit_address {
+        memory_end - bss_explicit_address
+    } else {
+        0
+    };
 
-    if rw_data_size > VM_MAXIMUM_MEMORY_SIZE as u64 {
-        return Err(ProgramFromElfError::other(
-            "size of `.data` section exceeded the maximum memory size",
-        ));
-    }
+    bss_size =
+        align_to_next_page_u64(VM_PAGE_SIZE as u64, bss_size).ok_or(ProgramFromElfError::other("out of range size for BSS sections"))?;
 
-    if bss_size > VM_MAXIMUM_MEMORY_SIZE as u64 {
-        return Err(ProgramFromElfError::other(
-            "size of `.bss` section exceeded the maximum memory size",
-        ));
-    }
+    // TODO: This should be configurable.
+    let stack_size = VM_PAGE_SIZE as u64;
 
-    if stack_size > VM_MAXIMUM_MEMORY_SIZE as u64 {
-        return Err(ProgramFromElfError::other("size of the stack exceeded the maximum memory size"));
-    }
+    // Sanity check that the memory configuration is actually valid.
+    {
+        let ro_data_size_physical: u64 = ro_data.iter().map(|x| x.size() as u64).sum();
+        let rw_data_size_physical: u64 = rw_data.iter().map(|x| x.size() as u64).sum();
 
-    if ro_data_size + rw_data_size + bss_size + stack_size > VM_MAXIMUM_MEMORY_SIZE as u64 {
-        return Err(ProgramFromElfError::other("maximum memory size exceeded"));
+        assert!(ro_data_size_physical <= ro_data_size);
+        assert!(rw_data_size_physical <= rw_data_size);
+
+        let config = match GuestMemoryConfig::new(ro_data_size, rw_data_size, bss_size, stack_size) {
+            Ok(config) => config,
+            Err(error) => {
+                return Err(ProgramFromElfError::other(error));
+            }
+        };
+
+        assert_eq!(config.ro_data_address() as u64, ro_data_address);
+        assert_eq!(config.rw_data_address() as u64, rw_data_address);
     }
 
     let memory_config = MemoryConfig {
@@ -345,8 +398,8 @@ fn extract_memory_config(
     Ok(memory_config)
 }
 
-fn extract_export_metadata<'a>(data: &'a [u8], section: ElfSection) -> Result<Vec<ExportMetadata<'a>>, ProgramFromElfError> {
-    let section_range = get_section_range(data, &section)?;
+fn extract_export_metadata<'a>(data: &'a [u8], section: &ElfSection) -> Result<Vec<ExportMetadata<'a>>, ProgramFromElfError> {
+    let section_range = get_section_range(data, section)?;
     let mut contents = &data[section_range];
     let mut exports = Vec::new();
     while !contents.is_empty() {
@@ -364,8 +417,8 @@ fn extract_export_metadata<'a>(data: &'a [u8], section: ElfSection) -> Result<Ve
     Ok(exports)
 }
 
-fn extract_import_metadata<'a>(data: &'a [u8], section: ElfSection) -> Result<BTreeMap<u32, ImportMetadata<'a>>, ProgramFromElfError> {
-    let section_range = get_section_range(data, &section)?;
+fn extract_import_metadata<'a>(data: &'a [u8], section: &ElfSection) -> Result<BTreeMap<u32, ImportMetadata<'a>>, ProgramFromElfError> {
+    let section_range = get_section_range(data, section)?;
     let mut contents = &data[section_range];
     let mut import_by_index = BTreeMap::new();
     let mut indexless = Vec::new();
@@ -520,7 +573,7 @@ fn get_relocation_target(
 fn extract_functions<'a>(
     data: &'a [u8],
     elf: &'a Elf,
-    section_text: ElfSection,
+    section_text: &ElfSection,
     import_metadata: &BTreeMap<u32, ImportMetadata>,
     jump_targets: &mut HashSet<u32>,
     relocation_for_section: &HashMap<SectionIndex, i64>,
@@ -1750,52 +1803,89 @@ pub fn program_from_elf(_config: Config, data: &[u8]) -> Result<ProgramBlob, Pro
         return Err(ProgramFromElfError::other("file is not a RISC-V file (EM_RISCV)"));
     }
 
-    let mut section_rodata = None;
-    let mut section_data = None;
-    let mut section_data_rel_ro = None;
+    let mut sections_ro_data = Vec::new();
+    let mut sections_rw_data = Vec::new();
+    let mut sections_bss = Vec::new();
     let mut section_got = None;
-    let mut section_bss = None;
     let mut section_text = None;
     let mut section_import_metadata = None;
     let mut section_export_metadata = None;
 
     let mut relocation_for_section = HashMap::new();
-    for section in elf.sections() {
+    let sections: Vec<_> = elf.sections().collect();
+    for section in &sections {
         // Make sure the data is accessible.
-        get_section_data(data, &section)?;
+        get_section_data(data, section)?;
 
+        let flags = match section.flags() {
+            object::SectionFlags::Elf { sh_flags } => sh_flags,
+            _ => unreachable!(),
+        };
+
+        let is_writable = flags & object::elf::SHF_WRITE as u64 != 0;
         let name = section.name()?;
-        match name {
-            ".rodata" => section_rodata = Some(section),
-            ".data" => section_data = Some(section),
-            ".data.rel.ro" => section_data_rel_ro = Some(section),
-            ".got" => section_got = Some(section),
-            ".bss" => section_bss = Some(section),
-            ".text" => {
-                // Relocate code to 0x00000004.
-                #[allow(clippy::neg_multiply)]
-                relocation_for_section.insert(section.index(), (section.address() as i64 * -1).wrapping_add(0x4));
-                section_text = Some(section);
+        if name == ".rodata"
+            || name.starts_with(".rodata.")
+            || name == ".data.rel.ro"
+            || name.starts_with(".data.rel.ro.")
+            || name == ".got"
+        {
+            if name == ".rodata" && is_writable {
+                return Err(ProgramFromElfError::other(format!(
+                    "expected section '{name}' to be read-only, yet it is writable"
+                )));
             }
-            ".polkavm_imports" => section_import_metadata = Some(section),
-            ".polkavm_exports" => {
-                relocation_for_section.insert(section.index(), 0);
-                section_export_metadata = Some(section);
-            }
-            _ => {
-                let flags = match section.flags() {
-                    object::SectionFlags::Elf { sh_flags } => sh_flags,
-                    _ => unreachable!(),
-                };
 
-                if flags & object::elf::SHF_ALLOC as u64 != 0 {
-                    // We're supposed to load this section into memory at runtime, but we don't know what it is.
-                    return Err(ProgramFromElfErrorKind::UnsupportedSection(name.to_owned()).into());
+            if name == ".got" {
+                section_got = Some(section);
+            }
+
+            sections_ro_data.push(section);
+        } else if name == ".data" || name.starts_with(".data.") || name == ".sdata" || name.starts_with(".sdata.") {
+            if !is_writable {
+                return Err(ProgramFromElfError::other(format!(
+                    "expected section '{name}' to be writable, yet it is read-only"
+                )));
+            }
+
+            sections_rw_data.push(section);
+        } else if name == ".bss" || name.starts_with(".bss.") || name == ".sbss" || name.starts_with(".sbss.") {
+            if !is_writable {
+                return Err(ProgramFromElfError::other(format!(
+                    "expected section '{name}' to be writable, yet it is read-only"
+                )));
+            }
+
+            sections_bss.push(section);
+        } else {
+            match name {
+                ".text" => {
+                    if is_writable {
+                        return Err(ProgramFromElfError::other(format!(
+                            "expected section '{name}' to be read-only, yet it is writable"
+                        )));
+                    }
+
+                    // Relocate code to 0x00000004.
+                    #[allow(clippy::neg_multiply)]
+                    relocation_for_section.insert(section.index(), (section.address() as i64 * -1).wrapping_add(0x4));
+                    section_text = Some(section);
                 }
+                ".polkavm_imports" => section_import_metadata = Some(section),
+                ".polkavm_exports" => {
+                    relocation_for_section.insert(section.index(), 0);
+                    section_export_metadata = Some(section);
+                }
+                _ => {
+                    if name != ".eh_frame" && flags & object::elf::SHF_ALLOC as u64 != 0 {
+                        // We're supposed to load this section into memory at runtime, but we don't know what it is.
+                        return Err(ProgramFromElfErrorKind::UnsupportedSection(name.to_owned()).into());
+                    }
 
-                // For sections which will not be in memory at runtime we just don't relocate them.
-                relocation_for_section.insert(section.index(), 0);
-                continue;
+                    // For sections which will not be in memory at runtime we just don't relocate them.
+                    relocation_for_section.insert(section.index(), 0);
+                    continue;
+                }
             }
         }
     }
@@ -1804,11 +1894,9 @@ pub fn program_from_elf(_config: Config, data: &[u8]) -> Result<ProgramBlob, Pro
 
     let memory_config = extract_memory_config(
         data,
-        section_rodata.as_ref(),
-        section_data.as_ref(),
-        section_data_rel_ro.as_ref(),
-        section_bss.as_ref(),
-        section_got.as_ref(),
+        &sections_ro_data,
+        &sections_rw_data,
+        &sections_bss,
         &mut relocation_for_section,
     )?;
 
@@ -1822,7 +1910,7 @@ pub fn program_from_elf(_config: Config, data: &[u8]) -> Result<ProgramBlob, Pro
     }
 
     let mut jump_targets = HashSet::new();
-    if let Some(ref section) = section_got {
+    if let Some(section) = section_got {
         let section_range = get_section_range(data, section)?;
         if section_range.len() % 4 != 0 {
             return Err(ProgramFromElfError::other("size of the '.got' section is not divisible by 4"));
@@ -1840,16 +1928,15 @@ pub fn program_from_elf(_config: Config, data: &[u8]) -> Result<ProgramBlob, Pro
     let mut instruction_overrides = HashMap::new();
     let mut data = data.to_vec();
     for section in elf.sections() {
-        let is_data_section = [
-            section_rodata.as_ref(),
-            section_data.as_ref(),
-            section_data_rel_ro.as_ref(),
-            section_bss.as_ref(),
-            section_got.as_ref(),
-        ]
-        .into_iter()
-        .flatten()
-        .any(|s| s.index() == section.index());
+        if section.name().expect("failed to get section name") == ".eh_frame" {
+            continue;
+        }
+
+        let is_data_section = sections_ro_data
+            .iter()
+            .chain(sections_rw_data.iter())
+            .any(|s| s.index() == section.index());
+
         let jump_targets = if is_data_section {
             // If it's one of the data sections then harvest the jump targets from it.
             Some(&mut jump_targets)
@@ -1860,8 +1947,8 @@ pub fn program_from_elf(_config: Config, data: &[u8]) -> Result<ProgramBlob, Pro
 
         relocate(
             &elf,
-            &section_text,
-            section_got.as_ref(),
+            section_text,
+            section_got,
             &relocation_for_section,
             &section,
             &mut data,
@@ -1995,8 +2082,17 @@ pub fn program_from_elf(_config: Config, data: &[u8]) -> Result<ProgramBlob, Pro
     });
 
     writer.push_section(program::SECTION_RW_DATA, |writer| {
-        if let Some(range) = memory_config.rw_data {
-            writer.push_raw_bytes(&data[range]);
+        for range in memory_config.rw_data {
+            match range {
+                RangeOrPadding::Range(range) => {
+                    writer.push_raw_bytes(&data[range]);
+                }
+                RangeOrPadding::Padding(bytes) => {
+                    for _ in 0..bytes {
+                        writer.push_byte(0);
+                    }
+                }
+            }
         }
     });
 
