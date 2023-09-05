@@ -174,6 +174,13 @@ impl<const N: usize> AsUninitSliceMut for MaybeUninit<[u8; N]> {
     }
 }
 
+impl<const N: usize> AsUninitSliceMut for [u8; N] {
+    fn as_uninit_slice_mut(&mut self) -> &mut [MaybeUninit<u8>] {
+        let slice: &mut [u8] = &mut self[..];
+        slice.as_uninit_slice_mut()
+    }
+}
+
 pub trait Access<'a> {
     type Error;
 
