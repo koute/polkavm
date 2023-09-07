@@ -99,8 +99,7 @@ fn disassemble_into(blob: &polkavm_linker::ProgramBlob, mut writer: impl Write) 
             }
             Err(error) => {
                 eprintln!(
-                    "ERROR: failed to parse raw instruction from blob. {}. nth:{} ",
-                    error, nth_instruction
+                    "ERROR: failed to parse instruction #{}: {}", nth_instruction, error
                 );
                 std::process::exit(1);
             }
