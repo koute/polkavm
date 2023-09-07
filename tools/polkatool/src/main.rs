@@ -90,7 +90,7 @@ fn main() {
 
 fn disassemble_into(blob: &polkavm_linker::ProgramBlob, mut writer: impl Write) {
     for (nth_instruction, maybe_instruction) in blob.instructions().enumerate() {
-        let instruction = match maybe_instruction {
+        match maybe_instruction {
             Ok(instruction) => {
                 if let Err(error) = writeln!(&mut writer, "{nth_instruction}: {instruction}") {
                     eprintln!("ERROR: failed to write to output: {}", error);
@@ -98,9 +98,7 @@ fn disassemble_into(blob: &polkavm_linker::ProgramBlob, mut writer: impl Write) 
                 }
             }
             Err(error) => {
-                eprintln!(
-                    "ERROR: failed to parse instruction #{}: {}", nth_instruction, error
-                );
+                eprintln!("ERROR: failed to parse instruction #{}: {}", nth_instruction, error);
                 std::process::exit(1);
             }
         };
