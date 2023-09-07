@@ -9,4 +9,5 @@ description = "A swiss knife toolkit for PolkaVM"
 
 [dependencies]
 clap = { workspace = true, features = ["derive"] }
+
 polkavm-linker = { workspace = true }
