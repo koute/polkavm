@@ -91,7 +91,12 @@ fn main() {
 fn disassemble_into(blob: &polkavm_linker::ProgramBlob, mut writer: impl Write) {
     for (nth_instruction, maybe_instruction) in blob.instructions().enumerate() {
         let instruction = match maybe_instruction {
-            Ok(instruction) => format!("{}: {}", nth_instruction, instruction),
+            Ok(instruction) => {
+                if let Err(error) = writeln!(&mut writer, "{nth_instruction}: {instruction}") {
+                    eprintln!("ERROR: failed to write instruction from buffer. {:?} {}.", error, instruction);
+                    std::process::exit(1);
+                }
+            }
             Err(error) => {
                 eprintln!(
                     "ERROR: failed to parse raw instruction from blob. {}. nth:{} ",
@@ -100,10 +105,6 @@ fn disassemble_into(blob: &polkavm_linker::ProgramBlob, mut writer: impl Write) 
                 std::process::exit(1);
             }
         };
-        if let Err(error) = writeln!(&mut writer, "{}", instruction) {
-            eprintln!("ERROR: failed to write instruction from buffer. {:?} {}.", error, instruction);
-            std::process::exit(1);
-        }
     }
     if let Err(error) = writer.flush() {
         eprintln!("ERROR: failed to flush buffer writer. {}.", error);
