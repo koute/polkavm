@@ -454,6 +454,9 @@ unsafe fn initialize(mut stack: *mut usize) -> linux_raw::Fd {
     linux_raw::sys_rt_sigaction(linux_raw::SIGILL, &sa, None)
         .unwrap_or_else(|error| abort_with_error("failed to set up a signal handler for SIGILL", error));
 
+    linux_raw::sys_rt_sigaction(linux_raw::SIGFPE, &sa, None)
+        .unwrap_or_else(|error| abort_with_error("failed to set up a signal handler for SIGFPE", error));
+
     // Set up the sysreturn jump table.
     linux_raw::sys_mmap(
         VM_ADDR_JUMP_TABLE_RETURN_TO_HOST as *mut core::ffi::c_void,
