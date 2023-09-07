@@ -60,7 +60,7 @@ fn main() {
                     std::process::exit(1);
                 }
             };
-            let blob = match polkavm::ProgramBlob::parse(&data[..]) {
+            let blob = match polkavm_linker::ProgramBlob::parse(&data[..]) {
                 Ok(b) => b,
                 Err(error) => {
                     eprintln!("ERROR: failed to parse the raw data into a blob {:?}: {}", input, error);
@@ -68,8 +68,7 @@ fn main() {
                 }
             };
 
-            let std_out = std::io::stdout();
-            let mut bw: Box<dyn Write> = match output {
+            match output {
                 Some(out) => {
                     let fp = match std::fs::File::create(&out) {
                         Ok(fp) => fp,
@@ -78,28 +77,36 @@ fn main() {
                             std::process::exit(1);
                         }
                     };
-                    Box::new(std::io::BufWriter::new(fp))
-                }
-                None => Box::new(std::io::BufWriter::new(std_out)),
-            };
-
-            for (nth_instruction, maybe_instruction) in blob.instructions().enumerate() {
-                let instruction = match maybe_instruction {
-                    Ok(instruction) => format!("{}: {}", nth_instruction, instruction),
-                    Err(error) => {
-                        eprintln!(
-                            "ERROR: failed to parse raw instruction from blob. {:?}: {}. nth:{} ",
-                            input, error, nth_instruction
-                        );
-                        std::process::exit(1);
-                    }
-                };
-                if let Err(error) = writeln!(&mut bw, "{}", instruction) {
-                    eprintln!("ERROR: failed to write instruction from buffer. {:?} {}.", error, instruction);
-                    std::process::exit(1);
+                    disassemble_into(&blob, std::io::BufWriter::new(fp));
+                },
+                None => {
+                    let std_out = std::io::stdout();
+                    disassemble_into(&blob, std::io::BufWriter::new(std_out));
                 }
             }
-            bw.flush().unwrap();
         }
+    }
+}
+
+fn disassemble_into(blob: &polkavm_linker::ProgramBlob, mut writer: impl Write) {
+    for (nth_instruction, maybe_instruction) in blob.instructions().enumerate() {
+        let instruction = match maybe_instruction {
+            Ok(instruction) => format!("{}: {}", nth_instruction, instruction),
+            Err(error) => {
+                eprintln!(
+                    "ERROR: failed to parse raw instruction from blob. {}. nth:{} ",
+                    error, nth_instruction
+                );
+                std::process::exit(1);
+            }
+        };
+        if let Err(error) = writeln!(&mut writer, "{}", instruction) {
+            eprintln!("ERROR: failed to write instruction from buffer. {:?} {}.", error, instruction);
+            std::process::exit(1);
+        }
+    }
+    if let Err(error) = writer.flush() {
+        eprintln!("ERROR: failed to flush buffer writer. {}.", error);
+        std::process::exit(1);
     }
 }
