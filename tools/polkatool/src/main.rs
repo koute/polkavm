@@ -107,7 +107,7 @@ fn disassemble_into(blob: &polkavm_linker::ProgramBlob, mut writer: impl Write) 
         };
     }
     if let Err(error) = writer.flush() {
-        eprintln!("ERROR: failed to flush buffer writer. {}.", error);
+        eprintln!("ERROR: failed to write to output: {}", error);
         std::process::exit(1);
     }
 }
