@@ -1478,9 +1478,42 @@ mod tests {
         }
     }
 
-    #[ignore]
     #[test]
     fn divide_by_zero_generates_a_trap() {
-        todo!()
+        let _ = env_logger::try_init();
+
+        let init = GuestProgramInit::new().with_bss(4);
+        let init = SandboxProgramInit::new(init);
+        let mem = init.memory_config(get_native_page_size()).unwrap();
+        let mut asm = Assembler::new();
+        let code = asm
+            .push(load32_imm(rdx, 0))
+            .push(load32_imm(rax, 1))
+            .push(load32_imm(rcx, 0))
+            .push(load32_imm(r8, 0x11223344))
+            .push(store_abs(i32::try_from(mem.rw_data_address()).unwrap(), r8, StoreKind::U32))
+            .push(idiv(RegSize::R32, rcx))
+            .push(load32_imm(r8, 0x12345678))
+            .push(store_abs(i32::try_from(mem.rw_data_address()).unwrap(), r8, StoreKind::U32))
+            .push(ret())
+            .finalize();
+
+        let program = SandboxProgram::new(init.with_code(code)).unwrap();
+        let mut sandbox = Sandbox::spawn(&Default::default()).unwrap();
+
+        {
+            let mut args = ExecuteArgs::new();
+            args.set_program(&program);
+            args.set_call(VM_ADDR_NATIVE_CODE);
+            match sandbox.execute(args) {
+                Err(ExecutionError::Trap(_)) => {}
+                _ => panic!(),
+            }
+
+            assert_eq!(
+                sandbox.access().read_memory_into_new_vec(mem.rw_data_address(), 4).unwrap(),
+                [0x44, 0x33, 0x22, 0x11]
+            );
+        }
     }
 }
