@@ -63,7 +63,7 @@ fn main() {
             let blob = match polkavm_linker::ProgramBlob::parse(&data[..]) {
                 Ok(b) => b,
                 Err(error) => {
-                    eprintln!("ERROR: failed to parse the raw data into a blob {:?}: {}", input, error);
+                    eprintln!("ERROR: failed to parse {:?}: {}", input, error);
                     std::process::exit(1);
                 }
             };
