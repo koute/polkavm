@@ -1,0 +1,57 @@
+name: Rust
+
+on:
+  push:
+    branches: [ "master" ]
+  pull_request:
+    branches: [ "master" ]
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build-and-test-linux:
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v4
+    - name: Install LLD
+      run: sudo apt-get install -y lld
+    - name: Install target -- i686-unknown-linux-musl
+      run: rustup target add i686-unknown-linux-musl
+    - name: Build and test (generic)
+      run: ./ci/jobs/build-and-test.sh
+    - name: Build and test (Linux-only)
+      run: ./ci/jobs/build-and-test-linux.sh
+  build-and-test-macos:
+    runs-on: macos-latest
+    steps:
+    - uses: actions/checkout@v4
+    - name: Build and test
+      run: ./ci/jobs/build-and-test.sh
+  build-and-test-windows:
+    runs-on: windows-latest
+    steps:
+    - uses: actions/checkout@v4
+    - name: Build and test
+      shell: bash
+      run: ./ci/jobs/build-and-test.sh
+  clippy:
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v4
+    - name: Install clippy (base toolchain)
+      run: rustup component add clippy
+    - name: Install clippy (zygote toolchain)
+      run: cd crates/polkavm-zygote && rustup component add clippy
+    - name: Run clippy
+      run: ./ci/jobs/clippy.sh
+  rustfmt:
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v4
+    - name: Install rustfmt (base toolchain)
+      run: rustup component add rustfmt
+    - name: Install rustfmt (zygote toolchain)
+      run: cd crates/polkavm-zygote && rustup component add rustfmt
+    - name: Run rustfmt
+      run: ./ci/jobs/rustfmt.sh
