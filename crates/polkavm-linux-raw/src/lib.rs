@@ -10,12 +10,7 @@
 #![allow(clippy::manual_range_contains)]
 // This crate mostly contains syscall wrappers. If you use them you should know what you're doing.
 #![allow(clippy::missing_safety_doc)]
-
-#[cfg(not(target_os = "linux"))]
-compile_error!("unsupported operating system");
-
-#[cfg(not(target_arch = "x86_64"))]
-compile_error!("unsupported architecture");
+#![cfg(all(target_os = "linux", target_arch = "x86_64"))]
 
 #[cfg(feature = "std")]
 extern crate std;
@@ -89,15 +84,6 @@ pub use crate::arch_amd64_bindings::{
     SECCOMP_RET_ALLOW, SECCOMP_RET_KILL_THREAD, SECCOMP_SET_MODE_FILTER, SIGCONT, SIGILL, SIGKILL, SIGSEGV, SIGSTOP, SIG_BLOCK,
     SIG_SETMASK, SIG_UNBLOCK, WEXITED, WNOHANG, _LINUX_CAPABILITY_VERSION_3, __WALL,
 };
-
-// impl core::ops::Deref for siginfo_t {
-//     type Target = crate::arch_amd64_bindings::siginfo__bindgen_ty_1__bindgen_ty_1;
-//     fn deref(&self) -> &Self::Target {
-//         unsafe {
-//             &self.__bindgen_anon_1.__bindgen_anon_1
-//         }
-//     }
-// }
 
 impl siginfo_t {
     pub unsafe fn si_signo(&self) -> c_int {
@@ -1133,7 +1119,7 @@ pub fn sys_prctl_set_name(name: &[u8; 16]) -> Result<(), Error> {
     Error::from_syscall("prctl(PR_SET_NAME)", result)
 }
 
-pub fn sys_capset(header: &__user_cap_header_struct, data: &__user_cap_data_struct) -> Result<(), Error> {
+pub fn sys_capset(header: &__user_cap_header_struct, data: &[__user_cap_data_struct; 2]) -> Result<(), Error> {
     let result = unsafe {
         syscall_readonly!(
             SYS_capset,
@@ -1149,11 +1135,11 @@ pub fn sys_capset_drop_all() -> Result<(), Error> {
         version: _LINUX_CAPABILITY_VERSION_3,
         pid: 0,
     };
-    let cap_user_data = __user_cap_data_struct {
+    let cap_user_data = [__user_cap_data_struct {
         effective: 0,
         inheritable: 0,
         permitted: 0,
-    };
+    }; 2];
 
     sys_capset(&cap_user_header, &cap_user_data)
 }
