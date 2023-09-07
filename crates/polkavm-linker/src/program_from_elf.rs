@@ -9,7 +9,8 @@ use std::borrow::Cow;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::ops::Range;
 
-use crate::riscv::{BranchKind, Inst, Reg, RegImmKind};
+use crate::dwarf::DwarfInfo;
+use crate::riscv::{BranchKind, Inst, LoadKind, Reg, RegImmKind, RegRegKind, ShiftKind, StoreKind};
 
 use object::{LittleEndian, Object, ObjectSection, ObjectSymbol, SectionIndex};
 
@@ -88,75 +89,32 @@ fn check_reg(reg: Reg) -> Result<(), ProgramFromElfError> {
     }
 }
 
-// TODO: Enable this again.
-// fn is_nop(op: InstExt) -> bool {
-//     match op {
-//         | InstExt::Inst(Inst::LoadUpperImmediate { dst, .. })
-//         | InstExt::Inst(Inst::AddUpperImmediateToPc { dst, .. })
-//         | InstExt::Inst(Inst::RegImm { dst, .. })
-//         | InstExt::Inst(Inst::Shift { dst, .. })
-//         | InstExt::Inst(Inst::RegReg { dst, .. })
-//             => dst == Reg::Zero,
-//         | InstExt::Inst(Inst::JumpAndLink { .. })
-//         | InstExt::Inst(Inst::JumpAndLinkRegister { .. })
-//         | InstExt::Inst(Inst::Load { .. })
-//         | InstExt::Inst(Inst::Store { .. })
-//         | InstExt::Inst(Inst::Branch { .. })
-//         | InstExt::Inst(Inst::Ecall)
-//         | InstExt::Inst(Inst::Unimplemented)
-//         | InstExt::Ecalli { .. }
-//             => false,
-//     }
-// }
-
-#[derive(Debug)]
+#[derive(Copy, Clone, Debug)]
 enum EndOfBlock {
-    Fallthrough {
-        target: u32,
-    },
-    Jump {
-        source: AddressRange,
-        target: u32,
-    },
-    Call {
-        source: AddressRange,
-        ra: Reg,
-        target: u32,
-        return_address: u32,
-    },
-    JumpIndirect {
-        source: AddressRange,
-        base: Reg,
-        offset: i32,
-    },
-    CallIndirect {
-        source: AddressRange,
-        ra: Reg,
-        base: Reg,
-        offset: i32,
-        return_address: u32,
-    },
-    Branch {
-        source: AddressRange,
-        kind: BranchKind,
-        src1: Reg,
-        src2: Reg,
-        target_true: u32,
-        target_false: u32,
-    },
-    Unimplemented {
-        source: AddressRange,
-    },
+    Fallthrough { target: u64 },
+    Control { source: AddressRange, instruction: ControlInst },
 }
 
-#[derive(Copy, Clone, PartialEq, Eq, Debug)]
+#[derive(Copy, Clone, PartialEq, Eq)]
 struct AddressRange {
-    start: u32,
-    end: u32,
+    start: u64,
+    end: u64,
 }
 
-impl From<Range<u32>> for AddressRange {
-    fn from(range: Range<u32>) -> Self {
+impl core::fmt::Display for AddressRange {
+    fn fmt(&self, fmt: &mut core::fmt::Formatter) -> core::fmt::Result {
+        write!(fmt, "0x{:x}-0x{:x}", self.start, self.end)
+    }
+}
+
+impl core::fmt::Debug for AddressRange {
+    fn fmt(&self, fmt: &mut core::fmt::Formatter) -> core::fmt::Result {
+        write!(fmt, "0x{:x}-0x{:x}", self.start, self.end)
+    }
+}
+
+impl From<Range<u64>> for AddressRange {
+    fn from(range: Range<u64>) -> Self {
         AddressRange {
             start: range.start,
             end: range.end,
@@ -165,20 +123,69 @@ impl From<Range<u32>> for AddressRange {
 }
 
 #[derive(Copy, Clone, Debug)]
-enum InstExt {
-    Inst(Inst),
+enum BasicInst {
+    Load { kind: LoadKind, dst: Reg, base: Reg, offset: i32 },
+    Store { kind: StoreKind, src: Reg, base: Reg, offset: i32 },
+    RegImm { kind: RegImmKind, dst: Reg, src: Reg, imm: i32 },
+    Shift { kind: ShiftKind, dst: Reg, src: Reg, amount: u8 },
+    RegReg { kind: RegRegKind, dst: Reg, src1: Reg, src2: Reg },
     Ecalli { syscall: u32 },
+}
+
+impl BasicInst {
+    fn is_nop(self) -> bool {
+        match self {
+            BasicInst::RegImm { dst, .. } | BasicInst::Shift { dst, .. } | BasicInst::RegReg { dst, .. } => dst == Reg::Zero,
+            BasicInst::Load { .. } | BasicInst::Store { .. } | BasicInst::Ecalli { .. } => false,
+        }
+    }
+}
+
+#[derive(Copy, Clone, Debug)]
+enum ControlInst {
+    Jump {
+        target: u64,
+    },
+    Call {
+        ra: Reg,
+        target: u64,
+        return_address: u64,
+    },
+    JumpIndirect {
+        base: Reg,
+        offset: i64,
+    },
+    CallIndirect {
+        ra: Reg,
+        base: Reg,
+        offset: i64,
+        return_address: u64,
+    },
+    Branch {
+        kind: BranchKind,
+        src1: Reg,
+        src2: Reg,
+        target_true: u64,
+        target_false: u64,
+    },
+    Unimplemented,
+}
+
+#[derive(Copy, Clone, Debug)]
+enum InstExt {
+    Basic(BasicInst),
+    Control(ControlInst),
 }
 
 #[derive(Debug)]
 struct BasicBlock {
     source: AddressRange,
-    ops: Vec<(AddressRange, InstExt)>,
+    ops: Vec<(AddressRange, BasicInst)>,
     next: EndOfBlock,
 }
 
 impl BasicBlock {
-    fn new(source: AddressRange, ops: Vec<(AddressRange, InstExt)>, next: EndOfBlock) -> Self {
+    fn new(source: AddressRange, ops: Vec<(AddressRange, BasicInst)>, next: EndOfBlock) -> Self {
         Self { source, ops, next }
     }
 }
@@ -186,7 +193,68 @@ impl BasicBlock {
 struct Fn<'a> {
     name: Option<&'a str>,
     range: AddressRange,
-    body: Vec<usize>,
+    frames: Vec<crate::dwarf::Frame>,
+    blocks: Vec<usize>,
+}
+
+impl<'a> Fn<'a> {
+    fn namespace_and_name(&self) -> Option<(String, String)> {
+        let name = self.name?;
+        let name = rustc_demangle::try_demangle(name).ok()?;
+
+        // Ideally we'd parse the symbol into an actual AST and use that,
+        // but that's a lot of work, so for now let's just do it like this.
+        let with_hash = name.to_string();
+        let without_hash = format!("{:#}", name);
+
+        // Here we want to split the symbol into two parts: the namespace, and the name + hash.
+        // The idea being that multiple symbols most likely share the namespcae, allowing us to
+        // deduplicate those strings in the output blob.
+        //
+        // For example, this symbol:
+        //   _ZN5alloc7raw_vec19RawVec$LT$T$C$A$GT$7reserve21do_reserve_and_handle17hddecba91f804dbebE
+        // can be demangled into these:
+        //   with_hash    = "alloc::raw_vec::RawVec<T,A>::reserve::do_reserve_and_handle::hddecba91f804dbeb"
+        //   without_hash = "alloc::raw_vec::RawVec<T,A>::reserve::do_reserve_and_handle"
+        //
+        // So what we want is to split it in two like this:
+        //   prefix = "alloc::raw_vec::RawVec<T,A>::reserve"
+        //   suffix = "do_reserve_and_handle::hddecba91f804dbeb"
+
+        if with_hash.contains("::") {
+            let suffix_index = {
+                let mut found = None;
+                let mut depth = 0;
+                let mut last = '\0';
+                let mut index = without_hash.len();
+                for ch in without_hash.chars().rev() {
+                    if ch == '>' {
+                        depth += 1;
+                    } else if ch == '<' {
+                        depth -= 1;
+                    } else if ch == ':' && depth == 0 && last == ':' {
+                        found = Some(index + 1);
+                        break;
+                    }
+
+                    last = ch;
+                    index -= ch.len_utf8();
+                }
+
+                found
+            };
+
+            if let Some(suffix_index) = suffix_index {
+                let prefix = &with_hash[..suffix_index - 2];
+                let suffix = &with_hash[suffix_index..];
+                return Some((prefix.to_owned(), suffix.to_owned()));
+            } else {
+                log::warn!("Failed to split symbol: {:?}", with_hash);
+            }
+        }
+
+        Some((String::new(), with_hash))
+    }
 }
 
 #[derive(Clone)]
@@ -217,6 +285,15 @@ struct MemoryConfig {
     stack_size: u32,
 }
 
+fn get_padding(memory_end: u64, section: &ElfSection) -> Option<u64> {
+    let misalignment = memory_end % section.align();
+    if misalignment == 0 {
+        None
+    } else {
+        Some(section.align() - misalignment)
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn extract_memory_config(
     data: &[u8],
@@ -228,15 +305,6 @@ fn extract_memory_config(
     let mut memory_end = VM_ADDR_USER_MEMORY as u64;
     let mut ro_data = Vec::new();
     let mut ro_data_size = 0;
-
-    fn get_padding(memory_end: u64, section: &ElfSection) -> Option<u64> {
-        let misalignment = memory_end % section.align();
-        if misalignment == 0 {
-            None
-        } else {
-            Some(section.align() - misalignment)
-        }
-    }
 
     fn align_if_necessary(memory_end: &mut u64, output_size: &mut u64, output_chunks: &mut Vec<RangeOrPadding>, section: &ElfSection) {
         if let Some(padding) = get_padding(*memory_end, section) {
@@ -570,365 +638,326 @@ fn get_relocation_target(
     }
 }
 
-fn extract_functions<'a>(
-    data: &'a [u8],
-    elf: &'a Elf,
+fn parse_text_section(
+    data: &[u8],
     section_text: &ElfSection,
     import_metadata: &BTreeMap<u32, ImportMetadata>,
-    jump_targets: &mut HashSet<u32>,
     relocation_for_section: &HashMap<SectionIndex, i64>,
-    mut instruction_overrides: HashMap<u64, Inst>,
-) -> Result<(Vec<Fn<'a>>, Vec<BasicBlock>), ProgramFromElfError> {
+    instruction_overrides: &mut HashMap<u64, Inst>,
+    output: &mut Vec<(AddressRange, InstExt)>,
+) -> Result<(), ProgramFromElfError> {
     let hostcall_by_hash: HashMap<[u8; 16], u32> = import_metadata.iter().map(|(index, metadata)| (metadata.hash, *index)).collect();
 
-    let text_range = section_text.file_range().unwrap_or((0, 0));
-    let text_start = usize::try_from(text_range.0).map_err(|_| ProgramFromElfError::other("out of range offset for '.text' section"))?;
-    let text_size = usize::try_from(text_range.1).map_err(|_| ProgramFromElfError::other("out of range size for '.text' section"))?;
-    let text_end = text_start
-        .checked_add(text_size)
-        .ok_or(ProgramFromElfError::other("out of range '.text' section"))?;
-    let text = &data[text_start..text_end];
+    let section_name = section_text.name().expect("failed to get section name");
+    let text_range = get_section_range(data, section_text)?;
+    let text = &data[text_range];
 
-    let mut functions = Vec::new();
-    for sym in elf.symbols() {
-        let kind = sym.raw_symbol().st_type();
-        match kind {
-            object::elf::STT_FUNC => {
-                let name = sym.name()?;
-                let name = if name.is_empty() { None } else { Some(name) };
-
-                let start = u32::try_from(sym.address()).map_err(|_| ProgramFromElfError::other("function has out of range address"))?;
-                let end = u32::try_from(sym.address() + sym.size())
-                    .map_err(|_| ProgramFromElfError::other("function has out of range end address"))?;
-                let range = (start..end).into();
-                functions.push(Fn {
-                    name,
-                    range,
-                    body: Default::default(),
-                });
-            }
-            object::elf::STT_NOTYPE | object::elf::STT_OBJECT | object::elf::STT_SECTION | object::elf::STT_FILE => {}
-            _ => return Err(ProgramFromElfError::other(format!("unsupported symbol type: {}", kind))),
-        }
+    if text.len() % 4 != 0 {
+        return Err(ProgramFromElfError::other(format!(
+            "size of section '{section_name}' is not divisible by 4"
+        )));
     }
 
-    functions.sort_unstable_by_key(|func| (func.range.start, func.range.end));
-    functions.dedup_by_key(|func| func.range);
-
-    if functions.is_empty() {
-        return Err(ProgramFromElfError::other("no functions found in the symbol table"));
-    }
-
-    if functions[0].range.start as u64 != section_text.address() {
-        return Err(ProgramFromElfError::other(
-            "incomplete symbol table: first function doesn't match the start of the '.text' section",
-        ));
-    }
-
-    if functions[functions.len() - 1].range.end as u64 != section_text.address() + section_text.size() {
-        return Err(ProgramFromElfError::other(
-            "incomplete symbol table: last function doesn't match the end of the '.text' section",
-        ));
-    }
-
-    for xs in functions.windows(2) {
-        if xs[0].range.end != xs[1].range.start {
-            return Err(ProgramFromElfError::other(
-                "incomplete symbol table: the whole '.text' section is not covered",
-            ));
-        }
-    }
-
-    let text_relocation_delta = *relocation_for_section
+    let section_relocation_delta = *relocation_for_section
         .get(&section_text.index())
-        .expect("internal error: no relocation offset for the '.text' section");
+        .ok_or_else(|| ProgramFromElfError::other(format!("internal error: no relocation offset for section '{}'", section_name)))?;
 
-    let mut blocks = Vec::new();
-    for func in &mut functions {
-        // The range of addresses for this function before relocation.
-        let original_range = func.range.start as u64..func.range.end as u64;
+    let relocated_base = section_text.address().wrapping_add(section_relocation_delta as u64);
 
-        // The range of addresses for this function after relocation.
-        let relocated_start = (original_range.start.wrapping_add(text_relocation_delta as u64)) as usize;
-        let relocated_end = (original_range.end.wrapping_add(text_relocation_delta as u64)) as usize;
+    output.reserve(text.len() / 4);
+    let mut relative_offset = 0;
+    while relative_offset < text.len() {
+        let op = u32::from_le_bytes([
+            text[relative_offset],
+            text[relative_offset + 1],
+            text[relative_offset + 2],
+            text[relative_offset + 3],
+        ]);
 
-        // The range of addresses for this function relative to the start of the section.
-        let relative_start = (original_range.start - section_text.address()) as usize;
-        let relative_end = (original_range.end - section_text.address()) as usize;
-
-        let fn_code = &text[relative_start..relative_end];
-        if fn_code.len() % 4 != 0 {
-            return Err(ProgramFromElfError::other("function's size is not divisible by 4"));
-        }
-
-        let relocated_start = u32::try_from(relocated_start).map_err(|_| ProgramFromElfError::other("program counter overflow"))?;
-        let relocated_end = u32::try_from(relocated_end).map_err(|_| ProgramFromElfError::other("program counter overflow"))?;
-        let mut pc_offset: u32 = 0;
-
-        func.range = (relocated_start..relocated_end).into();
-
-        let mut body: Vec<(AddressRange, InstExt)> = Vec::with_capacity(fn_code.len());
-        while (pc_offset as usize) < fn_code.len() {
-            let op = u32::from_le_bytes([
-                fn_code[pc_offset as usize],
-                fn_code[pc_offset as usize + 1],
-                fn_code[pc_offset as usize + 2],
-                fn_code[pc_offset as usize + 3],
-            ]);
-            let relative_pc = relative_start as u64 + pc_offset as u64;
-            let relocated_pc = relocated_start
-                .checked_add(pc_offset)
-                .ok_or(ProgramFromElfError::other("program counter overflow"))?;
-            let source = AddressRange::from(relocated_pc..relocated_pc + 4);
-
-            if op == INSTRUCTION_ECALLI {
-                if pc_offset != 0 {
-                    return Err(ProgramFromElfError::other(
-                        "hostcall instruction is not the first instruction in the function",
-                    ));
-                }
-                if fn_code.len() != 24 {
-                    return Err(ProgramFromElfError::other("hostcall function has unexpected length"));
-                }
-
-                let h = &fn_code[4..20];
-                let hash = [
-                    h[0], h[1], h[2], h[3], h[4], h[5], h[6], h[7], h[8], h[9], h[10], h[11], h[12], h[13], h[14], h[15],
-                ];
-                pc_offset += 20;
-
-                const INST_RET: Inst = Inst::JumpAndLinkRegister {
-                    dst: Reg::Zero,
-                    base: Reg::RA,
-                    value: 0,
-                };
-
-                let op = u32::from_le_bytes([
-                    fn_code[pc_offset as usize],
-                    fn_code[pc_offset as usize + 1],
-                    fn_code[pc_offset as usize + 2],
-                    fn_code[pc_offset as usize + 3],
-                ]);
-                if Inst::decode(op) != Some(INST_RET) {
-                    return Err(ProgramFromElfError::other("hostcall function doesn't end with a 'ret'"));
-                }
-
-                let hostcall_index = match hostcall_by_hash.get(&hash) {
-                    Some(index) => *index,
-                    None => {
-                        return Err(ProgramFromElfError::other(format!(
-                            "hostcall with hash that doesn't match any metadata: {:?}",
-                            hash
-                        )));
-                    }
-                };
-
-                body.push((
-                    AddressRange::from(relocated_pc..relocated_pc + 20),
-                    InstExt::Ecalli { syscall: hostcall_index },
-                ));
-                body.push((AddressRange::from(relocated_pc + 20..relocated_pc + 24), InstExt::Inst(INST_RET)));
-                break;
+        if op == INSTRUCTION_ECALLI {
+            let initial_offset = relative_offset as u64;
+            if relative_offset + 24 < text.len() {
+                return Err(ProgramFromElfError::other("truncated ecalli instruction"));
             }
 
-            pc_offset += 4;
+            relative_offset += 4;
 
-            let op = match Inst::decode(op) {
-                Some(op) => instruction_overrides.remove(&relative_pc).unwrap_or(op),
+            let h = &text[relative_offset..relative_offset + 16];
+            let hash = [
+                h[0], h[1], h[2], h[3], h[4], h[5], h[6], h[7], h[8], h[9], h[10], h[11], h[12], h[13], h[14], h[15],
+            ];
+            relative_offset += 16;
+
+            let hostcall_index = match hostcall_by_hash.get(&hash) {
+                Some(index) => *index,
                 None => {
-                    return Err(ProgramFromElfErrorKind::UnsupportedInstruction {
-                        pc: original_range.start.wrapping_add(pc_offset as u64),
-                        instruction: op,
-                    }
-                    .into());
+                    return Err(ProgramFromElfError::other(format!(
+                        "external call with a hash that doesn't match any metadata: {:?}",
+                        hash
+                    )));
                 }
             };
 
-            match op {
-                Inst::LoadUpperImmediate { dst, .. } | Inst::AddUpperImmediateToPc { dst, .. } | Inst::JumpAndLink { dst, .. } => {
-                    check_reg(dst)?;
-                }
-                Inst::JumpAndLinkRegister { dst, base, .. } | Inst::Load { dst, base, .. } => {
-                    check_reg(dst)?;
-                    check_reg(base)?;
-                }
-                Inst::Store { src, base, .. } => {
-                    check_reg(src)?;
-                    check_reg(base)?;
-                }
-                Inst::Branch { src1, src2, .. } => {
-                    check_reg(src1)?;
-                    check_reg(src2)?;
-                }
-                Inst::RegImm { dst, src, .. } | Inst::Shift { dst, src, .. } => {
-                    check_reg(dst)?;
-                    check_reg(src)?;
-                }
+            output.push((
+                AddressRange::from(relocated_base + initial_offset..relocated_base + relative_offset as u64),
+                InstExt::Basic(BasicInst::Ecalli { syscall: hostcall_index }),
+            ));
 
-                Inst::RegReg { dst, src1, src2, .. } => {
-                    check_reg(dst)?;
-                    check_reg(src1)?;
-                    check_reg(src2)?;
-                }
-                Inst::Ecall | Inst::Unimplemented => {}
+            const INST_RET: Inst = Inst::JumpAndLinkRegister {
+                dst: Reg::Zero,
+                base: Reg::RA,
+                value: 0,
+            };
+
+            let op = u32::from_le_bytes([
+                text[relative_offset],
+                text[relative_offset + 1],
+                text[relative_offset + 2],
+                text[relative_offset + 3],
+            ]);
+
+            if Inst::decode(op) != Some(INST_RET) {
+                return Err(ProgramFromElfError::other("external call shim doesn't end with a 'ret'"));
             }
 
-            let op = match op {
-                Inst::LoadUpperImmediate { dst, value } => InstExt::Inst(Inst::RegImm {
-                    kind: RegImmKind::Add,
-                    dst,
-                    src: Reg::Zero,
-                    imm: value as i32,
-                }),
-                Inst::JumpAndLink { dst, target } => {
-                    let target = (relocated_pc as i32 + target as i32) as u32;
-                    if u64::from(target) >= section_text.size() {
-                        return Err(ProgramFromElfError::other("out of range jump (JAL)"));
-                    }
+            output.push((
+                AddressRange::from(relocated_base + relative_offset as u64..relocated_base + relative_offset as u64 + 4),
+                InstExt::Control(ControlInst::JumpIndirect { base: Reg::RA, offset: 0 }),
+            ));
 
-                    jump_targets.insert(target);
-                    if dst != Reg::Zero {
-                        if relocated_pc + 4 >= relocated_end {
-                            return Err(ProgramFromElfError::other("out of range return address"));
-                        }
-                        jump_targets.insert(relocated_pc + 4);
-                    }
-                    InstExt::Inst(Inst::JumpAndLink { dst, target })
-                }
-                Inst::Branch { kind, src1, src2, target } => {
-                    let target = (relocated_pc as i32 + target as i32) as u32;
-                    if target < relocated_start || target >= relocated_end {
-                        // These are not supposed to be used across functions.
-                        return Err(ProgramFromElfError::other("found a branch jumping out of its function"));
-                    }
-                    jump_targets.insert(target);
-                    InstExt::Inst(Inst::Branch { kind, src1, src2, target })
-                }
-                Inst::AddUpperImmediateToPc { .. } => {
-                    return Err(ProgramFromElfError::other(
-                        "found an unrelocated auipc instruction; is the program compiled with relocations?",
-                    ));
-                }
-                Inst::Ecall => {
-                    return Err(ProgramFromElfError::other(
-                        "found a bare ecall instruction; those are not supported",
-                    ));
-                }
-                _ => InstExt::Inst(op),
-            };
-
-            body.push((source, op));
+            relative_offset += 4;
+            continue;
         }
 
-        // Split the function into basic blocks.
-        let mut local_blocks = Vec::new();
-        let mut current_block = Vec::new();
-        let mut block_start = 0;
-        for (source, op) in body {
-            if current_block.is_empty() {
-                block_start = source.start;
+        let absolute_address = section_text.address() + relative_offset as u64;
+        let relocated_address = relocated_base + relative_offset as u64;
+        relative_offset += 4;
+
+        // Shadow the `relative_offset` to make sure it's not accidentally used again.
+        #[allow(clippy::let_unit_value)]
+        #[allow(unused_variables)]
+        let relative_offset = ();
+
+        let op = match Inst::decode(op) {
+            Some(op) => instruction_overrides.remove(&absolute_address).unwrap_or(op),
+            None => {
+                return Err(ProgramFromElfErrorKind::UnsupportedInstruction {
+                    pc: absolute_address,
+                    instruction: op,
+                }
+                .into());
+            }
+        };
+
+        match op {
+            Inst::LoadUpperImmediate { dst, .. } | Inst::AddUpperImmediateToPc { dst, .. } | Inst::JumpAndLink { dst, .. } => {
+                check_reg(dst)?;
+            }
+            Inst::JumpAndLinkRegister { dst, base, .. } | Inst::Load { dst, base, .. } => {
+                check_reg(dst)?;
+                check_reg(base)?;
+            }
+            Inst::Store { src, base, .. } => {
+                check_reg(src)?;
+                check_reg(base)?;
+            }
+            Inst::Branch { src1, src2, .. } => {
+                check_reg(src1)?;
+                check_reg(src2)?;
+            }
+            Inst::RegImm { dst, src, .. } | Inst::Shift { dst, src, .. } => {
+                check_reg(dst)?;
+                check_reg(src)?;
             }
 
-            if !current_block.is_empty() && jump_targets.contains(&source.start) {
-                local_blocks.push(blocks.len());
-                blocks.push(BasicBlock::new(
-                    (block_start..source.start).into(),
-                    std::mem::take(&mut current_block),
-                    EndOfBlock::Fallthrough { target: source.start },
-                ));
-                block_start = source.start;
+            Inst::RegReg { dst, src1, src2, .. } => {
+                check_reg(dst)?;
+                check_reg(src1)?;
+                check_reg(src2)?;
             }
+            Inst::Ecall | Inst::Unimplemented => {}
+        }
 
-            if let InstExt::Inst(Inst::JumpAndLink { dst, target }) = op {
+        let op = match op {
+            Inst::LoadUpperImmediate { dst, value } => InstExt::Basic(BasicInst::RegImm {
+                kind: RegImmKind::Add,
+                dst,
+                src: Reg::Zero,
+                imm: value as i32,
+            }),
+            Inst::JumpAndLink { dst, target } => {
+                let target = (relocated_address as i64).wrapping_add(target as i32 as i64) as u64;
                 let next = if dst != Reg::Zero {
-                    EndOfBlock::Call {
-                        source,
+                    ControlInst::Call {
                         ra: dst,
                         target,
-                        return_address: source.end,
+                        return_address: relocated_address.wrapping_add(4),
                     }
                 } else {
-                    EndOfBlock::Jump { source, target }
+                    ControlInst::Jump { target }
                 };
 
-                local_blocks.push(blocks.len());
-                blocks.push(BasicBlock::new(
-                    (block_start..source.end).into(),
-                    std::mem::take(&mut current_block),
-                    next,
-                ));
-                block_start = source.start;
-            } else if let InstExt::Inst(Inst::JumpAndLinkRegister { dst, base, value }) = op {
+                InstExt::Control(next)
+            }
+            Inst::JumpAndLinkRegister { dst, base, value } => {
                 let next = if dst != Reg::Zero {
-                    EndOfBlock::CallIndirect {
-                        source,
+                    ControlInst::CallIndirect {
                         ra: dst,
                         base,
-                        offset: value,
-                        return_address: source.end,
+                        offset: value.into(),
+                        return_address: relocated_address.wrapping_add(4),
                     }
                 } else {
-                    EndOfBlock::JumpIndirect {
-                        source,
+                    ControlInst::JumpIndirect {
                         base,
-                        offset: value,
+                        offset: value.into(),
                     }
                 };
 
-                local_blocks.push(blocks.len());
-                blocks.push(BasicBlock::new(
-                    (block_start..source.end).into(),
-                    std::mem::take(&mut current_block),
-                    next,
+                InstExt::Control(next)
+            }
+            Inst::Branch { kind, src1, src2, target } => {
+                let target = (relocated_address as i64).wrapping_add(target as i32 as i64) as u64;
+                let next = ControlInst::Branch {
+                    kind,
+                    src1,
+                    src2,
+                    target_true: target,
+                    target_false: relocated_address.wrapping_add(4),
+                };
+
+                InstExt::Control(next)
+            }
+            Inst::Unimplemented => InstExt::Control(ControlInst::Unimplemented),
+            Inst::Load { kind, dst, base, offset } => InstExt::Basic(BasicInst::Load { kind, dst, base, offset }),
+            Inst::Store { kind, src, base, offset } => InstExt::Basic(BasicInst::Store { kind, src, base, offset }),
+            Inst::RegImm { kind, dst, src, imm } => InstExt::Basic(BasicInst::RegImm { kind, dst, src, imm }),
+            Inst::Shift { kind, dst, src, amount } => InstExt::Basic(BasicInst::Shift { kind, dst, src, amount }),
+            Inst::RegReg { kind, dst, src1, src2 } => InstExt::Basic(BasicInst::RegReg { kind, dst, src1, src2 }),
+            Inst::AddUpperImmediateToPc { .. } => {
+                return Err(ProgramFromElfError::other(
+                    "found an unrelocated auipc instruction; is the program compiled with relocations?",
                 ));
-                block_start = source.start;
-            } else if let InstExt::Inst(Inst::Branch { kind, src1, src2, target }) = op {
-                local_blocks.push(blocks.len());
-                blocks.push(BasicBlock::new(
-                    (block_start..source.end).into(),
-                    std::mem::take(&mut current_block),
-                    EndOfBlock::Branch {
-                        source,
-                        kind,
-                        src1,
-                        src2,
-                        target_true: target,
-                        target_false: source.end,
-                    },
+            }
+            Inst::Ecall => {
+                return Err(ProgramFromElfError::other(
+                    "found a bare ecall instruction; those are not supported",
                 ));
-                block_start = source.start;
-            } else if let InstExt::Inst(Inst::Unimplemented) = op {
-                local_blocks.push(blocks.len());
-                blocks.push(BasicBlock::new(
-                    (block_start..source.end).into(),
-                    std::mem::take(&mut current_block),
-                    EndOfBlock::Unimplemented { source },
-                ));
-                block_start = source.start;
+            }
+        };
+
+        let source = AddressRange::from(relocated_address..relocated_address + 4);
+        output.push((source, op));
+    }
+
+    Ok(())
+}
+
+fn split_code_into_basic_blocks(
+    jump_targets: &HashSet<u64>,
+    instructions: Vec<(AddressRange, InstExt)>,
+) -> Result<Vec<BasicBlock>, ProgramFromElfError> {
+    let mut blocks = Vec::new();
+    let mut current_block = Vec::new();
+    let mut block_start_opt = None;
+    for (source, op) in instructions {
+        assert!(source.start < source.end);
+        let is_jump_target = jump_targets.contains(&source.start);
+        let block_start = if !is_jump_target {
+            // Make sure nothing wants to jump into the middle of this instruction.
+            assert!((source.start..source.end)
+                .step_by(4)
+                .skip(1)
+                .all(|address| !jump_targets.contains(&address)));
+
+            if let Some(block_start) = block_start_opt {
+                // We're in a block that's reachable by a jump.
+                block_start
             } else {
-                current_block.push((source, op));
+                // Nothing can possibly jump here, so just skip this instruction.
+                continue;
+            }
+        } else {
+            // Control flow can jump to this instruction.
+            if let Some(block_start) = block_start_opt.take() {
+                // End the current basic block to prevent a jump into the middle of it.
+                if !current_block.is_empty() {
+                    blocks.push(BasicBlock::new(
+                        (block_start..source.start).into(),
+                        std::mem::take(&mut current_block),
+                        EndOfBlock::Fallthrough { target: source.start },
+                    ));
+                }
+            }
+
+            block_start_opt = Some(source.start);
+            source.start
+        };
+
+        match op {
+            InstExt::Control(instruction) => {
+                block_start_opt = None;
+                blocks.push(BasicBlock::new(
+                    (block_start..source.end).into(),
+                    std::mem::take(&mut current_block),
+                    EndOfBlock::Control { source, instruction },
+                ));
+
+                if let ControlInst::Branch { target_false, .. } = instruction {
+                    assert_eq!(source.end, target_false);
+                    block_start_opt = Some(source.end);
+                }
+            }
+            InstExt::Basic(instruction) => {
+                if instruction.is_nop() {
+                    continue;
+                }
+
+                current_block.push((source, instruction));
             }
         }
+    }
 
-        // TODO: Enable this again.
-        // for block in &mut blocks {
-        //     block.ops.retain(|(_, op)| !is_nop(*op));
-        // }
+    if !current_block.is_empty() {
+        return Err(ProgramFromElfError::other(
+            "code doesn't end with a control-flow affecting instruction",
+        ));
+    }
 
-        if !current_block.is_empty() {
-            return Err(ProgramFromElfError::other(
-                "function doesn't end with a control-flow affecting instruction",
-            ));
+    blocks.sort_unstable_by_key(|block| (block.source.start, block.source.end));
+    let mut last_address = 0;
+    for block in &blocks {
+        if last_address > block.source.start {
+            return Err(ProgramFromElfError::other("found overlapping basic blocks"));
+        }
+        last_address = block.source.end;
+    }
+
+    Ok(blocks)
+}
+
+fn retain_only_non_empty_functions(blocks: &[BasicBlock], functions: &mut Vec<Fn>) -> Result<(), ProgramFromElfError> {
+    let iter = iterate_in_tandem(
+        blocks.iter().enumerate().map(|(index, block)| (block.source, (index, block))),
+        functions.iter_mut().map(|func| (func.range, func)),
+    );
+
+    for ((block_index, block), function) in iter {
+        if block.source.start < function.range.start || block.source.end > function.range.end {
+            return Err(ProgramFromElfError::other("found inconsistent basic block <-> function overlap"));
         }
 
-        func.body = local_blocks;
+        function.blocks.push(block_index);
     }
 
-    if !instruction_overrides.is_empty() {
-        return Err(ProgramFromElfError::other("internal error: instruction overrides map is not empty"));
-    }
+    let initial_length = functions.len();
+    functions.retain(|func| !func.blocks.is_empty());
+    log::trace!(
+        "Number of functions removed due to dead code elimination: {}",
+        initial_length - functions.len()
+    );
 
-    Ok((functions, blocks))
+    Ok(())
 }
 
 fn cast_reg(reg: Reg) -> PReg {
@@ -952,225 +981,250 @@ fn cast_reg(reg: Reg) -> PReg {
     }
 }
 
-fn emit_code(
-    mut jump_targets: HashSet<u32>,
-    functions: &[Fn],
-    blocks: &[BasicBlock],
-) -> Result<Vec<(AddressRange, RawInstruction)>, ProgramFromElfError> {
-    for func in functions {
-        jump_targets.insert(blocks[func.body[0]].source.start);
-        for &block_index in &func.body {
-            let block = &blocks[block_index];
-            match block.next {
-                EndOfBlock::Fallthrough { .. } => {}
-                EndOfBlock::Jump { target, .. } => {
-                    jump_targets.insert(target);
-                }
-                EndOfBlock::Call {
-                    target, return_address, ..
-                } => {
-                    jump_targets.insert(target);
-                    jump_targets.insert(return_address);
-                }
-                EndOfBlock::JumpIndirect { .. } => {}
-                EndOfBlock::CallIndirect { return_address, .. } => {
-                    jump_targets.insert(return_address);
-                }
-                EndOfBlock::Branch { target_true, .. } => {
-                    jump_targets.insert(target_true);
-                }
-                EndOfBlock::Unimplemented { .. } => {}
+fn harvest_jump_targets(jump_targets: &mut HashSet<u64>, instructions: &[(AddressRange, InstExt)]) {
+    for (source, instruction) in instructions {
+        let InstExt::Control(instruction) = instruction else { continue };
+        match *instruction {
+            ControlInst::Jump { target, .. } => {
+                jump_targets.insert(target);
             }
+            ControlInst::Call {
+                target, return_address, ..
+            } => {
+                jump_targets.insert(target);
+                jump_targets.insert(return_address);
+            }
+            ControlInst::JumpIndirect { .. } => {}
+            ControlInst::CallIndirect { return_address, .. } => {
+                jump_targets.insert(return_address);
+            }
+            ControlInst::Branch {
+                target_true, target_false, ..
+            } => {
+                jump_targets.insert(target_true);
+                assert_eq!(target_false, source.end);
+            }
+            ControlInst::Unimplemented { .. } => {}
+        }
+    }
+}
+
+fn emit_code(jump_targets: HashSet<u64>, blocks: &[BasicBlock]) -> Result<Vec<(AddressRange, RawInstruction)>, ProgramFromElfError> {
+    let mut code: Vec<(AddressRange, RawInstruction)> = Vec::new();
+    {
+        let mut set = HashSet::new();
+        for block in blocks {
+            assert!(set.insert(block.source.start), "duplicate jump target: {:x}", block.source.start);
         }
     }
 
-    let mut code: Vec<(AddressRange, RawInstruction)> = Vec::new();
-    for func in functions {
-        for &block_index in &func.body {
-            let block = &blocks[block_index];
-            if jump_targets.contains(&block.source.start) {
-                assert_eq!(block.source.start % 4, 0);
-                code.push((
-                    (block.source.start..block.source.start + 4).into(),
-                    RawInstruction::new_with_imm(Opcode::jump_target, block.source.start / 4),
-                ));
+    for block in blocks {
+        if jump_targets.contains(&block.source.start) {
+            assert_eq!(block.source.start % 4, 0);
+            let Ok(target) = u32::try_from(block.source.start) else {
+                return Err(ProgramFromElfError::other("basic block start address overflow"));
+            };
+            code.push((
+                (block.source.start..block.source.start + 4).into(),
+                RawInstruction::new_with_imm(Opcode::jump_target, target / 4),
+            ));
+        }
+
+        for &(source, op) in &block.ops {
+            let op = match op {
+                BasicInst::Load { kind, dst, base, offset } => {
+                    let kind = match kind {
+                        LoadKind::I8 => Opcode::load_i8,
+                        LoadKind::I16 => Opcode::load_i16,
+                        LoadKind::U32 => Opcode::load_u32,
+                        LoadKind::U8 => Opcode::load_u8,
+                        LoadKind::U16 => Opcode::load_u16,
+                    };
+                    RawInstruction::new_with_regs2_imm(kind, cast_reg(dst), cast_reg(base), offset as u32)
+                }
+                BasicInst::Store { kind, src, base, offset } => {
+                    let kind = match kind {
+                        StoreKind::U32 => Opcode::store_u32,
+                        StoreKind::U8 => Opcode::store_u8,
+                        StoreKind::U16 => Opcode::store_u16,
+                    };
+                    RawInstruction::new_with_regs2_imm(kind, cast_reg(src), cast_reg(base), offset as u32)
+                }
+                BasicInst::RegImm { kind, dst, src, imm } => {
+                    let kind = match kind {
+                        RegImmKind::Add => Opcode::add_imm,
+                        RegImmKind::SetLessThanSigned => Opcode::set_less_than_signed_imm,
+                        RegImmKind::SetLessThanUnsigned => Opcode::set_less_than_unsigned_imm,
+                        RegImmKind::Xor => Opcode::xor_imm,
+                        RegImmKind::Or => Opcode::or_imm,
+                        RegImmKind::And => Opcode::and_imm,
+                    };
+                    RawInstruction::new_with_regs2_imm(kind, cast_reg(dst), cast_reg(src), imm as u32)
+                }
+                BasicInst::Shift { kind, dst, src, amount } => {
+                    let kind = match kind {
+                        ShiftKind::LogicalLeft => Opcode::shift_logical_left_imm,
+                        ShiftKind::LogicalRight => Opcode::shift_logical_right_imm,
+                        ShiftKind::ArithmeticRight => Opcode::shift_arithmetic_right_imm,
+                    };
+                    RawInstruction::new_with_regs2_imm(kind, cast_reg(dst), cast_reg(src), amount as u32)
+                }
+                BasicInst::RegReg { kind, dst, src1, src2 } => {
+                    let kind = match kind {
+                        RegRegKind::Add => Opcode::add,
+                        RegRegKind::Sub => Opcode::sub,
+                        RegRegKind::ShiftLogicalLeft => Opcode::shift_logical_left,
+                        RegRegKind::SetLessThanSigned => Opcode::set_less_than_signed,
+                        RegRegKind::SetLessThanUnsigned => Opcode::set_less_than_unsigned,
+                        RegRegKind::Xor => Opcode::xor,
+                        RegRegKind::ShiftLogicalRight => Opcode::shift_logical_right,
+                        RegRegKind::ShiftArithmeticRight => Opcode::shift_arithmetic_right,
+                        RegRegKind::Or => Opcode::or,
+                        RegRegKind::And => Opcode::and,
+                        RegRegKind::Mul => Opcode::mul,
+                        RegRegKind::MulUpperSignedSigned => Opcode::mul_upper_signed_signed,
+                        RegRegKind::MulUpperUnsignedUnsigned => Opcode::mul_upper_unsigned_unsigned,
+                        RegRegKind::MulUpperSignedUnsigned => Opcode::mul_upper_signed_unsigned,
+                        RegRegKind::Div => Opcode::div_signed,
+                        RegRegKind::DivUnsigned => Opcode::div_unsigned,
+                        RegRegKind::Rem => Opcode::rem_signed,
+                        RegRegKind::RemUnsigned => Opcode::rem_unsigned,
+                    };
+                    RawInstruction::new_with_regs3(kind, cast_reg(dst), cast_reg(src1), cast_reg(src2))
+                }
+                BasicInst::Ecalli { syscall } => RawInstruction::new_with_imm(Opcode::ecalli, syscall),
+            };
+
+            code.push((source, op));
+        }
+
+        match block.next {
+            EndOfBlock::Fallthrough { target } => {
+                assert_eq!(target, block.source.end);
             }
-
-            for &(source, op) in &block.ops {
-                let op = match op {
-                    InstExt::Inst(Inst::Load { kind, dst, base, offset }) => {
-                        use crate::riscv::LoadKind;
-                        let kind = match kind {
-                            LoadKind::I8 => Opcode::load_i8,
-                            LoadKind::I16 => Opcode::load_i16,
-                            LoadKind::U32 => Opcode::load_u32,
-                            LoadKind::U8 => Opcode::load_u8,
-                            LoadKind::U16 => Opcode::load_u16,
-                        };
-                        RawInstruction::new_with_regs2_imm(kind, cast_reg(dst), cast_reg(base), offset as u32)
-                    }
-                    InstExt::Inst(Inst::Store { kind, src, base, offset }) => {
-                        use crate::riscv::StoreKind;
-                        let kind = match kind {
-                            StoreKind::U32 => Opcode::store_u32,
-                            StoreKind::U8 => Opcode::store_u8,
-                            StoreKind::U16 => Opcode::store_u16,
-                        };
-                        RawInstruction::new_with_regs2_imm(kind, cast_reg(src), cast_reg(base), offset as u32)
-                    }
-                    InstExt::Inst(Inst::RegImm { kind, dst, src, imm }) => {
-                        let kind = match kind {
-                            RegImmKind::Add => Opcode::add_imm,
-                            RegImmKind::SetLessThanSigned => Opcode::set_less_than_signed_imm,
-                            RegImmKind::SetLessThanUnsigned => Opcode::set_less_than_unsigned_imm,
-                            RegImmKind::Xor => Opcode::xor_imm,
-                            RegImmKind::Or => Opcode::or_imm,
-                            RegImmKind::And => Opcode::and_imm,
-                        };
-                        RawInstruction::new_with_regs2_imm(kind, cast_reg(dst), cast_reg(src), imm as u32)
-                    }
-                    InstExt::Inst(Inst::Shift { kind, dst, src, amount }) => {
-                        use crate::riscv::ShiftKind;
-                        let kind = match kind {
-                            ShiftKind::LogicalLeft => Opcode::shift_logical_left_imm,
-                            ShiftKind::LogicalRight => Opcode::shift_logical_right_imm,
-                            ShiftKind::ArithmeticRight => Opcode::shift_arithmetic_right_imm,
-                        };
-                        RawInstruction::new_with_regs2_imm(kind, cast_reg(dst), cast_reg(src), amount as u32)
-                    }
-                    InstExt::Inst(Inst::RegReg { kind, dst, src1, src2 }) => {
-                        use crate::riscv::RegRegKind;
-                        let kind = match kind {
-                            RegRegKind::Add => Opcode::add,
-                            RegRegKind::Sub => Opcode::sub,
-                            RegRegKind::ShiftLogicalLeft => Opcode::shift_logical_left,
-                            RegRegKind::SetLessThanSigned => Opcode::set_less_than_signed,
-                            RegRegKind::SetLessThanUnsigned => Opcode::set_less_than_unsigned,
-                            RegRegKind::Xor => Opcode::xor,
-                            RegRegKind::ShiftLogicalRight => Opcode::shift_logical_right,
-                            RegRegKind::ShiftArithmeticRight => Opcode::shift_arithmetic_right,
-                            RegRegKind::Or => Opcode::or,
-                            RegRegKind::And => Opcode::and,
-                            RegRegKind::Mul => Opcode::mul,
-                            RegRegKind::MulUpperSignedSigned => Opcode::mul_upper_signed_signed,
-                            RegRegKind::MulUpperUnsignedUnsigned => Opcode::mul_upper_unsigned_unsigned,
-                            RegRegKind::MulUpperSignedUnsigned => Opcode::mul_upper_signed_unsigned,
-                            RegRegKind::Div => Opcode::div_signed,
-                            RegRegKind::DivUnsigned => Opcode::div_unsigned,
-                            RegRegKind::Rem => Opcode::rem_signed,
-                            RegRegKind::RemUnsigned => Opcode::rem_unsigned,
-                        };
-                        RawInstruction::new_with_regs3(kind, cast_reg(dst), cast_reg(src1), cast_reg(src2))
-                    }
-                    InstExt::Ecalli { syscall } => RawInstruction::new_with_imm(Opcode::ecalli, syscall),
-
-                    InstExt::Inst(Inst::JumpAndLink { .. })
-                    | InstExt::Inst(Inst::JumpAndLinkRegister { .. })
-                    | InstExt::Inst(Inst::Branch { .. })
-                    | InstExt::Inst(Inst::AddUpperImmediateToPc { .. })
-                    | InstExt::Inst(Inst::LoadUpperImmediate { .. })
-                    | InstExt::Inst(Inst::Unimplemented)
-                    | InstExt::Inst(Inst::Ecall) => unreachable!(),
+            EndOfBlock::Control {
+                source,
+                instruction: ControlInst::Jump { target },
+            } => {
+                if target % 4 != 0 {
+                    return Err(ProgramFromElfError::other("found a jump with a target that isn't aligned"));
+                }
+                let Ok(target) = u32::try_from(target) else {
+                    return Err(ProgramFromElfError::other("jump target address overflow"));
                 };
 
-                code.push((source, op));
+                code.push((
+                    source,
+                    RawInstruction::new_with_regs2_imm(
+                        Opcode::jump_and_link_register,
+                        cast_reg(Reg::Zero),
+                        cast_reg(Reg::Zero),
+                        target / 4,
+                    ),
+                ));
             }
+            EndOfBlock::Control {
+                source,
+                instruction:
+                    ControlInst::Call {
+                        ra,
+                        target,
+                        return_address,
+                    },
+            } => {
+                if target % 4 != 0 {
+                    return Err(ProgramFromElfError::other("found a call with a target that isn't aligned"));
+                }
 
-            match block.next {
-                EndOfBlock::Fallthrough { target } => {
-                    assert_eq!(target, block.source.end);
-                }
-                EndOfBlock::Jump { source, target } => {
-                    if target % 4 != 0 {
-                        return Err(ProgramFromElfError::other("found a jump with a target that isn't aligned"));
-                    }
-                    code.push((
-                        source,
-                        RawInstruction::new_with_regs2_imm(
-                            Opcode::jump_and_link_register,
-                            cast_reg(Reg::Zero),
-                            cast_reg(Reg::Zero),
-                            target / 4,
-                        ),
-                    ));
-                }
-                EndOfBlock::Call {
+                let Ok(target) = u32::try_from(target) else {
+                    return Err(ProgramFromElfError::other("call target address overflow"));
+                };
+
+                code.push((
                     source,
-                    ra,
-                    target,
-                    return_address,
-                } => {
-                    if target % 4 != 0 {
-                        return Err(ProgramFromElfError::other("found a call with a target that isn't aligned"));
-                    }
-                    code.push((
-                        source,
-                        RawInstruction::new_with_regs2_imm(Opcode::jump_and_link_register, cast_reg(ra), cast_reg(Reg::Zero), target / 4),
-                    ));
-                    assert_eq!(return_address, block.source.end);
-                }
-                EndOfBlock::JumpIndirect { source, base, offset } => {
-                    if offset % 4 != 0 {
-                        return Err(ProgramFromElfError::other(
-                            "found an indirect jump with a target that isn't aligned",
-                        ));
-                    }
-                    code.push((
-                        source,
-                        RawInstruction::new_with_regs2_imm(
-                            Opcode::jump_and_link_register,
-                            cast_reg(Reg::Zero),
-                            cast_reg(base),
-                            offset as u32 / 4,
-                        ),
+                    RawInstruction::new_with_regs2_imm(Opcode::jump_and_link_register, cast_reg(ra), cast_reg(Reg::Zero), target / 4),
+                ));
+                assert_eq!(return_address, block.source.end);
+            }
+            EndOfBlock::Control {
+                source,
+                instruction: ControlInst::JumpIndirect { base, offset },
+            } => {
+                if offset % 4 != 0 {
+                    return Err(ProgramFromElfError::other(
+                        "found an indirect jump with a target that isn't aligned",
                     ));
                 }
-                EndOfBlock::CallIndirect {
+
+                code.push((
                     source,
-                    ra,
-                    base,
-                    offset,
-                    return_address,
-                } => {
-                    if offset % 4 != 0 {
-                        return Err(ProgramFromElfError::other(
-                            "found an indirect call with a target that isn't aligned",
-                        ));
-                    }
-                    code.push((
-                        source,
-                        RawInstruction::new_with_regs2_imm(Opcode::jump_and_link_register, cast_reg(ra), cast_reg(base), offset as u32 / 4),
+                    RawInstruction::new_with_regs2_imm(
+                        Opcode::jump_and_link_register,
+                        cast_reg(Reg::Zero),
+                        cast_reg(base),
+                        offset as u32 / 4,
+                    ),
+                ));
+            }
+            EndOfBlock::Control {
+                source,
+                instruction:
+                    ControlInst::CallIndirect {
+                        ra,
+                        base,
+                        offset,
+                        return_address,
+                    },
+            } => {
+                if offset % 4 != 0 {
+                    return Err(ProgramFromElfError::other(
+                        "found an indirect call with a target that isn't aligned",
                     ));
-                    assert_eq!(return_address, block.source.end);
                 }
-                EndOfBlock::Branch {
+                code.push((
                     source,
-                    kind,
-                    src1,
-                    src2,
-                    target_true,
-                    target_false,
-                } => {
-                    if target_true % 4 != 0 {
-                        return Err(ProgramFromElfError::other("found a branch with a target that isn't aligned"));
-                    }
-                    let kind = match kind {
-                        BranchKind::Eq => Opcode::branch_eq,
-                        BranchKind::NotEq => Opcode::branch_not_eq,
-                        BranchKind::LessSigned => Opcode::branch_less_signed,
-                        BranchKind::GreaterOrEqualSigned => Opcode::branch_greater_or_equal_signed,
-                        BranchKind::LessUnsigned => Opcode::branch_less_unsigned,
-                        BranchKind::GreaterOrEqualUnsigned => Opcode::branch_greater_or_equal_unsigned,
-                    };
-                    code.push((
-                        source,
-                        RawInstruction::new_with_regs2_imm(kind, cast_reg(src1), cast_reg(src2), target_true / 4),
-                    ));
-                    assert_eq!(target_false, block.source.end);
+                    RawInstruction::new_with_regs2_imm(Opcode::jump_and_link_register, cast_reg(ra), cast_reg(base), offset as u32 / 4),
+                ));
+                assert_eq!(return_address, block.source.end);
+            }
+            EndOfBlock::Control {
+                source,
+                instruction:
+                    ControlInst::Branch {
+                        kind,
+                        src1,
+                        src2,
+                        target_true,
+                        target_false,
+                    },
+            } => {
+                if target_true % 4 != 0 {
+                    return Err(ProgramFromElfError::other("found a branch with a target that isn't aligned"));
                 }
-                EndOfBlock::Unimplemented { source } => {
-                    code.push((source, RawInstruction::new_argless(Opcode::trap)));
-                }
+
+                let Ok(target_true) = u32::try_from(target_true) else {
+                    return Err(ProgramFromElfError::other("branch target address overflow"));
+                };
+
+                let kind = match kind {
+                    BranchKind::Eq => Opcode::branch_eq,
+                    BranchKind::NotEq => Opcode::branch_not_eq,
+                    BranchKind::LessSigned => Opcode::branch_less_signed,
+                    BranchKind::GreaterOrEqualSigned => Opcode::branch_greater_or_equal_signed,
+                    BranchKind::LessUnsigned => Opcode::branch_less_unsigned,
+                    BranchKind::GreaterOrEqualUnsigned => Opcode::branch_greater_or_equal_unsigned,
+                };
+                code.push((
+                    source,
+                    RawInstruction::new_with_regs2_imm(kind, cast_reg(src1), cast_reg(src2), target_true / 4),
+                ));
+                assert_eq!(target_false, block.source.end);
+            }
+            EndOfBlock::Control {
+                source,
+                instruction: ControlInst::Unimplemented,
+            } => {
+                code.push((source, RawInstruction::new_argless(Opcode::trap)));
             }
         }
     }
@@ -1178,76 +1232,82 @@ fn emit_code(
     Ok(code)
 }
 
+#[derive(Copy, Clone)]
+enum HiRelocKind {
+    PcRel,
+    Got,
+}
+
+impl core::fmt::Display for HiRelocKind {
+    fn fmt(&self, fmt: &mut core::fmt::Formatter) -> core::fmt::Result {
+        match self {
+            HiRelocKind::PcRel => fmt.write_str(".rela"),
+            HiRelocKind::Got => fmt.write_str(".got"),
+        }
+    }
+}
+
+#[derive(Default)]
+struct RelocPairs {
+    reloc_pcrel_hi20: HashMap<u64, (HiRelocKind, u64)>,
+    reloc_pcrel_lo12: HashMap<u64, u64>,
+}
+
+fn read_u32(data: &[u8], relative_address: u64) -> Result<u32, ProgramFromElfError> {
+    let target_range = relative_address as usize..relative_address as usize + 4;
+    let value = data
+        .get(target_range)
+        .ok_or(ProgramFromElfError::other("out of range relocation"))?;
+    Ok(u32::from_le_bytes([value[0], value[1], value[2], value[3]]))
+}
+
+fn read_u16(data: &[u8], relative_address: u64) -> Result<u16, ProgramFromElfError> {
+    let target_range = relative_address as usize..relative_address as usize + 2;
+    let value = data
+        .get(target_range)
+        .ok_or(ProgramFromElfError::other("out of range relocation"))?;
+    Ok(u16::from_le_bytes([value[0], value[1]]))
+}
+
+fn read_u8(data: &[u8], relative_address: u64) -> Result<u8, ProgramFromElfError> {
+    data.get(relative_address as usize)
+        .ok_or(ProgramFromElfError::other("out of range relocation"))
+        .copied()
+}
+
+fn write_u32(data: &mut [u8], relative_address: u64, value: u32) -> Result<(), ProgramFromElfError> {
+    let value = value.to_le_bytes();
+    data[relative_address as usize + 3] = value[3];
+    data[relative_address as usize + 2] = value[2];
+    data[relative_address as usize + 1] = value[1];
+    data[relative_address as usize] = value[0];
+    Ok(())
+}
+
+fn write_u16(data: &mut [u8], relative_address: u64, value: u16) -> Result<(), ProgramFromElfError> {
+    let value = value.to_le_bytes();
+    data[relative_address as usize + 1] = value[1];
+    data[relative_address as usize] = value[0];
+    Ok(())
+}
+
 #[allow(clippy::too_many_arguments)]
 fn relocate(
     elf: &Elf,
-    section_text: &ElfSection,
+    sections_text_indexes: &HashSet<SectionIndex>,
+    sections_text: &[&ElfSection],
     section_got: Option<&ElfSection>,
     relocation_for_section: &HashMap<SectionIndex, i64>,
     section: &ElfSection,
     data: &mut [u8],
-    mut jump_targets: Option<&mut HashSet<u32>>,
+    mut jump_targets: Option<&mut HashSet<u64>>,
     instruction_overrides: &mut HashMap<u64, Inst>,
 ) -> Result<(), ProgramFromElfError> {
-    #[derive(Copy, Clone)]
-    enum HiRelocKind {
-        PcRel,
-        Got,
-    }
-
-    impl core::fmt::Display for HiRelocKind {
-        fn fmt(&self, fmt: &mut core::fmt::Formatter) -> core::fmt::Result {
-            match self {
-                HiRelocKind::PcRel => fmt.write_str(".rela"),
-                HiRelocKind::Got => fmt.write_str(".got"),
-            }
-        }
-    }
-
-    fn read_u32(data: &[u8], relative_address: u64) -> Result<u32, ProgramFromElfError> {
-        let target_range = relative_address as usize..relative_address as usize + 4;
-        let value = data
-            .get(target_range)
-            .ok_or(ProgramFromElfError::other("out of range relocation"))?;
-        Ok(u32::from_le_bytes([value[0], value[1], value[2], value[3]]))
-    }
-
-    fn read_u16(data: &[u8], relative_address: u64) -> Result<u16, ProgramFromElfError> {
-        let target_range = relative_address as usize..relative_address as usize + 2;
-        let value = data
-            .get(target_range)
-            .ok_or(ProgramFromElfError::other("out of range relocation"))?;
-        Ok(u16::from_le_bytes([value[0], value[1]]))
-    }
-
-    fn read_u8(data: &[u8], relative_address: u64) -> Result<u8, ProgramFromElfError> {
-        data.get(relative_address as usize)
-            .ok_or(ProgramFromElfError::other("out of range relocation"))
-            .copied()
-    }
-
-    fn write_u32(data: &mut [u8], relative_address: u64, value: u32) -> Result<(), ProgramFromElfError> {
-        let value = value.to_le_bytes();
-        data[relative_address as usize + 3] = value[3];
-        data[relative_address as usize + 2] = value[2];
-        data[relative_address as usize + 1] = value[1];
-        data[relative_address as usize] = value[0];
-        Ok(())
-    }
-
-    fn write_u16(data: &mut [u8], relative_address: u64, value: u16) -> Result<(), ProgramFromElfError> {
-        let value = value.to_le_bytes();
-        data[relative_address as usize + 1] = value[1];
-        data[relative_address as usize] = value[0];
-        Ok(())
-    }
-
     if section.relocations().next().is_none() {
         return Ok(());
     }
 
-    let mut reloc_pcrel_hi20: HashMap<u64, (HiRelocKind, u64)> = HashMap::new();
-    let mut reloc_pcrel_lo12: HashMap<u64, u64> = HashMap::new();
+    let mut pairs_for_section: HashMap<SectionIndex, RelocPairs> = Default::default();
 
     let section_name = section.name()?;
     log::trace!("Relocating section: {}", section_name);
@@ -1271,6 +1331,17 @@ fn relocate(
         let relative_address = absolute_address - section.address();
         let relocated_address = absolute_address.wrapping_add(section_relocation_delta as u64);
         let target = get_relocation_target(elf, relocation_for_section, &relocation)?;
+
+        let source_section_is_text = sections_text_indexes.contains(&section.index());
+        let target_section_is_text = target
+            .target_section_index
+            .map(|index| sections_text_indexes.contains(&index))
+            .unwrap_or(false);
+        if !source_section_is_text && target_section_is_text {
+            if let Some(jump_targets) = jump_targets.as_mut() {
+                jump_targets.insert(target.relocated_address);
+            }
+        }
 
         match relocation.kind() {
             object::RelocationKind::Absolute => {
@@ -1440,12 +1511,6 @@ fn relocate(
                         );
                     }
                     object::elf::R_RISCV_ADD32 => {
-                        if target.target_section_index == Some(section_text.index()) {
-                            if let Some(jump_targets) = jump_targets.as_mut() {
-                                jump_targets.insert(target.relocated_address as u32);
-                            }
-                        }
-
                         let old_value = read_u32(section_data, relative_address)?;
                         let arg = (target.delta as i32).wrapping_add(relocation.addend() as i32);
                         let new_value = (old_value as i32).wrapping_add(arg) as u32;
@@ -1459,12 +1524,6 @@ fn relocate(
                         );
                     }
                     object::elf::R_RISCV_SUB32 => {
-                        if target.target_section_index == Some(section_text.index()) {
-                            if let Some(jump_targets) = jump_targets.as_mut() {
-                                jump_targets.insert(target.relocated_address as u32);
-                            }
-                        }
-
                         let old_value = read_u32(section_data, relative_address)?;
                         let arg = (target.delta as i32).wrapping_add(relocation.addend() as i32);
                         let new_value = (old_value as i32).wrapping_sub(arg) as u32;
@@ -1479,14 +1538,14 @@ fn relocate(
                     }
                     object::elf::R_RISCV_CALL_PLT => {
                         // This relocation is for a pair of instructions, namely AUIPC + JALR, where we're allowed to delete the AUIPC if it's unnecessary.
-                        if section.index() != section_text.index() {
+                        if !sections_text_indexes.contains(&section.index()) {
                             return Err(ProgramFromElfError::other(format!(
                                 "found a R_RISCV_CALL_PLT relocation in an unexpected section: '{}'",
                                 section.name()?
                             )));
                         };
 
-                        let data_text = get_section_data(data, section_text)?;
+                        let data_text = get_section_data(data, section)?;
                         let Some(xs) = data_text.get(relative_address as usize..relative_address as usize + 8) else {
                             return Err(ProgramFromElfError::other("invalid R_RISCV_CALL_PLT relocation"));
                         };
@@ -1531,7 +1590,7 @@ fn relocate(
                         let new_target = (target.relocated_address as u32).wrapping_sub(relocated_address as u32 + 4);
 
                         instruction_overrides.insert(
-                            relative_address,
+                            absolute_address,
                             Inst::RegImm {
                                 kind: RegImmKind::Add,
                                 dst: Reg::Zero,
@@ -1540,7 +1599,7 @@ fn relocate(
                             },
                         );
                         instruction_overrides.insert(
-                            relative_address + 4,
+                            absolute_address + 4,
                             Inst::JumpAndLink {
                                 dst: lo_dst,
                                 target: new_target,
@@ -1556,14 +1615,16 @@ fn relocate(
                     object::elf::R_RISCV_PCREL_HI20 => {
                         // This relocation is for an AUIPC.
 
-                        if section.index() != section_text.index() {
+                        if !sections_text_indexes.contains(&section.index()) {
                             return Err(ProgramFromElfError::other(format!(
                                 "found a R_RISCV_PCREL_HI20 relocation in an unexpected section: '{}'",
                                 section.name()?
                             )));
                         }
 
-                        reloc_pcrel_hi20.insert(relative_address, (HiRelocKind::PcRel, target.relocated_address));
+                        let p = pairs_for_section.entry(section.index()).or_insert_with(Default::default);
+                        p.reloc_pcrel_hi20
+                            .insert(relative_address, (HiRelocKind::PcRel, target.relocated_address));
                         log::trace!(
                             "  R_RISCV_PCREL_HI20: {}[0x{relative_address:x}] (0x{absolute_address:x}): -> 0x{:08x}",
                             section.name()?,
@@ -1571,14 +1632,16 @@ fn relocate(
                         );
                     }
                     object::elf::R_RISCV_GOT_HI20 => {
-                        if section.index() != section_text.index() {
+                        if !sections_text_indexes.contains(&section.index()) {
                             return Err(ProgramFromElfError::other(format!(
                                 "found a R_RISCV_GOT_HI20 relocation in an unexpected section: '{}'",
                                 section.name()?
                             )));
                         };
 
-                        reloc_pcrel_hi20.insert(relative_address, (HiRelocKind::Got, target.relocated_address));
+                        let p = pairs_for_section.entry(section.index()).or_insert_with(Default::default);
+                        p.reloc_pcrel_hi20
+                            .insert(relative_address, (HiRelocKind::Got, target.relocated_address));
                         log::trace!(
                             "  R_RISCV_GOT_HI20: {}[0x{relative_address:x}] (0x{absolute_address:x}): -> 0x{:08x}",
                             section.name()?,
@@ -1586,20 +1649,21 @@ fn relocate(
                         );
                     }
                     object::elf::R_RISCV_PCREL_LO12_I => {
-                        if section.index() != section_text.index() {
+                        if !sections_text_indexes.contains(&section.index()) {
                             return Err(ProgramFromElfError::other(format!(
                                 "found a R_RISCV_PCREL_LO12_I relocation in an unexpected section: '{}'",
                                 section.name()?
                             )));
                         };
 
-                        if target.target_section_index != Some(section_text.index()) {
+                        if !target_section_is_text {
                             return Err(ProgramFromElfError::other(
                                 "R_RISCV_PCREL_LO12_I relocation points to a non '.text' section",
                             ));
                         }
 
-                        reloc_pcrel_lo12.insert(relative_address, target.relative_address);
+                        let p = pairs_for_section.entry(section.index()).or_insert_with(Default::default);
+                        p.reloc_pcrel_lo12.insert(relative_address, target.relative_address);
                         log::trace!(
                             "  R_RISCV_PCREL_LO12_I: {}[0x{relative_address:x}] (0x{absolute_address:x}): -> 0x{:08x}",
                             section.name()?,
@@ -1607,20 +1671,21 @@ fn relocate(
                         );
                     }
                     object::elf::R_RISCV_PCREL_LO12_S => {
-                        if section.index() != section_text.index() {
+                        if !sections_text_indexes.contains(&section.index()) {
                             return Err(ProgramFromElfError::other(format!(
                                 "found a R_RISCV_PCREL_LO12_S relocation in an unexpected section: '{}'",
                                 section.name()?
                             )));
                         };
 
-                        if target.target_section_index != Some(section_text.index()) {
+                        if !target_section_is_text {
                             return Err(ProgramFromElfError::other(
                                 "R_RISCV_PCREL_LO12_S relocation points to a non '.text' section",
                             ));
                         }
 
-                        reloc_pcrel_lo12.insert(relative_address, target.relative_address);
+                        let p = pairs_for_section.entry(section.index()).or_insert_with(Default::default);
+                        p.reloc_pcrel_lo12.insert(relative_address, target.relative_address);
                         log::trace!(
                             "  R_RISCV_PCREL_LO12_S: {}[0x{relative_address:x}] (0x{absolute_address:x}): -> 0x{:08x}",
                             section.name()?,
@@ -1646,15 +1711,38 @@ fn relocate(
         }
     }
 
+    for (section_index, pairs) in pairs_for_section {
+        let section_text = sections_text.iter().find(|section| section.index() == section_index).unwrap();
+        process_pcrel_pairs(
+            data,
+            section_got,
+            section_text,
+            pairs,
+            relocation_for_section,
+            instruction_overrides,
+        )?;
+    }
+
+    Ok(())
+}
+
+fn process_pcrel_pairs(
+    data: &mut [u8],
+    section_got: Option<&ElfSection>,
+    section_text: &ElfSection,
+    pairs: RelocPairs,
+    relocation_for_section: &HashMap<SectionIndex, i64>,
+    instruction_overrides: &mut HashMap<u64, Inst>,
+) -> Result<(), ProgramFromElfError> {
     let text_range = get_section_range(data, section_text)?;
-    for (relative_lo, relative_hi) in reloc_pcrel_lo12 {
+    for (relative_lo, relative_hi) in pairs.reloc_pcrel_lo12 {
         let data_text = &mut data[text_range.clone()];
         let lo_inst_raw = &data_text[relative_lo as usize..][..4];
         let mut lo_inst = Inst::decode(u32::from_le_bytes([lo_inst_raw[0], lo_inst_raw[1], lo_inst_raw[2], lo_inst_raw[3]]));
         let hi_inst_raw = &data_text[relative_hi as usize..][..4];
         let hi_inst = Inst::decode(u32::from_le_bytes([hi_inst_raw[0], hi_inst_raw[1], hi_inst_raw[2], hi_inst_raw[3]]));
 
-        let Some((hi_kind, target_address)) = reloc_pcrel_hi20.get(&relative_hi).copied() else {
+        let Some((hi_kind, target_address)) = pairs.reloc_pcrel_hi20.get(&relative_hi).copied() else {
             return Err(ProgramFromElfError::other(format!("R_RISCV_PCREL_LO12_* relocation at 0x{relative_lo:x} targets 0x{relative_hi:x} which doesn't have a R_RISCV_PCREL_HI20/R_RISCV_GOT_HI20 relocation")));
         };
 
@@ -1744,7 +1832,7 @@ fn relocate(
 
         // Since we support full length immediates just turn the upper instructions into a NOP.
         instruction_overrides.insert(
-            relative_hi,
+            section_text.address() + relative_hi,
             Inst::RegImm {
                 kind: RegImmKind::Add,
                 dst: Reg::Zero,
@@ -1752,9 +1840,160 @@ fn relocate(
                 imm: 0,
             },
         );
-        instruction_overrides.insert(relative_lo, lo_inst.unwrap());
+        instruction_overrides.insert(section_text.address() + relative_lo, lo_inst.unwrap());
 
         log::trace!("Replaced and merged 0x{hi_original:08x} (pc) + 0x{hi_value:08x} (hi) + 0x{old_lo_value:08x} (lo) = 0x{old_merged:08x} to point to 0x{new_merged:08x} (from {hi_kind}, 0x{relative_hi:x} (rel hi), 0x{relative_lo:x} (rel lo))");
+    }
+
+    Ok(())
+}
+
+fn parse_symbols<'a>(elf: &'a Elf, relocation_for_section: &HashMap<SectionIndex, i64>) -> Result<Vec<Fn<'a>>, ProgramFromElfError> {
+    let mut functions = Vec::new();
+    for sym in elf.symbols() {
+        let kind = sym.raw_symbol().st_type();
+        match kind {
+            object::elf::STT_FUNC => {
+                let section_index = sym.section().index().ok_or_else(|| {
+                    ProgramFromElfError::other(format!(
+                        "failed to process symbol table: symbol is for unsupported section: {:?}",
+                        sym.section()
+                    ))
+                })?;
+
+                let section = elf.section_by_index(section_index).map_err(|error| {
+                    ProgramFromElfError::other(format!("failed to process symbol table: failed to fetch section: {}", error))
+                })?;
+
+                let section_relocation_delta = *relocation_for_section.get(&section_index).ok_or_else(|| {
+                    ProgramFromElfError::other(format!(
+                        "failed to process symbol table: no relocation offset for section {:?}",
+                        section.name().ok()
+                    ))
+                })?;
+
+                let name = sym.name()?;
+                let name = if name.is_empty() { None } else { Some(name) };
+
+                let relocated_address = sym.address().wrapping_add(section_relocation_delta as u64);
+                functions.push(Fn {
+                    name,
+                    range: (relocated_address..relocated_address + sym.size()).into(),
+                    frames: Vec::new(),
+                    blocks: Vec::new(),
+                });
+            }
+            object::elf::STT_NOTYPE | object::elf::STT_OBJECT | object::elf::STT_SECTION | object::elf::STT_FILE => {}
+            _ => return Err(ProgramFromElfError::other(format!("unsupported symbol type: {}", kind))),
+        }
+    }
+
+    functions.sort_unstable_by_key(|func| (func.range.start, func.range.end));
+    functions.dedup_by_key(|func| func.range);
+
+    Ok(functions)
+}
+
+fn iterate_in_tandem<T, U>(
+    iter_1: impl IntoIterator<Item = (AddressRange, T)>,
+    iter_2: impl IntoIterator<Item = (AddressRange, U)>,
+) -> impl Iterator<Item = (T, U)> {
+    struct Iter<T, U, TI, UI>
+    where
+        TI: Iterator<Item = (AddressRange, T)>,
+        UI: Iterator<Item = (AddressRange, U)>,
+    {
+        iter_1: core::iter::Peekable<TI>,
+        iter_2: core::iter::Peekable<UI>,
+    }
+
+    impl<T, U, TI, UI> Iterator for Iter<T, U, TI, UI>
+    where
+        TI: Iterator<Item = (AddressRange, T)>,
+        UI: Iterator<Item = (AddressRange, U)>,
+    {
+        type Item = (T, U);
+        fn next(&mut self) -> Option<Self::Item> {
+            loop {
+                let (range_1, _) = self.iter_1.peek()?;
+                let (range_2, _) = self.iter_2.peek()?;
+
+                use core::cmp::Ordering;
+                match range_1.start.cmp(&range_2.start) {
+                    Ordering::Less => {
+                        if range_1.end > range_2.start {
+                            // There is overlap.
+                            break;
+                        } else {
+                            self.iter_1.next();
+                            continue;
+                        }
+                    }
+                    Ordering::Greater => {
+                        self.iter_2.next();
+                        continue;
+                    }
+                    Ordering::Equal => break,
+                }
+            }
+
+            let (_, value_1) = self.iter_1.next().unwrap();
+            let (_, value_2) = self.iter_2.next().unwrap();
+
+            Some((value_1, value_2))
+        }
+    }
+
+    Iter {
+        iter_1: iter_1.into_iter().peekable(),
+        iter_2: iter_2.into_iter().peekable(),
+    }
+}
+
+#[allow(clippy::single_range_in_vec_init)]
+#[test]
+fn test_iterate_in_tandem() {
+    fn overlaps(first: impl IntoIterator<Item = Range<u64>>, second: impl IntoIterator<Item = Range<u64>>) -> Vec<(usize, usize)> {
+        let first: Vec<_> = first
+            .into_iter()
+            .map(AddressRange::from)
+            .enumerate()
+            .map(|(index, range)| (range, index))
+            .collect();
+        let second: Vec<_> = second
+            .into_iter()
+            .map(AddressRange::from)
+            .enumerate()
+            .map(|(index, range)| (range, index))
+            .collect();
+        iterate_in_tandem(first, second).collect()
+    }
+
+    assert_eq!(overlaps([], []), vec![]);
+    assert_eq!(overlaps([0..4], [4..8]), vec![]);
+    assert_eq!(overlaps([0..5], [4..8]), vec![(0, 0)]);
+    assert_eq!(overlaps([0..4], [3..8]), vec![(0, 0)]);
+    assert_eq!(overlaps([0..1, 1..2, 2..3], [1..2]), vec![(1, 0)]);
+    assert_eq!(overlaps([1..2], [0..1, 1..2, 2..3]), vec![(0, 1)]);
+}
+
+fn merge_functions_with_dwarf(functions: &mut [Fn], dwarf_info: DwarfInfo) -> Result<(), ProgramFromElfError> {
+    let iter = iterate_in_tandem(
+        functions.iter_mut().map(|func| (func.range, func)),
+        dwarf_info.frames.into_iter().map(|dwarf| {
+            let range: AddressRange = (dwarf.0..dwarf.1).into();
+            (range, (range, dwarf.2))
+        }),
+    );
+
+    for (function, (dwarf_range, frames)) in iter {
+        if function.range != dwarf_range {
+            return Err(ProgramFromElfError::other(
+                "a function defined in DWARF info has inconsistent bounds with the same function in the symbol table",
+            ));
+        }
+
+        function.frames = frames;
     }
 
     Ok(())
@@ -1795,8 +2034,11 @@ pub fn program_from_elf(_config: Config, data: &[u8]) -> Result<ProgramBlob, Pro
         return Err(ProgramFromElfError::other("file doesn't use the System V ABI"));
     }
 
-    if elf.raw_header().e_type.get(LittleEndian) != object::elf::ET_EXEC {
-        return Err(ProgramFromElfError::other("file is not an executable file (ET_EXEC)"));
+    if !matches!(
+        elf.raw_header().e_type.get(LittleEndian),
+        object::elf::ET_EXEC | object::elf::ET_REL
+    ) {
+        return Err(ProgramFromElfError::other("file is not a supported ELF file (ET_EXEC or ET_REL)"));
     }
 
     if elf.raw_header().e_machine.get(LittleEndian) != object::elf::EM_RISCV {
@@ -1806,10 +2048,13 @@ pub fn program_from_elf(_config: Config, data: &[u8]) -> Result<ProgramBlob, Pro
     let mut sections_ro_data = Vec::new();
     let mut sections_rw_data = Vec::new();
     let mut sections_bss = Vec::new();
+    let mut sections_text = Vec::new();
     let mut section_got = None;
-    let mut section_text = None;
     let mut section_import_metadata = None;
     let mut section_export_metadata = None;
+
+    // Relocate code to 0x00000004.
+    let mut text_end = 0x00000004;
 
     let mut relocation_for_section = HashMap::new();
     let sections: Vec<_> = elf.sections().collect();
@@ -1857,20 +2102,24 @@ pub fn program_from_elf(_config: Config, data: &[u8]) -> Result<ProgramBlob, Pro
             }
 
             sections_bss.push(section);
+        } else if name == ".text" || name.starts_with(".text.") {
+            if is_writable {
+                return Err(ProgramFromElfError::other(format!(
+                    "expected section '{name}' to be read-only, yet it is writable"
+                )));
+            }
+
+            if let Some(padding) = get_padding(text_end, section) {
+                text_end += padding;
+            }
+
+            #[allow(clippy::neg_multiply)]
+            relocation_for_section.insert(section.index(), (section.address() as i64 * -1).wrapping_add(text_end as i64));
+            text_end += section.size();
+
+            sections_text.push(section);
         } else {
             match name {
-                ".text" => {
-                    if is_writable {
-                        return Err(ProgramFromElfError::other(format!(
-                            "expected section '{name}' to be read-only, yet it is writable"
-                        )));
-                    }
-
-                    // Relocate code to 0x00000004.
-                    #[allow(clippy::neg_multiply)]
-                    relocation_for_section.insert(section.index(), (section.address() as i64 * -1).wrapping_add(0x4));
-                    section_text = Some(section);
-                }
                 ".polkavm_imports" => section_import_metadata = Some(section),
                 ".polkavm_exports" => {
                     relocation_for_section.insert(section.index(), 0);
@@ -1890,7 +2139,9 @@ pub fn program_from_elf(_config: Config, data: &[u8]) -> Result<ProgramBlob, Pro
         }
     }
 
-    let section_text = section_text.ok_or(ProgramFromElfError::other("missing '.text' section"))?;
+    if sections_text.is_empty() {
+        return Err(ProgramFromElfError::other("missing '.text' section"));
+    }
 
     let memory_config = extract_memory_config(
         data,
@@ -1925,6 +2176,8 @@ pub fn program_from_elf(_config: Config, data: &[u8]) -> Result<ProgramBlob, Pro
         }
     }
 
+    let sections_text_indexes: HashSet<_> = sections_text.iter().map(|section| section.index()).collect();
+
     let mut instruction_overrides = HashMap::new();
     let mut data = data.to_vec();
     for section in elf.sections() {
@@ -1947,7 +2200,8 @@ pub fn program_from_elf(_config: Config, data: &[u8]) -> Result<ProgramBlob, Pro
 
         relocate(
             &elf,
-            section_text,
+            &sections_text_indexes,
+            &sections_text,
             section_got,
             &relocation_for_section,
             &section,
@@ -1970,22 +2224,34 @@ pub fn program_from_elf(_config: Config, data: &[u8]) -> Result<ProgramBlob, Pro
     };
 
     for export in &export_metadata {
-        jump_targets.insert(export.address);
+        jump_targets.insert(export.address.into());
     }
 
     let dwarf = crate::dwarf::load_dwarf(&elf, &data)?;
+    let mut functions = parse_symbols(&elf, &relocation_for_section)?;
+    merge_functions_with_dwarf(&mut functions, dwarf)?;
 
-    let (functions, blocks) = extract_functions(
-        &data,
-        &elf,
-        section_text,
-        &import_metadata,
-        &mut jump_targets,
-        &relocation_for_section,
-        instruction_overrides,
-    )?;
+    let mut instructions = Vec::new();
+    for section_text in sections_text {
+        parse_text_section(
+            &data,
+            section_text,
+            &import_metadata,
+            &relocation_for_section,
+            &mut instruction_overrides,
+            &mut instructions,
+        )?;
+    }
 
-    let code = emit_code(jump_targets, &functions, &blocks)?;
+    if !instruction_overrides.is_empty() {
+        return Err(ProgramFromElfError::other("internal error: instruction overrides map is not empty"));
+    }
+
+    harvest_jump_targets(&mut jump_targets, &instructions);
+    let blocks = split_code_into_basic_blocks(&jump_targets, instructions)?;
+    retain_only_non_empty_functions(&blocks, &mut functions)?;
+
+    let code = emit_code(jump_targets, &blocks)?;
 
     #[derive(Default)]
     struct Writer {
@@ -2121,8 +2387,8 @@ pub fn program_from_elf(_config: Config, data: &[u8]) -> Result<ProgramBlob, Pro
         }
     });
 
-    let mut start_address_to_instruction_index: BTreeMap<u32, u32> = Default::default();
-    let mut end_address_to_instruction_index: BTreeMap<u32, u32> = Default::default();
+    let mut start_address_to_instruction_index: BTreeMap<u64, u32> = Default::default();
+    let mut end_address_to_instruction_index: BTreeMap<u64, u32> = Default::default();
     writer.push_section(program::SECTION_CODE, |writer| {
         let mut buffer = [0; program::MAX_INSTRUCTION_LENGTH];
         for (nth_inst, (source, inst)) in code.into_iter().enumerate() {
@@ -2202,22 +2468,11 @@ pub fn program_from_elf(_config: Config, data: &[u8]) -> Result<ProgramBlob, Pro
         path.into()
     }
 
-    enum FunctionInfoKind<'a> {
-        Full(&'a crate::dwarf::Frame),
-        SymbolOnly(u32, u32),
-    }
-
     let mut dbg_strings = DebugStringsBuilder::default();
     let empty_string_id = dbg_strings.dedup("");
 
-    let mut function_info_list = Vec::new();
-    let mut addresses_with_dwarf_info = HashSet::new();
-    for &(function_start_address, function_end_address, ref frames) in &dwarf.frames {
-        let function_start_address = function_start_address.try_into().expect("function address overflow");
-        let function_end_address = function_end_address.try_into().expect("function address overflow");
-
-        addresses_with_dwarf_info.insert(function_start_address);
-        for frame in frames {
+    for function in &functions {
+        for frame in &function.frames {
             dbg_strings.dedup_namespace(&frame.location.namespace);
 
             if let Some(s) = frame.location.function_name.as_ref() {
@@ -2239,91 +2494,15 @@ pub fn program_from_elf(_config: Config, data: &[u8]) -> Result<ProgramBlob, Pro
                     dbg_strings.dedup_cow(simplify_path(s));
                 }
             }
-
-            function_info_list.push((
-                AddressRange {
-                    start: function_start_address,
-                    end: function_end_address,
-                },
-                FunctionInfoKind::Full(frame),
-            ));
-        }
-    }
-
-    // Not everything might have debug info linked in, so as a backup add symbols from the symbol table.
-    //
-    // This can happen for e.g. the symbols from the standard library, if the standard library wasn't recompiled.
-    for func in &functions {
-        let source = blocks[func.body[0]].source;
-        if addresses_with_dwarf_info.contains(&source.start) {
-            continue;
         }
 
-        if let Some(name) = func.name {
-            if let Ok(name) = rustc_demangle::try_demangle(name) {
-                // Ideally we'd parse the symbol into an actual AST and use that,
-                // but that's a lot of work, so for now let's just do it like this.
-                let with_hash = name.to_string();
-                let without_hash = format!("{:#}", name);
-
-                // Here we want to split the symbol into two parts: the namespace, and the name + hash.
-                // The idea being that multiple symbols most likely share the namespcae, allowing us to
-                // deduplicate those strings in the output blob.
-                //
-                // For example, this symbol:
-                //   _ZN5alloc7raw_vec19RawVec$LT$T$C$A$GT$7reserve21do_reserve_and_handle17hddecba91f804dbebE
-                // can be demangled into these:
-                //   with_hash    = "alloc::raw_vec::RawVec<T,A>::reserve::do_reserve_and_handle::hddecba91f804dbeb"
-                //   without_hash = "alloc::raw_vec::RawVec<T,A>::reserve::do_reserve_and_handle"
-                //
-                // So what we want is to split it in two like this:
-                //   prefix = "alloc::raw_vec::RawVec<T,A>::reserve"
-                //   suffix = "do_reserve_and_handle::hddecba91f804dbeb"
-
-                if !with_hash.contains("::") {
-                    let string_id = dbg_strings.dedup_cow(with_hash.into());
-                    function_info_list.push((source, FunctionInfoKind::SymbolOnly(empty_string_id, string_id)));
-                } else {
-                    let suffix_index = {
-                        let mut found = None;
-                        let mut depth = 0;
-                        let mut last = '\0';
-                        let mut index = without_hash.len();
-                        for ch in without_hash.chars().rev() {
-                            if ch == '>' {
-                                depth += 1;
-                            } else if ch == '<' {
-                                depth -= 1;
-                            } else if ch == ':' && depth == 0 && last == ':' {
-                                found = Some(index + 1);
-                                break;
-                            }
-
-                            last = ch;
-                            index -= ch.len_utf8();
-                        }
-
-                        found
-                    };
-
-                    if let Some(suffix_index) = suffix_index {
-                        let prefix = &with_hash[..suffix_index - 2];
-                        let suffix = &with_hash[suffix_index..];
-                        let prefix_id = dbg_strings.dedup_cow(prefix.to_owned().into());
-                        let suffix_id = dbg_strings.dedup_cow(suffix.to_owned().into());
-                        function_info_list.push((source, FunctionInfoKind::SymbolOnly(prefix_id, suffix_id)));
-                    } else {
-                        log::warn!("Failed to split symbol: {:?}", with_hash);
-
-                        let string_id = dbg_strings.dedup_cow(with_hash.into());
-                        function_info_list.push((source, FunctionInfoKind::SymbolOnly(empty_string_id, string_id)));
-                    }
-                }
+        if function.frames.is_empty() {
+            if let Some((prefix, suffix)) = function.namespace_and_name() {
+                dbg_strings.dedup_cow(prefix.into());
+                dbg_strings.dedup_cow(suffix.into());
             }
         }
     }
-
-    function_info_list.sort_by_key(|(source, _)| (source.start, !source.end));
 
     dbg_strings.write_protected = true;
 
@@ -2331,81 +2510,85 @@ pub fn program_from_elf(_config: Config, data: &[u8]) -> Result<ProgramBlob, Pro
         writer.push_raw_bytes(&dbg_strings.section);
     });
 
-    let mut function_ranges = Vec::with_capacity(dwarf.frames.len());
+    let mut function_ranges = Vec::with_capacity(functions.len());
     writer.push_section(program::SECTION_OPT_DEBUG_FUNCTION_INFO, |writer| {
         let offset_base = writer.len();
         writer.push_byte(program::VERSION_DEBUG_FUNCTION_INFO_V1);
         let mut last_range = AddressRange { start: 0, end: 0 };
-        for (function_range, kind) in function_info_list {
-            assert!(function_range.start >= last_range.end || function_range == last_range);
+        for function in &functions {
+            assert!(function.range.start >= last_range.end || function.range == last_range);
 
             let info_offset: u32 = (writer.len() - offset_base).try_into().expect("function info offset overflow");
+
             // TODO: These should be handled more intelligently instead of panicking.
             let function_start_index = *start_address_to_instruction_index
-                .get(&function_range.start)
+                .get(&function.range.start)
                 .expect("function start address has no matching instructions");
             let function_end_index = *end_address_to_instruction_index
-                .get(&function_range.end)
+                .get(&function.range.end)
                 .expect("function end address has no matching instructions");
-            function_ranges.push((function_start_index, function_end_index, info_offset));
 
-            match kind {
-                FunctionInfoKind::Full(frame) => {
-                    let Some(name_offset) = frame.location.function_name.as_ref().map(|s| dbg_strings.dedup(s)) else {
-                        continue;
-                    };
-                    let namespace_offset = dbg_strings.dedup_namespace(&frame.location.namespace);
-                    let file_offset = frame
-                        .location
+            let mut written = false;
+            for frame in &function.frames {
+                let Some(name_offset) = frame.location.function_name.as_ref().map(|s| dbg_strings.dedup(s)) else {
+                    continue;
+                };
+                let namespace_offset = dbg_strings.dedup_namespace(&frame.location.namespace);
+                let file_offset = frame
+                    .location
+                    .path
+                    .as_ref()
+                    .map(|s| dbg_strings.dedup_cow(simplify_path(s)))
+                    .unwrap_or(empty_string_id);
+
+                written = true;
+                writer.push_varint(namespace_offset);
+                writer.push_varint(name_offset);
+                writer.push_varint(file_offset);
+                writer.push_varint(frame.location.line.unwrap_or(0) as u32);
+                writer.push_varint(frame.location.column.unwrap_or(0) as u32);
+                writer.push_varint(frame.inline_frames.len().try_into().expect("function inline frames overflow"));
+                for &(inline_start_address, inline_end_address, inline_depth, ref inline_location) in &frame.inline_frames {
+                    let inline_name_offset = dbg_strings.dedup(inline_location.function_name.as_deref().unwrap_or(""));
+                    let inline_namespace_offset = dbg_strings.dedup_namespace(&inline_location.namespace);
+                    let inline_file_offset = inline_location
                         .path
                         .as_ref()
                         .map(|s| dbg_strings.dedup_cow(simplify_path(s)))
                         .unwrap_or(empty_string_id);
 
-                    writer.push_varint(namespace_offset);
-                    writer.push_varint(name_offset);
-                    writer.push_varint(file_offset);
-                    writer.push_varint(frame.location.line.unwrap_or(0) as u32);
-                    writer.push_varint(frame.location.column.unwrap_or(0) as u32);
-                    writer.push_varint(frame.inline_frames.len().try_into().expect("function inline frames overflow"));
-                    for &(inline_start_address, inline_end_address, inline_depth, ref inline_location) in &frame.inline_frames {
-                        let inline_name_offset = dbg_strings.dedup(inline_location.function_name.as_deref().unwrap_or(""));
-                        let inline_namespace_offset = dbg_strings.dedup_namespace(&inline_location.namespace);
-                        let inline_file_offset = inline_location
-                            .path
-                            .as_ref()
-                            .map(|s| dbg_strings.dedup_cow(simplify_path(s)))
-                            .unwrap_or(empty_string_id);
-                        let inline_start_address: u32 = inline_start_address.try_into().expect("function inline frame address overflow");
-                        let inline_end_address = inline_end_address.try_into().expect("function inline frame address overflow");
-
-                        // TODO: These should be handled more intelligently instead of panicking.
-                        let (&next_inline_start_address, &inline_start_index) = start_address_to_instruction_index
-                            .range(inline_start_address..)
-                            .next()
-                            .expect("inline function start address has no matching instructions");
-                        if next_inline_start_address >= inline_end_address {
-                            todo!();
-                        }
-                        let inline_end_index = *end_address_to_instruction_index
-                            .get(&inline_end_address)
-                            .expect("inline function end address has no matching instructions");
-
-                        assert!(inline_start_index <= inline_end_index);
-                        assert!(inline_start_index >= function_start_index);
-                        assert!(inline_end_index <= function_end_index);
-
-                        writer.push_varint(inline_start_index - function_start_index);
-                        writer.push_varint(inline_end_index - function_start_index);
-                        writer.push_varint(inline_depth);
-                        writer.push_varint(inline_namespace_offset);
-                        writer.push_varint(inline_name_offset);
-                        writer.push_varint(inline_file_offset);
-                        writer.push_varint(inline_location.line.unwrap_or(0) as u32);
-                        writer.push_varint(inline_location.column.unwrap_or(0) as u32);
+                    // TODO: These should be handled more intelligently instead of panicking.
+                    let (&next_inline_start_address, &inline_start_index) = start_address_to_instruction_index
+                        .range(inline_start_address..)
+                        .next()
+                        .expect("inline function start address has no matching instructions");
+                    if next_inline_start_address >= inline_end_address {
+                        todo!();
                     }
+                    let inline_end_index = *end_address_to_instruction_index
+                        .get(&inline_end_address)
+                        .expect("inline function end address has no matching instructions");
+
+                    assert!(inline_start_index <= inline_end_index);
+                    assert!(inline_start_index >= function_start_index);
+                    assert!(inline_end_index <= function_end_index);
+
+                    writer.push_varint(inline_start_index - function_start_index);
+                    writer.push_varint(inline_end_index - function_start_index);
+                    writer.push_varint(inline_depth);
+                    writer.push_varint(inline_namespace_offset);
+                    writer.push_varint(inline_name_offset);
+                    writer.push_varint(inline_file_offset);
+                    writer.push_varint(inline_location.line.unwrap_or(0) as u32);
+                    writer.push_varint(inline_location.column.unwrap_or(0) as u32);
                 }
-                FunctionInfoKind::SymbolOnly(prefix_id, suffix_id) => {
+            }
+
+            if function.frames.is_empty() {
+                if let Some((prefix, suffix)) = function.namespace_and_name() {
+                    written = true;
+                    let prefix_id = dbg_strings.dedup_cow(prefix.into());
+                    let suffix_id = dbg_strings.dedup_cow(suffix.into());
                     writer.push_varint(prefix_id);
                     writer.push_varint(suffix_id);
                     writer.push_varint(empty_string_id); // File path.
@@ -2415,7 +2598,11 @@ pub fn program_from_elf(_config: Config, data: &[u8]) -> Result<ProgramBlob, Pro
                 }
             }
 
-            last_range = function_range;
+            if written {
+                function_ranges.push((function_start_index, function_end_index, info_offset));
+            }
+
+            last_range = function.range;
         }
     });
 
