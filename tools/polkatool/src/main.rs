@@ -93,7 +93,7 @@ fn disassemble_into(blob: &polkavm_linker::ProgramBlob, mut writer: impl Write) 
         let instruction = match maybe_instruction {
             Ok(instruction) => {
                 if let Err(error) = writeln!(&mut writer, "{nth_instruction}: {instruction}") {
-                    eprintln!("ERROR: failed to write instruction from buffer. {:?} {}.", error, instruction);
+                    eprintln!("ERROR: failed to write to output: {}", error);
                     std::process::exit(1);
                 }
             }
