@@ -78,7 +78,7 @@ fn main() {
                         }
                     };
                     disassemble_into(&blob, std::io::BufWriter::new(fp));
-                },
+                }
                 None => {
                     let std_out = std::io::stdout();
                     disassemble_into(&blob, std::io::BufWriter::new(std_out));
