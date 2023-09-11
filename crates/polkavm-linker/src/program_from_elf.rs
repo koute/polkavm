@@ -1768,7 +1768,12 @@ fn process_pcrel_pairs(
     instruction_overrides: &mut HashMap<u64, Inst>,
 ) -> Result<(), ProgramFromElfError> {
     let text_range = get_section_range(data, section_text)?;
-    for (relative_lo, relative_hi) in pairs.reloc_pcrel_lo12 {
+
+    // Technically should be unnecessary, but let's sort this to ensure determinism.
+    let mut reloc_pcrel_lo12: Vec<_> = pairs.reloc_pcrel_lo12.into_iter().collect();
+    reloc_pcrel_lo12.sort();
+
+    for (relative_lo, relative_hi) in reloc_pcrel_lo12 {
         let data_text = &mut data[text_range.clone()];
         let lo_inst_raw = &data_text[relative_lo as usize..][..4];
         let mut lo_inst = Inst::decode(u32::from_le_bytes([lo_inst_raw[0], lo_inst_raw[1], lo_inst_raw[2], lo_inst_raw[3]]));
