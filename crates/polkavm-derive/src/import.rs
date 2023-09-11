@@ -1,4 +1,4 @@
-use polkavm_common::elf::{ImportMetadata, INSTRUCTION_ECALLI};
+use polkavm_common::elf::INSTRUCTION_ECALLI;
 use proc_macro::*;
 use quote::quote;
 use std::fmt::Write;
@@ -32,20 +32,8 @@ impl syn::parse::Parse for ImportAttribute {
 
 fn generate_import_assembly(index: Option<u32>, sig: &syn::Signature, bitness: Bitness) -> Result<proc_macro2::TokenStream, syn::Error> {
     let prototype = create_fn_prototype(sig, bitness)?;
-    let hash = {
-        let mut hasher = crate::blake3::Hasher::new();
-        hasher.update(prototype.name.as_bytes());
-        let mut h = [0; 32];
-        hasher.finalize(&mut h);
-        [
-            h[0], h[1], h[2], h[3], h[4], h[5], h[6], h[7], h[8], h[9], h[10], h[11], h[12], h[13], h[14], h[15],
-        ]
-    };
-
-    let metadata = ImportMetadata { hash, index, prototype };
-
     let mut metadata_bytes = Vec::new();
-    metadata.serialize(|slice| metadata_bytes.extend_from_slice(slice));
+    prototype.serialize(|slice| metadata_bytes.extend_from_slice(slice));
 
     let mut assembly = String::new();
     macro_rules! gen_asm {
@@ -58,22 +46,41 @@ fn generate_import_assembly(index: Option<u32>, sig: &syn::Signature, bitness: B
         }
     }
 
-    let name = metadata.name();
+    let import_symbol = syn::Ident::new(&format!("__polkavm_import_{}", sig.ident), sig.ident.span());
+    let name = &sig.ident;
     gen_asm! {
+        (".pushsection .polkavm_imports.{},\"a\",@progbits", name)
+        (".globl {}", import_symbol)
+        (".hidden {}", import_symbol)
+        ("{}:", import_symbol)
+        (".byte 1") // Version.
+    }
+
+    if let Some(index) = index {
+        gen_asm! {
+            (".byte 1")
+            (".4byte 0x{:08x}", index)
+        }
+    } else {
+        gen_asm! {
+            (".byte 0")
+        }
+    }
+
+    assembly.push_str(&bytes_to_asm(&metadata_bytes));
+
+    gen_asm! {
+        (".popsection")
         (".pushsection .text.{},\"ax\",@progbits", name)
         (".globl {}", name)
         (".hidden {}", name)
         (".balign 4")
         (".type {},@function", name)
         ("{}:", name)
-        (".word 0x{:08x}", INSTRUCTION_ECALLI)
-        ("{}", bytes_to_asm(&hash))
+        (".4byte 0x{:08x}", INSTRUCTION_ECALLI)
+        (".4byte {}", import_symbol)
         ("ret")
         (".size {}, . - {}", name, name)
-        (".popsection")
-
-        (".pushsection .polkavm_imports,\"\",@progbits")
-        ("{}", bytes_to_asm(&metadata_bytes))
         (".popsection")
     }
 

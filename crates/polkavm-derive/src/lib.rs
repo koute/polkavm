@@ -3,12 +3,6 @@
 
 extern crate proc_macro;
 
-// A copy of BLAKE3 reference implementation to keep the number of dependencies low.
-#[allow(dead_code)]
-#[allow(clippy::explicit_counter_loop)]
-#[rustfmt::skip]
-mod blake3;
-
 #[macro_use]
 mod common;
 

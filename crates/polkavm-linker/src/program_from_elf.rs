@@ -501,70 +501,116 @@ fn extract_export_metadata<'a>(data: &'a [u8], section: &ElfSection) -> Result<V
     Ok(exports)
 }
 
-fn extract_import_metadata<'a>(data: &'a [u8], section: &ElfSection) -> Result<BTreeMap<u32, ImportMetadata<'a>>, ProgramFromElfError> {
-    let section_range = get_section_range(data, section)?;
-    let mut contents = &data[section_range];
-    let mut import_by_index = BTreeMap::new();
-    let mut indexless = Vec::new();
-    while !contents.is_empty() {
-        match ImportMetadata::try_deserialize(contents) {
-            Ok((bytes_consumed, metadata)) => {
-                contents = &contents[bytes_consumed..];
+#[derive(Debug)]
+struct Import<'a> {
+    metadata_addresses: Vec<u64>,
+    metadata: ImportMetadata<'a>,
+}
 
-                if let Some(index) = metadata.index {
-                    if let Some(old_metadata) = import_by_index.insert(index, metadata.clone()) {
-                        if old_metadata == metadata {
+fn extract_import_metadata<'a>(data: &'a [u8], sections: Vec<&ElfSection>) -> Result<Vec<Import<'a>>, ProgramFromElfError> {
+    let mut imports: Vec<Import> = Vec::new();
+    let mut import_by_index: BTreeMap<u32, usize> = BTreeMap::new();
+    let mut import_by_name: HashMap<String, usize> = HashMap::new();
+    let mut import_by_metadata_address: HashMap<u64, usize> = HashMap::new();
+    let mut indexless: Vec<usize> = Vec::new();
+
+    for section in sections {
+        let section_range = get_section_range(data, section)?;
+        let mut absolute_address = section.address();
+        let mut contents = &data[section_range];
+        while !contents.is_empty() {
+            match ImportMetadata::try_deserialize(contents) {
+                Ok((bytes_consumed, metadata)) => {
+                    let metadata_address = absolute_address;
+                    contents = &contents[bytes_consumed..];
+                    absolute_address += bytes_consumed as u64;
+
+                    if let Some(&old_nth_import) = import_by_metadata_address.get(&metadata_address) {
+                        let old_import = &mut imports[old_nth_import];
+                        if metadata == old_import.metadata {
+                            old_import.metadata_addresses.push(metadata_address);
                             continue;
                         }
 
-                        let old_name = old_metadata.name();
-                        let new_name = metadata.name();
                         return Err(ProgramFromElfError::other(format!(
-                            "duplicate imports with the same index: index = {index}, names = [{old_name:?}, {new_name:?}]"
+                            "found multiple imports with the same metadata address: 0x{:08x}",
+                            metadata_address
                         )));
                     }
-                } else {
-                    indexless.push(metadata);
+
+                    if let Some(&old_nth_import) = import_by_name.get(metadata.name()) {
+                        let old_import = &mut imports[old_nth_import];
+                        if metadata == old_import.metadata {
+                            old_import.metadata_addresses.push(metadata_address);
+                            continue;
+                        }
+
+                        return Err(ProgramFromElfError::other(format!(
+                            "duplicate imports with the same name yet different prototype: {}",
+                            metadata.name()
+                        )));
+                    }
+
+                    let nth_import = imports.len();
+                    if let Some(index) = metadata.index {
+                        if let Some(&old_nth_import) = import_by_index.get(&index) {
+                            let old_import = &mut imports[old_nth_import];
+                            if metadata == old_import.metadata {
+                                old_import.metadata_addresses.push(metadata_address);
+                                continue;
+                            }
+
+                            let old_name = old_import.metadata.name();
+                            let new_name = metadata.name();
+                            return Err(ProgramFromElfError::other(format!(
+                                "duplicate imports with the same index: index = {index}, names = [{old_name:?}, {new_name:?}]"
+                            )));
+                        }
+
+                        import_by_index.insert(index, nth_import);
+                    } else {
+                        indexless.push(nth_import);
+                    }
+
+                    import_by_metadata_address.insert(metadata_address, nth_import);
+                    import_by_name.insert(metadata.name().to_owned(), nth_import);
+
+                    let import = Import {
+                        metadata_addresses: vec![metadata_address],
+                        metadata,
+                    };
+
+                    imports.push(import);
                 }
-            }
-            Err(error) => {
-                return Err(ProgramFromElfError::other(format!("failed to parse import metadata: {}", error)));
+                Err(error) => {
+                    return Err(ProgramFromElfError::other(format!("failed to parse import metadata: {}", error)));
+                }
             }
         }
     }
 
-    indexless.sort_by(|a, b| a.name().cmp(b.name()));
+    indexless.sort_by(|&a, &b| imports[a].metadata.name().cmp(imports[b].metadata.name()));
     indexless.dedup();
 
     let mut next_index = 0;
-    for metadata in indexless {
+    for nth_import in indexless {
         while import_by_index.contains_key(&next_index) {
             next_index += 1;
         }
 
-        import_by_index.insert(
-            next_index,
-            ImportMetadata {
-                index: Some(next_index),
-                ..metadata
-            },
-        );
+        imports[nth_import].metadata.index = Some(next_index);
+        import_by_index.insert(next_index, nth_import);
         next_index += 1;
     }
 
-    let mut import_by_name = HashMap::new();
-    for metadata in import_by_index.values() {
-        if let Some(old_metadata) = import_by_name.insert(metadata.name(), metadata) {
-            if old_metadata.prototype() != metadata.prototype() {
-                return Err(ProgramFromElfError::other(format!(
-                    "duplicate imports with the same name yet different prototype: {}",
-                    metadata.name()
-                )));
-            }
+    for import in &imports {
+        log::trace!("Import: {:?}", import.metadata);
+        for address in &import.metadata_addresses {
+            log::trace!("  Address: 0x{:08x}", address);
         }
     }
 
-    Ok(import_by_index)
+    Ok(imports)
 }
 
 #[derive(Copy, Clone, Debug)]
@@ -657,12 +703,15 @@ fn get_relocation_target(
 fn parse_text_section(
     data: &[u8],
     section_text: &ElfSection,
-    import_metadata: &BTreeMap<u32, ImportMetadata>,
+    imports: &[Import],
     relocation_for_section: &HashMap<SectionIndex, i64>,
     instruction_overrides: &mut HashMap<u64, Inst>,
     output: &mut Vec<(AddressRange, InstExt)>,
 ) -> Result<(), ProgramFromElfError> {
-    let hostcall_by_hash: HashMap<[u8; 16], u32> = import_metadata.iter().map(|(index, metadata)| (metadata.hash, *index)).collect();
+    let import_by_address: HashMap<u64, &Import> = imports
+        .iter()
+        .flat_map(|import| import.metadata_addresses.iter().map(move |&address| (address, import)))
+        .collect();
 
     let section_name = section_text.name().expect("failed to get section name");
     let text_range = get_section_range(data, section_text)?;
@@ -692,31 +741,31 @@ fn parse_text_section(
 
         if op == INSTRUCTION_ECALLI {
             let initial_offset = relative_offset as u64;
-            if relative_offset + 24 < text.len() {
+            if relative_offset + 12 < text.len() {
                 return Err(ProgramFromElfError::other("truncated ecalli instruction"));
             }
 
             relative_offset += 4;
 
-            let h = &text[relative_offset..relative_offset + 16];
-            let hash = [
-                h[0], h[1], h[2], h[3], h[4], h[5], h[6], h[7], h[8], h[9], h[10], h[11], h[12], h[13], h[14], h[15],
-            ];
-            relative_offset += 16;
+            let h = &text[relative_offset..relative_offset + 4];
+            let target_address = u32::from_le_bytes([h[0], h[1], h[2], h[3]]) as u64;
+            relative_offset += 4;
 
-            let hostcall_index = match hostcall_by_hash.get(&hash) {
-                Some(index) => *index,
+            let import = match import_by_address.get(&target_address) {
+                Some(import) => *import,
                 None => {
                     return Err(ProgramFromElfError::other(format!(
-                        "external call with a hash that doesn't match any metadata: {:?}",
-                        hash
+                        "external call with an address that doesn't match any metadata: 0x{:08x}",
+                        target_address
                     )));
                 }
             };
 
             output.push((
                 AddressRange::from(relocated_base + initial_offset..relocated_base + relative_offset as u64),
-                InstExt::Basic(BasicInst::Ecalli { syscall: hostcall_index }),
+                InstExt::Basic(BasicInst::Ecalli {
+                    syscall: import.metadata.index.expect("internal error: no index assigned to import"),
+                }),
             ));
 
             const INST_RET: Inst = Inst::JumpAndLinkRegister {
@@ -2307,7 +2356,7 @@ pub fn program_from_elf(_config: Config, data: &[u8]) -> Result<ProgramBlob, Pro
     let mut sections_bss = Vec::new();
     let mut sections_text = Vec::new();
     let mut section_got = None;
-    let mut section_import_metadata = None;
+    let mut sections_import_metadata = Vec::new();
     let mut section_export_metadata = None;
 
     // Relocate code to 0x00000004.
@@ -2375,9 +2424,11 @@ pub fn program_from_elf(_config: Config, data: &[u8]) -> Result<ProgramBlob, Pro
             text_end += section.size();
 
             sections_text.push(section);
+        } else if name == ".polkavm_imports" || name.starts_with(".polkavm_imports.") {
+            relocation_for_section.insert(section.index(), 0);
+            sections_import_metadata.push(section);
         } else {
             match name {
-                ".polkavm_imports" => section_import_metadata = Some(section),
                 ".polkavm_exports" => {
                     relocation_for_section.insert(section.index(), 0);
                     section_export_metadata = Some(section);
@@ -2513,12 +2564,7 @@ pub fn program_from_elf(_config: Config, data: &[u8]) -> Result<ProgramBlob, Pro
         )?;
     }
 
-    let import_metadata = if let Some(section) = section_import_metadata {
-        extract_import_metadata(&data, section)?
-    } else {
-        Default::default()
-    };
-
+    let import_metadata = extract_import_metadata(&data, sections_import_metadata)?;
     let export_metadata = if let Some(section) = section_export_metadata {
         extract_export_metadata(&data, section)?
     } else {
@@ -2675,10 +2721,18 @@ pub fn program_from_elf(_config: Config, data: &[u8]) -> Result<ProgramBlob, Pro
             return;
         }
 
+        let mut import_metadata = import_metadata;
+        import_metadata.sort_by(|a, b| {
+            a.metadata
+                .index
+                .cmp(&b.metadata.index)
+                .then_with(|| a.metadata.name().cmp(b.metadata.name()))
+        });
+
         writer.push_varint(import_metadata.len() as u32);
-        for (index, meta) in import_metadata {
-            writer.push_varint(index);
-            writer.push_function_prototype(meta.prototype());
+        for import in import_metadata {
+            writer.push_varint(import.metadata.index.expect("internal error: no index assigned to import"));
+            writer.push_function_prototype(import.metadata.prototype());
         }
     });
 

@@ -98,7 +98,6 @@ impl<'a> FnMetadata<'a> {
 /// Import metadata. Serialized by the derive macro and deserialized when relinking the ELF file.
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub struct ImportMetadata<'a> {
-    pub hash: [u8; 16],
     pub index: Option<u32>,
     pub prototype: FnMetadata<'a>,
 }
@@ -120,19 +119,6 @@ impl<'a> ImportMetadata<'a> {
         self.prototype.name()
     }
 
-    pub fn serialize(&self, mut cb: impl FnMut(&[u8])) {
-        cb(&[1]);
-        cb(&self.hash);
-        if let Some(index) = self.index {
-            cb(&[1]);
-            cb(&index.to_le_bytes());
-        } else {
-            cb(&[0]);
-        }
-
-        self.prototype.serialize(cb);
-    }
-
     pub fn try_deserialize(b: &'a [u8]) -> Result<(usize, Self), &'static str> {
         let mut b: Reader = b.into();
 
@@ -141,10 +127,6 @@ impl<'a> ImportMetadata<'a> {
             return Err("unsupported version");
         }
 
-        let h = b.read(16)?;
-        let hash = [
-            h[0], h[1], h[2], h[3], h[4], h[5], h[6], h[7], h[8], h[9], h[10], h[11], h[12], h[13], h[14], h[15],
-        ];
         let index = match b.read_byte()? {
             0 => None,
             1 => Some(b.read_u32()?),
@@ -152,7 +134,7 @@ impl<'a> ImportMetadata<'a> {
         };
 
         let prototype = FnMetadata::try_deserialize(&mut b)?;
-        Ok((b.bytes_consumed, Self { hash, index, prototype }))
+        Ok((b.bytes_consumed, Self { index, prototype }))
     }
 }
 
