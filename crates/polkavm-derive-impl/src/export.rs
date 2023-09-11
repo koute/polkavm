@@ -104,7 +104,7 @@ pub fn polkavm_export(input: syn::ItemFn) -> Result<proc_macro2::TokenStream, sy
 
         #(#cfg_attributes)*
         #(#fn_attributes)*
-        #[link_section = ".text.polkavm_export"]
-        #vis fn #ident(#args) #return_ty #body
+        #[cfg_attr(any(target_arch = "riscv32", target_arch = "riscv64"), link_section = ".text.polkavm_export")]
+        #vis extern "C" fn #ident(#args) #return_ty #body
     })
 }
