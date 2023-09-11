@@ -2307,7 +2307,14 @@ fn merge_functions_with_dwarf(functions: &mut [Fn], dwarf_info: DwarfInfo) -> Re
 
 #[derive(Default)]
 pub struct Config {
-    _private: (),
+    strip: bool,
+}
+
+impl Config {
+    pub fn set_strip(&mut self, value: bool) -> &mut Self {
+        self.strip = value;
+        self
+    }
 }
 
 fn get_section_range(data: &[u8], section: &ElfSection) -> Result<Range<usize>, ProgramFromElfError> {
@@ -2329,7 +2336,7 @@ fn get_section_data<'a>(data: &'a [u8], section: &ElfSection) -> Result<&'a [u8]
     Ok(&data[get_section_range(data, section)?])
 }
 
-pub fn program_from_elf(_config: Config, data: &[u8]) -> Result<ProgramBlob, ProgramFromElfError> {
+pub fn program_from_elf(config: Config, data: &[u8]) -> Result<ProgramBlob, ProgramFromElfError> {
     let elf = Elf::parse(data)?;
 
     if elf.raw_header().e_ident.data != object::elf::ELFDATA2LSB {
@@ -2601,76 +2608,6 @@ pub fn program_from_elf(_config: Config, data: &[u8]) -> Result<ProgramBlob, Pro
 
     let code = emit_code(jump_targets, &blocks)?;
 
-    #[derive(Default)]
-    struct Writer {
-        blob: Vec<u8>,
-    }
-
-    impl Writer {
-        fn push_raw_bytes(&mut self, slice: &[u8]) {
-            self.blob.extend_from_slice(slice);
-        }
-
-        fn push_byte(&mut self, byte: u8) {
-            self.blob.push(byte);
-        }
-
-        fn push_section(&mut self, section: u8, callback: impl FnOnce(&mut Self)) -> Range<usize> {
-            let section_position = self.blob.len();
-            self.blob.push(section);
-
-            // Reserve the space for the length varint.
-            let length_position = self.blob.len();
-            self.push_raw_bytes(&[0xff_u8; varint::MAX_VARINT_LENGTH]);
-
-            let payload_position = self.blob.len();
-            callback(self);
-
-            let payload_length: u32 = (self.blob.len() - payload_position).try_into().expect("section size overflow");
-            if payload_length == 0 {
-                // Nothing was written by the callback. Skip writing the section.
-                self.blob.truncate(section_position);
-                return 0..0;
-            }
-
-            // Write the length varint.
-            let length_length = varint::write_varint(payload_length, &mut self.blob[length_position..]);
-
-            // Drain any excess length varint bytes.
-            self.blob
-                .drain(length_position + length_length..length_position + varint::MAX_VARINT_LENGTH);
-            length_position + length_length..self.blob.len()
-        }
-
-        fn push_varint(&mut self, value: u32) {
-            let mut buffer = [0xff_u8; varint::MAX_VARINT_LENGTH];
-            let length = varint::write_varint(value, &mut buffer);
-            self.push_raw_bytes(&buffer[..length]);
-        }
-
-        fn push_u32(&mut self, value: u32) {
-            self.push_raw_bytes(&value.to_le_bytes());
-        }
-
-        fn push_bytes_with_length(&mut self, slice: &[u8]) {
-            self.push_varint(slice.len().try_into().expect("length overflow"));
-            self.push_raw_bytes(slice);
-        }
-
-        fn push_function_prototype(&mut self, meta: &FnMetadata) {
-            self.push_bytes_with_length(meta.name().as_bytes());
-            self.push_varint(meta.args().count() as u32);
-            for arg_ty in meta.args() {
-                self.push_byte(arg_ty as u8);
-            }
-            self.push_byte(meta.return_ty().map(|ty| ty as u8).unwrap_or(0));
-        }
-
-        fn len(&self) -> usize {
-            self.blob.len()
-        }
-    }
-
     let mut writer = Writer::default();
     writer.push_raw_bytes(&program::BLOB_MAGIC);
     writer.push_byte(program::BLOB_VERSION_V1);
@@ -2772,6 +2709,97 @@ pub fn program_from_elf(_config: Config, data: &[u8]) -> Result<ProgramBlob, Pro
         }
     });
 
+    if !config.strip {
+        emit_debug_info(
+            &mut writer,
+            functions,
+            start_address_to_instruction_index,
+            end_address_to_instruction_index,
+        );
+    }
+
+    writer.push_raw_bytes(&[program::SECTION_END_OF_FILE]);
+
+    log::trace!("Built a program of {} bytes", writer.blob.len());
+    Ok(ProgramBlob::parse(writer.blob)?)
+}
+
+#[derive(Default)]
+struct Writer {
+    blob: Vec<u8>,
+}
+
+impl Writer {
+    fn push_raw_bytes(&mut self, slice: &[u8]) {
+        self.blob.extend_from_slice(slice);
+    }
+
+    fn push_byte(&mut self, byte: u8) {
+        self.blob.push(byte);
+    }
+
+    fn push_section(&mut self, section: u8, callback: impl FnOnce(&mut Self)) -> Range<usize> {
+        let section_position = self.blob.len();
+        self.blob.push(section);
+
+        // Reserve the space for the length varint.
+        let length_position = self.blob.len();
+        self.push_raw_bytes(&[0xff_u8; varint::MAX_VARINT_LENGTH]);
+
+        let payload_position = self.blob.len();
+        callback(self);
+
+        let payload_length: u32 = (self.blob.len() - payload_position).try_into().expect("section size overflow");
+        if payload_length == 0 {
+            // Nothing was written by the callback. Skip writing the section.
+            self.blob.truncate(section_position);
+            return 0..0;
+        }
+
+        // Write the length varint.
+        let length_length = varint::write_varint(payload_length, &mut self.blob[length_position..]);
+
+        // Drain any excess length varint bytes.
+        self.blob
+            .drain(length_position + length_length..length_position + varint::MAX_VARINT_LENGTH);
+        length_position + length_length..self.blob.len()
+    }
+
+    fn push_varint(&mut self, value: u32) {
+        let mut buffer = [0xff_u8; varint::MAX_VARINT_LENGTH];
+        let length = varint::write_varint(value, &mut buffer);
+        self.push_raw_bytes(&buffer[..length]);
+    }
+
+    fn push_u32(&mut self, value: u32) {
+        self.push_raw_bytes(&value.to_le_bytes());
+    }
+
+    fn push_bytes_with_length(&mut self, slice: &[u8]) {
+        self.push_varint(slice.len().try_into().expect("length overflow"));
+        self.push_raw_bytes(slice);
+    }
+
+    fn push_function_prototype(&mut self, meta: &FnMetadata) {
+        self.push_bytes_with_length(meta.name().as_bytes());
+        self.push_varint(meta.args().count() as u32);
+        for arg_ty in meta.args() {
+            self.push_byte(arg_ty as u8);
+        }
+        self.push_byte(meta.return_ty().map(|ty| ty as u8).unwrap_or(0));
+    }
+
+    fn len(&self) -> usize {
+        self.blob.len()
+    }
+}
+
+fn emit_debug_info(
+    writer: &mut Writer,
+    functions: Vec<Fn>,
+    start_address_to_instruction_index: BTreeMap<u64, u32>,
+    end_address_to_instruction_index: BTreeMap<u64, u32>,
+) {
     #[derive(Default)]
     struct DebugStringsBuilder<'a> {
         buffer: String,
@@ -2975,9 +3003,4 @@ pub fn program_from_elf(_config: Config, data: &[u8]) -> Result<ProgramBlob, Pro
             writer.push_u32(info_offset);
         }
     });
-
-    writer.push_raw_bytes(&[program::SECTION_END_OF_FILE]);
-
-    log::trace!("Built a program of {} bytes", writer.blob.len());
-    Ok(ProgramBlob::parse(writer.blob)?)
 }

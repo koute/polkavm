@@ -10,6 +10,9 @@ enum Args {
         #[clap(short = 'o', long)]
         output: PathBuf,
 
+        #[clap(short = 's', long)]
+        strip: bool,
+
         /// The input file.
         input: PathBuf,
     },
@@ -36,7 +39,7 @@ fn main() {
 
     let args = Args::parse();
     let result = match args {
-        Args::Link { output, input } => main_link(input, output),
+        Args::Link { output, input, strip } => main_link(input, output, strip),
         Args::Disassemble { output, input } => main_disassemble(input, output),
     };
 
@@ -46,8 +49,10 @@ fn main() {
     }
 }
 
-fn main_link(input: PathBuf, output: PathBuf) -> Result<(), String> {
-    let config = polkavm_linker::Config::default();
+fn main_link(input: PathBuf, output: PathBuf, strip: bool) -> Result<(), String> {
+    let mut config = polkavm_linker::Config::default();
+    config.set_strip(strip);
+
     let data = match std::fs::read(&input) {
         Ok(data) => data,
         Err(error) => {
