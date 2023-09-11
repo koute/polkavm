@@ -746,7 +746,7 @@ fn parse_text_section(
 
         if op == INSTRUCTION_ECALLI {
             let initial_offset = relative_offset as u64;
-            if relative_offset + 12 < text.len() {
+            if relative_offset + 12 > text.len() {
                 return Err(ProgramFromElfError::other("truncated ecalli instruction"));
             }
 
