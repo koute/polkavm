@@ -1047,7 +1047,7 @@ impl<'a> Reader<'a> {
 }
 
 impl<'a> ProgramBlob<'a> {
-    /// Parses the given into a program blob.
+    /// Parses the given bytes into a program blob.
     pub fn parse(bytes: impl Into<CowBytes<'a>>) -> Result<Self, ProgramParseError> {
         Self::parse_impl(bytes.into())
     }
