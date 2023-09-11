@@ -473,7 +473,7 @@ impl AbiTy for i64 {
 /// A type which can be returned from a host function.
 pub trait ReturnTy: Sized + Send + 'static {
     #[doc(hidden)]
-    const _PRIVATE_EXTERN_TY: ExternTy;
+    const _PRIVATE_EXTERN_TY: Option<ExternTy>;
     fn _handle_return(self, set_reg: impl FnMut(u32)) -> Result<(), Trap>;
 }
 
@@ -481,10 +481,24 @@ impl<T> ReturnTy for T
 where
     T: AbiTy,
 {
-    const _PRIVATE_EXTERN_TY: ExternTy = T::_PRIVATE_EXTERN_TY;
+    const _PRIVATE_EXTERN_TY: Option<ExternTy> = Some(T::_PRIVATE_EXTERN_TY);
     fn _handle_return(self, set_reg: impl FnMut(u32)) -> Result<(), Trap> {
         self._set(set_reg);
         Ok(())
+    }
+}
+
+impl ReturnTy for () {
+    const _PRIVATE_EXTERN_TY: Option<ExternTy> = None;
+    fn _handle_return(self, _set_reg: impl FnMut(u32)) -> Result<(), Trap> {
+        Ok(())
+    }
+}
+
+impl ReturnTy for Result<(), Trap> {
+    const _PRIVATE_EXTERN_TY: Option<ExternTy> = None;
+    fn _handle_return(self, _set_reg: impl FnMut(u32)) -> Result<(), Trap> {
+        self
     }
 }
 
@@ -492,7 +506,7 @@ impl<T> ReturnTy for Result<T, Trap>
 where
     T: AbiTy,
 {
-    const _PRIVATE_EXTERN_TY: ExternTy = T::_PRIVATE_EXTERN_TY;
+    const _PRIVATE_EXTERN_TY: Option<ExternTy> = Some(T::_PRIVATE_EXTERN_TY);
     fn _handle_return(self, set_reg: impl FnMut(u32)) -> Result<(), Trap> {
         self?._set(set_reg);
         Ok(())
@@ -652,11 +666,11 @@ macro_rules! impl_into_extern_fn {
 
             fn typecheck(&self, prototype: &ExternFnPrototype) -> Result<(), Error> {
                 let args: [ExternTy; $arg_count] = [$($args::_PRIVATE_EXTERN_TY,)*];
-                if args.len() != prototype.args().len() || args.into_iter().zip(prototype.args()).any(|(lhs, rhs)| lhs != rhs) || Some(R::_PRIVATE_EXTERN_TY) != prototype.return_ty() {
+                if args.len() != prototype.args().len() || args.into_iter().zip(prototype.args()).any(|(lhs, rhs)| lhs != rhs) || R::_PRIVATE_EXTERN_TY != prototype.return_ty() {
                     bail!(
                         "failed to instantiate module: the module wanted to import function '{}', while the function that was registered was '{}'",
                         DisplayFn { name: prototype.name(), args: prototype.args(), return_ty: prototype.return_ty() },
-                        DisplayFn { name: prototype.name(), args: args.into_iter(), return_ty: Some(R::_PRIVATE_EXTERN_TY) },
+                        DisplayFn { name: prototype.name(), args: args.into_iter(), return_ty: R::_PRIVATE_EXTERN_TY },
                     );
                 }
 
