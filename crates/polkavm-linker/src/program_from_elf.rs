@@ -6,7 +6,7 @@ use polkavm_common::utils::align_to_next_page_u64;
 use polkavm_common::varint;
 
 use std::borrow::Cow;
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::ops::Range;
 
 use crate::dwarf::DwarfInfo;
@@ -261,6 +261,7 @@ impl<'a> Fn<'a> {
 enum RangeOrPadding {
     Range(Range<usize>),
     Padding(usize),
+    SyntheticGot(usize),
 }
 
 impl RangeOrPadding {
@@ -268,6 +269,7 @@ impl RangeOrPadding {
         match self {
             RangeOrPadding::Range(range) => range.len(),
             RangeOrPadding::Padding(size) => *size,
+            RangeOrPadding::SyntheticGot(size) => *size,
         }
     }
 }
@@ -283,6 +285,7 @@ struct MemoryConfig {
     rw_data: Vec<RangeOrPadding>,
     bss_size: u32,
     stack_size: u32,
+    synthetic_got_base: Option<u64>,
 }
 
 fn get_padding(memory_end: u64, section: &ElfSection) -> Option<u64> {
@@ -298,6 +301,7 @@ fn get_padding(memory_end: u64, section: &ElfSection) -> Option<u64> {
 fn extract_memory_config(
     data: &[u8],
     sections_ro_data: &[&ElfSection],
+    synthetic_got_size: u64,
     sections_rw_data: &[&ElfSection],
     sections_bss: &[&ElfSection],
     relocation_for_section: &mut HashMap<SectionIndex, i64>,
@@ -347,6 +351,17 @@ fn extract_memory_config(
             )));
         }
     }
+
+    let synthetic_got_base = if synthetic_got_size > 0 {
+        let synthetic_got_base = memory_end;
+        memory_end += synthetic_got_size;
+        ro_data.push(RangeOrPadding::SyntheticGot(synthetic_got_size as usize));
+        ro_data_size += synthetic_got_size;
+
+        Some(synthetic_got_base)
+    } else {
+        None
+    };
 
     {
         let ro_data_size_unaligned = ro_data_size;
@@ -461,6 +476,7 @@ fn extract_memory_config(
         rw_data,
         bss_size: bss_size as u32,
         stack_size: stack_size as u32,
+        synthetic_got_base,
     };
 
     Ok(memory_config)
@@ -551,8 +567,9 @@ fn extract_import_metadata<'a>(data: &'a [u8], section: &ElfSection) -> Result<B
     Ok(import_by_index)
 }
 
-#[derive(Debug)]
+#[derive(Copy, Clone, Debug)]
 struct RelocTarget {
+    original_address: u64,
     relative_address: u64,
     relocated_address: u64,
     target_section_index: Option<SectionIndex>,
@@ -574,6 +591,7 @@ fn get_relocation_target(
             // I'm not entirely sure what's the point of those, as they don't point to any symbol
             // and have an addend of zero.
             Ok(RelocTarget {
+                original_address: 0,
                 relative_address: 0,
                 relocated_address: relocation.addend() as u64,
                 target_section_index: None,
@@ -623,6 +641,7 @@ fn get_relocation_target(
             );
 
             Ok(RelocTarget {
+                original_address,
                 relative_address: original_address - target_section.address(),
                 relocated_address,
                 target_section_index: Some(target_section_index),
@@ -1246,7 +1265,7 @@ impl core::fmt::Display for HiRelocKind {
 
 #[derive(Default)]
 struct RelocPairs {
-    reloc_pcrel_hi20: HashMap<u64, (HiRelocKind, u64)>,
+    reloc_pcrel_hi20: HashMap<u64, (HiRelocKind, RelocTarget)>,
     reloc_pcrel_lo12: HashMap<u64, u64>,
 }
 
@@ -1294,6 +1313,7 @@ fn relocate(
     sections_text_indexes: &HashSet<SectionIndex>,
     sections_text: &[&ElfSection],
     section_got: Option<&ElfSection>,
+    mut synthetic_got: Option<&mut (u64, Vec<u8>, BTreeMap<u64, usize>)>,
     relocation_for_section: &HashMap<SectionIndex, i64>,
     section: &ElfSection,
     data: &mut [u8],
@@ -1656,8 +1676,7 @@ fn relocate(
                         }
 
                         let p = pairs_for_section.entry(section.index()).or_insert_with(Default::default);
-                        p.reloc_pcrel_hi20
-                            .insert(relative_address, (HiRelocKind::PcRel, target.relocated_address));
+                        p.reloc_pcrel_hi20.insert(relative_address, (HiRelocKind::PcRel, target));
                         log::trace!(
                             "  R_RISCV_PCREL_HI20: {}[0x{relative_address:x}] (0x{absolute_address:x}): -> 0x{:08x}",
                             section.name()?,
@@ -1673,8 +1692,7 @@ fn relocate(
                         };
 
                         let p = pairs_for_section.entry(section.index()).or_insert_with(Default::default);
-                        p.reloc_pcrel_hi20
-                            .insert(relative_address, (HiRelocKind::Got, target.relocated_address));
+                        p.reloc_pcrel_hi20.insert(relative_address, (HiRelocKind::Got, target));
                         log::trace!(
                             "  R_RISCV_GOT_HI20: {}[0x{relative_address:x}] (0x{absolute_address:x}): -> 0x{:08x}",
                             section.name()?,
@@ -1941,6 +1959,7 @@ fn relocate(
         process_pcrel_pairs(
             data,
             section_got,
+            synthetic_got.as_deref_mut(),
             section_text,
             pairs,
             relocation_for_section,
@@ -1954,6 +1973,7 @@ fn relocate(
 fn process_pcrel_pairs(
     data: &mut [u8],
     section_got: Option<&ElfSection>,
+    mut synthetic_got: Option<&mut (u64, Vec<u8>, BTreeMap<u64, usize>)>,
     section_text: &ElfSection,
     pairs: RelocPairs,
     relocation_for_section: &HashMap<SectionIndex, i64>,
@@ -1972,11 +1992,11 @@ fn process_pcrel_pairs(
         let hi_inst_raw = &data_text[relative_hi as usize..][..4];
         let hi_inst = Inst::decode(u32::from_le_bytes([hi_inst_raw[0], hi_inst_raw[1], hi_inst_raw[2], hi_inst_raw[3]]));
 
-        let Some((hi_kind, target_address)) = pairs.reloc_pcrel_hi20.get(&relative_hi).copied() else {
+        let Some((hi_kind, target)) = pairs.reloc_pcrel_hi20.get(&relative_hi).copied() else {
             return Err(ProgramFromElfError::other(format!("R_RISCV_PCREL_LO12_* relocation at 0x{relative_lo:x} targets 0x{relative_hi:x} which doesn't have a R_RISCV_PCREL_HI20/R_RISCV_GOT_HI20 relocation")));
         };
 
-        let target_address = u32::try_from(target_address).expect("R_RISCV_PCREL_HI20/R_RISCV_GOT_HI20 target address overflow");
+        let target_address = u32::try_from(target.relocated_address).expect("R_RISCV_PCREL_HI20/R_RISCV_GOT_HI20 target address overflow");
 
         let (hi_reg, hi_value) = match hi_inst {
             Some(Inst::AddUpperImmediateToPc { dst, value }) => (dst, value),
@@ -2021,38 +2041,45 @@ fn process_pcrel_pairs(
         let new_merged;
 
         if matches!(hi_kind, HiRelocKind::Got) {
-            // For these relocations the target address still points to the symbol that the code wants to reference,
-            // but the actual address that's in the code shouldn't point to the symbol directly, but to a place where
-            // the symbol's address can be found.
+            // For these relocations the target address points to the symbol that the code wants to reference,
+            // but the actual address that's in the code shouldn't point to the symbol directly, but to a place
+            // where the symbol's address can be found.
 
-            let Some(section_got) = section_got else {
-                return Err(ProgramFromElfError::other(
-                    "found a R_RISCV_GOT_HI20 relocation but no '.got' section",
-                ));
+            if let Some(section_got) = section_got {
+                // First make sure the '.got' section itself is relocated.
+                let got_delta = *relocation_for_section
+                    .get(&section_got.index())
+                    .expect("internal error: no relocation offset for the '.got' section");
+
+                let old_got_address = old_merged;
+                let new_got_address = (old_got_address as i64).wrapping_add(got_delta) as u64;
+                new_merged = new_got_address as u32;
+
+                // And then fix the address inside of the GOT table itself.
+                let relative_got_offset = old_got_address as u64 - section_got.address();
+
+                let section_got_range = section_got.file_range().unwrap_or((0, 0));
+                let section_got_data = &mut data[section_got_range.0 as usize..][..section_got_range.1 as usize];
+                let old_target_address = read_u32(section_got_data, relative_got_offset)?;
+                write_u32(section_got_data, relative_got_offset, target_address)?;
+
+                log::trace!(
+                    "  (GOT): {}[0x{relative_got_offset:x}] (0x{old_got_address:x}): 0x{:08x} -> 0x{:08x}",
+                    section_got.name()?,
+                    old_target_address,
+                    target_address
+                );
+            } else {
+                // We have no existing '.got' section, so we have to synthesize one ourselves.
+                let (synthetic_got_base, synthetic_got, symbol_to_got_index) = synthetic_got.as_mut().unwrap();
+                let index = *symbol_to_got_index
+                    .get(&target.original_address)
+                    .expect("GOT relocation is missing an entry in symbol to GOT map");
+                write_u32(synthetic_got, index as u64 * 4, target_address)?;
+
+                let new_got_address = *synthetic_got_base + index as u64 * 4;
+                new_merged = u32::try_from(new_got_address).expect("GOT address overflow");
             };
-
-            // First make sure the '.got' section itself is relocated.
-            let got_delta = *relocation_for_section
-                .get(&section_got.index())
-                .expect("internal error: no relocation offset for the '.got' section");
-            let old_got_address = old_merged;
-            let new_got_address = (old_got_address as i64).wrapping_add(got_delta) as u64;
-            new_merged = new_got_address as u32;
-
-            // And then fix the address inside of the GOT table itself.
-            let relative_got_offset = old_got_address as u64 - section_got.address();
-
-            let section_got_range = section_got.file_range().unwrap_or((0, 0));
-            let section_got_data = &mut data[section_got_range.0 as usize..][..section_got_range.1 as usize];
-            let old_target_address = read_u32(section_got_data, relative_got_offset)?;
-            write_u32(section_got_data, relative_got_offset, target_address)?;
-
-            log::trace!(
-                "  (GOT): {}[0x{relative_got_offset:x}] (0x{old_got_address:x}): 0x{:08x} -> 0x{:08x}",
-                section_got.name()?,
-                old_target_address,
-                target_address
-            );
         } else {
             new_merged = target_address;
         }
@@ -2373,13 +2400,57 @@ pub fn program_from_elf(_config: Config, data: &[u8]) -> Result<ProgramBlob, Pro
         return Err(ProgramFromElfError::other("missing '.text' section"));
     }
 
+    let symbol_to_got_index = if section_got.is_none() {
+        let mut symbol_to_got_index = BTreeSet::new();
+        for section in elf.sections() {
+            if section.name().expect("failed to get section name") == ".eh_frame" {
+                continue;
+            }
+
+            for (_, relocation) in section.relocations() {
+                if !matches!(relocation.kind(), object::RelocationKind::Elf(object::elf::R_RISCV_GOT_HI20)) {
+                    continue;
+                }
+
+                let object::RelocationTarget::Symbol(target_symbol_index) = relocation.target() else {
+                    return Err(ProgramFromElfError::other(format!(
+                        "unhandled target for R_RISCV_GOT_HI20 relocation: {:?}",
+                        relocation
+                    )));
+                };
+
+                let target_symbol = elf
+                    .symbol_by_index(target_symbol_index)
+                    .map_err(|error| ProgramFromElfError::other(format!("failed to fetch relocation target: {}", error)))?;
+
+                symbol_to_got_index.insert(target_symbol.address());
+            }
+        }
+
+        let symbol_to_got_index: BTreeMap<_, _> = symbol_to_got_index
+            .into_iter()
+            .enumerate()
+            .map(|(index, address)| (address, index))
+            .collect();
+        symbol_to_got_index
+    } else {
+        BTreeMap::new()
+    };
+
     let memory_config = extract_memory_config(
         data,
         &sections_ro_data,
+        symbol_to_got_index.len() as u64 * 4,
         &sections_rw_data,
         &sections_bss,
         &mut relocation_for_section,
     )?;
+
+    let mut synthetic_got = memory_config.synthetic_got_base.map(|synthetic_got_base| {
+        let mut synthetic_got: Vec<u8> = Vec::new();
+        synthetic_got.resize(symbol_to_got_index.len() * 4, 0);
+        (synthetic_got_base, synthetic_got, symbol_to_got_index)
+    });
 
     for (index, offset) in &relocation_for_section {
         if *offset == 0 {
@@ -2433,6 +2504,7 @@ pub fn program_from_elf(_config: Config, data: &[u8]) -> Result<ProgramBlob, Pro
             &sections_text_indexes,
             &sections_text,
             section_got,
+            synthetic_got.as_mut(),
             &relocation_for_section,
             &section,
             &mut data,
@@ -2573,6 +2645,11 @@ pub fn program_from_elf(_config: Config, data: &[u8]) -> Result<ProgramBlob, Pro
                         writer.push_byte(0);
                     }
                 }
+                RangeOrPadding::SyntheticGot(size) => {
+                    let (_, bytes, _) = synthetic_got.as_ref().unwrap();
+                    assert_eq!(bytes.len(), size);
+                    writer.push_raw_bytes(bytes);
+                }
             }
         }
     });
@@ -2588,6 +2665,7 @@ pub fn program_from_elf(_config: Config, data: &[u8]) -> Result<ProgramBlob, Pro
                         writer.push_byte(0);
                     }
                 }
+                RangeOrPadding::SyntheticGot(..) => unreachable!(),
             }
         }
     });
