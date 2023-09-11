@@ -15,7 +15,6 @@ extern "C" {
 }
 
 #[polkavm_derive::polkavm_export]
-#[no_mangle]
-pub extern "C" fn add_numbers(a: u32, b: u32) -> u32 {
+extern "C" fn add_numbers(a: u32, b: u32) -> u32 {
     a + b + unsafe { get_third_number() }
 }
