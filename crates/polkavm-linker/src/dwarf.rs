@@ -113,11 +113,18 @@ impl<R: gimli::Reader> AttributeParser<R> {
                 }
             },
             gimli::DW_AT_high_pc => match attribute.value() {
-                gimli::AttributeValue::Addr(val) => self.high_pc = Some(val),
+                gimli::AttributeValue::Addr(val) => {
+                    log::trace!("  = 0x{:x} (address)", val);
+                    self.high_pc = Some(val)
+                }
                 gimli::AttributeValue::DebugAddrIndex(index) => {
+                    log::trace!("  = 0x{:x} ({:?})", dwarf.address(unit, index)?, index);
                     self.high_pc = Some(dwarf.address(unit, index)?);
                 }
-                gimli::AttributeValue::Udata(val) => self.size = Some(val),
+                gimli::AttributeValue::Udata(val) => {
+                    log::trace!("  = DW_AT_low_pc + {val} (size)");
+                    self.size = Some(val)
+                }
                 value => {
                     return Err(ProgramFromElfError::other(format!(
                         "failed to process DWARF: unsupported value for DW_AT_high_pc: {:?}",
