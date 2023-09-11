@@ -1725,6 +1725,198 @@ fn relocate(
                             target.relocated_address
                         );
                     }
+                    object::elf::R_RISCV_JAL => {
+                        if !sections_text_indexes.contains(&section.index()) {
+                            return Err(ProgramFromElfError::other(format!(
+                                "found a R_RISCV_JAL relocation in an unexpected section: '{}'",
+                                section.name()?
+                            )));
+                        };
+
+                        let inst_raw = read_u32(section_data, relative_address)?;
+                        let Some(inst) = Inst::decode(inst_raw) else {
+                            return Err(ProgramFromElfError::other(format!(
+                                "R_RISCV_JAL for an unsupported instruction: 0x{inst_raw:08}"
+                            )));
+                        };
+
+                        let Inst::JumpAndLink { dst, .. } = inst else {
+                            return Err(ProgramFromElfError::other(format!(
+                                "R_RISCV_JAL for an unsupported instruction: 0x{inst_raw:08} ({inst:?})"
+                            )));
+                        };
+
+                        let new_target = (target.relocated_address as u32).wrapping_sub(relocated_address as u32);
+
+                        instruction_overrides.insert(absolute_address, Inst::JumpAndLink { dst, target: new_target });
+
+                        log::trace!(
+                            "  R_RISCV_JAL: {}[0x{relative_address:x}] (0x{absolute_address:x} -> 0x{relocated_address:x}): -> 0x{:08x}",
+                            section.name()?,
+                            target.relocated_address as u32
+                        );
+                    }
+                    object::elf::R_RISCV_BRANCH => {
+                        if !sections_text_indexes.contains(&section.index()) {
+                            return Err(ProgramFromElfError::other(format!(
+                                "found a R_RISCV_BRANCH relocation in an unexpected section: '{}'",
+                                section.name()?
+                            )));
+                        };
+
+                        let inst_raw = read_u32(section_data, relative_address)?;
+                        let Some(inst) = Inst::decode(inst_raw) else {
+                            return Err(ProgramFromElfError::other(format!(
+                                "R_RISCV_BRANCH for an unsupported instruction: 0x{inst_raw:08}"
+                            )));
+                        };
+
+                        let Inst::Branch { kind, src1, src2, .. } = inst else {
+                            return Err(ProgramFromElfError::other(format!(
+                                "R_RISCV_BRANCH for an unsupported instruction: 0x{inst_raw:08} ({inst:?})"
+                            )));
+                        };
+
+                        let new_target = (target.relocated_address as u32).wrapping_sub(relocated_address as u32);
+
+                        instruction_overrides.insert(
+                            absolute_address,
+                            Inst::Branch {
+                                kind,
+                                src1,
+                                src2,
+                                target: new_target,
+                            },
+                        );
+
+                        log::trace!(
+                            "  R_RISCV_BRANCH: {}[0x{relative_address:x}] (0x{absolute_address:x} -> 0x{relocated_address:x}): -> 0x{:08x}",
+                            section.name()?,
+                            target.relocated_address as u32
+                        );
+                    }
+                    object::elf::R_RISCV_HI20 => {
+                        // This relocation is for a LUI + ADDI.
+
+                        if !sections_text_indexes.contains(&section.index()) {
+                            return Err(ProgramFromElfError::other(format!(
+                                "found a R_RISCV_HI20 relocation in an unexpected section: '{}'",
+                                section.name()?
+                            )));
+                        }
+
+                        let data_text = get_section_data(data, section)?;
+                        let Some(xs) = data_text.get(relative_address as usize..relative_address as usize + 8) else {
+                            return Err(ProgramFromElfError::other("invalid R_RISCV_HI20 relocation"));
+                        };
+
+                        let hi_inst_raw = u32::from_le_bytes([xs[0], xs[1], xs[2], xs[3]]);
+                        let Some(hi_inst) = Inst::decode(hi_inst_raw) else {
+                            return Err(ProgramFromElfError::other(format!(
+                                "R_RISCV_HI20 for an unsupported instruction (1st): 0x{hi_inst_raw:08}"
+                            )));
+                        };
+
+                        let lo_inst_raw = u32::from_le_bytes([xs[4], xs[5], xs[6], xs[7]]);
+                        let Some(lo_inst) = Inst::decode(lo_inst_raw) else {
+                            return Err(ProgramFromElfError::other(format!(
+                                "R_RISCV_HI20 for an unsupported instruction (2st): 0x{lo_inst_raw:08}"
+                            )));
+                        };
+
+                        let Inst::LoadUpperImmediate { dst: hi_reg, value: _ } = hi_inst else {
+                            return Err(ProgramFromElfError::other(format!(
+                                "R_RISCV_HI20 for an unsupported instruction (1st): 0x{hi_inst_raw:08} ({hi_inst:?})"
+                            )));
+                        };
+
+                        let Inst::RegImm {
+                            kind: RegImmKind::Add,
+                            dst: lo_dst,
+                            src: lo_src,
+                            imm: _,
+                        } = lo_inst
+                        else {
+                            return Err(ProgramFromElfError::other(format!(
+                                "R_RISCV_HI20 for an unsupported instruction (2st): 0x{lo_inst_raw:08} ({lo_inst:?})"
+                            )));
+                        };
+
+                        if hi_reg != lo_dst || lo_dst != lo_src {
+                            return Err(ProgramFromElfError::other(
+                                "R_RISCV_HI20 for a pair of instructions with different destination registers",
+                            ));
+                        }
+
+                        let new_target = (target.relocated_address as u32).wrapping_sub(relocated_address as u32 + 4);
+
+                        instruction_overrides.insert(
+                            absolute_address,
+                            Inst::RegImm {
+                                kind: RegImmKind::Add,
+                                dst: Reg::Zero,
+                                src: Reg::Zero,
+                                imm: 0,
+                            },
+                        );
+
+                        instruction_overrides.insert(
+                            absolute_address + 4,
+                            Inst::RegImm {
+                                kind: RegImmKind::Add,
+                                dst: hi_reg,
+                                src: Reg::Zero,
+                                imm: new_target as i32,
+                            },
+                        );
+
+                        log::trace!(
+                            "  R_RISCV_HI20: {}[0x{relative_address:x}] (0x{absolute_address:x}): -> 0x{:08x}",
+                            section.name()?,
+                            target.relocated_address
+                        );
+
+                        continue;
+                    }
+                    object::elf::R_RISCV_LO12_I => {
+                        if !sections_text_indexes.contains(&section.index()) {
+                            return Err(ProgramFromElfError::other(format!(
+                                "found a R_RISCV_LO12_I relocation in an unexpected section: '{}'",
+                                section.name()?
+                            )));
+                        };
+
+                        let inst_raw = read_u32(section_data, relative_address)?;
+                        let Some(inst) = Inst::decode(inst_raw) else {
+                            return Err(ProgramFromElfError::other(format!(
+                                "R_RISCV_LO12_I for an unsupported instruction: 0x{inst_raw:08}"
+                            )));
+                        };
+
+                        let Inst::RegImm { kind, dst, src, .. } = inst else {
+                            return Err(ProgramFromElfError::other(format!(
+                                "R_RISCV_LO12_I for an unsupported instruction: 0x{inst_raw:08} ({inst:?})"
+                            )));
+                        };
+
+                        let new_target = target.relocated_address as u32;
+                        instruction_overrides.insert(
+                            absolute_address,
+                            Inst::RegImm {
+                                kind,
+                                dst,
+                                src,
+                                imm: new_target as i32,
+                            },
+                        );
+
+                        log::trace!(
+                            "  R_RISCV_LO12_I: {}[0x{relative_address:x}] (0x{absolute_address:x}): -> 0x{:08x}",
+                            section.name()?,
+                            target.relocated_address
+                        );
+                    }
+                    object::elf::R_RISCV_RELAX => {}
                     _ => {
                         return Err(ProgramFromElfError::other(format!(
                             "unsupported relocation type in section '{}': 0x{:08x}",
