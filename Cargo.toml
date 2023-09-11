@@ -16,7 +16,7 @@ members = [
 ]
 
 [workspace.package]
-version = "0.1.1"
+version = "0.2.0"
 authors = ["Jan Bujak <jan@parity.io>", "Parity Technologies <admin@parity.io>"]
 license = "MIT/Apache-2.0"
 edition = "2021"
@@ -24,13 +24,13 @@ rust-version = "1.70.0"
 repository = "https://github.com/koute/polkavm"
 
 [workspace.dependencies]
-polkavm                 = { version = "0.1.1", path = "crates/polkavm" }
-polkavm-assembler       = { version = "0.1.1", path = "crates/polkavm-assembler" }
-polkavm-common          = { version = "0.1.1", path = "crates/polkavm-common" }
-polkavm-derive          = { version = "0.1.1", path = "crates/polkavm-derive" }
-polkavm-linker          = { version = "0.1.1", path = "crates/polkavm-linker" }
-polkavm-linux-raw       = { version = "0.1.1", path = "crates/polkavm-linux-raw" }
-polkavm-linux-sandbox   = { version = "0.1.1", path = "crates/polkavm-linux-sandbox" }
+polkavm                 = { version = "0.2.0", path = "crates/polkavm" }
+polkavm-assembler       = { version = "0.2.0", path = "crates/polkavm-assembler" }
+polkavm-common          = { version = "0.2.0", path = "crates/polkavm-common" }
+polkavm-derive          = { version = "0.2.0", path = "crates/polkavm-derive" }
+polkavm-linker          = { version = "0.2.0", path = "crates/polkavm-linker" }
+polkavm-linux-raw       = { version = "0.2.0", path = "crates/polkavm-linux-raw" }
+polkavm-linux-sandbox   = { version = "0.2.0", path = "crates/polkavm-linux-sandbox" }
 
 clap = "4.4.1"
 env_logger = { version = "0.10.0", default-features = false }

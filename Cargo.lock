@@ -434,7 +434,7 @@ checksum = "19b17cddbe7ec3f8bc800887bab5e717348c95ea2ca0b1bf0837fb964dc67099"
 
 [[package]]
 name = "polkatool"
-version = "0.1.1"
+version = "0.2.0"
 dependencies = [
  "clap",
  "env_logger",
@@ -443,7 +443,7 @@ dependencies = [
 
 [[package]]
 name = "polkavm"
-version = "0.1.1"
+version = "0.2.0"
 dependencies = [
  "log",
  "polkavm-assembler",
@@ -453,7 +453,7 @@ dependencies = [
 
 [[package]]
 name = "polkavm-assembler"
-version = "0.1.1"
+version = "0.2.0"
 dependencies = [
  "iced-x86",
  "log",
@@ -461,7 +461,7 @@ dependencies = [
 
 [[package]]
 name = "polkavm-common"
-version = "0.1.1"
+version = "0.2.0"
 dependencies = [
  "log",
  "proptest",
@@ -469,7 +469,7 @@ dependencies = [
 
 [[package]]
 name = "polkavm-derive"
-version = "0.1.1"
+version = "0.2.0"
 dependencies = [
  "polkavm-common",
  "proc-macro2",
@@ -479,7 +479,7 @@ dependencies = [
 
 [[package]]
 name = "polkavm-linker"
-version = "0.1.1"
+version = "0.2.0"
 dependencies = [
  "gimli",
  "log",
@@ -490,7 +490,7 @@ dependencies = [
 
 [[package]]
 name = "polkavm-linux-raw"
-version = "0.1.1"
+version = "0.2.0"
 
 [[package]]
 name = "polkavm-linux-raw-generate"
@@ -501,7 +501,7 @@ dependencies = [
 
 [[package]]
 name = "polkavm-linux-sandbox"
-version = "0.1.1"
+version = "0.2.0"
 dependencies = [
  "env_logger",
  "log",

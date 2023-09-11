@@ -4,11 +4,11 @@ version = 3
 
 [[package]]
 name = "polkavm-common"
-version = "0.1.1"
+version = "0.2.0"
 
 [[package]]
 name = "polkavm-linux-raw"
-version = "0.1.1"
+version = "0.2.0"
 
 [[package]]
 name = "polkavm-zygote"
