@@ -28,10 +28,13 @@ static_assert!(VM_ADDR_RETURN_TO_HOST & 0b11 == 0);
 
 /// The total maximum amount of memory a program can use.
 ///
-/// This is the whole 32-bit address space, minus the guard pages at the start,
-/// minus the guard page between the heap and the stack, and minus the guard page at the end.
-pub const VM_MAXIMUM_MEMORY_SIZE: u32 = 0xfffe8000;
-static_assert!(VM_MAXIMUM_MEMORY_SIZE as u64 == (1_u64 << 32) - VM_ADDR_USER_MEMORY as u64 - VM_PAGE_SIZE as u64 * 2);
+/// This is the whole 32-bit address space, except:
+///   * the guard pages at the start,
+///   * the guard page between read-only data and read-write data
+///   * the guard page between the heap and the stack,
+///   * and the guard page at the end.
+pub const VM_MAXIMUM_MEMORY_SIZE: u32 = 0xfffe4000;
+static_assert!(VM_MAXIMUM_MEMORY_SIZE as u64 == (1_u64 << 32) - VM_ADDR_USER_MEMORY as u64 - VM_PAGE_SIZE as u64 * 3);
 
 /// The maximum number of VM instructions a program can be composed of.
 pub const VM_MAXIMUM_INSTRUCTION_COUNT: u32 = 2 * 1024 * 1024;
@@ -195,7 +198,11 @@ impl GuestMemoryConfig {
     /// The address at where the program's read-write data starts inside of the VM.
     #[inline]
     pub const fn rw_data_address(self) -> u32 {
-        self.ro_data_address() + self.ro_data_size
+        if self.ro_data_size == 0 {
+            self.user_memory_address()
+        } else {
+            self.ro_data_address() + self.ro_data_size + VM_PAGE_SIZE
+        }
     }
 
     pub const fn rw_data_size(self) -> u32 {

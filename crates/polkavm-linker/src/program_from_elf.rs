@@ -375,6 +375,11 @@ fn extract_memory_config(
 
     assert_eq!(memory_end % VM_PAGE_SIZE as u64, 0);
 
+    if ro_data_size > 0 {
+        // Add a guard page between read-only data and read-write data.
+        memory_end += u64::from(VM_PAGE_SIZE);
+    }
+
     let mut rw_data = Vec::new();
     let mut rw_data_size = 0;
     let rw_data_address = memory_end;
