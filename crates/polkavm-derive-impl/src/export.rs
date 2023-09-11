@@ -30,7 +30,6 @@ pub fn is_no_mangle(attr: &syn::Attribute) -> bool {
 pub fn polkavm_export(input: syn::ItemFn) -> Result<proc_macro2::TokenStream, syn::Error> {
     let mut cfg_attributes = Vec::new();
     let mut fn_attributes = Vec::new();
-    let mut no_mangle_found = false;
     for attr in input.attrs {
         if is_rustfmt(&attr) {
             continue;
@@ -41,26 +40,12 @@ pub fn polkavm_export(input: syn::ItemFn) -> Result<proc_macro2::TokenStream, sy
             continue;
         }
 
-        if is_doc(&attr) {
+        if is_doc(&attr) || is_no_mangle(&attr) {
             fn_attributes.push(attr);
             continue;
         }
 
-        if is_no_mangle(&attr) {
-            no_mangle_found = true;
-            fn_attributes.push(attr.clone());
-            continue;
-        }
-
         unsupported!(attr);
-    }
-
-    if !matches!(input.vis, syn::Visibility::Public(..)) {
-        return Err(syn::Error::new(input.sig.ident.span(), "must be marked as 'pub'"));
-    }
-
-    if !no_mangle_found {
-        return Err(syn::Error::new(input.sig.ident.span(), "must be marked as '#[no_mangle]'"));
     }
 
     let sig = input.sig;
