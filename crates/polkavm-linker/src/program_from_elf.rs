@@ -555,7 +555,6 @@ fn extract_import_metadata<'a>(data: &'a [u8], section: &ElfSection) -> Result<B
 struct RelocTarget {
     relative_address: u64,
     relocated_address: u64,
-    delta: i64,
     target_section_index: Option<SectionIndex>,
 }
 
@@ -577,7 +576,6 @@ fn get_relocation_target(
             Ok(RelocTarget {
                 relative_address: 0,
                 relocated_address: relocation.addend() as u64,
-                delta: 0,
                 target_section_index: None,
             })
         }
@@ -627,7 +625,6 @@ fn get_relocation_target(
             Ok(RelocTarget {
                 relative_address: original_address - target_section.address(),
                 relocated_address,
-                delta,
                 target_section_index: Some(target_section_index),
             })
         }
@@ -1316,6 +1313,7 @@ fn relocate(
         .get(&section.index())
         .ok_or_else(|| ProgramFromElfError::other(format!("internal error: no relocation offset for section '{}'", section_name)))?;
     let section_range = section.file_range().unwrap_or((0, 0));
+    let mut seen = HashSet::new();
     for (absolute_address, relocation) in section.relocations() {
         let section_data = &mut data[section_range.0 as usize..][..section_range.1 as usize];
 
@@ -1343,6 +1341,23 @@ fn relocate(
             }
         }
 
+        // This is needed for the ADD/SUB relocations, which are stateful relocations
+        // that need to read the previous value and modify it.
+        //
+        // This is used in e.g. the debug info, where there will be pairs of ADD and SUB
+        // relocations for exactly the same address. The ADD will point to the function's end,
+        // and the SUB will point to the function's start, effectively calculating `end - start`,
+        // or in other words the function's size.
+        //
+        // If we do this naively and the program is not fully linked (it's an '.o', or it was
+        // linked with `-Wl,--relocatable`) then these locations will initially contain zeros,
+        // and everything will be fine, but if the program *was* fully linked (because it was
+        // only compiled with `-Wl,--emit-relocs`) then these locations will already contain a value.
+        //
+        // So to make sure we handle this correctly in both cases we'll just ignore the existing
+        // value, but only for the first time.
+        let is_first_time = seen.insert(relative_address);
+
         match relocation.kind() {
             object::RelocationKind::Absolute => {
                 match (relocation.encoding(), relocation.size()) {
@@ -1369,8 +1384,10 @@ fn relocate(
                         }
 
                         let old_value = read_u8(section_data, relative_address)?;
-                        let arg = (target.delta as i8).wrapping_add(relocation.addend() as i8) as u8;
-                        let new_value = (old_value & 0b1100_0000) | (old_value.wrapping_sub(arg) & 0b0011_1111);
+                        let old_value_effective = if is_first_time { 0 } else { old_value };
+
+                        let arg = target.relocated_address as u8;
+                        let new_value = (old_value_effective & 0b1100_0000) | (old_value_effective.wrapping_sub(arg) & 0b0011_1111);
                         section_data[relative_address as usize] = new_value;
 
                         log::trace!(
@@ -1442,8 +1459,10 @@ fn relocate(
                         }
 
                         let old_value = read_u8(section_data, relative_address)?;
-                        let arg = (target.delta as i8).wrapping_add(relocation.addend() as i8);
-                        let new_value = (old_value as i8).wrapping_add(arg) as u8;
+                        let old_value_effective = if is_first_time { 0 } else { old_value };
+
+                        let arg = target.relocated_address as u8 as i8;
+                        let new_value = (old_value_effective as i8).wrapping_add(arg) as u8;
                         section_data[relative_address as usize] = new_value;
 
                         log::trace!(
@@ -1461,8 +1480,10 @@ fn relocate(
                         }
 
                         let old_value = read_u8(section_data, relative_address)?;
-                        let arg = (target.delta as i8).wrapping_add(relocation.addend() as i8);
-                        let new_value = (old_value as i8).wrapping_sub(arg) as u8;
+                        let old_value_effective = if is_first_time { 0 } else { old_value };
+
+                        let arg = target.relocated_address as u8 as i8;
+                        let new_value = (old_value_effective as i8).wrapping_sub(arg) as u8;
                         section_data[relative_address as usize] = new_value;
 
                         log::trace!(
@@ -1480,8 +1501,10 @@ fn relocate(
                         }
 
                         let old_value = read_u16(section_data, relative_address)?;
-                        let arg = (target.delta as i16).wrapping_add(relocation.addend() as i16);
-                        let new_value = (old_value as i16).wrapping_add(arg) as u16;
+                        let old_value_effective = if is_first_time { 0 } else { old_value };
+
+                        let arg = target.relocated_address as u16 as i16;
+                        let new_value = (old_value_effective as i16).wrapping_add(arg) as u16;
                         write_u16(section_data, relative_address, new_value)?;
 
                         log::trace!(
@@ -1499,8 +1522,10 @@ fn relocate(
                         }
 
                         let old_value = read_u16(section_data, relative_address)?;
-                        let arg = (target.delta as i16).wrapping_add(relocation.addend() as i16);
-                        let new_value = (old_value as i16).wrapping_sub(arg) as u16;
+                        let old_value_effective = if is_first_time { 0 } else { old_value };
+
+                        let arg = target.relocated_address as u16 as i16;
+                        let new_value = (old_value_effective as i16).wrapping_sub(arg) as u16;
                         write_u16(section_data, relative_address, new_value)?;
 
                         log::trace!(
@@ -1512,28 +1537,36 @@ fn relocate(
                     }
                     object::elf::R_RISCV_ADD32 => {
                         let old_value = read_u32(section_data, relative_address)?;
-                        let arg = (target.delta as i32).wrapping_add(relocation.addend() as i32);
-                        let new_value = (old_value as i32).wrapping_add(arg) as u32;
+                        let old_value_effective = if is_first_time { 0 } else { old_value };
+
+                        let arg = target.relocated_address as u32 as i32;
+                        let new_value = (old_value_effective as i32).wrapping_add(arg) as u32;
                         write_u32(section_data, relative_address, new_value)?;
 
                         log::trace!(
-                            "  R_RISCV_ADD32: {}[0x{relative_address:x}] (0x{absolute_address:x}): 0x{:08x} -> 0x{:08x}",
+                            "  R_RISCV_ADD32: {}[0x{relative_address:x}] (0x{absolute_address:x}): 0x{:08x} -> 0x{:08x} ({:x} + {:x})",
                             section.name()?,
                             old_value,
-                            new_value
+                            new_value,
+                            old_value_effective,
+                            arg,
                         );
                     }
                     object::elf::R_RISCV_SUB32 => {
                         let old_value = read_u32(section_data, relative_address)?;
-                        let arg = (target.delta as i32).wrapping_add(relocation.addend() as i32);
-                        let new_value = (old_value as i32).wrapping_sub(arg) as u32;
+                        let old_value_effective = if is_first_time { 0 } else { old_value };
+
+                        let arg = target.relocated_address as u32 as i32;
+                        let new_value = (old_value_effective as i32).wrapping_sub(arg) as u32;
                         write_u32(section_data, relative_address, new_value)?;
 
                         log::trace!(
-                            "  R_RISCV_SUB32: {}[0x{relative_address:x}] (0x{absolute_address:x}): 0x{:08x} -> 0x{:08x}",
+                            "  R_RISCV_SUB32: {}[0x{relative_address:x}] (0x{absolute_address:x}): 0x{:08x} -> 0x{:08x} ({:x} - {:x})",
                             section.name()?,
                             old_value,
-                            new_value
+                            new_value,
+                            old_value_effective,
+                            arg,
                         );
                     }
                     object::elf::R_RISCV_CALL_PLT => {
