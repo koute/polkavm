@@ -25,88 +25,99 @@ enum Args {
     },
 }
 
+macro_rules! bail {
+    ($($arg:tt)*) => {
+        return Err(format!($($arg)*))
+    }
+}
+
 fn main() {
     env_logger::init();
 
     let args = Args::parse();
-    match args {
-        Args::Link { output, input } => {
-            let config = polkavm_linker::Config::default();
-            let data = match std::fs::read(&input) {
-                Ok(data) => data,
-                Err(error) => {
-                    eprintln!("ERROR: failed to read {:?}: {}", input, error);
-                    std::process::exit(1);
-                }
-            };
+    let result = match args {
+        Args::Link { output, input } => main_link(input, output),
+        Args::Disassemble { output, input } => main_disassemble(input, output),
+    };
 
-            let blob = match polkavm_linker::program_from_elf(config, &data) {
-                Ok(blob) => blob,
-                Err(error) => {
-                    eprintln!("ERROR: failed to link {:?}: {}", input, error);
-                    std::process::exit(1);
-                }
-            };
+    if let Err(error) = result {
+        eprintln!("ERROR: {}", error);
+        std::process::exit(1);
+    }
+}
 
-            if let Err(error) = std::fs::write(&output, blob.as_bytes()) {
-                eprintln!("ERROR: failed to write the program blob to {:?}: {}", output, error);
-                std::process::exit(1);
-            }
+fn main_link(input: PathBuf, output: PathBuf) -> Result<(), String> {
+    let config = polkavm_linker::Config::default();
+    let data = match std::fs::read(&input) {
+        Ok(data) => data,
+        Err(error) => {
+            bail!("failed to read {input:?}: {error}");
         }
+    };
 
-        Args::Disassemble { output, input } => {
-            let data = match std::fs::read(&input) {
-                Ok(data) => data,
+    let blob = match polkavm_linker::program_from_elf(config, &data) {
+        Ok(blob) => blob,
+        Err(error) => {
+            bail!("failed to link {input:?}: {error}");
+        }
+    };
+
+    if let Err(error) = std::fs::write(&output, blob.as_bytes()) {
+        bail!("failed to write the program blob to {output:?}: {error}");
+    }
+
+    Ok(())
+}
+
+fn main_disassemble(input: PathBuf, output: Option<PathBuf>) -> Result<(), String> {
+    let data = match std::fs::read(&input) {
+        Ok(data) => data,
+        Err(error) => {
+            bail!("failed to read {input:?}: {error}");
+        }
+    };
+    let blob = match polkavm_linker::ProgramBlob::parse(&data[..]) {
+        Ok(b) => b,
+        Err(error) => {
+            bail!("failed to parse {input:?}: {error}");
+        }
+    };
+
+    match output {
+        Some(output) => {
+            let fp = match std::fs::File::create(&output) {
+                Ok(fp) => fp,
                 Err(error) => {
-                    eprintln!("ERROR: failed to read {:?}: {}", input, error);
-                    std::process::exit(1);
+                    bail!("failed to create output file {output:?}: {error}");
                 }
             };
-            let blob = match polkavm_linker::ProgramBlob::parse(&data[..]) {
-                Ok(b) => b,
-                Err(error) => {
-                    eprintln!("ERROR: failed to parse {:?}: {}", input, error);
-                    std::process::exit(1);
-                }
-            };
 
-            match output {
-                Some(out) => {
-                    let fp = match std::fs::File::create(&out) {
-                        Ok(fp) => fp,
-                        Err(error) => {
-                            eprintln!("ERROR: failed to create output file {:?}: {}", out, error);
-                            std::process::exit(1);
-                        }
-                    };
-                    disassemble_into(&blob, std::io::BufWriter::new(fp));
-                }
-                None => {
-                    let std_out = std::io::stdout();
-                    disassemble_into(&blob, std::io::BufWriter::new(std_out));
-                }
-            }
+            disassemble_into(&blob, std::io::BufWriter::new(fp))
+        }
+        None => {
+            let stdout = std::io::stdout();
+            disassemble_into(&blob, std::io::BufWriter::new(stdout))
         }
     }
 }
 
-fn disassemble_into(blob: &polkavm_linker::ProgramBlob, mut writer: impl Write) {
+fn disassemble_into(blob: &polkavm_linker::ProgramBlob, mut writer: impl Write) -> Result<(), String> {
     for (nth_instruction, maybe_instruction) in blob.instructions().enumerate() {
         match maybe_instruction {
             Ok(instruction) => {
                 if let Err(error) = writeln!(&mut writer, "{nth_instruction}: {instruction}") {
-                    eprintln!("ERROR: failed to write to output: {}", error);
-                    std::process::exit(1);
+                    bail!("failed to write to output: {error}");
                 }
             }
             Err(error) => {
-                eprintln!("ERROR: failed to parse instruction #{}: {}", nth_instruction, error);
-                std::process::exit(1);
+                bail!("failed to parse instruction #{nth_instruction}: {error}");
             }
         };
     }
+
     if let Err(error) = writer.flush() {
-        eprintln!("ERROR: failed to write to output: {}", error);
-        std::process::exit(1);
+        bail!("failed to write to output: {error}");
     }
+
+    Ok(())
 }
