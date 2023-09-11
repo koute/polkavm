@@ -1,5 +1,4 @@
 use polkavm_common::elf::INSTRUCTION_ECALLI;
-use proc_macro::*;
 use quote::quote;
 use std::fmt::Write;
 use syn::spanned::Spanned;
@@ -101,7 +100,7 @@ fn parse_import_attributes(attr: &syn::Attribute) -> Result<Option<Vec<ImportAtt
     Ok(Some(parsed_attrs.into_iter().collect()))
 }
 
-pub fn polkavm_import(input: syn::ItemForeignMod) -> Result<TokenStream, syn::Error> {
+pub fn polkavm_import(input: syn::ItemForeignMod) -> Result<proc_macro2::TokenStream, syn::Error> {
     let mut outer_cfg_attributes = Vec::new();
     for attr in input.attrs {
         if is_cfg(&attr) {
@@ -196,6 +195,5 @@ pub fn polkavm_import(input: syn::ItemForeignMod) -> Result<TokenStream, syn::Er
 
     Ok(quote! {
         #(#output)*
-    }
-    .into())
+    })
 }

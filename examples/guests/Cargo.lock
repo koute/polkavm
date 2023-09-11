@@ -17,6 +17,14 @@ version = "0.2.0"
 name = "polkavm-derive"
 version = "0.2.0"
 dependencies = [
+ "polkavm-derive-impl",
+ "syn",
+]
+
+[[package]]
+name = "polkavm-derive-impl"
+version = "0.2.0"
+dependencies = [
  "polkavm-common",
  "proc-macro2",
  "quote",

@@ -3,20 +3,14 @@
 
 extern crate proc_macro;
 
-#[macro_use]
-mod common;
-
-mod export;
-mod import;
-
 use proc_macro::TokenStream;
 
 #[proc_macro_attribute]
 pub fn polkavm_import(args: TokenStream, input: TokenStream) -> TokenStream {
     syn::parse_macro_input!(args as syn::parse::Nothing);
     let input = syn::parse_macro_input!(input as syn::ItemForeignMod);
-    match crate::import::polkavm_import(input) {
-        Ok(result) => result,
+    match polkavm_derive_impl::polkavm_import(input) {
+        Ok(result) => result.into(),
         Err(error) => error.into_compile_error().into(),
     }
 }
@@ -25,8 +19,8 @@ pub fn polkavm_import(args: TokenStream, input: TokenStream) -> TokenStream {
 pub fn polkavm_export(args: TokenStream, input: TokenStream) -> TokenStream {
     syn::parse_macro_input!(args as syn::parse::Nothing);
     let input = syn::parse_macro_input!(input as syn::ItemFn);
-    match crate::export::polkavm_export(input) {
-        Ok(result) => result,
+    match polkavm_derive_impl::polkavm_export(input) {
+        Ok(result) => result.into(),
         Err(error) => error.into_compile_error().into(),
     }
 }

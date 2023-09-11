@@ -13,7 +13,5 @@ description = "The derive crate for PolkaVM guest programs"
 proc-macro = true
 
 [dependencies]
-polkavm-common = { workspace = true, features = ["alloc"] }
+polkavm-derive-impl = { workspace = true }
 syn = { workspace = true, features = ["full"] }
-quote = { workspace = true }
-proc-macro2 = { workspace = true }

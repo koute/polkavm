@@ -1,4 +1,3 @@
-use proc_macro::*;
 use quote::quote;
 use syn::spanned::Spanned;
 
@@ -28,7 +27,7 @@ pub fn is_no_mangle(attr: &syn::Attribute) -> bool {
     }
 }
 
-pub fn polkavm_export(input: syn::ItemFn) -> Result<TokenStream, syn::Error> {
+pub fn polkavm_export(input: syn::ItemFn) -> Result<proc_macro2::TokenStream, syn::Error> {
     let mut cfg_attributes = Vec::new();
     let mut fn_attributes = Vec::new();
     let mut no_mangle_found = false;
@@ -107,6 +106,5 @@ pub fn polkavm_export(input: syn::ItemFn) -> Result<TokenStream, syn::Error> {
         #(#fn_attributes)*
         #[link_section = ".text.polkavm_export"]
         #vis fn #ident(#args) #return_ty #body
-    }
-    .into())
+    })
 }
