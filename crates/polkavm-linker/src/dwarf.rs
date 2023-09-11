@@ -561,7 +561,13 @@ where
                 for (nth_inline_frame, (inline_begin, inline_end, _, _)) in self.inline_frames.iter().enumerate() {
                     if *inline_begin < begin || *inline_end > end {
                         return Err(ProgramFromElfError::other(
-                            "failed to process DWARF: found inline subroutine which exceedes the bounds of its parent subprogram",
+                            format!(
+                                "failed to process DWARF: found inline subroutine which exceedes the bounds of its parent subprogram (parent = 0x{:x}-0x{:x}, inline = 0x{:x}-0x{:x})",
+                                begin,
+                                end,
+                                inline_begin,
+                                inline_end,
+                            )
                         ));
                     }
 
