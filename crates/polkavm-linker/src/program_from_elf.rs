@@ -833,7 +833,7 @@ fn parse_text_section(
             Inst::RegReg { kind, dst, src1, src2 } => InstExt::Basic(BasicInst::RegReg { kind, dst, src1, src2 }),
             Inst::AddUpperImmediateToPc { .. } => {
                 return Err(ProgramFromElfError::other(
-                    "found an unrelocated auipc instruction; is the program compiled with relocations?",
+                    format!("found an unrelocated auipc instruction at 0x{absolute_address:x} in section '{section_name}'; is the program compiled with relocations?")
                 ));
             }
             Inst::Ecall => {
