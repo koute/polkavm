@@ -1208,7 +1208,11 @@ impl<'a> ProgramBlob<'a> {
         }
 
         ImportIterator {
-            state: State::Uninitialized,
+            state: if self.imports != (0_usize..0_usize) {
+                State::Uninitialized
+            } else {
+                State::Finished
+            },
             reader: self.get_section_reader(self.imports.clone()),
         }
     }
@@ -1263,7 +1267,11 @@ impl<'a> ProgramBlob<'a> {
         }
 
         ExportIterator {
-            state: State::Uninitialized,
+            state: if self.exports != (0_usize..0_usize) {
+                State::Uninitialized
+            } else {
+                State::Finished
+            },
             reader: self.get_section_reader(self.exports.clone()),
         }
     }
