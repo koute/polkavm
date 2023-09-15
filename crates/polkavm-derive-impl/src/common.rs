@@ -37,7 +37,7 @@ pub fn is_doc(attr: &syn::Attribute) -> bool {
 
 pub fn is_cfg(attr: &syn::Attribute) -> bool {
     if let syn::Meta::List(syn::MetaList { ref path, .. }) = attr.meta {
-        is_path_eq(path, "cfg") || is_path_eq(path, "allow") || is_path_eq(path, "deny")
+        is_path_eq(path, "cfg") || is_path_eq(path, "cfg_attr") || is_path_eq(path, "allow") || is_path_eq(path, "deny")
     } else {
         false
     }
