@@ -8,8 +8,8 @@ PolkaVM is a general purpose user-level RISC-V based virtual machine.
 
 (**Note: not all of these are currently true!**)
 
-- Secure and sandboxed by default. The code running in the VM should run in a separate process, and should not be able to access the host system, even in the presence of an attacker with full remote code execution priviledges inside of the VM.
-- Fast to execute. The runtime performance of the code running in the VM should be competetive with state-of-art WebAssembly VMs, at least within the same order of magnitude.
+- Secure and sandboxed by default. The code running in the VM should run in a separate process, and should not be able to access the host system, even in the presence of an attacker with full remote code execution privileges inside of the VM.
+- Fast to execute. The runtime performance of the code running in the VM should be competitive with state-of-art WebAssembly VMs, at least within the same order of magnitude.
 - Fast to compile, with guaranteed single-pass O(n) compilation. Loading new code into the VM should be near instanteneous.
 - Low memory footprint. Each concurrent instance of the VM should have a baseline memory overhead of no more than 128KB.
 - Small binaries. Programs compiled for this VM should take up as little space as possible.
@@ -18,7 +18,7 @@ PolkaVM is a general purpose user-level RISC-V based virtual machine.
 - Support for high performance asynchronous gas metering. Gas metering should be cheap, deterministic, and reasonably accurate.
 - Simple. It should be possible for a single programmer to write an interpreter fully compatible with this VM in less than a week.
 - Versioned operational semantics. Any future changes to the semantics that are observable by a guest program will be versioned, and will be explicitly opt-in.
-- Standarized. There should be a spec fully describing the guest-observable operational semantics of this VM.
+- Standardized. There should be a spec fully describing the guest-observable operational semantics of this VM.
 - Cross-platform. On unsupported OSes and platforms the VM will run in an interpreted mode.
 - Minimum external dependencies. The VM should be mostly self-contained, fast to compile, and resistant to supply-chain attacks.
 - Built-in tooling for debugging and performance profiling.

@@ -444,14 +444,14 @@ unsafe fn child_main(zygote_memfd: Fd, child_socket: Fd, uid_map: &str, gid_map:
     // Clear all of our ambient capabilities.
     linux_raw::sys_prctl_cap_ambient_clear_all()?;
 
-    // Flag ourselves that we won't ever want to acquire any new priviledges.
+    // Flag ourselves that we won't ever want to acquire any new privileges.
     linux_raw::sys_prctl_set_no_new_privs()?;
 
     linux_raw::sys_prctl_set_securebits(
-        // Make UID == 0 have no special priviledges.
+        // Make UID == 0 have no special privileges.
         linux_raw::SECBIT_NOROOT |
         linux_raw::SECBIT_NOROOT_LOCKED |
-        // Calling 'setuid' from/to UID == 0 doesn't change any priviledges.
+        // Calling 'setuid' from/to UID == 0 doesn't change any privileges.
         linux_raw::SECBIT_NO_SETUID_FIXUP |
         linux_raw::SECBIT_NO_SETUID_FIXUP_LOCKED |
         // The process cannot add capabilities to its ambient set.
