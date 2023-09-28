@@ -983,7 +983,7 @@ pub mod inst {
             Inst::new(0xf7).modrm_opext(0b110).rex_64b_if(matches!(self.0, RegSize::R64)).modrm_rm_direct(self.1).encode(),
             (fmt.write_fmt(core::format_args!("div {}", self.1.name_from(self.0)))),
 
-        // https://www.felixcloutier.com/x86/div
+        // https://www.felixcloutier.com/x86/idiv
         idiv(RegSize, Reg) =>
             Inst::new(0xf7).modrm_opext(0b111).rex_64b_if(matches!(self.0, RegSize::R64)).modrm_rm_direct(self.1).encode(),
             (fmt.write_fmt(core::format_args!("idiv {}", self.1.name_from(self.0)))),
