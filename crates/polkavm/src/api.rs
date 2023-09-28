@@ -298,7 +298,7 @@ impl Module {
             export_index_by_name,
             jump_target_to_instruction,
 
-            blob: if debug_trace_execution {
+            blob: if debug_trace_execution || selected_backend == Backend::Interpreter {
                 Some(blob.clone().into_owned())
             } else {
                 None
