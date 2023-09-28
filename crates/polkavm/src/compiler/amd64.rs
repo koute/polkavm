@@ -52,6 +52,11 @@ enum Signedness {
     Unsigned,
 }
 
+enum DivRem {
+    Div,
+    Rem,
+}
+
 enum ShiftKind {
     LogicalLeft,
     LogicalRight,
@@ -353,15 +358,23 @@ impl<'a> Compiler<'a> {
         self.push(jcc_label32(condition, label));
     }
 
-    fn division(&mut self, d: Reg, s1: Reg, s2: Reg, kind: Signedness) {
+    fn div_rem(&mut self, d: Reg, s1: Reg, s2: Reg, div_rem: DivRem, kind: Signedness) {
         // Unlike most other architectures RISC-V doesn't trap on division by zero
-        // and has well defined results in such cases.
+        // nor on division with overflow, and has well defined results in such cases.
 
         match (d, s1, s2) {
             // 0 = s1 / s2
             (Z, _, _) => self.nop(),
             // d = s1 / 0
-            (_, _, Z) => self.fill_with_ones(d),
+            (_, _, Z) => match div_rem {
+                DivRem::Div => self.fill_with_ones(d),
+                DivRem::Rem if d == s1 => self.nop(),
+                DivRem::Rem => self.mov(d, s1),
+            },
+            // d = 0 / s2
+            (_, Z, _) => {
+                todo!();
+            }
             // d = s1 / s2
             _ => {
                 let label_divisor_is_zero = self.asm.forward_declare_label();
@@ -369,6 +382,26 @@ impl<'a> Compiler<'a> {
 
                 self.push(test(self.reg_size(), conv_reg(s2), conv_reg(s2)));
                 self.push(jcc_label8(Condition::Equal, label_divisor_is_zero));
+
+                if matches!(kind, Signedness::Signed) {
+                    let label_normal = self.asm.forward_declare_label();
+                    match self.reg_size() {
+                        RegSize::R32 => {
+                            self.push(cmp_imm(RegSize::R32, conv_reg(s1), i32::MIN));
+                            self.push(jcc_label8(Condition::NotEqual, label_normal));
+                            self.push(cmp_imm(RegSize::R32, conv_reg(s2), -1));
+                            self.push(jcc_label8(Condition::NotEqual, label_normal));
+                            match div_rem {
+                                DivRem::Div => self.mov(d, s1),
+                                DivRem::Rem => self.clear_reg(d),
+                            }
+                            self.push(jmp_label8(label_next));
+                        }
+                        RegSize::R64 => todo!(),
+                    }
+
+                    self.asm.define_label(label_normal);
+                }
 
                 if s1 == Reg::Zero {
                     self.clear_reg(d);
@@ -399,11 +432,17 @@ impl<'a> Compiler<'a> {
 
                     match kind {
                         Signedness::Unsigned => self.push(div(self.reg_size(), TMP_REG)),
-                        Signedness::Signed => self.push(idiv(self.reg_size(), TMP_REG)),
+                        Signedness::Signed => {
+                            self.push(cdq());
+                            self.push(idiv(self.reg_size(), TMP_REG))
+                        }
                     }
 
                     // Move the result to the temporary register.
-                    self.push(mov(self.reg_size(), TMP_REG, rax));
+                    match div_rem {
+                        DivRem::Div => self.push(mov(self.reg_size(), TMP_REG, rax)),
+                        DivRem::Rem => self.push(mov(self.reg_size(), TMP_REG, rdx)),
+                    }
 
                     // Restore the original registers.
                     self.push(pop(rax));
@@ -417,7 +456,11 @@ impl<'a> Compiler<'a> {
                 self.push(jmp_label8(label_next));
 
                 self.asm.define_label(label_divisor_is_zero);
-                self.fill_with_ones(d);
+                match div_rem {
+                    DivRem::Div => self.fill_with_ones(d),
+                    DivRem::Rem if d == s1 => {}
+                    DivRem::Rem => self.mov(d, s1),
+                }
 
                 self.asm.define_label(label_next);
             }
@@ -858,44 +901,22 @@ impl<'a> InstructionVisitor for Compiler<'a> {
     }
 
     fn div_unsigned(&mut self, d: Reg, s1: Reg, s2: Reg) -> Self::ReturnTy {
-        self.division(d, s1, s2, Signedness::Unsigned);
+        self.div_rem(d, s1, s2, DivRem::Div, Signedness::Unsigned);
         Ok(())
     }
 
     fn div_signed(&mut self, d: Reg, s1: Reg, s2: Reg) -> Self::ReturnTy {
-        self.division(d, s1, s2, Signedness::Unsigned);
+        self.div_rem(d, s1, s2, DivRem::Div, Signedness::Signed);
         Ok(())
     }
 
     fn rem_unsigned(&mut self, d: Reg, s1: Reg, s2: Reg) -> Self::ReturnTy {
-        match (d, s1, s2) {
-            // 0 = s1 % s2
-            (Z, _, _) => self.nop(),
-            // d = 0 % s2
-            (_, Z, _) => self.clear_reg(d),
-            // d = s1 % 0
-            (_, _, Z) => self.nop(),
-            _ => {
-                self.trap()?; // TODO
-            }
-        }
-
+        self.div_rem(d, s1, s2, DivRem::Rem, Signedness::Unsigned);
         Ok(())
     }
 
     fn rem_signed(&mut self, d: Reg, s1: Reg, s2: Reg) -> Self::ReturnTy {
-        match (d, s1, s2) {
-            // 0 = s1 % s2
-            (Z, _, _) => self.nop(),
-            // d = 0 % s2
-            (_, Z, _) => self.clear_reg(d),
-            // d = s1 % 0
-            (_, _, Z) => self.nop(),
-            _ => {
-                self.trap()?; // TODO
-            }
-        }
-
+        self.div_rem(d, s1, s2, DivRem::Rem, Signedness::Signed);
         Ok(())
     }
 
