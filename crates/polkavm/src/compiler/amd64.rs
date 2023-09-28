@@ -308,7 +308,6 @@ impl<'a> Compiler<'a> {
     }
 
     fn branch(&mut self, s1: Reg, s2: Reg, imm: u32, mut condition: Condition) {
-        let mut invert = false;
         match (s1, s2) {
             (Z, Z) => {
                 let should_jump = match condition {
@@ -335,23 +334,19 @@ impl<'a> Compiler<'a> {
             }
             (Z, _) => {
                 self.push(cmp_imm(self.reg_size(), conv_reg(s2), 0));
-                invert = true;
+                condition = match condition {
+                    Condition::Equal => Condition::Equal,
+                    Condition::NotEqual => Condition::NotEqual,
+                    Condition::Below => Condition::Above,
+                    Condition::AboveOrEqual => Condition::BelowOrEqual,
+                    Condition::Less => Condition::Greater,
+                    Condition::GreaterOrEqual => Condition::LessOrEqual,
+                    _ => unreachable!(),
+                };
             }
             (_, _) => {
                 self.push(cmp(self.reg_size(), conv_reg(s1), conv_reg(s2)));
             }
-        }
-
-        if invert {
-            condition = match condition {
-                Condition::Equal => Condition::NotEqual,
-                Condition::NotEqual => Condition::Equal,
-                Condition::Below => Condition::AboveOrEqual,
-                Condition::AboveOrEqual => Condition::Below,
-                Condition::Less => Condition::GreaterOrEqual,
-                Condition::GreaterOrEqual => Condition::Less,
-                _ => unreachable!(),
-            };
         }
 
         let label = self.get_or_forward_declare_label(imm);
