@@ -10,7 +10,7 @@ use polkavm_common::zygote::{
 };
 use polkavm_linux_sandbox::{ExecuteArgs, Sandbox, SandboxAccess, SandboxConfig, SandboxProgram, SandboxProgramInit};
 
-use crate::api::{BackendAccess, Module, OnHostcall};
+use crate::api::{BackendAccess, ExecutionConfig, Module, OnHostcall};
 use crate::error::{bail, Error};
 
 pub const IS_SUPPORTED: bool = true;
@@ -307,7 +307,7 @@ impl CompiledInstance {
         export_index: usize,
         on_hostcall: OnHostcall,
         args: &[u32],
-        reset_memory_after_execution: bool,
+        config: &ExecutionConfig,
     ) -> Result<(), ExecutionError<Error>> {
         let compiled_module = self
             .module
@@ -315,7 +315,7 @@ impl CompiledInstance {
             .expect("internal error: tried to call into a compiled instance without a compiled module");
         let address = compiled_module.export_trampolines[export_index];
         let mut exec_args = ExecuteArgs::new();
-        if reset_memory_after_execution {
+        if config.reset_memory_after_execution {
             exec_args.set_reset_memory_after_execution();
         }
         exec_args.set_call(address);

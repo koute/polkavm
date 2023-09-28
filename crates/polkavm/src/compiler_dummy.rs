@@ -1,4 +1,4 @@
-use crate::api::{Module, OnHostcall};
+use crate::api::{ExecutionConfig, Module, OnHostcall};
 use crate::error::Error;
 use polkavm_common::error::{ExecutionError, Trap};
 use polkavm_common::init::GuestProgramInit;
@@ -71,7 +71,7 @@ impl CompiledInstance {
         _export_index: usize,
         _on_hostcall: OnHostcall,
         _args: &[u32],
-        _reset_memory_after_execution: bool,
+        _config: &ExecutionConfig,
     ) -> Result<(), ExecutionError<Error>> {
         unimplemented!();
     }

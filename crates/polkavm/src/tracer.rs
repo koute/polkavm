@@ -1,4 +1,5 @@
 use crate::api::BackendAccess;
+use crate::api::ExecutionConfig;
 use crate::api::Module;
 use crate::interpreter::{InterpretedInstance, InterpreterContext};
 use crate::source_cache::SourceCache;
@@ -43,7 +44,7 @@ impl Tracer {
         }
     }
 
-    pub fn on_before_call(&mut self, export_index: usize, export: &ProgramExport, args: &[u32], reset_memory_after_execution: bool) {
+    pub fn on_before_call(&mut self, export_index: usize, export: &ProgramExport, args: &[u32], config: &ExecutionConfig) {
         let target = self
             .module
             .instruction_by_jump_target(export.address())
@@ -51,7 +52,7 @@ impl Tracer {
         log::trace!("Calling export: '{}' (at #{})", export.prototype().name(), target);
 
         if let Some(ref mut interpreter) = self.crosscheck_interpreter {
-            self.crosscheck_reset_memory_after_execution = reset_memory_after_execution;
+            self.crosscheck_reset_memory_after_execution = config.reset_memory_after_execution;
             interpreter.prepare_for_call(export_index, args);
         }
     }

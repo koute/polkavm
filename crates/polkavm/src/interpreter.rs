@@ -1,4 +1,4 @@
-use crate::api::{BackendAccess, Module, OnHostcall};
+use crate::api::{BackendAccess, ExecutionConfig, Module, OnHostcall};
 use crate::error::{bail, Error};
 use core::mem::MaybeUninit;
 use polkavm_common::abi::{VM_ADDR_RETURN_TO_HOST, VM_ADDR_USER_STACK_HIGH};
@@ -86,14 +86,14 @@ impl InterpretedInstance {
         export_index: usize,
         on_hostcall: OnHostcall,
         args: &[u32],
-        reset_memory_after_execution: bool,
+        config: &ExecutionConfig,
     ) -> Result<(), ExecutionError<Error>> {
         let mut ctx = InterpreterContext::default();
         ctx.set_on_hostcall(on_hostcall);
         self.prepare_for_call(export_index, args);
 
         let result = self.run(ctx);
-        if reset_memory_after_execution {
+        if config.reset_memory_after_execution {
             self.reset_memory();
         }
 
