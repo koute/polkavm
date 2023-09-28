@@ -420,6 +420,42 @@ impl StoreTy for u32 {
     }
 }
 
+fn divu(s1: u32, s2: u32) -> u32 {
+    if s2 == 0 {
+        u32::MAX
+    } else {
+        s1 / s2
+    }
+}
+
+fn remu(s1: u32, s2: u32) -> u32 {
+    if s2 == 0 {
+        s1
+    } else {
+        s1 % s2
+    }
+}
+
+fn div(s1: i32, s2: i32) -> i32 {
+    if s2 == 0 {
+        -1
+    } else if s1 == i32::MIN && s2 == -1 {
+        s1
+    } else {
+        s1 / s2
+    }
+}
+
+fn rem(s1: i32, s2: i32) -> i32 {
+    if s2 == 0 {
+        s1
+    } else if s1 == i32::MIN && s2 == -1 {
+        0
+    } else {
+        s1 % s2
+    }
+}
+
 impl<'a, 'b> InstructionVisitor for Visitor<'a, 'b> {
     type ReturnTy = Result<(), ExecutionError>;
 
@@ -520,19 +556,19 @@ impl<'a, 'b> InstructionVisitor for Visitor<'a, 'b> {
     }
 
     fn div_unsigned(&mut self, d: Reg, s1: Reg, s2: Reg) -> Self::ReturnTy {
-        self.set3(d, s1, s2, |s1, s2| if s2 == 0 { !0 } else { s1 / s2 })
+        self.set3(d, s1, s2, divu)
     }
 
     fn div_signed(&mut self, d: Reg, s1: Reg, s2: Reg) -> Self::ReturnTy {
-        self.set3(d, s1, s2, |s1, s2| if s2 == 0 { !0 } else { ((s1 as i32) / (s2 as i32)) as u32 })
+        self.set3(d, s1, s2, |s1, s2| div(s1 as i32, s2 as i32) as u32)
     }
 
     fn rem_unsigned(&mut self, d: Reg, s1: Reg, s2: Reg) -> Self::ReturnTy {
-        self.set3(d, s1, s2, |s1, s2| if s2 == 0 { 0 } else { s1 % s2 })
+        self.set3(d, s1, s2, remu)
     }
 
     fn rem_signed(&mut self, d: Reg, s1: Reg, s2: Reg) -> Self::ReturnTy {
-        self.set3(d, s1, s2, |s1, s2| if s2 == 0 { 0 } else { ((s1 as i32) % (s2 as i32)) as u32 })
+        self.set3(d, s1, s2, |s1, s2| rem(s1 as i32, s2 as i32) as u32)
     }
 
     fn set_less_than_unsigned_imm(&mut self, d: Reg, s: Reg, i: u32) -> Self::ReturnTy {
@@ -658,4 +694,23 @@ impl<'a, 'b> InstructionVisitor for Visitor<'a, 'b> {
         self.inner.pc = next_pc;
         Ok(())
     }
+}
+
+#[test]
+fn test_div_rem() {
+    assert_eq!(divu(10, 2), 5);
+    assert_eq!(divu(10, 0), u32::MAX);
+
+    assert_eq!(div(10, 2), 5);
+    assert_eq!(div(10, 0), -1);
+    assert_eq!(div(i32::MIN, -1), i32::MIN);
+
+    assert_eq!(remu(10, 9), 1);
+    assert_eq!(remu(10, 5), 0);
+    assert_eq!(remu(10, 0), 10);
+
+    assert_eq!(rem(10, 9), 1);
+    assert_eq!(rem(10, 5), 0);
+    assert_eq!(rem(10, 0), 10);
+    assert_eq!(rem(i32::MIN, -1), 0);
 }
