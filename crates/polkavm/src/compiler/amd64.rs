@@ -395,7 +395,7 @@ impl<'a> Compiler<'a> {
                         RegSize::R64 => todo!(),
                     }
 
-                    self.asm.define_label(label_normal);
+                    self.define_label(label_normal);
                 }
 
                 if s1 == Reg::Zero {
@@ -450,14 +450,14 @@ impl<'a> Compiler<'a> {
                 // Go to the next instruction.
                 self.push(jmp_label8(label_next));
 
-                self.asm.define_label(label_divisor_is_zero);
+                self.define_label(label_divisor_is_zero);
                 match div_rem {
                     DivRem::Div => self.fill_with_ones(d),
                     DivRem::Rem if d == s1 => {}
                     DivRem::Rem => self.mov(d, s1),
                 }
 
-                self.asm.define_label(label_next);
+                self.define_label(label_next);
             }
         }
     }
@@ -521,7 +521,7 @@ impl<'a> Compiler<'a> {
 
     pub(crate) fn emit_ecall_trampoline(&mut self) {
         log::trace!("Emitting trampoline: ecall");
-        self.asm.define_label(self.ecall_label);
+        self.define_label(self.ecall_label);
 
         self.push(push(TMP_REG)); // Save the ecall number.
         self.save_registers_to_vmctx();
@@ -535,7 +535,7 @@ impl<'a> Compiler<'a> {
 
     pub(crate) fn emit_trace_trampoline(&mut self) {
         log::trace!("Emitting trampoline: trace");
-        self.asm.define_label(self.trace_label);
+        self.define_label(self.trace_label);
 
         self.push(push(TMP_REG)); // Save the instruction number.
         self.save_registers_to_vmctx();
@@ -550,7 +550,7 @@ impl<'a> Compiler<'a> {
 
     pub(crate) fn emit_trap_trampoline(&mut self) {
         log::trace!("Emitting trampoline: trap");
-        self.asm.define_label(self.trap_label);
+        self.define_label(self.trap_label);
 
         self.save_registers_to_vmctx();
         self.push(load64_imm(TMP_REG, VM_ADDR_SYSCALL));
@@ -561,6 +561,11 @@ impl<'a> Compiler<'a> {
     pub(crate) fn trace_execution(&mut self, nth_instruction: usize) {
         self.push(load32_imm(TMP_REG, nth_instruction as u32));
         self.push(call_label32(self.trace_label));
+    }
+
+    fn define_label(&mut self, label: Label) {
+        log::trace!("label: {}", label);
+        self.asm.define_label(label);
     }
 }
 
@@ -577,9 +582,8 @@ impl<'a> InstructionVisitor for Compiler<'a> {
             .pc_to_label_pending
             .remove(&pcrel)
             .unwrap_or_else(|| self.asm.forward_declare_label());
-        log::trace!("label: {}", label);
 
-        self.asm.define_label(label);
+        self.define_label(label);
         if self.pc_to_label.insert(pcrel, label).is_some() {
             // TODO: Make the jump target numbering implicit, and then this won't be necessary.
             log::debug!("Duplicate jump target label: 0x{:x}", pcrel);
