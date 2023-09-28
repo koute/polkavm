@@ -16,8 +16,12 @@ pub(crate) struct InterpretedModule {
 
 impl InterpretedModule {
     pub fn new(init: GuestProgramInit) -> Result<Self, Error> {
+        let memory_config = init.memory_config().map_err(Error::from_static_str)?;
+        let mut ro_data: Vec<_> = init.ro_data().into();
+        ro_data.resize(memory_config.ro_data_size() as usize, 0);
+
         Ok(InterpretedModule {
-            ro_data: init.ro_data().into(),
+            ro_data,
             rw_data: init.rw_data().into(),
         })
     }
