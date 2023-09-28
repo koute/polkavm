@@ -641,7 +641,7 @@ impl<'a, 'b> InstructionVisitor for Visitor<'a, 'b> {
         }
 
         if target % 4 != 0 {
-            log::error!("Found a jump with a misaligned target!");
+            log::error!("Found a jump with a misaligned target: target = {target}");
             return Err(ExecutionError::Trap(Default::default()));
         }
 
