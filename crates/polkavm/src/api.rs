@@ -289,6 +289,16 @@ impl Module {
             memory_config: init.memory_config().map_err(Error::from_static_str)?,
         })))
     }
+
+    /// The address at where the program's stack starts inside of the VM.
+    pub fn stack_address_low(&self) -> u32 {
+        self.0.memory_config.stack_address_low()
+    }
+
+    /// The address at where the program's stack ends inside of the VM.
+    pub fn stack_address_high(&self) -> u32 {
+        self.0.memory_config.stack_address_high()
+    }
 }
 
 #[derive(Clone)]
