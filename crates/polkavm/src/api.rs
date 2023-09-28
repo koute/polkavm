@@ -10,7 +10,7 @@ use polkavm_common::abi::{VM_ADDR_RETURN_TO_HOST, VM_ADDR_USER_STACK_HIGH};
 use polkavm_common::error::Trap;
 use polkavm_common::init::GuestProgramInit;
 use polkavm_common::program::{ExternFnPrototype, ExternTy, ProgramBlob, ProgramExport, ProgramImport};
-use polkavm_common::program::{Opcode, RawInstruction, Reg};
+use polkavm_common::program::{FrameKind, Opcode, RawInstruction, Reg};
 use polkavm_common::utils::{Access, AsUninitSliceMut};
 
 use crate::caller::{Caller, CallerRaw};
@@ -317,6 +317,48 @@ impl Module {
     /// The address at where the program's stack ends inside of the VM.
     pub fn stack_address_high(&self) -> u32 {
         self.0.memory_config.stack_address_high()
+    }
+
+    pub(crate) fn debug_print_location(&self, log_level: log::Level, pc: u32) {
+        log::log!(log_level, "  At #{pc}:");
+
+        let Some(blob) = self.blob() else {
+            log::log!(log_level, "    (no location available)");
+            return;
+        };
+
+        let Ok(Some(mut line_program)) = blob.get_debug_line_program_at(pc) else {
+            log::log!(log_level, "    (no location available)");
+            return;
+        };
+
+        for _ in 0..128 {
+            // Have an upper bound on the number of iterations, just in case.
+            let region_info = match line_program.run() {
+                Ok(Some(region_info)) => region_info,
+                Ok(None) | Err(..) => break,
+            };
+
+            if !region_info.instruction_range().contains(&pc) {
+                continue;
+            }
+
+            for frame in region_info.frames() {
+                let kind = match frame.kind() {
+                    FrameKind::Enter => 'f',
+                    FrameKind::Call => 'c',
+                    FrameKind::Line => 'l',
+                };
+
+                if let Ok(full_name) = frame.full_name() {
+                    if let Ok(Some(location)) = frame.location() {
+                        log::log!(log_level, "    ({kind}) '{full_name}' [{location}]");
+                    } else {
+                        log::log!(log_level, "    ({kind}) '{full_name}'");
+                    }
+                }
+            }
+        }
     }
 }
 

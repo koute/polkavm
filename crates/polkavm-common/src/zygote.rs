@@ -64,7 +64,7 @@ pub const VM_ADDR_NATIVE_STACK_HIGH: u64 = VM_ADDR_NATIVE_STACK_LOW + VM_ADDR_NA
 ///
 /// This does *not* affect the VM ABI and can be changed at will,
 /// but should be high enough that it's never hit.
-pub const VM_COMPILER_MAXIMUM_INSTRUCTION_LENGTH: u32 = 32;
+pub const VM_COMPILER_MAXIMUM_INSTRUCTION_LENGTH: u32 = 53;
 
 /// The maximum number of native code bytes that can be emitted as an epilogue.
 ///

@@ -937,8 +937,8 @@ pub struct ProgramBlob<'a> {
     code: Range<usize>,
 
     debug_strings: Range<usize>,
-    debug_function_ranges: Range<usize>,
-    debug_function_info: Range<usize>,
+    debug_line_program_ranges: Range<usize>,
+    debug_line_programs: Range<usize>,
 }
 
 #[derive(Clone)]
@@ -1103,8 +1103,12 @@ impl<'a> ProgramBlob<'a> {
         reader.read_section_range_into(&mut section, &mut program.exports, SECTION_EXPORTS)?;
         reader.read_section_range_into(&mut section, &mut program.code, SECTION_CODE)?;
         reader.read_section_range_into(&mut section, &mut program.debug_strings, SECTION_OPT_DEBUG_STRINGS)?;
-        reader.read_section_range_into(&mut section, &mut program.debug_function_info, SECTION_OPT_DEBUG_FUNCTION_INFO)?;
-        reader.read_section_range_into(&mut section, &mut program.debug_function_ranges, SECTION_OPT_DEBUG_FUNCTION_RANGES)?;
+        reader.read_section_range_into(&mut section, &mut program.debug_line_programs, SECTION_OPT_DEBUG_LINE_PROGRAMS)?;
+        reader.read_section_range_into(
+            &mut section,
+            &mut program.debug_line_program_ranges,
+            SECTION_OPT_DEBUG_LINE_PROGRAM_RANGES,
+        )?;
 
         while (section & 0b10000000) != 0 {
             // We don't know this section, but it's optional, so just skip it.
@@ -1312,27 +1316,28 @@ impl<'a> ProgramBlob<'a> {
         }
     }
 
-    fn get_debug_string(&self, offset: u32) -> Result<&str, ProgramParseError> {
+    /// Returns the debug string for the given relative offset.
+    pub fn get_debug_string(&self, offset: u32) -> Result<&str, ProgramParseError> {
         let mut reader = self.get_section_reader(self.debug_strings.clone());
         reader.skip(offset)?;
         reader.read_string_with_length()
     }
 
-    /// Returns the debug info for the function corresponding to the given instruction.
-    pub fn get_function_debug_info(&self, nth_instruction: u32) -> Result<Option<FunctionInfo>, ProgramParseError> {
-        if self.debug_function_ranges.is_empty() || self.debug_function_info.is_empty() {
+    /// Returns the line program for the given instruction.
+    pub fn get_debug_line_program_at(&self, nth_instruction: u32) -> Result<Option<LineProgram>, ProgramParseError> {
+        if self.debug_line_program_ranges.is_empty() || self.debug_line_programs.is_empty() {
             return Ok(None);
         }
 
-        if self.blob[self.debug_function_info.start] != VERSION_DEBUG_FUNCTION_INFO_V1 {
+        if self.blob[self.debug_line_programs.start] != VERSION_DEBUG_LINE_PROGRAM_V1 {
             return Err(ProgramParseError(ProgramParseErrorKind::Other(
-                "the debug function info section has an unsupported version",
+                "the debug line programs section has an unsupported version",
             )));
         }
 
         const ENTRY_SIZE: usize = 12;
 
-        let slice = &self.blob[self.debug_function_ranges.clone()];
+        let slice = &self.blob[self.debug_line_program_ranges.clone()];
         if slice.len() % ENTRY_SIZE != 0 {
             return Err(ProgramParseError(ProgramParseErrorKind::Other(
                 "the debug function ranges section has an invalid size",
@@ -1366,20 +1371,19 @@ impl<'a> ProgramBlob<'a> {
             )));
         }
 
-        let mut reader = self.get_section_reader(self.debug_function_info.clone());
+        let mut reader = self.get_section_reader(self.debug_line_programs.clone());
         reader.skip(info_offset)?;
 
-        let common_info = FunctionInfoCommon::read(self, &mut reader)?;
-        let inline_frame_count = reader.read_varint()?;
-
-        Ok(Some(FunctionInfo {
-            blob: self,
+        Ok(Some(LineProgram {
             entry_index: offset / ENTRY_SIZE,
-            index_begin,
-            index_end,
-            common_info,
-            inline_frame_count,
-            inline_reader: reader,
+            region_counter: 0,
+            blob: self,
+            reader,
+            is_finished: false,
+            program_counter: index_begin,
+            stack: Default::default(),
+            stack_depth: 0,
+            mutation_depth: 0,
         }))
     }
 
@@ -1399,85 +1403,372 @@ impl<'a> ProgramBlob<'a> {
             code: self.code,
 
             debug_strings: self.debug_strings,
-            debug_function_ranges: self.debug_function_ranges,
-            debug_function_info: self.debug_function_info,
+            debug_line_program_ranges: self.debug_line_program_ranges,
+            debug_line_programs: self.debug_line_programs,
         }
     }
 }
 
 /// The source location.
 #[derive(Copy, Clone, PartialEq, Eq, Debug)]
-pub enum Location<'a> {
+pub enum SourceLocation<'a> {
     Path { path: &'a str },
     PathAndLine { path: &'a str, line: u32 },
     Full { path: &'a str, line: u32, column: u32 },
 }
 
-impl<'a> Location<'a> {
+impl<'a> SourceLocation<'a> {
     /// The path to the original source file.
     pub fn path(&self) -> &'a str {
         match *self {
-            Location::Path { path, .. } => path,
-            Location::PathAndLine { path, .. } => path,
-            Location::Full { path, .. } => path,
+            Self::Path { path, .. } => path,
+            Self::PathAndLine { path, .. } => path,
+            Self::Full { path, .. } => path,
         }
     }
 
     /// The line in the original source file.
     pub fn line(&self) -> Option<u32> {
         match *self {
-            Location::Path { .. } => None,
-            Location::PathAndLine { line, .. } => Some(line),
-            Location::Full { line, .. } => Some(line),
+            Self::Path { .. } => None,
+            Self::PathAndLine { line, .. } => Some(line),
+            Self::Full { line, .. } => Some(line),
         }
     }
 
     /// The column in the original source file.
     pub fn column(&self) -> Option<u32> {
         match *self {
-            Location::Path { .. } => None,
-            Location::PathAndLine { .. } => None,
-            Location::Full { column, .. } => Some(column),
+            Self::Path { .. } => None,
+            Self::PathAndLine { .. } => None,
+            Self::Full { column, .. } => Some(column),
         }
     }
 }
 
-impl<'a> core::fmt::Display for Location<'a> {
+impl<'a> core::fmt::Display for SourceLocation<'a> {
     fn fmt(&self, fmt: &mut core::fmt::Formatter) -> core::fmt::Result {
         match self {
-            Location::Path { path } => fmt.write_str(path),
-            Location::PathAndLine { path, line } => write!(fmt, "{}:{}", path, line),
-            Location::Full { path, line, column } => write!(fmt, "{}:{}:{}", path, line, column),
+            Self::Path { path } => fmt.write_str(path),
+            Self::PathAndLine { path, line } => write!(fmt, "{}:{}", path, line),
+            Self::Full { path, line, column } => write!(fmt, "{}:{}:{}", path, line, column),
         }
     }
 }
 
-struct FunctionInfoCommon<'a> {
-    name_prefix: &'a str,
-    name_suffix: &'a str,
-    path: &'a str,
+#[derive(Copy, Clone, PartialEq, Eq, Debug, Hash)]
+pub enum FrameKind {
+    Enter,
+    Call,
+    Line,
+}
+
+pub struct FrameInfo<'a> {
+    blob: &'a ProgramBlob<'a>,
+    inner: &'a LineProgramFrame,
+}
+
+impl<'a> FrameInfo<'a> {
+    /// Returns the namespace of this location, if available.
+    pub fn namespace(&self) -> Result<Option<&str>, ProgramParseError> {
+        let namespace = self.blob.get_debug_string(self.inner.namespace_offset)?;
+        if namespace.is_empty() {
+            Ok(None)
+        } else {
+            Ok(Some(namespace))
+        }
+    }
+
+    /// Returns the function name of location without the namespace, if available.
+    pub fn function_name_without_namespace(&self) -> Result<Option<&str>, ProgramParseError> {
+        let function_name = self.blob.get_debug_string(self.inner.function_name_offset)?;
+        if function_name.is_empty() {
+            Ok(None)
+        } else {
+            Ok(Some(function_name))
+        }
+    }
+
+    /// Returns the offset into the debug strings section containing the source code path of this location, if available.
+    pub fn path_debug_string_offset(&self) -> Option<u32> {
+        if self.inner.path_offset == 0 {
+            None
+        } else {
+            Some(self.inner.path_offset)
+        }
+    }
+
+    /// Returns the source code path of this location, if available.
+    pub fn path(&self) -> Result<Option<&str>, ProgramParseError> {
+        let path = self.blob.get_debug_string(self.inner.path_offset)?;
+        if path.is_empty() {
+            Ok(None)
+        } else {
+            Ok(Some(path))
+        }
+    }
+
+    /// Returns the source code line of this location, if available.
+    pub fn line(&self) -> Option<u32> {
+        if self.inner.line == 0 {
+            None
+        } else {
+            Some(self.inner.line)
+        }
+    }
+
+    /// Returns the source code column of this location, if available.
+    pub fn column(&self) -> Option<u32> {
+        if self.inner.column == 0 {
+            None
+        } else {
+            Some(self.inner.column)
+        }
+    }
+
+    pub fn kind(&self) -> FrameKind {
+        self.inner.kind.unwrap_or(FrameKind::Line)
+    }
+
+    /// Returns the full name of the function.
+    pub fn full_name(&'_ self) -> Result<impl core::fmt::Display + '_, ProgramParseError> {
+        Ok(DisplayName {
+            prefix: self.namespace()?.unwrap_or(""),
+            suffix: self.function_name_without_namespace()?.unwrap_or(""),
+        })
+    }
+
+    /// Returns the source location of where this frame comes from.
+    pub fn location(&self) -> Result<Option<SourceLocation>, ProgramParseError> {
+        if let Some(path) = self.path()? {
+            if let Some(line) = self.line() {
+                if let Some(column) = self.column() {
+                    Ok(Some(SourceLocation::Full { path, line, column }))
+                } else {
+                    Ok(Some(SourceLocation::PathAndLine { path, line }))
+                }
+            } else {
+                Ok(Some(SourceLocation::Path { path }))
+            }
+        } else {
+            Ok(None)
+        }
+    }
+}
+
+/// Debug information about a given region of bytecode.
+pub struct RegionInfo<'a> {
+    entry_index: usize,
+    blob: &'a ProgramBlob<'a>,
+    range: Range<u32>,
+    frames: &'a [LineProgramFrame],
+}
+
+impl<'a> RegionInfo<'a> {
+    /// Returns the entry index of this region info within the parent line program object.
+    pub fn entry_index(&self) -> usize {
+        self.entry_index
+    }
+
+    /// The range of instructions this region covers.
+    pub fn instruction_range(&self) -> Range<u32> {
+        self.range.clone()
+    }
+
+    /// Returns an iterator over the frames this region covers.
+    pub fn frames(&self) -> impl ExactSizeIterator<Item = FrameInfo> {
+        self.frames.iter().map(|inner| FrameInfo { blob: self.blob, inner })
+    }
+}
+
+#[derive(Default)]
+struct LineProgramFrame {
+    kind: Option<FrameKind>,
+    namespace_offset: u32,
+    function_name_offset: u32,
+    path_offset: u32,
     line: u32,
     column: u32,
 }
 
-/// Function debug info.
-pub struct FunctionInfo<'a> {
-    blob: &'a ProgramBlob<'a>,
+/// A line program state machine.
+pub struct LineProgram<'a> {
     entry_index: usize,
-    index_begin: u32,
-    index_end: u32,
-    common_info: FunctionInfoCommon<'a>,
-    inline_frame_count: u32,
-    inline_reader: Reader<'a>,
+    region_counter: usize,
+    blob: &'a ProgramBlob<'a>,
+    reader: Reader<'a>,
+    is_finished: bool,
+    program_counter: u32,
+    // Support inline call stacks ~16 frames deep. Picked entirely arbitrarily.
+    stack: [LineProgramFrame; 16],
+    stack_depth: u32,
+    mutation_depth: u32,
 }
 
-/// Inlined function debug info.
-pub struct InlineFunctionInfo<'a> {
-    index_base: u32,
-    rel_index_begin: u32,
-    rel_index_end: u32,
-    depth: u32,
-    common_info: FunctionInfoCommon<'a>,
+impl<'a> LineProgram<'a> {
+    /// Returns the entry index of this line program object.
+    pub fn entry_index(&self) -> usize {
+        self.entry_index
+    }
+
+    /// Runs the line program until the next region becomes available, or until the program ends.
+    pub fn run(&mut self) -> Result<Option<RegionInfo>, ProgramParseError> {
+        struct SetTrueOnDrop<'a>(&'a mut bool);
+        impl<'a> Drop for SetTrueOnDrop<'a> {
+            fn drop(&mut self) {
+                *self.0 = true;
+            }
+        }
+
+        if self.is_finished {
+            return Ok(None);
+        }
+
+        // Put an upper limit to how many instructions we'll process.
+        const INSTRUCTION_LIMIT_PER_REGION: usize = 128;
+
+        let mark_as_finished_on_drop = SetTrueOnDrop(&mut self.is_finished);
+        for _ in 0..INSTRUCTION_LIMIT_PER_REGION {
+            let byte = match self.reader.read_byte() {
+                Ok(byte) => byte,
+                Err(error) => {
+                    return Err(error);
+                }
+            };
+
+            let Some(opcode) = LineProgramOp::from_u8(byte) else {
+                return Err(ProgramParseError(ProgramParseErrorKind::Other(
+                    "found an unrecognized line program opcode",
+                )));
+            };
+
+            let (count, stack_depth) = match opcode {
+                LineProgramOp::FinishProgram => {
+                    return Ok(None);
+                }
+                LineProgramOp::SetMutationDepth => {
+                    self.mutation_depth = self.reader.read_varint()?;
+                    continue;
+                }
+                LineProgramOp::SetKindEnter => {
+                    if let Some(frame) = self.stack.get_mut(self.mutation_depth as usize) {
+                        frame.kind = Some(FrameKind::Enter);
+                    }
+                    continue;
+                }
+                LineProgramOp::SetKindCall => {
+                    if let Some(frame) = self.stack.get_mut(self.mutation_depth as usize) {
+                        frame.kind = Some(FrameKind::Call);
+                    }
+                    continue;
+                }
+                LineProgramOp::SetKindLine => {
+                    if let Some(frame) = self.stack.get_mut(self.mutation_depth as usize) {
+                        frame.kind = Some(FrameKind::Line);
+                    }
+                    continue;
+                }
+                LineProgramOp::SetNamespace => {
+                    if let Some(frame) = self.stack.get_mut(self.mutation_depth as usize) {
+                        frame.namespace_offset = self.reader.read_varint()?;
+                    }
+                    continue;
+                }
+                LineProgramOp::SetFunctionName => {
+                    if let Some(frame) = self.stack.get_mut(self.mutation_depth as usize) {
+                        frame.function_name_offset = self.reader.read_varint()?;
+                    }
+                    continue;
+                }
+                LineProgramOp::SetPath => {
+                    if let Some(frame) = self.stack.get_mut(self.mutation_depth as usize) {
+                        frame.path_offset = self.reader.read_varint()?;
+                    }
+                    continue;
+                }
+                LineProgramOp::SetLine => {
+                    if let Some(frame) = self.stack.get_mut(self.mutation_depth as usize) {
+                        frame.line = self.reader.read_varint()?;
+                    }
+                    continue;
+                }
+                LineProgramOp::SetColumn => {
+                    if let Some(frame) = self.stack.get_mut(self.mutation_depth as usize) {
+                        frame.column = self.reader.read_varint()?;
+                    }
+                    continue;
+                }
+                LineProgramOp::SetStackDepth => {
+                    self.stack_depth = self.reader.read_varint()?;
+                    continue;
+                }
+                LineProgramOp::IncrementLine => {
+                    if let Some(frame) = self.stack.get_mut(self.mutation_depth as usize) {
+                        frame.line += 1;
+                    }
+                    continue;
+                }
+                LineProgramOp::AddLine => {
+                    if let Some(frame) = self.stack.get_mut(self.mutation_depth as usize) {
+                        frame.line = frame.line.wrapping_add(self.reader.read_varint()?);
+                    }
+                    continue;
+                }
+                LineProgramOp::SubLine => {
+                    if let Some(frame) = self.stack.get_mut(self.mutation_depth as usize) {
+                        frame.line = frame.line.wrapping_sub(self.reader.read_varint()?);
+                    }
+                    continue;
+                }
+                LineProgramOp::FinishInstruction => (1, self.stack_depth),
+                LineProgramOp::FinishMultipleInstructions => {
+                    let count = self.reader.read_varint()?;
+                    (count, self.stack_depth)
+                }
+                LineProgramOp::FinishInstructionAndIncrementStackDepth => {
+                    let depth = self.stack_depth;
+                    self.stack_depth = self.stack_depth.saturating_add(1);
+                    (1, depth)
+                }
+                LineProgramOp::FinishMultipleInstructionsAndIncrementStackDepth => {
+                    let count = self.reader.read_varint()?;
+                    let depth = self.stack_depth;
+                    self.stack_depth = self.stack_depth.saturating_add(1);
+                    (count, depth)
+                }
+                LineProgramOp::FinishInstructionAndDecrementStackDepth => {
+                    let depth = self.stack_depth;
+                    self.stack_depth = self.stack_depth.saturating_sub(1);
+                    (1, depth)
+                }
+                LineProgramOp::FinishMultipleInstructionsAndDecrementStackDepth => {
+                    let count = self.reader.read_varint()?;
+                    let depth = self.stack_depth;
+                    self.stack_depth = self.stack_depth.saturating_sub(1);
+                    (count, depth)
+                }
+            };
+
+            let range = self.program_counter..self.program_counter + count;
+            self.program_counter += count;
+
+            let frames = &self.stack[..core::cmp::min(stack_depth as usize, self.stack.len())];
+            core::mem::forget(mark_as_finished_on_drop);
+
+            let entry_index = self.region_counter;
+            self.region_counter += 1;
+            return Ok(Some(RegionInfo {
+                entry_index,
+                blob: self.blob,
+                range,
+                frames,
+            }));
+        }
+
+        Err(ProgramParseError(ProgramParseErrorKind::Other(
+            "found a line program with too many instructions",
+        )))
+    }
 }
 
 struct DisplayName<'a> {
@@ -1492,150 +1783,6 @@ impl<'a> core::fmt::Display for DisplayName<'a> {
             fmt.write_str("::")?;
         }
         fmt.write_str(self.suffix)
-    }
-}
-
-impl<'a> FunctionInfoCommon<'a> {
-    fn read(blob: &'a ProgramBlob<'a>, reader: &mut Reader<'a>) -> Result<Self, ProgramParseError> {
-        let name_prefix_offset = reader.read_varint()?;
-        let name_suffix_offset = reader.read_varint()?;
-        let path_offset = reader.read_varint()?;
-        let line = reader.read_varint()?;
-        let column = reader.read_varint()?;
-
-        let name_prefix = blob.get_debug_string(name_prefix_offset)?;
-        let name_suffix = blob.get_debug_string(name_suffix_offset)?;
-        let path = blob.get_debug_string(path_offset)?;
-
-        Ok(Self {
-            name_prefix,
-            name_suffix,
-            path,
-            line,
-            column,
-        })
-    }
-
-    fn location(&self) -> Option<Location<'a>> {
-        if !self.path.is_empty() {
-            if self.line != 0 {
-                if self.column != 0 {
-                    Some(Location::Full {
-                        path: self.path,
-                        line: self.line,
-                        column: self.column,
-                    })
-                } else {
-                    Some(Location::PathAndLine {
-                        path: self.path,
-                        line: self.line,
-                    })
-                }
-            } else {
-                Some(Location::Path { path: self.path })
-            }
-        } else {
-            None
-        }
-    }
-}
-
-impl<'a> FunctionInfo<'a> {
-    /// Returns the entry index of this function info object.
-    pub fn entry_index(&self) -> usize {
-        self.entry_index
-    }
-
-    /// The range of instruction indexes this function covers.
-    pub fn instruction_range(&self) -> Range<u32> {
-        self.index_begin..self.index_end
-    }
-
-    /// The name of the function.
-    pub fn full_name(&self) -> impl core::fmt::Display + 'a {
-        DisplayName {
-            prefix: self.common_info.name_prefix,
-            suffix: self.common_info.name_suffix,
-        }
-    }
-
-    /// Return the source location of where the function is defined.
-    pub fn location(&self) -> Option<Location<'a>> {
-        self.common_info.location()
-    }
-
-    /// Returns an iterator over frames which were inlined into this function.
-    pub fn inlined(&self) -> impl Iterator<Item = Result<InlineFunctionInfo, ProgramParseError>> {
-        struct InlineIter<'a> {
-            index_base: u32,
-            blob: &'a ProgramBlob<'a>,
-            remaining: usize,
-            reader: Reader<'a>,
-        }
-
-        impl<'a> InlineIter<'a> {
-            fn read_next(&mut self) -> Result<Option<InlineFunctionInfo<'a>>, ProgramParseError> {
-                if self.remaining == 0 {
-                    return Ok(None);
-                }
-
-                let next_remaining = core::mem::replace(&mut self.remaining, 0) - 1;
-                let rel_index_begin = self.reader.read_varint()?;
-                let rel_index_end = self.reader.read_varint()?;
-                let depth = self.reader.read_varint()?;
-                let common_info = FunctionInfoCommon::read(self.blob, &mut self.reader)?;
-
-                let info = InlineFunctionInfo {
-                    index_base: self.index_base,
-                    rel_index_begin,
-                    rel_index_end,
-                    depth,
-                    common_info,
-                };
-
-                self.remaining = next_remaining;
-                Ok(Some(info))
-            }
-        }
-
-        impl<'a> Iterator for InlineIter<'a> {
-            type Item = Result<InlineFunctionInfo<'a>, ProgramParseError>;
-            fn next(&mut self) -> Option<Self::Item> {
-                self.read_next().transpose()
-            }
-        }
-
-        InlineIter {
-            index_base: self.index_begin,
-            blob: self.blob,
-            remaining: self.inline_frame_count as usize,
-            reader: self.inline_reader.clone(),
-        }
-    }
-}
-
-impl<'a> InlineFunctionInfo<'a> {
-    /// The range of instruction indexes this inline function covers.
-    pub fn instruction_range(&self) -> Range<u32> {
-        self.index_base + self.rel_index_begin..self.index_base + self.rel_index_end
-    }
-
-    /// The name of the function.
-    pub fn full_name(&self) -> impl core::fmt::Display + 'a {
-        DisplayName {
-            prefix: self.common_info.name_prefix,
-            suffix: self.common_info.name_suffix,
-        }
-    }
-
-    /// Returns the source location of the inline frame.
-    pub fn location(&self) -> Option<Location<'a>> {
-        self.common_info.location()
-    }
-
-    /// Returns the depth of the inline frame.
-    pub fn depth(&self) -> u32 {
-        self.depth
     }
 }
 
@@ -1727,10 +1874,63 @@ pub const SECTION_IMPORTS: u8 = 4;
 pub const SECTION_EXPORTS: u8 = 5;
 pub const SECTION_CODE: u8 = 6;
 pub const SECTION_OPT_DEBUG_STRINGS: u8 = 128;
-pub const SECTION_OPT_DEBUG_FUNCTION_INFO: u8 = 129;
-pub const SECTION_OPT_DEBUG_FUNCTION_RANGES: u8 = 130;
+pub const SECTION_OPT_DEBUG_LINE_PROGRAMS: u8 = 129;
+pub const SECTION_OPT_DEBUG_LINE_PROGRAM_RANGES: u8 = 130;
 pub const SECTION_END_OF_FILE: u8 = 0;
 
 pub const BLOB_VERSION_V1: u8 = 1;
 
-pub const VERSION_DEBUG_FUNCTION_INFO_V1: u8 = 1;
+pub const VERSION_DEBUG_LINE_PROGRAM_V1: u8 = 1;
+
+#[derive(Copy, Clone, Debug)]
+pub enum LineProgramOp {
+    FinishProgram = 0,
+    SetMutationDepth = 1,
+    SetKindEnter = 2,
+    SetKindCall = 3,
+    SetKindLine = 4,
+    SetNamespace = 5,
+    SetFunctionName = 6,
+    SetPath = 7,
+    SetLine = 8,
+    SetColumn = 9,
+    SetStackDepth = 10,
+    IncrementLine = 11,
+    AddLine = 12,
+    SubLine = 13,
+    FinishInstruction = 14,
+    FinishMultipleInstructions = 15,
+    FinishInstructionAndIncrementStackDepth = 16,
+    FinishMultipleInstructionsAndIncrementStackDepth = 17,
+    FinishInstructionAndDecrementStackDepth = 18,
+    FinishMultipleInstructionsAndDecrementStackDepth = 19,
+}
+
+impl LineProgramOp {
+    #[inline]
+    pub const fn from_u8(value: u8) -> Option<Self> {
+        match value {
+            0 => Some(Self::FinishProgram),
+            1 => Some(Self::SetMutationDepth),
+            2 => Some(Self::SetKindEnter),
+            3 => Some(Self::SetKindCall),
+            4 => Some(Self::SetKindLine),
+            5 => Some(Self::SetNamespace),
+            6 => Some(Self::SetFunctionName),
+            7 => Some(Self::SetPath),
+            8 => Some(Self::SetLine),
+            9 => Some(Self::SetColumn),
+            10 => Some(Self::SetStackDepth),
+            11 => Some(Self::IncrementLine),
+            12 => Some(Self::AddLine),
+            13 => Some(Self::SubLine),
+            14 => Some(Self::FinishInstruction),
+            15 => Some(Self::FinishMultipleInstructions),
+            16 => Some(Self::FinishInstructionAndIncrementStackDepth),
+            17 => Some(Self::FinishMultipleInstructionsAndIncrementStackDepth),
+            18 => Some(Self::FinishInstructionAndDecrementStackDepth),
+            19 => Some(Self::FinishMultipleInstructionsAndDecrementStackDepth),
+            _ => None,
+        }
+    }
+}

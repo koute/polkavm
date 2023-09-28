@@ -58,6 +58,7 @@ pub(crate) struct InterpretedInstance {
     regs: [u32; Reg::ALL_NON_ZERO.len() + 1],
     pc: u32,
     return_to_host: bool,
+    cycle_counter: u64,
 }
 
 impl InterpretedInstance {
@@ -79,6 +80,7 @@ impl InterpretedInstance {
             regs: [0; Reg::ALL_NON_ZERO.len() + 1],
             pc: VM_ADDR_RETURN_TO_HOST,
             return_to_host: true,
+            cycle_counter: 0,
         };
 
         interpreter.reset_memory();
@@ -101,6 +103,7 @@ impl InterpretedInstance {
     pub fn run(&mut self, ctx: InterpreterContext) -> Result<(), ExecutionError<Error>> {
         let mut visitor = Visitor { inner: self, ctx };
         loop {
+            visitor.inner.cycle_counter += 1;
             let Some(instruction) = visitor.inner.module.instructions().get(visitor.inner.pc as usize).copied() else {
                 return Err(ExecutionError::Trap(Default::default()));
             };
@@ -148,6 +151,7 @@ impl InterpretedInstance {
     }
 
     pub fn step_once(&mut self, ctx: InterpreterContext) -> Result<(), ExecutionError> {
+        self.cycle_counter += 1;
         let Some(instruction) = self.module.instructions().get(self.pc as usize).copied() else {
             return Err(ExecutionError::Trap(Default::default()));
         };
@@ -323,7 +327,12 @@ impl<'a, 'b> Visitor<'a, 'b> {
         let address = self.inner.regs[base as usize].wrapping_add(offset);
         let length = core::mem::size_of::<T>() as u32;
         let Some(slice) = self.inner.get_memory_slice(address, length) else {
-            log::debug!("Load of {length} bytes from 0x{address:x} failed!");
+            log::debug!(
+                "Load of {length} bytes from 0x{address:x} failed! (pc = #{pc}, cycle = {cycle})",
+                pc = self.inner.pc,
+                cycle = self.inner.cycle_counter
+            );
+            self.inner.module.debug_print_location(log::Level::Debug, self.inner.pc);
             return Err(ExecutionError::Trap(Default::default()));
         };
 
@@ -342,7 +351,12 @@ impl<'a, 'b> Visitor<'a, 'b> {
         let address = self.inner.regs[base as usize].wrapping_add(offset);
         let length = core::mem::size_of::<T>() as u32;
         let Some(slice) = self.inner.get_memory_slice_mut(address, length) else {
-            log::debug!("Store of {length} bytes to 0x{address:x} failed!");
+            log::debug!(
+                "Store of {length} bytes to 0x{address:x} failed! (pc = #{pc}, cycle = {cycle})",
+                pc = self.inner.pc,
+                cycle = self.inner.cycle_counter
+            );
+            self.inner.module.debug_print_location(log::Level::Debug, self.inner.pc);
             return Err(ExecutionError::Trap(Default::default()));
         };
 

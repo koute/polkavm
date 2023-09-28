@@ -1,5 +1,4 @@
 use crate::program::ExternTy;
-use crate::utils::CowString;
 
 /// Custom instruction used to make an external function call.
 ///
@@ -27,6 +26,14 @@ impl<'a> Reader<'a> {
         let v = self.read(4)?;
         Ok(u32::from_le_bytes([v[0], v[1], v[2], v[3]]))
     }
+
+    pub fn offset(&self) -> usize {
+        self.bytes_consumed
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.bytes_consumed >= self.buffer.len()
+    }
 }
 
 impl<'a> From<&'a [u8]> for Reader<'a> {
@@ -37,13 +44,13 @@ impl<'a> From<&'a [u8]> for Reader<'a> {
 
 /// Function prototype metadata. Serialized by the derive macro and deserialized when relinking the ELF file.
 #[derive(Clone, PartialEq, Eq, Debug)]
-pub struct FnMetadata<'a> {
-    pub name: CowString<'a>,
+pub struct FnMetadata {
+    pub name: alloc::string::String,
     pub return_ty: Option<ExternTy>,
     pub args: [Option<ExternTy>; crate::abi::VM_MAXIMUM_EXTERN_ARG_COUNT],
 }
 
-impl<'a> FnMetadata<'a> {
+impl FnMetadata {
     pub fn args(&self) -> impl Iterator<Item = ExternTy> + '_ {
         self.args.iter().take_while(|arg| arg.is_some()).flatten().copied()
     }
@@ -66,7 +73,7 @@ impl<'a> FnMetadata<'a> {
         }
     }
 
-    fn try_deserialize(b: &mut Reader<'a>) -> Result<Self, &'static str> {
+    pub fn try_deserialize(b: &mut Reader) -> Result<Self, &'static str> {
         let name_length = b.read_u32()? as usize;
         let name = core::str::from_utf8(b.read(name_length)?).map_err(|_| "name of the import is not valid UTF-8")?;
         let return_ty = b.read_byte()?;
@@ -97,12 +104,12 @@ impl<'a> FnMetadata<'a> {
 
 /// Import metadata. Serialized by the derive macro and deserialized when relinking the ELF file.
 #[derive(Clone, PartialEq, Eq, Debug)]
-pub struct ImportMetadata<'a> {
+pub struct ImportMetadata {
     pub index: Option<u32>,
-    pub prototype: FnMetadata<'a>,
+    pub prototype: FnMetadata,
 }
 
-impl<'a> ImportMetadata<'a> {
+impl ImportMetadata {
     pub fn prototype(&self) -> &FnMetadata {
         &self.prototype
     }
@@ -119,7 +126,7 @@ impl<'a> ImportMetadata<'a> {
         self.prototype.name()
     }
 
-    pub fn try_deserialize(b: &'a [u8]) -> Result<(usize, Self), &'static str> {
+    pub fn try_deserialize(b: &[u8]) -> Result<(usize, Self), &'static str> {
         let mut b: Reader = b.into();
 
         let version = b.read_byte()?;
@@ -135,47 +142,5 @@ impl<'a> ImportMetadata<'a> {
 
         let prototype = FnMetadata::try_deserialize(&mut b)?;
         Ok((b.bytes_consumed, Self { index, prototype }))
-    }
-}
-
-/// Export metadata. Serialized by the derive macro and deserialized when relinking the ELF file.
-#[derive(Clone, PartialEq, Eq, Debug)]
-pub struct ExportMetadata<'a> {
-    pub address: u32,
-    pub prototype: FnMetadata<'a>,
-}
-
-impl<'a> ExportMetadata<'a> {
-    pub fn address(&self) -> u32 {
-        self.address
-    }
-
-    pub fn prototype(&self) -> &FnMetadata {
-        &self.prototype
-    }
-
-    pub fn args(&self) -> impl Iterator<Item = ExternTy> + '_ {
-        self.prototype.args()
-    }
-
-    pub fn return_ty(&self) -> Option<ExternTy> {
-        self.prototype.return_ty
-    }
-
-    pub fn name(&self) -> &str {
-        &self.prototype.name
-    }
-
-    pub fn try_deserialize(b: &'a [u8]) -> Result<(usize, Self), &'static str> {
-        let mut b: Reader = b.into();
-
-        let version = b.read_byte()?;
-        if version != 1 {
-            return Err("unsupported version");
-        }
-
-        let address = b.read_u32()?;
-        let prototype = FnMetadata::try_deserialize(&mut b)?;
-        Ok((b.bytes_consumed, Self { address, prototype }))
     }
 }

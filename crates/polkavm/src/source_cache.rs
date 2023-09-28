@@ -1,4 +1,3 @@
-use polkavm_common::program::Location;
 use std::borrow::Cow;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -168,10 +167,7 @@ impl SourceCache {
         }
     }
 
-    pub fn lookup_source_line(&mut self, location: Location) -> Option<&str> {
-        let line = location.line()?;
-        let path = location.path();
-
+    pub fn lookup_source_line(&mut self, path: &str, line: u32) -> Option<&str> {
         if !self.cache.contains_key(path) {
             let Some(contents) = self.read_source_file(path) else {
                 self.cache.insert(path.to_owned(), None);

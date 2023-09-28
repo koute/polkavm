@@ -1,21 +1,20 @@
 use polkavm_common::abi::{GuestMemoryConfig, VM_ADDR_USER_MEMORY, VM_PAGE_SIZE};
-use polkavm_common::elf::{ExportMetadata, FnMetadata, ImportMetadata, INSTRUCTION_ECALLI};
+use polkavm_common::elf::{FnMetadata, ImportMetadata, INSTRUCTION_ECALLI};
 use polkavm_common::program::Reg as PReg;
-use polkavm_common::program::{self, Opcode, ProgramBlob, RawInstruction};
+use polkavm_common::program::{self, FrameKind, LineProgramOp, Opcode, ProgramBlob, RawInstruction};
 use polkavm_common::utils::align_to_next_page_u64;
 use polkavm_common::varint;
 
 use std::borrow::Cow;
-use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::ops::Range;
+use std::sync::Arc;
 
-use crate::dwarf::DwarfInfo;
+use crate::dwarf::Location;
+use crate::elf::{Elf, Section, SectionIndex};
 use crate::riscv::{BranchKind, Inst, LoadKind, Reg, RegImmKind, RegRegKind, ShiftKind, StoreKind};
 
-use object::{LittleEndian, Object, ObjectSection, ObjectSymbol, SectionIndex};
-
-pub(crate) type Elf<'a> = object::read::elf::ElfFile<'a, object::elf::FileHeader32<object::endian::LittleEndian>, &'a [u8]>;
-type ElfSection<'a, 'b> = object::read::elf::ElfSection<'a, 'b, object::elf::FileHeader32<object::endian::LittleEndian>, &'a [u8]>;
+const JUMP_TARGET_MULTIPLIER: u32 = 4;
 
 #[derive(Debug)]
 pub enum ProgramFromElfErrorKind {
@@ -23,7 +22,7 @@ pub enum ProgramFromElfErrorKind {
     FailedToParseDwarf(gimli::Error),
     FailedToParseProgram(program::ProgramParseError),
     UnsupportedSection(String),
-    UnsupportedInstruction { pc: u64, instruction: u32 },
+    UnsupportedInstruction { section: String, offset: u64, instruction: u32 },
     UnsupportedRegister { reg: Reg },
 
     Other(Cow<'static, str>),
@@ -69,8 +68,15 @@ impl core::fmt::Display for ProgramFromElfError {
             ProgramFromElfErrorKind::FailedToParseDwarf(error) => write!(fmt, "failed to parse DWARF: {}", error),
             ProgramFromElfErrorKind::FailedToParseProgram(error) => write!(fmt, "{}", error),
             ProgramFromElfErrorKind::UnsupportedSection(section) => write!(fmt, "unsupported section: {}", section),
-            ProgramFromElfErrorKind::UnsupportedInstruction { pc, instruction } => {
-                write!(fmt, "unsupported instruction at 0x{:x}: 0x{:08x}", pc, instruction)
+            ProgramFromElfErrorKind::UnsupportedInstruction {
+                section,
+                offset,
+                instruction,
+            } => {
+                write!(
+                    fmt,
+                    "unsupported instruction in section '{section}' at offset 0x{offset:x}: 0x{instruction:08x}"
+                )
             }
             ProgramFromElfErrorKind::UnsupportedRegister { reg } => write!(fmt, "unsupported register: {:?}", reg),
             ProgramFromElfErrorKind::Other(message) => fmt.write_str(message),
@@ -126,16 +132,65 @@ fn decode_inst(raw_inst: u32) -> Result<Option<Inst>, ProgramFromElfError> {
     Ok(Some(op))
 }
 
-#[derive(Copy, Clone, Debug)]
-enum EndOfBlock {
-    Fallthrough { target: u64 },
-    Control { source: AddressRange, instruction: ControlInst },
+#[derive(Copy, Clone, PartialEq, Eq, PartialOrd, Ord, Debug, Hash)]
+pub(crate) struct Source {
+    pub(crate) section_index: SectionIndex,
+    pub(crate) offset_range: AddressRange,
 }
 
-#[derive(Copy, Clone, PartialEq, Eq)]
-struct AddressRange {
-    start: u64,
-    end: u64,
+impl core::fmt::Display for Source {
+    fn fmt(&self, fmt: &mut core::fmt::Formatter) -> core::fmt::Result {
+        write!(
+            fmt,
+            "<{}+{}..{}>",
+            self.section_index, self.offset_range.start, self.offset_range.end
+        )
+    }
+}
+
+impl Source {
+    fn begin(&self) -> SectionTarget {
+        SectionTarget {
+            section_index: self.section_index,
+            offset: self.offset_range.start,
+        }
+    }
+
+    fn iter(&'_ self) -> impl Iterator<Item = SectionTarget> + '_ {
+        (self.offset_range.start..self.offset_range.end)
+            .step_by(4)
+            .map(|offset| SectionTarget {
+                section_index: self.section_index,
+                offset,
+            })
+    }
+}
+
+#[derive(Copy, Clone, Debug)]
+struct EndOfBlock<T> {
+    source: Source,
+    instruction: ControlInst<T>,
+}
+
+impl<T> EndOfBlock<T> {
+    fn map_target<U, E>(self, map: impl Fn(T) -> Result<U, E>) -> Result<EndOfBlock<U>, E> {
+        Ok(EndOfBlock {
+            source: self.source,
+            instruction: self.instruction.map_target(map)?,
+        })
+    }
+}
+
+#[derive(Copy, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub(crate) struct AddressRange {
+    pub(crate) start: u64,
+    pub(crate) end: u64,
+}
+
+impl AddressRange {
+    pub(crate) fn is_empty(&self) -> bool {
+        self.end == self.start
+    }
 }
 
 impl core::fmt::Display for AddressRange {
@@ -159,34 +214,124 @@ impl From<Range<u64>> for AddressRange {
     }
 }
 
+#[derive(Copy, Clone, PartialEq, Eq, PartialOrd, Ord, Debug, Hash)]
+pub(crate) struct SectionTarget {
+    pub(crate) section_index: SectionIndex,
+    pub(crate) offset: u64,
+}
+
+impl core::fmt::Display for SectionTarget {
+    fn fmt(&self, fmt: &mut core::fmt::Formatter) -> core::fmt::Result {
+        write!(fmt, "<{}+{}>", self.section_index, self.offset)
+    }
+}
+
+impl SectionTarget {
+    fn add(self, offset: u64) -> Self {
+        SectionTarget {
+            section_index: self.section_index,
+            offset: self.offset + offset,
+        }
+    }
+}
+
+#[derive(Copy, Clone, PartialEq, Eq, Debug, Hash)]
+#[repr(transparent)]
+struct BlockTarget {
+    block_index: usize,
+}
+
+impl BlockTarget {
+    fn from_raw(block_index: usize) -> Self {
+        BlockTarget { block_index }
+    }
+
+    fn index(self) -> usize {
+        self.block_index
+    }
+}
+
+#[derive(Copy, Clone, PartialEq, Eq, Debug, Hash)]
+enum AnyTarget {
+    Data(SectionTarget),
+    Code(BlockTarget),
+}
+
 #[derive(Copy, Clone, Debug)]
-enum BasicInst {
-    Load { kind: LoadKind, dst: Reg, base: Reg, offset: i32 },
-    Store { kind: StoreKind, src: Reg, base: Reg, offset: i32 },
+enum BasicInst<T> {
+    LoadAbsolute { kind: LoadKind, dst: Reg, target: SectionTarget },
+    StoreAbsolute { kind: StoreKind, src: Reg, target: SectionTarget },
+    LoadIndirect { kind: LoadKind, dst: Reg, base: Reg, offset: i32 },
+    StoreIndirect { kind: StoreKind, src: Reg, base: Reg, offset: i32 },
+    LoadAddress { dst: Reg, target: T },
+    // This is supposed to load the address of a location which contains the `target` address,
+    // not the `target` address directly.
+    LoadAddressIndirect { dst: Reg, target: T },
     RegImm { kind: RegImmKind, dst: Reg, src: Reg, imm: i32 },
     Shift { kind: ShiftKind, dst: Reg, src: Reg, amount: u8 },
     RegReg { kind: RegRegKind, dst: Reg, src1: Reg, src2: Reg },
     Ecalli { syscall: u32 },
 }
 
-impl BasicInst {
-    fn is_nop(self) -> bool {
+impl<T> BasicInst<T> {
+    fn is_nop(&self) -> bool {
+        match *self {
+            BasicInst::RegImm { dst, .. }
+            | BasicInst::Shift { dst, .. }
+            | BasicInst::RegReg { dst, .. }
+            | BasicInst::LoadAddress { dst, .. }
+            | BasicInst::LoadAddressIndirect { dst, .. } => dst == Reg::Zero,
+            BasicInst::LoadAbsolute { .. }
+            | BasicInst::LoadIndirect { .. }
+            | BasicInst::StoreAbsolute { .. }
+            | BasicInst::StoreIndirect { .. }
+            | BasicInst::Ecalli { .. } => false,
+        }
+    }
+
+    fn map_target<U, E>(self, map: impl Fn(T) -> Result<U, E>) -> Result<BasicInst<U>, E> {
+        Ok(match self {
+            BasicInst::LoadAbsolute { kind, dst, target } => BasicInst::LoadAbsolute { kind, dst, target },
+            BasicInst::StoreAbsolute { kind, src, target } => BasicInst::StoreAbsolute { kind, src, target },
+            BasicInst::LoadAddress { dst, target } => BasicInst::LoadAddress { dst, target: map(target)? },
+            BasicInst::LoadAddressIndirect { dst, target } => BasicInst::LoadAddressIndirect { dst, target: map(target)? },
+            BasicInst::LoadIndirect { kind, dst, base, offset } => BasicInst::LoadIndirect { kind, dst, base, offset },
+            BasicInst::StoreIndirect { kind, src, base, offset } => BasicInst::StoreIndirect { kind, src, base, offset },
+            BasicInst::RegImm { kind, dst, src, imm } => BasicInst::RegImm { kind, dst, src, imm },
+            BasicInst::Shift { kind, dst, src, amount } => BasicInst::Shift { kind, dst, src, amount },
+            BasicInst::RegReg { kind, dst, src1, src2 } => BasicInst::RegReg { kind, dst, src1, src2 },
+            BasicInst::Ecalli { syscall } => BasicInst::Ecalli { syscall },
+        })
+    }
+
+    fn target(&self) -> (Option<SectionTarget>, Option<T>)
+    where
+        T: Copy,
+    {
         match self {
-            BasicInst::RegImm { dst, .. } | BasicInst::Shift { dst, .. } | BasicInst::RegReg { dst, .. } => dst == Reg::Zero,
-            BasicInst::Load { .. } | BasicInst::Store { .. } | BasicInst::Ecalli { .. } => false,
+            BasicInst::LoadAbsolute { target, .. } | BasicInst::StoreAbsolute { target, .. } => (Some(*target), None),
+
+            BasicInst::LoadAddress { target, .. } | BasicInst::LoadAddressIndirect { target, .. } => (None, Some(*target)),
+
+            BasicInst::LoadIndirect { .. }
+            | BasicInst::StoreIndirect { .. }
+            | BasicInst::RegImm { .. }
+            | BasicInst::Shift { .. }
+            | BasicInst::RegReg { .. }
+            | BasicInst::Ecalli { .. } => (None, None),
         }
     }
 }
 
 #[derive(Copy, Clone, Debug)]
-enum ControlInst {
+enum ControlInst<T> {
     Jump {
-        target: u64,
+        target: T,
     },
     Call {
         ra: Reg,
-        target: u64,
-        return_address: u64,
+        target: T,
+        target_return: T,
     },
     JumpIndirect {
         base: Reg,
@@ -196,209 +341,255 @@ enum ControlInst {
         ra: Reg,
         base: Reg,
         offset: i64,
-        return_address: u64,
+        target_return: T,
     },
     Branch {
         kind: BranchKind,
         src1: Reg,
         src2: Reg,
-        target_true: u64,
-        target_false: u64,
+        target_true: T,
+        target_false: T,
     },
     Unimplemented,
 }
 
+impl<T> ControlInst<T> {
+    fn map_target<U, E>(self, map: impl Fn(T) -> Result<U, E>) -> Result<ControlInst<U>, E> {
+        Ok(match self {
+            ControlInst::Jump { target } => ControlInst::Jump { target: map(target)? },
+            ControlInst::Call { ra, target, target_return } => ControlInst::Call {
+                ra,
+                target: map(target)?,
+                target_return: map(target_return)?,
+            },
+            ControlInst::JumpIndirect { base, offset } => ControlInst::JumpIndirect { base, offset },
+            ControlInst::CallIndirect {
+                ra,
+                base,
+                offset,
+                target_return,
+            } => ControlInst::CallIndirect {
+                ra,
+                base,
+                offset,
+                target_return: map(target_return)?,
+            },
+            ControlInst::Branch {
+                kind,
+                src1,
+                src2,
+                target_true,
+                target_false,
+            } => ControlInst::Branch {
+                kind,
+                src1,
+                src2,
+                target_true: map(target_true)?,
+                target_false: map(target_false)?,
+            },
+            ControlInst::Unimplemented => ControlInst::Unimplemented,
+        })
+    }
+
+    fn targets(&self) -> [Option<&T>; 2] {
+        match self {
+            ControlInst::Jump { target, .. } => [Some(target), None],
+            ControlInst::Call { target, target_return, .. } => [Some(target), Some(target_return)],
+            ControlInst::CallIndirect { target_return, .. } => [Some(target_return), None],
+            ControlInst::Branch {
+                target_true, target_false, ..
+            } => [Some(target_true), Some(target_false)],
+
+            ControlInst::JumpIndirect { .. } | ControlInst::Unimplemented => [None, None],
+        }
+    }
+}
+
 #[derive(Copy, Clone, Debug)]
-enum InstExt {
-    Basic(BasicInst),
-    Control(ControlInst),
+enum InstExt<BasicT, ControlT> {
+    Basic(BasicInst<BasicT>),
+    Control(ControlInst<ControlT>),
+}
+
+impl<BasicT, ControlT> InstExt<BasicT, ControlT> {
+    fn nop() -> Self {
+        InstExt::Basic(BasicInst::RegImm {
+            kind: RegImmKind::Add,
+            dst: Reg::Zero,
+            src: Reg::Zero,
+            imm: 0,
+        })
+    }
+}
+
+impl<T> ControlInst<T> {
+    fn jump_or_call(ra: Reg, target: T, target_return: T) -> Self {
+        if ra == Reg::Zero {
+            ControlInst::Jump { target }
+        } else {
+            ControlInst::Call { ra, target, target_return }
+        }
+    }
 }
 
 #[derive(Debug)]
-struct BasicBlock {
-    source: AddressRange,
-    ops: Vec<(AddressRange, BasicInst)>,
-    next: EndOfBlock,
+struct BasicBlock<BasicT, ControlT> {
+    target: BlockTarget,
+    source: Source,
+    ops: Vec<(Source, BasicInst<BasicT>)>,
+    next: EndOfBlock<ControlT>,
 }
 
-impl BasicBlock {
-    fn new(source: AddressRange, ops: Vec<(AddressRange, BasicInst)>, next: EndOfBlock) -> Self {
-        Self { source, ops, next }
+impl<BasicT, ControlT> BasicBlock<BasicT, ControlT> {
+    fn new(target: BlockTarget, source: Source, ops: Vec<(Source, BasicInst<BasicT>)>, next: EndOfBlock<ControlT>) -> Self {
+        Self { target, source, ops, next }
     }
 }
 
-struct Fn<'a> {
-    name: Option<&'a str>,
-    range: AddressRange,
-    frames: Vec<crate::dwarf::Frame>,
-    blocks: Vec<usize>,
-}
+fn split_function_name(name: &str) -> (String, String) {
+    let name = rustc_demangle::try_demangle(name)
+        .ok()
+        .map(|name| name.to_string())
+        .unwrap_or_else(|| name.to_string());
 
-impl<'a> Fn<'a> {
-    fn namespace_and_name(&self) -> Option<(String, String)> {
-        let name = self.name?;
-        let name = rustc_demangle::try_demangle(name).ok()?;
+    // Ideally we'd parse the symbol into an actual AST and use that,
+    // but that's a lot of work, so for now let's just do it like this.
+    let with_hash = name.to_string();
+    let without_hash = format!("{:#}", name);
 
-        // Ideally we'd parse the symbol into an actual AST and use that,
-        // but that's a lot of work, so for now let's just do it like this.
-        let with_hash = name.to_string();
-        let without_hash = format!("{:#}", name);
+    // Here we want to split the symbol into two parts: the namespace, and the name + hash.
+    // The idea being that multiple symbols most likely share the namespcae, allowing us to
+    // deduplicate those strings in the output blob.
+    //
+    // For example, this symbol:
+    //   _ZN5alloc7raw_vec19RawVec$LT$T$C$A$GT$7reserve21do_reserve_and_handle17hddecba91f804dbebE
+    // can be demangled into these:
+    //   with_hash    = "alloc::raw_vec::RawVec<T,A>::reserve::do_reserve_and_handle::hddecba91f804dbeb"
+    //   without_hash = "alloc::raw_vec::RawVec<T,A>::reserve::do_reserve_and_handle"
+    //
+    // So what we want is to split it in two like this:
+    //   prefix = "alloc::raw_vec::RawVec<T,A>::reserve"
+    //   suffix = "do_reserve_and_handle::hddecba91f804dbeb"
 
-        // Here we want to split the symbol into two parts: the namespace, and the name + hash.
-        // The idea being that multiple symbols most likely share the namespcae, allowing us to
-        // deduplicate those strings in the output blob.
-        //
-        // For example, this symbol:
-        //   _ZN5alloc7raw_vec19RawVec$LT$T$C$A$GT$7reserve21do_reserve_and_handle17hddecba91f804dbebE
-        // can be demangled into these:
-        //   with_hash    = "alloc::raw_vec::RawVec<T,A>::reserve::do_reserve_and_handle::hddecba91f804dbeb"
-        //   without_hash = "alloc::raw_vec::RawVec<T,A>::reserve::do_reserve_and_handle"
-        //
-        // So what we want is to split it in two like this:
-        //   prefix = "alloc::raw_vec::RawVec<T,A>::reserve"
-        //   suffix = "do_reserve_and_handle::hddecba91f804dbeb"
-
-        if with_hash.contains("::") {
-            let suffix_index = {
-                let mut found = None;
-                let mut depth = 0;
-                let mut last = '\0';
-                let mut index = without_hash.len();
-                for ch in without_hash.chars().rev() {
-                    if ch == '>' {
-                        depth += 1;
-                    } else if ch == '<' {
-                        depth -= 1;
-                    } else if ch == ':' && depth == 0 && last == ':' {
-                        found = Some(index + 1);
-                        break;
-                    }
-
-                    last = ch;
-                    index -= ch.len_utf8();
+    if with_hash.contains("::") {
+        let suffix_index = {
+            let mut found = None;
+            let mut depth = 0;
+            let mut last = '\0';
+            let mut index = without_hash.len();
+            for ch in without_hash.chars().rev() {
+                if ch == '>' {
+                    depth += 1;
+                } else if ch == '<' {
+                    depth -= 1;
+                } else if ch == ':' && depth == 0 && last == ':' {
+                    found = Some(index + 1);
+                    break;
                 }
 
-                found
-            };
-
-            if let Some(suffix_index) = suffix_index {
-                let prefix = &with_hash[..suffix_index - 2];
-                let suffix = &with_hash[suffix_index..];
-                return Some((prefix.to_owned(), suffix.to_owned()));
-            } else {
-                log::warn!("Failed to split symbol: {:?}", with_hash);
+                last = ch;
+                index -= ch.len_utf8();
             }
-        }
 
-        Some((String::new(), with_hash))
+            found
+        };
+
+        if let Some(suffix_index) = suffix_index {
+            let prefix = &with_hash[..suffix_index - 2];
+            let suffix = &with_hash[suffix_index..];
+            return (prefix.to_owned(), suffix.to_owned());
+        } else {
+            log::warn!("Failed to split symbol: {:?}", with_hash);
+        }
     }
+
+    (String::new(), with_hash)
 }
 
 #[derive(Clone)]
-enum RangeOrPadding {
-    Range(Range<usize>),
+enum DataRef {
+    Section { section_index: SectionIndex, range: Range<usize> },
     Padding(usize),
-    SyntheticGot(usize),
 }
 
-impl RangeOrPadding {
+impl DataRef {
     fn size(&self) -> usize {
         match self {
-            RangeOrPadding::Range(range) => range.len(),
-            RangeOrPadding::Padding(size) => *size,
-            RangeOrPadding::SyntheticGot(size) => *size,
+            Self::Section { range, .. } => range.len(),
+            Self::Padding(size) => *size,
         }
-    }
-}
-
-impl From<Range<usize>> for RangeOrPadding {
-    fn from(range: Range<usize>) -> Self {
-        RangeOrPadding::Range(range)
     }
 }
 
 struct MemoryConfig {
-    ro_data: Vec<RangeOrPadding>,
-    rw_data: Vec<RangeOrPadding>,
+    ro_data: Vec<DataRef>,
+    rw_data: Vec<DataRef>,
     bss_size: u32,
     stack_size: u32,
-    synthetic_got_base: Option<u64>,
 }
 
-fn get_padding(memory_end: u64, section: &ElfSection) -> Option<u64> {
-    let misalignment = memory_end % section.align();
+fn get_padding(memory_end: u64, align: u64) -> Option<u64> {
+    let misalignment = memory_end % align;
     if misalignment == 0 {
         None
     } else {
-        Some(section.align() - misalignment)
+        Some(align - misalignment)
     }
 }
 
 #[allow(clippy::too_many_arguments)]
 fn extract_memory_config(
-    data: &[u8],
-    sections_ro_data: &[&ElfSection],
-    synthetic_got_size: u64,
-    sections_rw_data: &[&ElfSection],
-    sections_bss: &[&ElfSection],
-    relocation_for_section: &mut HashMap<SectionIndex, i64>,
+    elf: &Elf,
+    sections_ro_data: &[SectionIndex],
+    sections_rw_data: &[SectionIndex],
+    sections_bss: &[SectionIndex],
+    base_address_for_section: &mut HashMap<SectionIndex, u64>,
 ) -> Result<MemoryConfig, ProgramFromElfError> {
     let mut memory_end = VM_ADDR_USER_MEMORY as u64;
     let mut ro_data = Vec::new();
     let mut ro_data_size = 0;
 
-    fn align_if_necessary(memory_end: &mut u64, output_size: &mut u64, output_chunks: &mut Vec<RangeOrPadding>, section: &ElfSection) {
-        if let Some(padding) = get_padding(*memory_end, section) {
+    fn align_if_necessary(memory_end: &mut u64, output_size: &mut u64, output_chunks: &mut Vec<DataRef>, section: &Section) {
+        if let Some(padding) = get_padding(*memory_end, section.align()) {
             *memory_end += padding;
             *output_size += padding;
-            output_chunks.push(RangeOrPadding::Padding(padding as usize));
+            output_chunks.push(DataRef::Padding(padding as usize));
         }
     }
 
     assert_eq!(memory_end % VM_PAGE_SIZE as u64, 0);
 
     let ro_data_address = memory_end;
-    for section in sections_ro_data.iter() {
+    for &section_index in sections_ro_data {
+        let section = elf.section_by_index(section_index);
         align_if_necessary(&mut memory_end, &mut ro_data_size, &mut ro_data, section);
 
-        let section_name = section.name().expect("failed to get section name");
-        let relocation_offset = (memory_end as i64).wrapping_sub(section.address() as i64);
-        relocation_for_section.insert(section.index(), relocation_offset);
+        let section_name = section.name();
+        let base_address = memory_end;
+        base_address_for_section.insert(section.index(), base_address);
 
-        let initial_ro_data_size = ro_data_size;
-        let section_range = get_section_range(data, section)?;
-        memory_end += section_range.len() as u64;
-        ro_data.push(section_range.clone().into());
-        ro_data_size += section_range.len() as u64;
+        memory_end += section.size();
+        ro_data.push(DataRef::Section {
+            section_index: section.index(),
+            range: 0..section.data().len(),
+        });
+
+        ro_data_size += section.data().len() as u64;
+        let padding = section.size() - section.data().len() as u64;
+        if padding > 0 {
+            ro_data.push(DataRef::Padding(padding.try_into().expect("overflow")))
+        }
 
         log::trace!(
-            "Found read-only section: '{}', address = 0x{:x}..0x{:x} (relocated to: 0x{:x}..0x{:x}), size = 0x{:x}",
+            "Found read-only section: '{}', original range = 0x{:x}..0x{:x} (relocated to: 0x{:x}..0x{:x}), size = 0x{:x}",
             section_name,
-            section.address(),
-            section.address() + section_range.len() as u64,
-            section.address() as i64 + relocation_offset,
-            section.address() as i64 + relocation_offset + (ro_data_size - initial_ro_data_size) as i64,
-            section_range.len(),
+            section.original_address(),
+            section.original_address() + section.size(),
+            base_address,
+            base_address + section.size(),
+            section.size(),
         );
-
-        if section.size() > (ro_data_size - initial_ro_data_size) {
-            // Technically we can work around this, but until something actually hits this let's not bother.
-            return Err(ProgramFromElfError::other(format!(
-                "internal error: size of section '{section_name}' covers more than what the file contains"
-            )));
-        }
     }
-
-    let synthetic_got_base = if synthetic_got_size > 0 {
-        let synthetic_got_base = memory_end;
-        memory_end += synthetic_got_size;
-        ro_data.push(RangeOrPadding::SyntheticGot(synthetic_got_size as usize));
-        ro_data_size += synthetic_got_size;
-
-        Some(synthetic_got_base)
-    } else {
-        None
-    };
 
     {
         let ro_data_size_unaligned = ro_data_size;
@@ -420,34 +611,35 @@ fn extract_memory_config(
     let mut rw_data = Vec::new();
     let mut rw_data_size = 0;
     let rw_data_address = memory_end;
-    for section in sections_rw_data.iter() {
+    for &section_index in sections_rw_data {
+        let section = elf.section_by_index(section_index);
         align_if_necessary(&mut memory_end, &mut rw_data_size, &mut rw_data, section);
 
-        let section_name = section.name().expect("failed to get section name");
-        let relocation_offset = (memory_end as i64).wrapping_sub(section.address() as i64);
-        relocation_for_section.insert(section.index(), relocation_offset);
+        let section_name = section.name();
+        let base_address = memory_end;
+        base_address_for_section.insert(section.index(), memory_end);
 
-        let initial_rw_data_size = rw_data_size;
-        let section_range = get_section_range(data, section)?;
-        memory_end += section_range.len() as u64;
-        rw_data.push(section_range.clone().into());
-        rw_data_size += section_range.len() as u64;
+        memory_end += section.size();
+        rw_data.push(DataRef::Section {
+            section_index: section.index(),
+            range: 0..section.data().len(),
+        });
+
+        rw_data_size += section.data().len() as u64;
+        let padding = section.size() - section.data().len() as u64;
+        if padding > 0 {
+            rw_data.push(DataRef::Padding(padding.try_into().expect("overflow")))
+        }
 
         log::trace!(
-            "Found read-write section: '{}', address = 0x{:x}..0x{:x} (relocated to: 0x{:x}..0x{:x}), size = 0x{:x}",
+            "Found read-write section: '{}', original range = 0x{:x}..0x{:x} (relocated to: 0x{:x}..0x{:x}), size = 0x{:x}",
             section_name,
-            section.address(),
-            section.address() + section_range.len() as u64,
-            section.address() as i64 + relocation_offset,
-            section.address() as i64 + relocation_offset + (rw_data_size - initial_rw_data_size) as i64,
-            section_range.len(),
+            section.original_address(),
+            section.original_address() + section.size(),
+            base_address,
+            base_address + section.size(),
+            section.size(),
         );
-
-        if section.size() > (rw_data_size - initial_rw_data_size) {
-            return Err(ProgramFromElfError::other(format!(
-                "internal error: size of section '{section_name}' covers more than what the file contains"
-            )));
-        }
     }
 
     let bss_explicit_address = {
@@ -460,26 +652,27 @@ fn extract_memory_config(
         memory_end + (rw_data_size - rw_data_size_unaligned)
     };
 
-    for section in sections_bss {
-        if let Some(padding) = get_padding(memory_end, section) {
+    for &section_index in sections_bss {
+        let section = elf.section_by_index(section_index);
+        if let Some(padding) = get_padding(memory_end, section.align()) {
             memory_end += padding;
         }
 
-        let section_name = section.name().expect("failed to get section name");
-        let relocation_offset = (memory_end as i64).wrapping_sub(section.address() as i64);
-        relocation_for_section.insert(section.index(), relocation_offset);
-
-        log::trace!(
-            "Found BSS section: '{}', address = 0x{:x}..0x{:x} (relocated to: 0x{:x}..0x{:x}), size = 0x{:x}",
-            section_name,
-            section.address(),
-            section.address() + section.size(),
-            section.address() as i64 + relocation_offset,
-            section.address() as i64 + relocation_offset + section.size() as i64,
-            section.size(),
-        );
+        let section_name = section.name();
+        let base_address = memory_end;
+        base_address_for_section.insert(section.index(), memory_end);
 
         memory_end += section.size();
+
+        log::trace!(
+            "Found BSS section: '{}', original range = 0x{:x}..0x{:x} (relocated to: 0x{:x}..0x{:x}), size = 0x{:x}",
+            section_name,
+            section.original_address(),
+            section.original_address() + section.size(),
+            base_address,
+            base_address + section.size(),
+            section.size(),
+        );
     }
 
     let mut bss_size = if memory_end > bss_explicit_address {
@@ -518,72 +711,104 @@ fn extract_memory_config(
         rw_data,
         bss_size: bss_size as u32,
         stack_size: stack_size as u32,
-        synthetic_got_base,
     };
 
     Ok(memory_config)
 }
 
-fn extract_export_metadata<'a>(data: &'a [u8], section: &ElfSection) -> Result<Vec<ExportMetadata<'a>>, ProgramFromElfError> {
-    let section_range = get_section_range(data, section)?;
-    let mut contents = &data[section_range];
+#[derive(Clone, PartialEq, Eq, Debug)]
+struct ExportMetadata {
+    location: SectionTarget,
+    prototype: FnMetadata,
+}
+
+fn extract_export_metadata(
+    relocations: &BTreeMap<SectionTarget, RelocationKind>,
+    section: &Section,
+) -> Result<Vec<ExportMetadata>, ProgramFromElfError> {
+    let mut b = polkavm_common::elf::Reader::from(section.data());
     let mut exports = Vec::new();
-    while !contents.is_empty() {
-        match ExportMetadata::try_deserialize(contents) {
-            Ok((bytes_consumed, metadata)) => {
-                contents = &contents[bytes_consumed..];
-                exports.push(metadata);
-            }
+    loop {
+        let Ok(version) = b.read_byte() else { break };
+
+        if version != 1 {
+            return Err(ProgramFromElfError::other(format!(
+                "failed to parse export metadata: unsupported export metadata version: {}",
+                version
+            )));
+        }
+
+        let metadata_location = SectionTarget {
+            section_index: section.index(),
+            offset: b.offset() as u64,
+        };
+
+        let Some(relocation) = relocations.get(&metadata_location) else {
+            return Err(ProgramFromElfError::other(format!(
+                "found an export without a relocation for a pointer to code at {metadata_location}"
+            )));
+        };
+
+        let RelocationKind::Abs {
+            target: code_location,
+            size: RelocationSize::U32,
+        } = relocation
+        else {
+            return Err(ProgramFromElfError::other(format!(
+                "found an export with an unexpected relocation at {metadata_location}: {relocation:?}"
+            )));
+        };
+
+        // Ignore the address as written; later we'll just use the relocations instead.
+        if let Err(error) = b.read_u32() {
+            return Err(ProgramFromElfError::other(format!("failed to parse export metadata: {}", error)));
+        };
+
+        let prototype = match polkavm_common::elf::FnMetadata::try_deserialize(&mut b) {
+            Ok(prototype) => prototype,
             Err(error) => {
                 return Err(ProgramFromElfError::other(format!("failed to parse export metadata: {}", error)));
             }
-        }
+        };
+
+        exports.push(ExportMetadata {
+            location: *code_location,
+            prototype,
+        });
     }
 
     Ok(exports)
 }
 
 #[derive(Debug)]
-struct Import<'a> {
-    metadata_addresses: Vec<u64>,
-    metadata: ImportMetadata<'a>,
+struct Import {
+    metadata_locations: Vec<SectionTarget>,
+    metadata: ImportMetadata,
 }
 
-fn extract_import_metadata<'a>(data: &'a [u8], sections: Vec<&ElfSection>) -> Result<Vec<Import<'a>>, ProgramFromElfError> {
+fn extract_import_metadata(elf: &Elf, sections: &[SectionIndex]) -> Result<Vec<Import>, ProgramFromElfError> {
     let mut imports: Vec<Import> = Vec::new();
     let mut import_by_index: BTreeMap<u32, usize> = BTreeMap::new();
     let mut import_by_name: HashMap<String, usize> = HashMap::new();
-    let mut import_by_metadata_address: HashMap<u64, usize> = HashMap::new();
     let mut indexless: Vec<usize> = Vec::new();
 
-    for section in sections {
-        let section_range = get_section_range(data, section)?;
-        let mut absolute_address = section.address();
-        let mut contents = &data[section_range];
-        while !contents.is_empty() {
-            match ImportMetadata::try_deserialize(contents) {
+    for &section_index in sections {
+        let section = elf.section_by_index(section_index);
+        let mut offset = 0;
+        while offset < section.data().len() {
+            match ImportMetadata::try_deserialize(&section.data()[offset..]) {
                 Ok((bytes_consumed, metadata)) => {
-                    let metadata_address = absolute_address;
-                    contents = &contents[bytes_consumed..];
-                    absolute_address += bytes_consumed as u64;
+                    let location = SectionTarget {
+                        section_index: section.index(),
+                        offset: offset as u64,
+                    };
 
-                    if let Some(&old_nth_import) = import_by_metadata_address.get(&metadata_address) {
-                        let old_import = &mut imports[old_nth_import];
-                        if metadata == old_import.metadata {
-                            old_import.metadata_addresses.push(metadata_address);
-                            continue;
-                        }
-
-                        return Err(ProgramFromElfError::other(format!(
-                            "found multiple imports with the same metadata address: 0x{:08x}",
-                            metadata_address
-                        )));
-                    }
+                    offset += bytes_consumed;
 
                     if let Some(&old_nth_import) = import_by_name.get(metadata.name()) {
                         let old_import = &mut imports[old_nth_import];
                         if metadata == old_import.metadata {
-                            old_import.metadata_addresses.push(metadata_address);
+                            old_import.metadata_locations.push(location);
                             continue;
                         }
 
@@ -598,7 +823,7 @@ fn extract_import_metadata<'a>(data: &'a [u8], sections: Vec<&ElfSection>) -> Re
                         if let Some(&old_nth_import) = import_by_index.get(&index) {
                             let old_import = &mut imports[old_nth_import];
                             if metadata == old_import.metadata {
-                                old_import.metadata_addresses.push(metadata_address);
+                                old_import.metadata_locations.push(location);
                                 continue;
                             }
 
@@ -614,11 +839,10 @@ fn extract_import_metadata<'a>(data: &'a [u8], sections: Vec<&ElfSection>) -> Re
                         indexless.push(nth_import);
                     }
 
-                    import_by_metadata_address.insert(metadata_address, nth_import);
                     import_by_name.insert(metadata.name().to_owned(), nth_import);
 
                     let import = Import {
-                        metadata_addresses: vec![metadata_address],
+                        metadata_locations: vec![location],
                         metadata,
                     };
 
@@ -647,27 +871,15 @@ fn extract_import_metadata<'a>(data: &'a [u8], sections: Vec<&ElfSection>) -> Re
 
     for import in &imports {
         log::trace!("Import: {:?}", import.metadata);
-        for address in &import.metadata_addresses {
-            log::trace!("  Address: 0x{:08x}", address);
+        for location in &import.metadata_locations {
+            log::trace!("  {}", location);
         }
     }
 
     Ok(imports)
 }
 
-#[derive(Copy, Clone, Debug)]
-struct RelocTarget {
-    original_address: u64,
-    relative_address: u64,
-    relocated_address: u64,
-    target_section_index: Option<SectionIndex>,
-}
-
-fn get_relocation_target(
-    elf: &Elf,
-    relocation_for_section: &HashMap<SectionIndex, i64>,
-    relocation: &object::read::Relocation,
-) -> Result<RelocTarget, ProgramFromElfError> {
+fn get_relocation_target(elf: &Elf, relocation: &object::read::Relocation) -> Result<Option<SectionTarget>, ProgramFromElfError> {
     match relocation.target() {
         object::RelocationTarget::Absolute => {
             // Example of such relocation:
@@ -678,62 +890,35 @@ fn get_relocation_target(
             //
             // I'm not entirely sure what's the point of those, as they don't point to any symbol
             // and have an addend of zero.
-            Ok(RelocTarget {
-                original_address: 0,
-                relative_address: 0,
-                relocated_address: relocation.addend() as u64,
-                target_section_index: None,
-            })
+            assert_eq!(relocation.addend(), 0);
+            assert!(!relocation.has_implicit_addend());
+            Ok(None)
         }
         object::RelocationTarget::Symbol(target_symbol_index) => {
             let target_symbol = elf
                 .symbol_by_index(target_symbol_index)
                 .map_err(|error| ProgramFromElfError::other(format!("failed to fetch relocation target: {}", error)))?;
-            let target_section_index = match target_symbol.section() {
-                object::read::SymbolSection::Section(section_index) => section_index,
-                section => {
-                    return Err(ProgramFromElfError::other(format!(
-                        "relocation refers to a symbol in an unhandled section: {:?}",
-                        section
-                    )));
-                }
-            };
 
-            let target_section = elf
-                .section_by_index(target_section_index)
-                .expect("target section for relocation was not found");
-
-            let delta = match relocation_for_section.get(&target_section_index) {
-                Some(delta) => *delta,
-                None => {
-                    let section = elf.section_by_index(target_section_index)?;
-                    return Err(ProgramFromElfError::other(format!(
-                        "relocation targets unsupported section: {}",
-                        section.name()?
-                    )));
-                }
-            };
-
-            let original_address = target_symbol.address();
-            let relocated_address = (original_address as i64).wrapping_add(relocation.addend()).wrapping_add(delta) as u64;
-
+            let (section, offset) = target_symbol.section_and_offset()?;
             log::trace!(
-                "Fetched relocation target: target section = \"{}\", target symbol = \"{}\" ({}), delta = {:08x}, addend = 0x{:x}, symbol address = 0x{:08x}, relocated = 0x{:08x}",
-                elf.section_by_index(target_section_index)?.name()?,
-                target_symbol.name()?,
+                "Fetched relocation target: target section = \"{}\", target symbol = \"{}\" ({}), symbol offset = 0x{:x} + 0x{:x}",
+                section.name(),
+                target_symbol.name().unwrap_or(""),
                 target_symbol_index.0,
-                delta,
+                offset,
                 relocation.addend(),
-                original_address,
-                relocated_address,
             );
 
-            Ok(RelocTarget {
-                original_address,
-                relative_address: original_address - target_section.address(),
-                relocated_address,
-                target_section_index: Some(target_section_index),
-            })
+            let Some(offset) = offset.checked_add_signed(relocation.addend()) else {
+                return Err(ProgramFromElfError::other(
+                    "failed to add addend to the symbol's offset due to overflow",
+                ));
+            };
+
+            Ok(Some(SectionTarget {
+                section_index: section.index(),
+                offset,
+            }))
         }
         _ => Err(ProgramFromElfError::other(format!(
             "unsupported target for relocation: {:?}",
@@ -742,22 +927,16 @@ fn get_relocation_target(
     }
 }
 
-fn parse_text_section(
-    data: &[u8],
-    section_text: &ElfSection,
-    imports: &[Import],
-    relocation_for_section: &HashMap<SectionIndex, i64>,
-    instruction_overrides: &mut HashMap<u64, Inst>,
-    output: &mut Vec<(AddressRange, InstExt)>,
+fn parse_code_section(
+    section: &Section,
+    import_by_location: &HashMap<SectionTarget, &Import>,
+    relocations: &BTreeMap<SectionTarget, RelocationKind>,
+    instruction_overrides: &mut HashMap<SectionTarget, InstExt<SectionTarget, SectionTarget>>,
+    output: &mut Vec<(Source, InstExt<SectionTarget, SectionTarget>)>,
 ) -> Result<(), ProgramFromElfError> {
-    let import_by_address: HashMap<u64, &Import> = imports
-        .iter()
-        .flat_map(|import| import.metadata_addresses.iter().map(move |&address| (address, import)))
-        .collect();
-
-    let section_name = section_text.name().expect("failed to get section name");
-    let text_range = get_section_range(data, section_text)?;
-    let text = &data[text_range];
+    let section_index = section.index();
+    let section_name = section.name();
+    let text = &section.data();
 
     if text.len() % 4 != 0 {
         return Err(ProgramFromElfError::other(format!(
@@ -765,46 +944,57 @@ fn parse_text_section(
         )));
     }
 
-    let section_relocation_delta = *relocation_for_section
-        .get(&section_text.index())
-        .ok_or_else(|| ProgramFromElfError::other(format!("internal error: no relocation offset for section '{}'", section_name)))?;
-
-    let relocated_base = section_text.address().wrapping_add(section_relocation_delta as u64);
-
     output.reserve(text.len() / 4);
     let mut relative_offset = 0;
     while relative_offset < text.len() {
-        let op = u32::from_le_bytes([
+        let current_location = SectionTarget {
+            section_index: section.index(),
+            offset: relative_offset.try_into().expect("overflow"),
+        };
+
+        let raw_inst = u32::from_le_bytes([
             text[relative_offset],
             text[relative_offset + 1],
             text[relative_offset + 2],
             text[relative_offset + 3],
         ]);
 
-        if op == INSTRUCTION_ECALLI {
+        if raw_inst == INSTRUCTION_ECALLI {
             let initial_offset = relative_offset as u64;
             if relative_offset + 12 > text.len() {
                 return Err(ProgramFromElfError::other("truncated ecalli instruction"));
             }
 
-            relative_offset += 4;
+            let target_location = current_location.add(4);
+            relative_offset += 8;
 
-            let h = &text[relative_offset..relative_offset + 4];
-            let target_address = u32::from_le_bytes([h[0], h[1], h[2], h[3]]) as u64;
-            relative_offset += 4;
+            let Some(relocation) = relocations.get(&target_location) else {
+                return Err(ProgramFromElfError::other(format!(
+                    "found an external call without a relocation for a pointer to metadata at {current_location}"
+                )));
+            };
 
-            let import = match import_by_address.get(&target_address) {
-                Some(import) => *import,
-                None => {
-                    return Err(ProgramFromElfError::other(format!(
-                        "external call with an address that doesn't match any metadata: 0x{:08x}",
-                        target_address
-                    )));
-                }
+            let RelocationKind::Abs {
+                target: metadata_location,
+                size: RelocationSize::U32,
+            } = relocation
+            else {
+                return Err(ProgramFromElfError::other(format!(
+                    "found an external call with an unexpected relocation at {current_location}"
+                )));
+            };
+
+            let Some(import) = import_by_location.get(metadata_location) else {
+                return Err(ProgramFromElfError::other(format!(
+                    "found an external call with a relocation to something that isn't import metadata at {current_location}"
+                )));
             };
 
             output.push((
-                AddressRange::from(relocated_base + initial_offset..relocated_base + relative_offset as u64),
+                Source {
+                    section_index,
+                    offset_range: AddressRange::from(initial_offset..relative_offset as u64),
+                },
                 InstExt::Basic(BasicInst::Ecalli {
                     syscall: import.metadata.index.expect("internal error: no index assigned to import"),
                 }),
@@ -816,19 +1006,22 @@ fn parse_text_section(
                 value: 0,
             };
 
-            let op = u32::from_le_bytes([
+            let next_raw_inst = u32::from_le_bytes([
                 text[relative_offset],
                 text[relative_offset + 1],
                 text[relative_offset + 2],
                 text[relative_offset + 3],
             ]);
 
-            if decode_inst(op)? != Some(INST_RET) {
+            if decode_inst(next_raw_inst)? != Some(INST_RET) {
                 return Err(ProgramFromElfError::other("external call shim doesn't end with a 'ret'"));
             }
 
             output.push((
-                AddressRange::from(relocated_base + relative_offset as u64..relocated_base + relative_offset as u64 + 4),
+                Source {
+                    section_index,
+                    offset_range: AddressRange::from(relative_offset as u64..relative_offset as u64 + 4),
+                },
                 InstExt::Control(ControlInst::JumpIndirect { base: Reg::RA, offset: 0 }),
             ));
 
@@ -836,8 +1029,11 @@ fn parse_text_section(
             continue;
         }
 
-        let absolute_address = section_text.address() + relative_offset as u64;
-        let relocated_address = relocated_base + relative_offset as u64;
+        let source = Source {
+            section_index,
+            offset_range: AddressRange::from(relative_offset as u64..relative_offset as u64 + 4),
+        };
+
         relative_offset += 4;
 
         // Shadow the `relative_offset` to make sure it's not accidentally used again.
@@ -845,86 +1041,122 @@ fn parse_text_section(
         #[allow(unused_variables)]
         let relative_offset = ();
 
-        let op = match decode_inst(op)? {
-            Some(op) => instruction_overrides.remove(&absolute_address).unwrap_or(op),
-            None => {
-                return Err(ProgramFromElfErrorKind::UnsupportedInstruction {
-                    pc: absolute_address,
-                    instruction: op,
+        let Some(original_inst) = decode_inst(raw_inst)? else {
+            return Err(ProgramFromElfErrorKind::UnsupportedInstruction {
+                section: section.name().into(),
+                offset: current_location.offset,
+                instruction: raw_inst,
+            }
+            .into());
+        };
+
+        let op = if let Some(inst) = instruction_overrides.remove(&current_location) {
+            inst
+        } else {
+            match original_inst {
+                Inst::LoadUpperImmediate { dst, value } => InstExt::Basic(BasicInst::RegImm {
+                    kind: RegImmKind::Add,
+                    dst,
+                    src: Reg::Zero,
+                    imm: value as i32,
+                }),
+                Inst::JumpAndLink { dst, target } => {
+                    let target = SectionTarget {
+                        section_index: section.index(),
+                        offset: current_location.offset.wrapping_add_signed(target as i32 as i64),
+                    };
+
+                    if target.offset > section.size() {
+                        return Err(ProgramFromElfError::other("out of range JAL instruction"));
+                    }
+
+                    let next = if dst != Reg::Zero {
+                        let target_return = current_location.add(4);
+                        ControlInst::Call {
+                            ra: dst,
+                            target,
+                            target_return,
+                        }
+                    } else {
+                        ControlInst::Jump { target }
+                    };
+
+                    InstExt::Control(next)
                 }
-                .into());
+                Inst::Branch { kind, src1, src2, target } => {
+                    let target_true = SectionTarget {
+                        section_index: section.index(),
+                        offset: current_location.offset.wrapping_add_signed(target as i32 as i64),
+                    };
+
+                    if target_true.offset > section.size() {
+                        return Err(ProgramFromElfError::other("out of range unrelocated branch"));
+                    }
+
+                    let target_false = current_location.add(4);
+                    let next = ControlInst::Branch {
+                        kind,
+                        src1,
+                        src2,
+                        target_true,
+                        target_false,
+                    };
+
+                    InstExt::Control(next)
+                }
+                Inst::JumpAndLinkRegister { dst, base, value } => {
+                    if base == Reg::Zero {
+                        return Err(ProgramFromElfError::other("found an unrelocated JALR instruction"));
+                    }
+
+                    let next = if dst != Reg::Zero {
+                        let target_return = current_location.add(4);
+                        ControlInst::CallIndirect {
+                            ra: dst,
+                            base,
+                            offset: value.into(),
+                            target_return,
+                        }
+                    } else {
+                        ControlInst::JumpIndirect {
+                            base,
+                            offset: value.into(),
+                        }
+                    };
+
+                    InstExt::Control(next)
+                }
+                Inst::Unimplemented => InstExt::Control(ControlInst::Unimplemented),
+                Inst::Load { kind, dst, base, offset } => {
+                    if base == Reg::Zero {
+                        return Err(ProgramFromElfError::other("found an unrelocated absolute load"));
+                    }
+
+                    InstExt::Basic(BasicInst::LoadIndirect { kind, dst, base, offset })
+                }
+                Inst::Store { kind, src, base, offset } => {
+                    if base == Reg::Zero {
+                        return Err(ProgramFromElfError::other("found an unrelocated absolute store"));
+                    }
+
+                    InstExt::Basic(BasicInst::StoreIndirect { kind, src, base, offset })
+                }
+                Inst::RegImm { kind, dst, src, imm } => InstExt::Basic(BasicInst::RegImm { kind, dst, src, imm }),
+                Inst::Shift { kind, dst, src, amount } => InstExt::Basic(BasicInst::Shift { kind, dst, src, amount }),
+                Inst::RegReg { kind, dst, src1, src2 } => InstExt::Basic(BasicInst::RegReg { kind, dst, src1, src2 }),
+                Inst::AddUpperImmediateToPc { .. } => {
+                    return Err(ProgramFromElfError::other(
+                        format!("found an unrelocated auipc instruction at offset {} in section '{section_name}'; is the program compiled with relocations?", current_location.offset)
+                    ));
+                }
+                Inst::Ecall => {
+                    return Err(ProgramFromElfError::other(
+                        "found a bare ecall instruction; those are not supported",
+                    ));
+                }
             }
         };
 
-        let op = match op {
-            Inst::LoadUpperImmediate { dst, value } => InstExt::Basic(BasicInst::RegImm {
-                kind: RegImmKind::Add,
-                dst,
-                src: Reg::Zero,
-                imm: value as i32,
-            }),
-            Inst::JumpAndLink { dst, target } => {
-                let target = (relocated_address as i64).wrapping_add(target as i32 as i64) as u64;
-                let next = if dst != Reg::Zero {
-                    ControlInst::Call {
-                        ra: dst,
-                        target,
-                        return_address: relocated_address.wrapping_add(4),
-                    }
-                } else {
-                    ControlInst::Jump { target }
-                };
-
-                InstExt::Control(next)
-            }
-            Inst::JumpAndLinkRegister { dst, base, value } => {
-                let next = if dst != Reg::Zero {
-                    ControlInst::CallIndirect {
-                        ra: dst,
-                        base,
-                        offset: value.into(),
-                        return_address: relocated_address.wrapping_add(4),
-                    }
-                } else {
-                    ControlInst::JumpIndirect {
-                        base,
-                        offset: value.into(),
-                    }
-                };
-
-                InstExt::Control(next)
-            }
-            Inst::Branch { kind, src1, src2, target } => {
-                let target = (relocated_address as i64).wrapping_add(target as i32 as i64) as u64;
-                let next = ControlInst::Branch {
-                    kind,
-                    src1,
-                    src2,
-                    target_true: target,
-                    target_false: relocated_address.wrapping_add(4),
-                };
-
-                InstExt::Control(next)
-            }
-            Inst::Unimplemented => InstExt::Control(ControlInst::Unimplemented),
-            Inst::Load { kind, dst, base, offset } => InstExt::Basic(BasicInst::Load { kind, dst, base, offset }),
-            Inst::Store { kind, src, base, offset } => InstExt::Basic(BasicInst::Store { kind, src, base, offset }),
-            Inst::RegImm { kind, dst, src, imm } => InstExt::Basic(BasicInst::RegImm { kind, dst, src, imm }),
-            Inst::Shift { kind, dst, src, amount } => InstExt::Basic(BasicInst::Shift { kind, dst, src, amount }),
-            Inst::RegReg { kind, dst, src1, src2 } => InstExt::Basic(BasicInst::RegReg { kind, dst, src1, src2 }),
-            Inst::AddUpperImmediateToPc { .. } => {
-                return Err(ProgramFromElfError::other(
-                    format!("found an unrelocated auipc instruction at 0x{absolute_address:x} in section '{section_name}'; is the program compiled with relocations?")
-                ));
-            }
-            Inst::Ecall => {
-                return Err(ProgramFromElfError::other(
-                    "found a bare ecall instruction; those are not supported",
-                ));
-            }
-        };
-
-        let source = AddressRange::from(relocated_address..relocated_address + 4);
         output.push((source, op));
     }
 
@@ -932,65 +1164,90 @@ fn parse_text_section(
 }
 
 fn split_code_into_basic_blocks(
-    jump_targets: &HashSet<u64>,
-    instructions: Vec<(AddressRange, InstExt)>,
-) -> Result<Vec<BasicBlock>, ProgramFromElfError> {
-    let mut blocks = Vec::new();
+    jump_targets: &HashSet<SectionTarget>,
+    instructions: Vec<(Source, InstExt<SectionTarget, SectionTarget>)>,
+) -> Result<Vec<BasicBlock<SectionTarget, SectionTarget>>, ProgramFromElfError> {
+    let mut blocks: Vec<BasicBlock<SectionTarget, SectionTarget>> = Vec::new();
     let mut current_block = Vec::new();
     let mut block_start_opt = None;
     for (source, op) in instructions {
-        assert!(source.start < source.end);
-        let is_jump_target = jump_targets.contains(&source.start);
-        let block_start = if !is_jump_target {
+        assert!(source.offset_range.start < source.offset_range.end);
+
+        let is_jump_target = jump_targets.contains(&source.begin());
+        let (block_section, block_start) = if !is_jump_target {
             // Make sure nothing wants to jump into the middle of this instruction.
-            assert!((source.start..source.end)
+            assert!((source.offset_range.start..source.offset_range.end)
                 .step_by(4)
                 .skip(1)
-                .all(|address| !jump_targets.contains(&address)));
+                .all(|offset| !jump_targets.contains(&SectionTarget {
+                    section_index: source.section_index,
+                    offset
+                })));
 
-            if let Some(block_start) = block_start_opt {
+            if let Some((block_section, block_start)) = block_start_opt {
                 // We're in a block that's reachable by a jump.
-                block_start
+                (block_section, block_start)
             } else {
                 // Nothing can possibly jump here, so just skip this instruction.
+                log::trace!("Skipping dead instruction at {}: {:?}", source.begin(), op);
                 continue;
             }
         } else {
             // Control flow can jump to this instruction.
-            if let Some(block_start) = block_start_opt.take() {
+            if let Some((block_section, block_start)) = block_start_opt.take() {
                 // End the current basic block to prevent a jump into the middle of it.
                 if !current_block.is_empty() {
+                    let block_index = BlockTarget::from_raw(blocks.len());
+                    let block_source = Source {
+                        section_index: block_section,
+                        offset_range: (block_start..source.offset_range.start).into(),
+                    };
+
+                    log::trace!("Emitting block (due to a potential jump): {}", block_source.begin());
                     blocks.push(BasicBlock::new(
-                        (block_start..source.start).into(),
+                        block_index,
+                        block_source,
                         std::mem::take(&mut current_block),
-                        EndOfBlock::Fallthrough { target: source.start },
+                        EndOfBlock {
+                            source: Source {
+                                section_index: block_section,
+                                offset_range: (source.offset_range.start..source.offset_range.start).into(),
+                            },
+                            instruction: ControlInst::Jump { target: source.begin() },
+                        },
                     ));
                 }
             }
 
-            block_start_opt = Some(source.start);
-            source.start
+            block_start_opt = Some((source.section_index, source.offset_range.start));
+            (source.section_index, source.offset_range.start)
         };
 
         match op {
             InstExt::Control(instruction) => {
                 block_start_opt = None;
+
+                let block_index = BlockTarget::from_raw(blocks.len());
+                let block_source = Source {
+                    section_index: block_section,
+                    offset_range: (block_start..source.offset_range.end).into(),
+                };
+
+                log::trace!("Emitting block (due to a control instruction): {}", block_source.begin());
                 blocks.push(BasicBlock::new(
-                    (block_start..source.end).into(),
+                    block_index,
+                    block_source,
                     std::mem::take(&mut current_block),
-                    EndOfBlock::Control { source, instruction },
+                    EndOfBlock { source, instruction },
                 ));
 
                 if let ControlInst::Branch { target_false, .. } = instruction {
-                    assert_eq!(source.end, target_false);
-                    block_start_opt = Some(source.end);
+                    assert_eq!(source.section_index, target_false.section_index);
+                    assert_eq!(source.offset_range.end, target_false.offset);
+                    block_start_opt = Some((block_section, source.offset_range.end));
                 }
             }
             InstExt::Basic(instruction) => {
-                if instruction.is_nop() {
-                    continue;
-                }
-
                 current_block.push((source, instruction));
             }
         }
@@ -1002,40 +1259,279 @@ fn split_code_into_basic_blocks(
         ));
     }
 
-    blocks.sort_unstable_by_key(|block| (block.source.start, block.source.end));
-    let mut last_address = 0;
-    for block in &blocks {
-        if last_address > block.source.start {
-            return Err(ProgramFromElfError::other("found overlapping basic blocks"));
-        }
-        last_address = block.source.end;
-    }
-
     Ok(blocks)
 }
 
-fn retain_only_non_empty_functions(blocks: &[BasicBlock], functions: &mut Vec<Fn>) -> Result<(), ProgramFromElfError> {
-    let iter = iterate_in_tandem(
-        blocks.iter().enumerate().map(|(index, block)| (block.source, (index, block))),
-        functions.iter_mut().map(|func| (func.range, func)),
-    );
+fn build_section_to_block_map(
+    blocks: &[BasicBlock<SectionTarget, SectionTarget>],
+) -> Result<HashMap<SectionTarget, BlockTarget>, ProgramFromElfError> {
+    let mut section_to_block = HashMap::new();
+    for (block_index, block) in blocks.iter().enumerate() {
+        let section_target = SectionTarget {
+            section_index: block.source.section_index,
+            offset: block.source.offset_range.start,
+        };
 
-    for ((block_index, block), function) in iter {
-        if block.source.start < function.range.start || block.source.end > function.range.end {
-            return Err(ProgramFromElfError::other("found inconsistent basic block <-> function overlap"));
+        let block_target = BlockTarget::from_raw(block_index);
+        if section_to_block.insert(section_target, block_target).is_some() {
+            return Err(ProgramFromElfError::other("found two or more basic blocks with the same location"));
         }
-
-        function.blocks.push(block_index);
     }
 
-    let initial_length = functions.len();
-    functions.retain(|func| !func.blocks.is_empty());
-    log::trace!(
-        "Number of functions removed due to dead code elimination: {}",
-        initial_length - functions.len()
-    );
+    Ok(section_to_block)
+}
 
-    Ok(())
+fn resolve_basic_block_references(
+    data_sections_set: &HashSet<SectionIndex>,
+    section_to_block: &HashMap<SectionTarget, BlockTarget>,
+    blocks: &[BasicBlock<SectionTarget, SectionTarget>],
+) -> Result<Vec<BasicBlock<AnyTarget, BlockTarget>>, ProgramFromElfError> {
+    let mut output = Vec::with_capacity(blocks.len());
+    for block in blocks {
+        let mut ops = Vec::with_capacity(block.ops.len());
+        for (source, op) in &block.ops {
+            let map = |target: SectionTarget| {
+                if data_sections_set.contains(&target.section_index) {
+                    Ok(AnyTarget::Data(target))
+                } else if let Some(&target) = section_to_block.get(&target) {
+                    Ok(AnyTarget::Code(target))
+                } else {
+                    return Err(ProgramFromElfError::other(format!(
+                        "found basic instruction which doesn't point to a data section nor resolve to any basic block: {source:?}, {op:?}",
+                    )));
+                }
+            };
+
+            let op = op.map_target(map)?;
+            ops.push((*source, op));
+        }
+
+        let Ok(next) = block
+            .next
+            .map_target(|section_target| section_to_block.get(&section_target).copied().ok_or(()))
+        else {
+            return Err(ProgramFromElfError::other(format!(
+                "found control instruction at the end of block at {block_source} whose target doesn't resolve to any basic block: {next:?}",
+                block_source = block.source.begin(),
+                next = block.next.instruction,
+            )));
+        };
+
+        output.push(BasicBlock::new(block.target, block.source, ops, next));
+    }
+
+    Ok(output)
+}
+
+fn delete_nop_instructions_in_blocks(all_blocks: &mut Vec<BasicBlock<AnyTarget, BlockTarget>>) {
+    for block in all_blocks {
+        for index in 0..block.ops.len() {
+            let &(source, instruction) = &block.ops[index];
+            if !instruction.is_nop() {
+                continue;
+            }
+
+            // We're going to delete this instruction, so let's extend the source region of the next instruction to cover it.
+            if index + 1 < block.ops.len() {
+                let next_source = &mut block.ops[index + 1].0;
+                assert_eq!(source.section_index, next_source.section_index);
+                next_source.offset_range.start = source.offset_range.start;
+            }
+        }
+
+        block.ops.retain(|(_, instruction)| !instruction.is_nop());
+    }
+}
+
+fn harvest_all_jump_targets(
+    elf: &Elf,
+    data_sections_set: &HashSet<SectionIndex>,
+    code_sections_set: &HashSet<SectionIndex>,
+    instructions: &[(Source, InstExt<SectionTarget, SectionTarget>)],
+    relocations: &BTreeMap<SectionTarget, RelocationKind>,
+) -> Result<HashSet<SectionTarget>, ProgramFromElfError> {
+    let mut all_jump_targets = HashSet::new();
+    for (_, instruction) in instructions {
+        match instruction {
+            InstExt::Basic(instruction) => {
+                let (data_target, code_or_data_target) = instruction.target();
+                if let Some(target) = data_target {
+                    if !data_sections_set.contains(&target.section_index) {
+                        return Err(ProgramFromElfError::other(
+                            "found basic instruction which refers to a non-data section",
+                        ));
+                    }
+                }
+
+                if let Some(target) = code_or_data_target {
+                    if code_sections_set.contains(&target.section_index) {
+                        if all_jump_targets.insert(target) {
+                            log::trace!("Adding jump target: {target} (referenced indirectly by code)");
+                        }
+                    } else if !data_sections_set.contains(&target.section_index) {
+                        return Err(ProgramFromElfError::other(
+                            "found basic instruction which refers to neither a data nor a text section",
+                        ));
+                    }
+                }
+            }
+            InstExt::Control(instruction) => {
+                for target in instruction.targets().into_iter().flatten() {
+                    if !code_sections_set.contains(&target.section_index) {
+                        return Err(ProgramFromElfError::other(
+                            "found control instruction which refers to a non-text section",
+                        ));
+                    }
+
+                    if all_jump_targets.insert(*target) {
+                        log::trace!("Adding jump target: {target} (referenced by a control instruction)");
+                    }
+                }
+            }
+        }
+    }
+
+    for (source_location, relocation) in relocations {
+        if !data_sections_set.contains(&source_location.section_index) {
+            continue;
+        }
+
+        for target in relocation.targets().into_iter().flatten() {
+            #[allow(clippy::collapsible_if)]
+            if code_sections_set.contains(&target.section_index) {
+                if all_jump_targets.insert(target) {
+                    log::trace!(
+                        "Adding jump target: {target} (referenced by relocation from {source_location} in '{}')",
+                        elf.section_by_index(source_location.section_index).name()
+                    );
+                }
+            }
+        }
+    }
+
+    Ok(all_jump_targets)
+}
+
+struct UniqueQueue<T> {
+    vec: Vec<T>,
+    seen: HashSet<T>,
+}
+
+impl<T> UniqueQueue<T> {
+    fn new() -> Self {
+        Self {
+            vec: Vec::new(),
+            seen: HashSet::new(),
+        }
+    }
+
+    fn pop(&mut self) -> Option<T> {
+        self.vec.pop()
+    }
+
+    fn push(&mut self, value: T)
+    where
+        T: core::hash::Hash + Eq + Clone,
+    {
+        if self.seen.insert(value.clone()) {
+            self.vec.push(value);
+        }
+    }
+
+    fn is_empty(&self) -> bool {
+        self.vec.is_empty()
+    }
+}
+
+fn find_reachable(
+    section_to_block: &HashMap<SectionTarget, BlockTarget>,
+    all_blocks: &[BasicBlock<AnyTarget, BlockTarget>],
+    data_sections_set: &HashSet<SectionIndex>,
+    export_metadata: &[ExportMetadata],
+    relocations: &BTreeMap<SectionTarget, RelocationKind>,
+) -> Result<(HashSet<BlockTarget>, HashSet<SectionIndex>), ProgramFromElfError> {
+    let mut data_section_queue: UniqueQueue<SectionIndex> = UniqueQueue::new();
+    let mut section_queue: UniqueQueue<SectionTarget> = UniqueQueue::new();
+    let mut block_queue: UniqueQueue<BlockTarget> = UniqueQueue::new();
+    for export in export_metadata {
+        if !section_to_block.contains_key(&export.location) {
+            return Err(ProgramFromElfError::other("export points to a non-block"));
+        }
+
+        section_queue.push(export.location);
+    }
+
+    while !section_queue.is_empty() || !block_queue.is_empty() || !data_section_queue.is_empty() {
+        while let Some(target) = section_queue.pop() {
+            if let Some(block_target) = section_to_block.get(&target) {
+                block_queue.push(*block_target);
+                continue;
+            }
+
+            if data_sections_set.contains(&target.section_index) {
+                data_section_queue.push(target.section_index);
+            }
+        }
+
+        while let Some(block_target) = block_queue.pop() {
+            let block = &all_blocks[block_target.index()];
+            for (_, instruction) in &block.ops {
+                let (data_target, code_or_data_target) = instruction.target();
+                if let Some(target) = data_target {
+                    section_queue.push(target);
+                }
+
+                if let Some(target) = code_or_data_target {
+                    match target {
+                        AnyTarget::Code(target) => block_queue.push(target),
+                        AnyTarget::Data(target) => {
+                            if data_sections_set.contains(&target.section_index) {
+                                data_section_queue.push(target.section_index);
+                            }
+                            section_queue.push(target);
+                        }
+                    }
+                }
+            }
+
+            match block.next.instruction {
+                ControlInst::Jump { target } => {
+                    block_queue.push(target);
+                }
+                ControlInst::Call { target, target_return, .. } => {
+                    block_queue.push(target);
+                    block_queue.push(target_return);
+                }
+                ControlInst::CallIndirect { target_return, .. } => {
+                    block_queue.push(target_return);
+                }
+                ControlInst::Branch {
+                    target_true, target_false, ..
+                } => {
+                    block_queue.push(target_true);
+                    block_queue.push(target_false);
+                }
+
+                ControlInst::JumpIndirect { .. } | ControlInst::Unimplemented => {}
+            }
+        }
+
+        while let Some(section_index) = data_section_queue.pop() {
+            // TODO: Can we skip some parts of the data sections?
+            for (relocation_location, relocation) in relocations.iter() {
+                // TOOD: Make this more efficient?
+                if relocation_location.section_index != section_index {
+                    continue;
+                }
+
+                for relocation_target in relocation.targets().into_iter().flatten() {
+                    section_queue.push(relocation_target);
+                }
+            }
+        }
+    }
+
+    Ok((block_queue.seen, data_section_queue.seen))
 }
 
 fn cast_reg(reg: Reg) -> PReg {
@@ -1059,74 +1555,139 @@ fn cast_reg(reg: Reg) -> PReg {
     }
 }
 
-fn harvest_jump_targets(jump_targets: &mut HashSet<u64>, instructions: &[(AddressRange, InstExt)]) {
-    for (source, instruction) in instructions {
-        let InstExt::Control(instruction) = instruction else { continue };
-        match *instruction {
-            ControlInst::Jump { target, .. } => {
-                jump_targets.insert(target);
-            }
-            ControlInst::Call {
-                target, return_address, ..
-            } => {
-                jump_targets.insert(target);
-                jump_targets.insert(return_address);
-            }
-            ControlInst::JumpIndirect { .. } => {}
-            ControlInst::CallIndirect { return_address, .. } => {
-                jump_targets.insert(return_address);
-            }
-            ControlInst::Branch {
-                target_true, target_false, ..
-            } => {
-                jump_targets.insert(target_true);
-                assert_eq!(target_false, source.end);
-            }
-            ControlInst::Unimplemented { .. } => {}
-        }
+fn assign_jump_targets(all_blocks: &[BasicBlock<AnyTarget, BlockTarget>], used_blocks: &[BlockTarget]) -> Vec<Option<u32>> {
+    let mut jump_target_for_block: Vec<Option<u32>> = Vec::new();
+    jump_target_for_block.resize(all_blocks.len(), None);
+
+    for (nth, block_target) in used_blocks.iter().enumerate() {
+        jump_target_for_block[block_target.index()] = Some(nth as u32 + 1);
     }
+
+    jump_target_for_block
 }
 
-fn emit_code(jump_targets: HashSet<u64>, blocks: &[BasicBlock]) -> Result<Vec<(AddressRange, RawInstruction)>, ProgramFromElfError> {
-    let mut code: Vec<(AddressRange, RawInstruction)> = Vec::new();
-    {
-        let mut set = HashSet::new();
-        for block in blocks {
-            assert!(set.insert(block.source.start), "duplicate jump target: {:x}", block.source.start);
+fn emit_code(
+    base_address_for_section: &HashMap<SectionIndex, u64>,
+    section_got: SectionIndex,
+    target_to_got_offset: &HashMap<AnyTarget, u64>,
+    all_blocks: &[BasicBlock<AnyTarget, BlockTarget>],
+    used_blocks: &[BlockTarget],
+    used_imports: &HashSet<u32>,
+    jump_target_for_block: &[Option<u32>],
+) -> Result<Vec<(Source, RawInstruction)>, ProgramFromElfError> {
+    let mut can_fallthrough_to_next_block: HashSet<BlockTarget> = HashSet::new();
+    for window in used_blocks.windows(2) {
+        match all_blocks[window[0].index()].next.instruction {
+            ControlInst::Jump { target }
+            | ControlInst::Branch { target_false: target, .. }
+            | ControlInst::Call { target_return: target, .. }
+            | ControlInst::CallIndirect { target_return: target, .. } => {
+                if target == window[1] {
+                    can_fallthrough_to_next_block.insert(window[0]);
+                }
+            }
+
+            ControlInst::JumpIndirect { .. } | ControlInst::Unimplemented => {}
         }
     }
 
-    for block in blocks {
-        if jump_targets.contains(&block.source.start) {
-            assert_eq!(block.source.start % 4, 0);
-            let Ok(target) = u32::try_from(block.source.start) else {
-                return Err(ProgramFromElfError::other("basic block start address overflow"));
+    let get_data_address = |target: SectionTarget| -> Result<u32, ProgramFromElfError> {
+        if let Some(base_address) = base_address_for_section.get(&target.section_index) {
+            let Some(address) = base_address.checked_add(target.offset) else {
+                return Err(ProgramFromElfError::other("address overflow when relocating"));
             };
-            code.push((
-                (block.source.start..block.source.start + 4).into(),
-                RawInstruction::new_with_imm(Opcode::jump_target, target / 4),
-            ));
+
+            let Ok(address) = address.try_into() else {
+                return Err(ProgramFromElfError::other("address overflow when casting"));
+            };
+
+            Ok(address)
+        } else {
+            Err(ProgramFromElfError::other("internal error: section with no base address"))
+        }
+    };
+
+    let get_jump_target = |target: BlockTarget| -> Result<u32, ProgramFromElfError> {
+        let Some(jump_target) = jump_target_for_block[target.index()] else {
+            return Err(ProgramFromElfError::other("out of range jump target"));
+        };
+
+        Ok(jump_target)
+    };
+
+    let mut code: Vec<(Source, RawInstruction)> = Vec::new();
+    for block_target in used_blocks {
+        let block = &all_blocks[block_target.index()];
+        let jump_target = jump_target_for_block[block.target.index()].unwrap();
+
+        code.push((
+            Source {
+                section_index: block.source.section_index,
+                offset_range: (block.source.offset_range.start..block.source.offset_range.start + 4).into(),
+            },
+            RawInstruction::new_with_imm(Opcode::jump_target, jump_target),
+        ));
+
+        fn conv_load_kind(kind: LoadKind) -> Opcode {
+            match kind {
+                LoadKind::I8 => Opcode::load_i8,
+                LoadKind::I16 => Opcode::load_i16,
+                LoadKind::U32 => Opcode::load_u32,
+                LoadKind::U8 => Opcode::load_u8,
+                LoadKind::U16 => Opcode::load_u16,
+            }
+        }
+
+        fn conv_store_kind(kind: StoreKind) -> Opcode {
+            match kind {
+                StoreKind::U32 => Opcode::store_u32,
+                StoreKind::U8 => Opcode::store_u8,
+                StoreKind::U16 => Opcode::store_u16,
+            }
         }
 
         for &(source, op) in &block.ops {
             let op = match op {
-                BasicInst::Load { kind, dst, base, offset } => {
-                    let kind = match kind {
-                        LoadKind::I8 => Opcode::load_i8,
-                        LoadKind::I16 => Opcode::load_i16,
-                        LoadKind::U32 => Opcode::load_u32,
-                        LoadKind::U8 => Opcode::load_u8,
-                        LoadKind::U16 => Opcode::load_u16,
-                    };
-                    RawInstruction::new_with_regs2_imm(kind, cast_reg(dst), cast_reg(base), offset as u32)
+                BasicInst::LoadAbsolute { kind, dst, target } => {
+                    RawInstruction::new_with_regs2_imm(conv_load_kind(kind), cast_reg(dst), cast_reg(Reg::Zero), get_data_address(target)?)
                 }
-                BasicInst::Store { kind, src, base, offset } => {
-                    let kind = match kind {
-                        StoreKind::U32 => Opcode::store_u32,
-                        StoreKind::U8 => Opcode::store_u8,
-                        StoreKind::U16 => Opcode::store_u16,
+                BasicInst::StoreAbsolute { kind, src, target } => {
+                    RawInstruction::new_with_regs2_imm(conv_store_kind(kind), cast_reg(src), cast_reg(Reg::Zero), get_data_address(target)?)
+                }
+                BasicInst::LoadIndirect { kind, dst, base, offset } => {
+                    RawInstruction::new_with_regs2_imm(conv_load_kind(kind), cast_reg(dst), cast_reg(base), offset as u32)
+                }
+                BasicInst::StoreIndirect { kind, src, base, offset } => {
+                    RawInstruction::new_with_regs2_imm(conv_store_kind(kind), cast_reg(src), cast_reg(base), offset as u32)
+                }
+                BasicInst::LoadAddress { dst, target } => {
+                    let value = match target {
+                        AnyTarget::Code(target) => {
+                            let value = get_jump_target(target)?;
+                            let Some(value) = value.checked_mul(JUMP_TARGET_MULTIPLIER) else {
+                                return Err(ProgramFromElfError::other("overflow when emitting an address load"));
+                            };
+                            value
+                        }
+                        AnyTarget::Data(target) => get_data_address(target)?,
                     };
-                    RawInstruction::new_with_regs2_imm(kind, cast_reg(src), cast_reg(base), offset as u32)
+
+                    RawInstruction::new_with_regs2_imm(Opcode::add_imm, cast_reg(dst), cast_reg(Reg::Zero), value)
+                }
+                BasicInst::LoadAddressIndirect { dst, target } => {
+                    let Some(&offset) = target_to_got_offset.get(&target) else {
+                        return Err(ProgramFromElfError::other(
+                            "indirect address load without a corresponding GOT entry",
+                        ));
+                    };
+
+                    let target = SectionTarget {
+                        section_index: section_got,
+                        offset,
+                    };
+
+                    let value = get_data_address(target)?;
+                    RawInstruction::new_with_regs2_imm(conv_load_kind(LoadKind::U32), cast_reg(dst), cast_reg(Reg::Zero), value)
                 }
                 BasicInst::RegImm { kind, dst, src, imm } => {
                     let kind = match kind {
@@ -1170,72 +1731,49 @@ fn emit_code(jump_targets: HashSet<u64>, blocks: &[BasicBlock]) -> Result<Vec<(A
                     };
                     RawInstruction::new_with_regs3(kind, cast_reg(dst), cast_reg(src1), cast_reg(src2))
                 }
-                BasicInst::Ecalli { syscall } => RawInstruction::new_with_imm(Opcode::ecalli, syscall),
+                BasicInst::Ecalli { syscall } => {
+                    assert!(used_imports.contains(&syscall));
+                    RawInstruction::new_with_imm(Opcode::ecalli, syscall)
+                }
             };
 
             code.push((source, op));
         }
 
-        match block.next {
-            EndOfBlock::Fallthrough { target } => {
-                assert_eq!(target, block.source.end);
-            }
-            EndOfBlock::Control {
-                source,
-                instruction: ControlInst::Jump { target },
-            } => {
-                if target % 4 != 0 {
-                    return Err(ProgramFromElfError::other("found a jump with a target that isn't aligned"));
+        fn unconditional_jump(target: u32) -> RawInstruction {
+            RawInstruction::new_with_regs2_imm(Opcode::jump_and_link_register, cast_reg(Reg::Zero), cast_reg(Reg::Zero), target)
+        }
+
+        match block.next.instruction {
+            ControlInst::Jump { target } => {
+                let target = get_jump_target(target)?;
+                if !can_fallthrough_to_next_block.contains(block_target) {
+                    code.push((block.next.source, unconditional_jump(target)));
                 }
-                let Ok(target) = u32::try_from(target) else {
-                    return Err(ProgramFromElfError::other("jump target address overflow"));
-                };
+            }
+            ControlInst::Call { ra, target, target_return } => {
+                let target = get_jump_target(target)?;
+                let target_return = get_jump_target(target_return)?;
 
                 code.push((
-                    source,
-                    RawInstruction::new_with_regs2_imm(
-                        Opcode::jump_and_link_register,
-                        cast_reg(Reg::Zero),
-                        cast_reg(Reg::Zero),
-                        target / 4,
-                    ),
+                    block.next.source,
+                    RawInstruction::new_with_regs2_imm(Opcode::jump_and_link_register, cast_reg(ra), cast_reg(Reg::Zero), target),
                 ));
-            }
-            EndOfBlock::Control {
-                source,
-                instruction:
-                    ControlInst::Call {
-                        ra,
-                        target,
-                        return_address,
-                    },
-            } => {
-                if target % 4 != 0 {
-                    return Err(ProgramFromElfError::other("found a call with a target that isn't aligned"));
+
+                if !can_fallthrough_to_next_block.contains(block_target) {
+                    // TODO: This could be more efficient if we'd just directly set the return address to where we want to return.
+                    code.push((block.next.source, unconditional_jump(target_return)));
                 }
-
-                let Ok(target) = u32::try_from(target) else {
-                    return Err(ProgramFromElfError::other("call target address overflow"));
-                };
-
-                code.push((
-                    source,
-                    RawInstruction::new_with_regs2_imm(Opcode::jump_and_link_register, cast_reg(ra), cast_reg(Reg::Zero), target / 4),
-                ));
-                assert_eq!(return_address, block.source.end);
             }
-            EndOfBlock::Control {
-                source,
-                instruction: ControlInst::JumpIndirect { base, offset },
-            } => {
+            ControlInst::JumpIndirect { base, offset } => {
                 if offset % 4 != 0 {
                     return Err(ProgramFromElfError::other(
-                        "found an indirect jump with a target that isn't aligned",
+                        "found an indirect jump with an offset that isn't aligned",
                     ));
                 }
 
                 code.push((
-                    source,
+                    block.next.source,
                     RawInstruction::new_with_regs2_imm(
                         Opcode::jump_and_link_register,
                         cast_reg(Reg::Zero),
@@ -1244,45 +1782,38 @@ fn emit_code(jump_targets: HashSet<u64>, blocks: &[BasicBlock]) -> Result<Vec<(A
                     ),
                 ));
             }
-            EndOfBlock::Control {
-                source,
-                instruction:
-                    ControlInst::CallIndirect {
-                        ra,
-                        base,
-                        offset,
-                        return_address,
-                    },
+            ControlInst::CallIndirect {
+                ra,
+                base,
+                offset,
+                target_return,
             } => {
                 if offset % 4 != 0 {
                     return Err(ProgramFromElfError::other(
                         "found an indirect call with a target that isn't aligned",
                     ));
                 }
+
+                let target_return = get_jump_target(target_return)?;
                 code.push((
-                    source,
+                    block.next.source,
                     RawInstruction::new_with_regs2_imm(Opcode::jump_and_link_register, cast_reg(ra), cast_reg(base), offset as u32 / 4),
                 ));
-                assert_eq!(return_address, block.source.end);
-            }
-            EndOfBlock::Control {
-                source,
-                instruction:
-                    ControlInst::Branch {
-                        kind,
-                        src1,
-                        src2,
-                        target_true,
-                        target_false,
-                    },
-            } => {
-                if target_true % 4 != 0 {
-                    return Err(ProgramFromElfError::other("found a branch with a target that isn't aligned"));
-                }
 
-                let Ok(target_true) = u32::try_from(target_true) else {
-                    return Err(ProgramFromElfError::other("branch target address overflow"));
-                };
+                if !can_fallthrough_to_next_block.contains(block_target) {
+                    // TODO: This could be more efficient if we'd just directly set the return address to where we want to return.
+                    code.push((block.next.source, unconditional_jump(target_return)));
+                }
+            }
+            ControlInst::Branch {
+                kind,
+                src1,
+                src2,
+                target_true,
+                target_false,
+            } => {
+                let target_true = get_jump_target(target_true)?;
+                let target_false = get_jump_target(target_false)?;
 
                 let kind = match kind {
                     BranchKind::Eq => Opcode::branch_eq,
@@ -1292,17 +1823,18 @@ fn emit_code(jump_targets: HashSet<u64>, blocks: &[BasicBlock]) -> Result<Vec<(A
                     BranchKind::LessUnsigned => Opcode::branch_less_unsigned,
                     BranchKind::GreaterOrEqualUnsigned => Opcode::branch_greater_or_equal_unsigned,
                 };
+
                 code.push((
-                    source,
-                    RawInstruction::new_with_regs2_imm(kind, cast_reg(src1), cast_reg(src2), target_true / 4),
+                    block.next.source,
+                    RawInstruction::new_with_regs2_imm(kind, cast_reg(src1), cast_reg(src2), target_true),
                 ));
-                assert_eq!(target_false, block.source.end);
+
+                if !can_fallthrough_to_next_block.contains(block_target) {
+                    code.push((block.next.source, unconditional_jump(target_false)));
+                }
             }
-            EndOfBlock::Control {
-                source,
-                instruction: ControlInst::Unimplemented,
-            } => {
-                code.push((source, RawInstruction::new_argless(Opcode::trap)));
+            ControlInst::Unimplemented => {
+                code.push((block.next.source, RawInstruction::new_argless(Opcode::trap)));
             }
         }
     }
@@ -1310,25 +1842,236 @@ fn emit_code(jump_targets: HashSet<u64>, blocks: &[BasicBlock]) -> Result<Vec<(A
     Ok(code)
 }
 
-#[derive(Copy, Clone)]
-enum HiRelocKind {
-    PcRel,
-    Got,
+#[derive(Copy, Clone, PartialEq, Eq, Debug)]
+enum Bitness {
+    B32,
 }
 
-impl core::fmt::Display for HiRelocKind {
-    fn fmt(&self, fmt: &mut core::fmt::Formatter) -> core::fmt::Result {
-        match self {
-            HiRelocKind::PcRel => fmt.write_str(".rela"),
-            HiRelocKind::Got => fmt.write_str(".got"),
+impl From<Bitness> for u64 {
+    fn from(value: Bitness) -> Self {
+        match value {
+            Bitness::B32 => 4,
         }
     }
 }
 
-#[derive(Default)]
-struct RelocPairs {
-    reloc_pcrel_hi20: HashMap<u64, (HiRelocKind, RelocTarget)>,
-    reloc_pcrel_lo12: HashMap<u64, u64>,
+impl From<Bitness> for RelocationSize {
+    fn from(value: Bitness) -> Self {
+        match value {
+            Bitness::B32 => RelocationSize::U32,
+        }
+    }
+}
+
+#[derive(Copy, Clone, PartialEq, Eq, Debug)]
+pub(crate) enum RelocationSize {
+    U8,
+    U16,
+    U32,
+}
+
+#[derive(Copy, Clone, Debug)]
+pub(crate) enum SizeRelocationSize {
+    SixBits,
+    Generic(RelocationSize),
+}
+
+#[derive(Copy, Clone, Debug)]
+pub(crate) enum RelocationKind {
+    Abs {
+        target: SectionTarget,
+        size: RelocationSize,
+    },
+    JumpTable {
+        target_code: SectionTarget,
+        target_base: SectionTarget,
+    },
+
+    Size {
+        section_index: SectionIndex,
+        range: AddressRange,
+        size: SizeRelocationSize,
+    },
+}
+
+impl RelocationKind {
+    fn targets(&self) -> [Option<SectionTarget>; 2] {
+        match self {
+            RelocationKind::Abs { target, .. } => [Some(*target), None],
+            RelocationKind::Size { section_index, range, .. } => [
+                Some(SectionTarget {
+                    section_index: *section_index,
+                    offset: range.start,
+                }),
+                Some(SectionTarget {
+                    section_index: *section_index,
+                    offset: range.end,
+                }),
+            ],
+            RelocationKind::JumpTable { target_code, target_base } => [Some(*target_code), Some(*target_base)],
+        }
+    }
+}
+
+fn harvest_data_relocations(
+    elf: &Elf,
+    code_sections_set: &HashSet<SectionIndex>,
+    section: &Section,
+    relocations: &mut BTreeMap<SectionTarget, RelocationKind>,
+) -> Result<(), ProgramFromElfError> {
+    #[derive(Debug)]
+    enum MutOp {
+        Add,
+        Sub,
+    }
+
+    #[derive(Debug)]
+    enum Kind {
+        Set(RelocationKind),
+        Mut(MutOp, RelocationSize, SectionTarget),
+
+        Set6 { target: SectionTarget },
+        Sub6 { target: SectionTarget },
+    }
+
+    if elf.relocations(section).next().is_none() {
+        return Ok(());
+    }
+
+    let section_name = section.name();
+    log::trace!("Harvesting data relocations from section: {}", section_name);
+
+    let mut for_address = BTreeMap::new();
+    for (absolute_address, relocation) in elf.relocations(section) {
+        let Some(relative_address) = absolute_address.checked_sub(section.original_address()) else {
+            return Err(ProgramFromElfError::other("invalid relocation offset"));
+        };
+
+        if relocation.has_implicit_addend() {
+            // AFAIK these should never be emitted for RISC-V.
+            return Err(ProgramFromElfError::other(format!("unsupported relocation: {:?}", relocation)));
+        }
+
+        let Some(target) = get_relocation_target(elf, &relocation)? else {
+            continue;
+        };
+
+        let (relocation_name, kind) = match relocation.kind() {
+            object::RelocationKind::Absolute if relocation.encoding() == object::RelocationEncoding::Generic && relocation.size() == 32 => {
+                (
+                    "R_RISCV_32",
+                    Kind::Set(RelocationKind::Abs {
+                        target,
+                        size: RelocationSize::U32,
+                    }),
+                )
+            }
+            object::RelocationKind::Elf(reloc_kind) => match reloc_kind {
+                object::elf::R_RISCV_SET6 => ("R_RISCV_SET6", Kind::Set6 { target }),
+                object::elf::R_RISCV_SUB6 => ("R_RISCV_SUB6", Kind::Sub6 { target }),
+                object::elf::R_RISCV_SET8 => (
+                    "R_RISCV_SET8",
+                    Kind::Set(RelocationKind::Abs {
+                        target,
+                        size: RelocationSize::U8,
+                    }),
+                ),
+                object::elf::R_RISCV_SET16 => (
+                    "R_RISCV_SET16",
+                    Kind::Set(RelocationKind::Abs {
+                        target,
+                        size: RelocationSize::U16,
+                    }),
+                ),
+                object::elf::R_RISCV_ADD8 => ("R_RISCV_ADD8", Kind::Mut(MutOp::Add, RelocationSize::U8, target)),
+                object::elf::R_RISCV_SUB8 => ("R_RISCV_SUB8", Kind::Mut(MutOp::Sub, RelocationSize::U8, target)),
+                object::elf::R_RISCV_ADD16 => ("R_RISCV_ADD16", Kind::Mut(MutOp::Add, RelocationSize::U16, target)),
+                object::elf::R_RISCV_SUB16 => ("R_RISCV_SUB16", Kind::Mut(MutOp::Sub, RelocationSize::U16, target)),
+                object::elf::R_RISCV_ADD32 => ("R_RISCV_ADD32", Kind::Mut(MutOp::Add, RelocationSize::U32, target)),
+                object::elf::R_RISCV_SUB32 => ("R_RISCV_SUB32", Kind::Mut(MutOp::Sub, RelocationSize::U32, target)),
+                _ => {
+                    return Err(ProgramFromElfError::other(format!(
+                        "unsupported relocation in data section '{section_name}': {relocation:?}"
+                    )))
+                }
+            },
+            _ => {
+                return Err(ProgramFromElfError::other(format!(
+                    "unsupported relocation in data section '{section_name}': {relocation:?}"
+                )))
+            }
+        };
+
+        log::trace!("  {relocation_name}: {section_name}[0x{relative_address:x}] (0x{absolute_address:x}): -> {target}");
+        for_address
+            .entry(relative_address)
+            .or_insert_with(Vec::new)
+            .push((relocation_name, kind));
+    }
+
+    for (relative_address, list) in for_address {
+        let current_location = SectionTarget {
+            section_index: section.index(),
+            offset: relative_address,
+        };
+
+        struct ErrorToken; // To make sure we don't forget a `continue` anywhere.
+        let _: ErrorToken = match &*list {
+            [(_, Kind::Set(kind))] => {
+                relocations.insert(current_location, *kind);
+                continue;
+            }
+            [(_, Kind::Mut(MutOp::Add, size_1, target_1)), (_, Kind::Mut(MutOp::Sub, size_2, target_2))]
+                if size_1 == size_2 && (target_1.section_index == target_2.section_index && target_1.offset >= target_2.offset) =>
+            {
+                relocations.insert(
+                    current_location,
+                    RelocationKind::Size {
+                        section_index: target_1.section_index,
+                        range: (target_2.offset..target_1.offset).into(),
+                        size: SizeRelocationSize::Generic(*size_1),
+                    },
+                );
+                continue;
+            }
+            [(_, Kind::Set6 { target: target_1 }), (_, Kind::Sub6 { target: target_2 })]
+                if target_1.section_index == target_2.section_index && target_1.offset >= target_2.offset =>
+            {
+                relocations.insert(
+                    current_location,
+                    RelocationKind::Size {
+                        section_index: target_1.section_index,
+                        range: (target_2.offset..target_1.offset).into(),
+                        size: SizeRelocationSize::SixBits,
+                    },
+                );
+                continue;
+            }
+            [(_, Kind::Mut(MutOp::Add, size_1, target_1)), (_, Kind::Mut(MutOp::Sub, size_2, target_2))]
+                if size_1 == size_2
+                    && *size_1 == RelocationSize::U32
+                    && code_sections_set.contains(&target_1.section_index)
+                    && !code_sections_set.contains(&target_2.section_index) =>
+            {
+                relocations.insert(
+                    current_location,
+                    RelocationKind::JumpTable {
+                        target_code: *target_1,
+                        target_base: *target_2,
+                    },
+                );
+                continue;
+            }
+            _ => ErrorToken,
+        };
+
+        return Err(ProgramFromElfError::other(format!(
+            "unsupported relocations for '{section_name}'[{relative_address:x}] (0x{absolute_address:08x}): {list:?}",
+            absolute_address = section.original_address() + relative_address
+        )));
+    }
+
+    Ok(())
 }
 
 fn read_u32(data: &[u8], relative_address: u64) -> Result<u32, ProgramFromElfError> {
@@ -1337,14 +2080,6 @@ fn read_u32(data: &[u8], relative_address: u64) -> Result<u32, ProgramFromElfErr
         .get(target_range)
         .ok_or(ProgramFromElfError::other("out of range relocation"))?;
     Ok(u32::from_le_bytes([value[0], value[1], value[2], value[3]]))
-}
-
-fn read_u16(data: &[u8], relative_address: u64) -> Result<u16, ProgramFromElfError> {
-    let target_range = relative_address as usize..relative_address as usize + 2;
-    let value = data
-        .get(target_range)
-        .ok_or(ProgramFromElfError::other("out of range relocation"))?;
-    Ok(u16::from_le_bytes([value[0], value[1]]))
 }
 
 fn read_u8(data: &[u8], relative_address: u64) -> Result<u8, ProgramFromElfError> {
@@ -1369,299 +2104,82 @@ fn write_u16(data: &mut [u8], relative_address: u64, value: u16) -> Result<(), P
     Ok(())
 }
 
-#[allow(clippy::too_many_arguments)]
-fn relocate(
+fn harvest_code_relocations(
     elf: &Elf,
-    sections_text_indexes: &HashSet<SectionIndex>,
-    sections_text: &[&ElfSection],
-    section_got: Option<&ElfSection>,
-    mut synthetic_got: Option<&mut (u64, Vec<u8>, BTreeMap<u64, usize>)>,
-    relocation_for_section: &HashMap<SectionIndex, i64>,
-    section: &ElfSection,
-    data: &mut [u8],
-    mut jump_targets: Option<&mut HashSet<u64>>,
-    instruction_overrides: &mut HashMap<u64, Inst>,
+    section: &Section,
+    instruction_overrides: &mut HashMap<SectionTarget, InstExt<SectionTarget, SectionTarget>>,
+    data_relocations: &mut BTreeMap<SectionTarget, RelocationKind>,
 ) -> Result<(), ProgramFromElfError> {
-    if section.relocations().next().is_none() {
+    #[derive(Copy, Clone)]
+    enum HiRelocKind {
+        PcRel,
+        Got,
+    }
+
+    impl core::fmt::Display for HiRelocKind {
+        fn fmt(&self, fmt: &mut core::fmt::Formatter) -> core::fmt::Result {
+            match self {
+                HiRelocKind::PcRel => fmt.write_str("R_RISCV_PCREL_HI20"),
+                HiRelocKind::Got => fmt.write_str("R_RISCV_GOT_HI20"),
+            }
+        }
+    }
+
+    #[derive(Default)]
+    struct RelocPairs {
+        reloc_pcrel_hi20: BTreeMap<u64, (HiRelocKind, SectionTarget)>,
+        reloc_pcrel_lo12: BTreeMap<u64, (&'static str, u64)>,
+    }
+
+    if elf.relocations(section).next().is_none() {
         return Ok(());
     }
 
-    let mut pairs_for_section: HashMap<SectionIndex, RelocPairs> = Default::default();
+    let mut pcrel_relocations = RelocPairs::default();
+    let mut skip_lo12: HashSet<SectionTarget> = Default::default();
 
-    let section_name = section.name()?;
-    log::trace!("Relocating section: {}", section_name);
+    let section_name = section.name();
+    log::trace!("Harvesting code relocations from section: {}", section_name);
 
-    let section_relocation_delta = *relocation_for_section
-        .get(&section.index())
-        .ok_or_else(|| ProgramFromElfError::other(format!("internal error: no relocation offset for section '{}'", section_name)))?;
-    let section_range = section.file_range().unwrap_or((0, 0));
-    let mut seen = HashSet::new();
-    for (absolute_address, relocation) in section.relocations() {
-        let section_data = &mut data[section_range.0 as usize..][..section_range.1 as usize];
-
-        if absolute_address < section.address() {
+    let section_data = section.data();
+    for (absolute_address, relocation) in elf.relocations(section) {
+        let Some(relative_address) = absolute_address.checked_sub(section.original_address()) else {
             return Err(ProgramFromElfError::other("invalid relocation offset"));
-        }
+        };
 
         if relocation.has_implicit_addend() {
             // AFAIK these should never be emitted for RISC-V.
-            return Err(ProgramFromElfError::other(format!("unsupported relocation: {:?}", relocation)));
+            return Err(ProgramFromElfError::other(format!(
+                "unsupported relocation in section '{section_name}': {relocation:?}"
+            )));
         }
 
-        let relative_address = absolute_address - section.address();
-        let relocated_address = absolute_address.wrapping_add(section_relocation_delta as u64);
-        let target = get_relocation_target(elf, relocation_for_section, &relocation)?;
+        let current_location = SectionTarget {
+            section_index: section.index(),
+            offset: relative_address,
+        };
 
-        let source_section_is_text = sections_text_indexes.contains(&section.index());
-        let target_section_is_text = target
-            .target_section_index
-            .map(|index| sections_text_indexes.contains(&index))
-            .unwrap_or(false);
-        if !source_section_is_text && target_section_is_text {
-            if let Some(jump_targets) = jump_targets.as_mut() {
-                jump_targets.insert(target.relocated_address);
-            }
-        }
-
-        // This is needed for the ADD/SUB relocations, which are stateful relocations
-        // that need to read the previous value and modify it.
-        //
-        // This is used in e.g. the debug info, where there will be pairs of ADD and SUB
-        // relocations for exactly the same address. The ADD will point to the function's end,
-        // and the SUB will point to the function's start, effectively calculating `end - start`,
-        // or in other words the function's size.
-        //
-        // If we do this naively and the program is not fully linked (it's an '.o', or it was
-        // linked with `-Wl,--relocatable`) then these locations will initially contain zeros,
-        // and everything will be fine, but if the program *was* fully linked (because it was
-        // only compiled with `-Wl,--emit-relocs`) then these locations will already contain a value.
-        //
-        // So to make sure we handle this correctly in both cases we'll just ignore the existing
-        // value, but only for the first time.
-        let is_first_time = seen.insert(relative_address);
+        let relative_address = current_location.offset;
+        let Some(target) = get_relocation_target(elf, &relocation)? else {
+            continue;
+        };
 
         match relocation.kind() {
-            object::RelocationKind::Absolute => {
-                match (relocation.encoding(), relocation.size()) {
-                    (object::RelocationEncoding::Generic, 32) => {}
-                    _ => return Err(ProgramFromElfError::other(format!("unsupported relocation: {:?}", relocation))),
-                }
-
-                log::trace!(
-                    "  Absolute: {}[0x{relative_address:x}] (0x{absolute_address:x}): 0x{:x} -> 0x{:x}",
-                    section_name,
-                    read_u32(section_data, relative_address)?,
-                    target.relocated_address as u32,
+            object::RelocationKind::Absolute if relocation.encoding() == object::RelocationEncoding::Generic && relocation.size() == 32 => {
+                data_relocations.insert(
+                    current_location,
+                    RelocationKind::Abs {
+                        target,
+                        size: RelocationSize::U32,
+                    },
                 );
-                write_u32(section_data, relative_address, target.relocated_address as u32)?;
             }
             object::RelocationKind::Elf(reloc_kind) => {
                 // https://github.com/riscv-non-isa/riscv-elf-psabi-doc/releases
                 match reloc_kind {
-                    object::elf::R_RISCV_SUB6 => {
-                        if jump_targets.is_some() {
-                            return Err(ProgramFromElfError::other(
-                                "found a R_RISCV_SUB6 relocation in an unexpected section",
-                            ));
-                        }
-
-                        let old_value = read_u8(section_data, relative_address)?;
-                        let old_value_effective = if is_first_time { 0 } else { old_value };
-
-                        let arg = target.relocated_address as u8;
-                        let new_value = (old_value_effective & 0b1100_0000) | (old_value_effective.wrapping_sub(arg) & 0b0011_1111);
-                        section_data[relative_address as usize] = new_value;
-
-                        log::trace!(
-                            "  R_RISCV_SUB6: {}[0x{relative_address:x}] (0x{absolute_address:x}): 0x{:02x} -> 0x{:02x}",
-                            section.name()?,
-                            old_value,
-                            new_value
-                        );
-                    }
-                    object::elf::R_RISCV_SET6 => {
-                        if jump_targets.is_some() {
-                            return Err(ProgramFromElfError::other(
-                                "found a R_RISCV_SET6 relocation in an unexpected section",
-                            ));
-                        }
-
-                        let old_value = read_u8(section_data, relative_address)?;
-                        let new_value = (old_value & 0b1100_0000) | ((target.relocated_address as u8) & 0b0011_1111);
-                        section_data[relative_address as usize] = new_value;
-
-                        log::trace!(
-                            "  R_RISCV_SET6: {}[0x{relative_address:x}] (0x{absolute_address:x}): 0x{:02x} -> 0x{:02x}",
-                            section.name()?,
-                            old_value,
-                            new_value
-                        );
-                    }
-                    object::elf::R_RISCV_SET8 => {
-                        if jump_targets.is_some() {
-                            return Err(ProgramFromElfError::other(
-                                "found a R_RISCV_SET8 relocation in an unexpected section",
-                            ));
-                        }
-
-                        let old_value = read_u8(section_data, relative_address)?;
-                        let new_value = target.relocated_address as u8;
-                        section_data[relative_address as usize] = new_value;
-
-                        log::trace!(
-                            "  R_RISCV_SET8: {}[0x{relative_address:x}] (0x{absolute_address:x}): 0x{:02x} -> 0x{:02x}",
-                            section.name()?,
-                            old_value,
-                            new_value
-                        );
-                    }
-                    object::elf::R_RISCV_SET16 => {
-                        if jump_targets.is_some() {
-                            return Err(ProgramFromElfError::other(
-                                "found a R_RISCV_SET16 relocation in an unexpected section",
-                            ));
-                        }
-
-                        let old_value = read_u16(section_data, relative_address)?;
-                        let new_value = target.relocated_address as u16;
-                        write_u16(section_data, relative_address, new_value)?;
-
-                        log::trace!(
-                            "  R_RISCV_SET16: {}[0x{relative_address:x}] (0x{absolute_address:x}): 0x{:04x} -> 0x{:04x}",
-                            section.name()?,
-                            old_value,
-                            new_value
-                        );
-                    }
-                    object::elf::R_RISCV_ADD8 => {
-                        if jump_targets.is_some() {
-                            return Err(ProgramFromElfError::other(
-                                "found a R_RISCV_ADD8 relocation in an unexpected section",
-                            ));
-                        }
-
-                        let old_value = read_u8(section_data, relative_address)?;
-                        let old_value_effective = if is_first_time { 0 } else { old_value };
-
-                        let arg = target.relocated_address as u8 as i8;
-                        let new_value = (old_value_effective as i8).wrapping_add(arg) as u8;
-                        section_data[relative_address as usize] = new_value;
-
-                        log::trace!(
-                            "  R_RISCV_ADD8: {}[0x{relative_address:x}] (0x{absolute_address:x}): 0x{:02x} -> 0x{:02x}",
-                            section.name()?,
-                            old_value,
-                            new_value
-                        );
-                    }
-                    object::elf::R_RISCV_SUB8 => {
-                        if jump_targets.is_some() {
-                            return Err(ProgramFromElfError::other(
-                                "found a R_RISCV_SUB8 relocation in an unexpected section",
-                            ));
-                        }
-
-                        let old_value = read_u8(section_data, relative_address)?;
-                        let old_value_effective = if is_first_time { 0 } else { old_value };
-
-                        let arg = target.relocated_address as u8 as i8;
-                        let new_value = (old_value_effective as i8).wrapping_sub(arg) as u8;
-                        section_data[relative_address as usize] = new_value;
-
-                        log::trace!(
-                            "  R_RISCV_SUB8: {}[0x{relative_address:x}] (0x{absolute_address:x}): 0x{:02x} -> 0x{:02x}",
-                            section.name()?,
-                            old_value,
-                            new_value
-                        );
-                    }
-                    object::elf::R_RISCV_ADD16 => {
-                        if jump_targets.is_some() {
-                            return Err(ProgramFromElfError::other(
-                                "found a R_RISCV_ADD16 relocation in an unexpected section",
-                            ));
-                        }
-
-                        let old_value = read_u16(section_data, relative_address)?;
-                        let old_value_effective = if is_first_time { 0 } else { old_value };
-
-                        let arg = target.relocated_address as u16 as i16;
-                        let new_value = (old_value_effective as i16).wrapping_add(arg) as u16;
-                        write_u16(section_data, relative_address, new_value)?;
-
-                        log::trace!(
-                            "  R_RISCV_ADD16: {}[0x{relative_address:x}] (0x{absolute_address:x}): 0x{:04x} -> 0x{:04x}",
-                            section.name()?,
-                            old_value,
-                            new_value
-                        );
-                    }
-                    object::elf::R_RISCV_SUB16 => {
-                        if jump_targets.is_some() {
-                            return Err(ProgramFromElfError::other(
-                                "found a R_RISCV_SUB16 relocation in an unexpected section",
-                            ));
-                        }
-
-                        let old_value = read_u16(section_data, relative_address)?;
-                        let old_value_effective = if is_first_time { 0 } else { old_value };
-
-                        let arg = target.relocated_address as u16 as i16;
-                        let new_value = (old_value_effective as i16).wrapping_sub(arg) as u16;
-                        write_u16(section_data, relative_address, new_value)?;
-
-                        log::trace!(
-                            "  R_RISCV_SUB16: {}[0x{relative_address:x}] (0x{absolute_address:x}): 0x{:04x} -> 0x{:04x}",
-                            section.name()?,
-                            old_value,
-                            new_value
-                        );
-                    }
-                    object::elf::R_RISCV_ADD32 => {
-                        let old_value = read_u32(section_data, relative_address)?;
-                        let old_value_effective = if is_first_time { 0 } else { old_value };
-
-                        let arg = target.relocated_address as u32 as i32;
-                        let new_value = (old_value_effective as i32).wrapping_add(arg) as u32;
-                        write_u32(section_data, relative_address, new_value)?;
-
-                        log::trace!(
-                            "  R_RISCV_ADD32: {}[0x{relative_address:x}] (0x{absolute_address:x}): 0x{:08x} -> 0x{:08x} ({:x} + {:x})",
-                            section.name()?,
-                            old_value,
-                            new_value,
-                            old_value_effective,
-                            arg,
-                        );
-                    }
-                    object::elf::R_RISCV_SUB32 => {
-                        let old_value = read_u32(section_data, relative_address)?;
-                        let old_value_effective = if is_first_time { 0 } else { old_value };
-
-                        let arg = target.relocated_address as u32 as i32;
-                        let new_value = (old_value_effective as i32).wrapping_sub(arg) as u32;
-                        write_u32(section_data, relative_address, new_value)?;
-
-                        log::trace!(
-                            "  R_RISCV_SUB32: {}[0x{relative_address:x}] (0x{absolute_address:x}): 0x{:08x} -> 0x{:08x} ({:x} - {:x})",
-                            section.name()?,
-                            old_value,
-                            new_value,
-                            old_value_effective,
-                            arg,
-                        );
-                    }
                     object::elf::R_RISCV_CALL_PLT => {
                         // This relocation is for a pair of instructions, namely AUIPC + JALR, where we're allowed to delete the AUIPC if it's unnecessary.
-                        if !sections_text_indexes.contains(&section.index()) {
-                            return Err(ProgramFromElfError::other(format!(
-                                "found a R_RISCV_CALL_PLT relocation in an unexpected section: '{}'",
-                                section.name()?
-                            )));
-                        };
-
-                        let data_text = get_section_data(data, section)?;
-                        let Some(xs) = data_text.get(relative_address as usize..relative_address as usize + 8) else {
+                        let Some(xs) = section_data.get(current_location.offset as usize..current_location.offset as usize + 8) else {
                             return Err(ProgramFromElfError::other("invalid R_RISCV_CALL_PLT relocation"));
                         };
 
@@ -1675,7 +2193,7 @@ fn relocate(
                         let lo_inst_raw = u32::from_le_bytes([xs[4], xs[5], xs[6], xs[7]]);
                         let Some(lo_inst) = decode_inst(lo_inst_raw)? else {
                             return Err(ProgramFromElfError::other(format!(
-                                "R_RISCV_CALL_PLT for an unsupported instruction (2st): 0x{lo_inst_raw:08}"
+                                "R_RISCV_CALL_PLT for an unsupported instruction (2nd): 0x{lo_inst_raw:08}"
                             )));
                         };
 
@@ -1692,7 +2210,7 @@ fn relocate(
                         } = lo_inst
                         else {
                             return Err(ProgramFromElfError::other(format!(
-                                "R_RISCV_CALL_PLT for an unsupported instruction (2st): 0x{lo_inst_raw:08} ({lo_inst:?})"
+                                "R_RISCV_CALL_PLT for an unsupported instruction (2nd): 0x{lo_inst_raw:08} ({lo_inst:?})"
                             )));
                         };
 
@@ -1702,117 +2220,73 @@ fn relocate(
                             ));
                         }
 
-                        let new_target = (target.relocated_address as u32).wrapping_sub(relocated_address as u32 + 4);
-
+                        let target_return = current_location.add(8);
+                        instruction_overrides.insert(current_location, InstExt::nop());
                         instruction_overrides.insert(
-                            absolute_address,
-                            Inst::RegImm {
-                                kind: RegImmKind::Add,
-                                dst: Reg::Zero,
-                                src: Reg::Zero,
-                                imm: 0,
-                            },
-                        );
-                        instruction_overrides.insert(
-                            absolute_address + 4,
-                            Inst::JumpAndLink {
-                                dst: lo_dst,
-                                target: new_target,
-                            },
+                            current_location.add(4),
+                            InstExt::Control(ControlInst::jump_or_call(lo_dst, target, target_return)),
                         );
 
                         log::trace!(
-                            "  R_RISCV_CALL_PLT: {}[0x{relative_address:x}] (0x{absolute_address:x}): -> 0x{:08x}",
-                            section.name()?,
-                            target.relocated_address
+                            "  R_RISCV_CALL_PLT: {}[0x{relative_address:x}] (0x{absolute_address:x}): -> {}",
+                            section.name(),
+                            target
                         );
                     }
                     object::elf::R_RISCV_PCREL_HI20 => {
                         // This relocation is for an AUIPC.
-
-                        if !sections_text_indexes.contains(&section.index()) {
-                            return Err(ProgramFromElfError::other(format!(
-                                "found a R_RISCV_PCREL_HI20 relocation in an unexpected section: '{}'",
-                                section.name()?
-                            )));
-                        }
-
-                        let p = pairs_for_section.entry(section.index()).or_insert_with(Default::default);
-                        p.reloc_pcrel_hi20.insert(relative_address, (HiRelocKind::PcRel, target));
+                        pcrel_relocations
+                            .reloc_pcrel_hi20
+                            .insert(relative_address, (HiRelocKind::PcRel, target));
                         log::trace!(
-                            "  R_RISCV_PCREL_HI20: {}[0x{relative_address:x}] (0x{absolute_address:x}): -> 0x{:08x}",
-                            section.name()?,
-                            target.relocated_address
+                            "  R_RISCV_PCREL_HI20: {}[0x{relative_address:x}] (0x{absolute_address:x}): -> {}",
+                            section.name(),
+                            target
                         );
                     }
                     object::elf::R_RISCV_GOT_HI20 => {
-                        if !sections_text_indexes.contains(&section.index()) {
-                            return Err(ProgramFromElfError::other(format!(
-                                "found a R_RISCV_GOT_HI20 relocation in an unexpected section: '{}'",
-                                section.name()?
-                            )));
-                        };
-
-                        let p = pairs_for_section.entry(section.index()).or_insert_with(Default::default);
-                        p.reloc_pcrel_hi20.insert(relative_address, (HiRelocKind::Got, target));
+                        pcrel_relocations
+                            .reloc_pcrel_hi20
+                            .insert(relative_address, (HiRelocKind::Got, target));
                         log::trace!(
-                            "  R_RISCV_GOT_HI20: {}[0x{relative_address:x}] (0x{absolute_address:x}): -> 0x{:08x}",
-                            section.name()?,
-                            target.relocated_address
+                            "  R_RISCV_GOT_HI20: {}[0x{relative_address:x}] (0x{absolute_address:x}): -> {}",
+                            section.name(),
+                            target
                         );
                     }
                     object::elf::R_RISCV_PCREL_LO12_I => {
-                        if !sections_text_indexes.contains(&section.index()) {
-                            return Err(ProgramFromElfError::other(format!(
-                                "found a R_RISCV_PCREL_LO12_I relocation in an unexpected section: '{}'",
-                                section.name()?
-                            )));
-                        };
-
-                        if !target_section_is_text {
+                        if target.section_index != section.index() {
                             return Err(ProgramFromElfError::other(
-                                "R_RISCV_PCREL_LO12_I relocation points to a non '.text' section",
+                                "R_RISCV_PCREL_LO12_I relocation points to a different section",
                             ));
                         }
 
-                        let p = pairs_for_section.entry(section.index()).or_insert_with(Default::default);
-                        p.reloc_pcrel_lo12.insert(relative_address, target.relative_address);
+                        pcrel_relocations
+                            .reloc_pcrel_lo12
+                            .insert(relative_address, ("R_RISCV_PCREL_LO12_I", target.offset));
                         log::trace!(
-                            "  R_RISCV_PCREL_LO12_I: {}[0x{relative_address:x}] (0x{absolute_address:x}): -> 0x{:08x}",
-                            section.name()?,
-                            target.relocated_address
+                            "  R_RISCV_PCREL_LO12_I: {}[0x{relative_address:x}] (0x{absolute_address:x}): -> {}",
+                            section.name(),
+                            target
                         );
                     }
                     object::elf::R_RISCV_PCREL_LO12_S => {
-                        if !sections_text_indexes.contains(&section.index()) {
-                            return Err(ProgramFromElfError::other(format!(
-                                "found a R_RISCV_PCREL_LO12_S relocation in an unexpected section: '{}'",
-                                section.name()?
-                            )));
-                        };
-
-                        if !target_section_is_text {
+                        if target.section_index != section.index() {
                             return Err(ProgramFromElfError::other(
-                                "R_RISCV_PCREL_LO12_S relocation points to a non '.text' section",
+                                "R_RISCV_PCREL_LO12_I relocation points to a different section",
                             ));
                         }
 
-                        let p = pairs_for_section.entry(section.index()).or_insert_with(Default::default);
-                        p.reloc_pcrel_lo12.insert(relative_address, target.relative_address);
+                        pcrel_relocations
+                            .reloc_pcrel_lo12
+                            .insert(relative_address, ("R_RISCV_PCREL_LO12_S", target.offset));
                         log::trace!(
-                            "  R_RISCV_PCREL_LO12_S: {}[0x{relative_address:x}] (0x{absolute_address:x}): -> 0x{:08x}",
-                            section.name()?,
-                            target.relocated_address
+                            "  R_RISCV_PCREL_LO12_S: {}[0x{relative_address:x}] (0x{absolute_address:x}): -> {}",
+                            section.name(),
+                            target
                         );
                     }
                     object::elf::R_RISCV_JAL => {
-                        if !sections_text_indexes.contains(&section.index()) {
-                            return Err(ProgramFromElfError::other(format!(
-                                "found a R_RISCV_JAL relocation in an unexpected section: '{}'",
-                                section.name()?
-                            )));
-                        };
-
                         let inst_raw = read_u32(section_data, relative_address)?;
                         let Some(inst) = decode_inst(inst_raw)? else {
                             return Err(ProgramFromElfError::other(format!(
@@ -1826,24 +2300,19 @@ fn relocate(
                             )));
                         };
 
-                        let new_target = (target.relocated_address as u32).wrapping_sub(relocated_address as u32);
-
-                        instruction_overrides.insert(absolute_address, Inst::JumpAndLink { dst, target: new_target });
+                        let target_return = current_location.add(4);
+                        instruction_overrides.insert(
+                            current_location,
+                            InstExt::Control(ControlInst::jump_or_call(dst, target, target_return)),
+                        );
 
                         log::trace!(
-                            "  R_RISCV_JAL: {}[0x{relative_address:x}] (0x{absolute_address:x} -> 0x{relocated_address:x}): -> 0x{:08x}",
-                            section.name()?,
-                            target.relocated_address as u32
+                            "  R_RISCV_JAL: {}[0x{relative_address:x}] (0x{absolute_address:x} -> {}",
+                            section.name(),
+                            target
                         );
                     }
                     object::elf::R_RISCV_BRANCH => {
-                        if !sections_text_indexes.contains(&section.index()) {
-                            return Err(ProgramFromElfError::other(format!(
-                                "found a R_RISCV_BRANCH relocation in an unexpected section: '{}'",
-                                section.name()?
-                            )));
-                        };
-
                         let inst_raw = read_u32(section_data, relative_address)?;
                         let Some(inst) = decode_inst(inst_raw)? else {
                             return Err(ProgramFromElfError::other(format!(
@@ -1857,36 +2326,27 @@ fn relocate(
                             )));
                         };
 
-                        let new_target = (target.relocated_address as u32).wrapping_sub(relocated_address as u32);
-
+                        let target_false = current_location.add(4);
                         instruction_overrides.insert(
-                            absolute_address,
-                            Inst::Branch {
+                            current_location,
+                            InstExt::Control(ControlInst::Branch {
                                 kind,
                                 src1,
                                 src2,
-                                target: new_target,
-                            },
+                                target_true: target,
+                                target_false,
+                            }),
                         );
 
                         log::trace!(
-                            "  R_RISCV_BRANCH: {}[0x{relative_address:x}] (0x{absolute_address:x} -> 0x{relocated_address:x}): -> 0x{:08x}",
-                            section.name()?,
-                            target.relocated_address as u32
+                            "  R_RISCV_BRANCH: {}[0x{relative_address:x}] (0x{absolute_address:x} -> {}",
+                            section.name(),
+                            target
                         );
                     }
                     object::elf::R_RISCV_HI20 => {
                         // This relocation is for a LUI + ADDI.
-
-                        if !sections_text_indexes.contains(&section.index()) {
-                            return Err(ProgramFromElfError::other(format!(
-                                "found a R_RISCV_HI20 relocation in an unexpected section: '{}'",
-                                section.name()?
-                            )));
-                        }
-
-                        let data_text = get_section_data(data, section)?;
-                        let Some(xs) = data_text.get(relative_address as usize..relative_address as usize + 8) else {
+                        let Some(xs) = section_data.get(relative_address as usize..relative_address as usize + 8) else {
                             return Err(ProgramFromElfError::other("invalid R_RISCV_HI20 relocation"));
                         };
 
@@ -1900,7 +2360,7 @@ fn relocate(
                         let lo_inst_raw = u32::from_le_bytes([xs[4], xs[5], xs[6], xs[7]]);
                         let Some(lo_inst) = decode_inst(lo_inst_raw)? else {
                             return Err(ProgramFromElfError::other(format!(
-                                "R_RISCV_HI20 for an unsupported instruction (2st): 0x{lo_inst_raw:08}"
+                                "R_RISCV_HI20 for an unsupported instruction (2nd): 0x{lo_inst_raw:08}"
                             )));
                         };
 
@@ -1918,7 +2378,7 @@ fn relocate(
                         } = lo_inst
                         else {
                             return Err(ProgramFromElfError::other(format!(
-                                "R_RISCV_HI20 for an unsupported instruction (2st): 0x{lo_inst_raw:08} ({lo_inst:?})"
+                                "R_RISCV_HI20 for an unsupported instruction (2nd): 0x{lo_inst_raw:08} ({lo_inst:?})"
                             )));
                         };
 
@@ -1928,79 +2388,47 @@ fn relocate(
                             ));
                         }
 
-                        let new_target = (target.relocated_address as u32).wrapping_sub(relocated_address as u32 + 4);
-
+                        instruction_overrides.insert(current_location, InstExt::nop());
                         instruction_overrides.insert(
-                            absolute_address,
-                            Inst::RegImm {
-                                kind: RegImmKind::Add,
-                                dst: Reg::Zero,
-                                src: Reg::Zero,
-                                imm: 0,
-                            },
+                            current_location.add(4),
+                            InstExt::Basic(BasicInst::LoadAddress { dst: hi_reg, target }),
                         );
 
-                        instruction_overrides.insert(
-                            absolute_address + 4,
-                            Inst::RegImm {
-                                kind: RegImmKind::Add,
-                                dst: hi_reg,
-                                src: Reg::Zero,
-                                imm: new_target as i32,
-                            },
-                        );
+                        skip_lo12.insert(current_location.add(4));
 
                         log::trace!(
-                            "  R_RISCV_HI20: {}[0x{relative_address:x}] (0x{absolute_address:x}): -> 0x{:08x}",
-                            section.name()?,
-                            target.relocated_address
+                            "  R_RISCV_HI20: {}[0x{relative_address:x}] (0x{absolute_address:x}): -> {}",
+                            section.name(),
+                            target
                         );
 
                         continue;
                     }
                     object::elf::R_RISCV_LO12_I => {
-                        if !sections_text_indexes.contains(&section.index()) {
-                            return Err(ProgramFromElfError::other(format!(
-                                "found a R_RISCV_LO12_I relocation in an unexpected section: '{}'",
-                                section.name()?
-                            )));
-                        };
+                        if skip_lo12.contains(&current_location) {
+                            continue;
+                        }
 
-                        let inst_raw = read_u32(section_data, relative_address)?;
-                        let Some(inst) = decode_inst(inst_raw)? else {
-                            return Err(ProgramFromElfError::other(format!(
-                                "R_RISCV_LO12_I for an unsupported instruction: 0x{inst_raw:08}"
-                            )));
-                        };
+                        return Err(ProgramFromElfError::other(format!(
+                            "found a R_RISCV_LO12_I relocation in '{}' without a R_RISCV_HI20 preceding it",
+                            section.name()
+                        )));
+                    }
+                    object::elf::R_RISCV_LO12_S => {
+                        if skip_lo12.contains(&current_location) {
+                            continue;
+                        }
 
-                        let Inst::RegImm { kind, dst, src, .. } = inst else {
-                            return Err(ProgramFromElfError::other(format!(
-                                "R_RISCV_LO12_I for an unsupported instruction: 0x{inst_raw:08} ({inst:?})"
-                            )));
-                        };
-
-                        let new_target = target.relocated_address as u32;
-                        instruction_overrides.insert(
-                            absolute_address,
-                            Inst::RegImm {
-                                kind,
-                                dst,
-                                src,
-                                imm: new_target as i32,
-                            },
-                        );
-
-                        log::trace!(
-                            "  R_RISCV_LO12_I: {}[0x{relative_address:x}] (0x{absolute_address:x}): -> 0x{:08x}",
-                            section.name()?,
-                            target.relocated_address
-                        );
+                        return Err(ProgramFromElfError::other(format!(
+                            "found a R_RISCV_LO12_S relocation in '{}' without a R_RISCV_HI20 preceding it",
+                            section.name()
+                        )));
                     }
                     object::elf::R_RISCV_RELAX => {}
                     _ => {
                         return Err(ProgramFromElfError::other(format!(
                             "unsupported relocation type in section '{}': 0x{:08x}",
-                            section.name()?,
+                            section.name(),
                             reloc_kind
                         )));
                     }
@@ -2008,314 +2436,144 @@ fn relocate(
             }
             _ => {
                 return Err(ProgramFromElfError::other(format!(
-                    "unsupported relocation in section '{}': {:?}",
-                    section.name()?,
+                    "unsupported relocation in code section '{}': {:?}",
+                    section.name(),
                     relocation
                 )))
             }
         }
     }
 
-    for (section_index, pairs) in pairs_for_section {
-        let section_text = sections_text.iter().find(|section| section.index() == section_index).unwrap();
-        process_pcrel_pairs(
-            data,
-            section_got,
-            synthetic_got.as_deref_mut(),
-            section_text,
-            pairs,
-            relocation_for_section,
-            instruction_overrides,
-        )?;
-    }
+    for (relative_lo, (lo_rel_name, relative_hi)) in pcrel_relocations.reloc_pcrel_lo12 {
+        let lo_inst_raw = &section_data[relative_lo as usize..][..4];
+        let lo_inst_raw = u32::from_le_bytes([lo_inst_raw[0], lo_inst_raw[1], lo_inst_raw[2], lo_inst_raw[3]]);
+        let lo_inst = decode_inst(lo_inst_raw)?;
+        let hi_inst_raw = &section_data[relative_hi as usize..][..4];
+        let hi_inst_raw = u32::from_le_bytes([hi_inst_raw[0], hi_inst_raw[1], hi_inst_raw[2], hi_inst_raw[3]]);
+        let hi_inst = decode_inst(hi_inst_raw)?;
 
-    Ok(())
-}
-
-fn process_pcrel_pairs(
-    data: &mut [u8],
-    section_got: Option<&ElfSection>,
-    mut synthetic_got: Option<&mut (u64, Vec<u8>, BTreeMap<u64, usize>)>,
-    section_text: &ElfSection,
-    pairs: RelocPairs,
-    relocation_for_section: &HashMap<SectionIndex, i64>,
-    instruction_overrides: &mut HashMap<u64, Inst>,
-) -> Result<(), ProgramFromElfError> {
-    let text_range = get_section_range(data, section_text)?;
-
-    // Technically should be unnecessary, but let's sort this to ensure determinism.
-    let mut reloc_pcrel_lo12: Vec<_> = pairs.reloc_pcrel_lo12.into_iter().collect();
-    reloc_pcrel_lo12.sort();
-
-    for (relative_lo, relative_hi) in reloc_pcrel_lo12 {
-        let data_text = &mut data[text_range.clone()];
-        let lo_inst_raw = &data_text[relative_lo as usize..][..4];
-        let mut lo_inst = decode_inst(u32::from_le_bytes([lo_inst_raw[0], lo_inst_raw[1], lo_inst_raw[2], lo_inst_raw[3]]))?;
-        let hi_inst_raw = &data_text[relative_hi as usize..][..4];
-        let hi_inst = decode_inst(u32::from_le_bytes([hi_inst_raw[0], hi_inst_raw[1], hi_inst_raw[2], hi_inst_raw[3]]))?;
-
-        let Some((hi_kind, target)) = pairs.reloc_pcrel_hi20.get(&relative_hi).copied() else {
-            return Err(ProgramFromElfError::other(format!("R_RISCV_PCREL_LO12_* relocation at 0x{relative_lo:x} targets 0x{relative_hi:x} which doesn't have a R_RISCV_PCREL_HI20/R_RISCV_GOT_HI20 relocation")));
+        let Some((hi_kind, target)) = pcrel_relocations.reloc_pcrel_hi20.get(&relative_hi).copied() else {
+            return Err(ProgramFromElfError::other(format!("{lo_rel_name} relocation at '{section_name}'0x{relative_lo:x} targets '{section_name}'0x{relative_hi:x} which doesn't have a R_RISCV_PCREL_HI20 or R_RISCV_GOT_HI20 relocation")));
         };
 
-        let target_address = u32::try_from(target.relocated_address).expect("R_RISCV_PCREL_HI20/R_RISCV_GOT_HI20 target address overflow");
-
-        let (hi_reg, hi_value) = match hi_inst {
-            Some(Inst::AddUpperImmediateToPc { dst, value }) => (dst, value),
-            _ => {
-                return Err(ProgramFromElfError::other(format!("R_RISCV_PCREL_HI20/R_RISCV_GOT_HI20 relocation for an unsupported instruction at .text[0x{relative_hi:x}]: {hi_inst:?}")));
-            }
+        let Some(hi_inst) = hi_inst else {
+            return Err(ProgramFromElfError::other(format!(
+                "{hi_kind} relocation for an unsupported instruction at '{section_name}'0x{relative_hi:x}: 0x{hi_inst_raw:08x}"
+            )));
         };
 
-        let (lo_reg, lo_value) = match lo_inst {
-            Some(Inst::RegImm {
-                kind: RegImmKind::Add,
-                ref mut src,
-                ref mut imm,
-                ..
-            }) => (src, imm),
-            Some(Inst::Load {
-                ref mut base,
-                ref mut offset,
-                ..
-            }) => (base, offset),
-            Some(Inst::Store {
-                ref mut base,
-                ref mut offset,
-                ..
-            }) => (base, offset),
+        let hi_reg = match hi_inst {
+            Inst::AddUpperImmediateToPc { dst, .. } => dst,
             _ => {
                 return Err(ProgramFromElfError::other(format!(
-                    "R_RISCV_PCREL_LO12_* relocation for an unsupported instruction: {lo_inst:?}"
-                )));
+                    "{hi_kind} relocation for an unsupported instruction at '{section_name}'[0x{relative_hi:x}]: {hi_inst:?}"
+                )))
             }
         };
 
-        if *lo_reg != hi_reg {
-            return Err(ProgramFromElfError::other(
-                "HI + LO relocation pair uses a different destination register",
-            ));
-        }
+        let Some(lo_inst) = lo_inst else {
+            return Err(ProgramFromElfError::other(format!(
+                "{lo_rel_name} relocation for an unsupported instruction: 0x{lo_inst_raw:08x}"
+            )));
+        };
 
-        let old_lo_value = *lo_value;
-        let hi_original = section_text.address().wrapping_add(relative_hi);
-        let old_merged = hi_original.wrapping_add(hi_value as u64).wrapping_add(old_lo_value as u32 as u64) as u32;
-        let new_merged;
-
-        if matches!(hi_kind, HiRelocKind::Got) {
+        let (lo_reg, new_instruction) = if matches!(hi_kind, HiRelocKind::Got) {
             // For these relocations the target address points to the symbol that the code wants to reference,
             // but the actual address that's in the code shouldn't point to the symbol directly, but to a place
             // where the symbol's address can be found.
 
-            if let Some(section_got) = section_got {
-                // First make sure the '.got' section itself is relocated.
-                let got_delta = *relocation_for_section
-                    .get(&section_got.index())
-                    .expect("internal error: no relocation offset for the '.got' section");
-
-                let old_got_address = old_merged;
-                let new_got_address = (old_got_address as i64).wrapping_add(got_delta) as u64;
-                new_merged = new_got_address as u32;
-
-                // And then fix the address inside of the GOT table itself.
-                let relative_got_offset = old_got_address as u64 - section_got.address();
-
-                let section_got_range = section_got.file_range().unwrap_or((0, 0));
-                let section_got_data = &mut data[section_got_range.0 as usize..][..section_got_range.1 as usize];
-                let old_target_address = read_u32(section_got_data, relative_got_offset)?;
-                write_u32(section_got_data, relative_got_offset, target_address)?;
-
-                log::trace!(
-                    "  (GOT): {}[0x{relative_got_offset:x}] (0x{old_got_address:x}): 0x{:08x} -> 0x{:08x}",
-                    section_got.name()?,
-                    old_target_address,
-                    target_address
-                );
-            } else {
-                // We have no existing '.got' section, so we have to synthesize one ourselves.
-                let (synthetic_got_base, synthetic_got, symbol_to_got_index) = synthetic_got.as_mut().unwrap();
-                let index = *symbol_to_got_index
-                    .get(&target.original_address)
-                    .expect("GOT relocation is missing an entry in symbol to GOT map");
-                write_u32(synthetic_got, index as u64 * 4, target_address)?;
-
-                let new_got_address = *synthetic_got_base + index as u64 * 4;
-                new_merged = u32::try_from(new_got_address).expect("GOT address overflow");
-            };
-        } else {
-            new_merged = target_address;
-        }
-
-        *lo_value = new_merged as i32;
-        *lo_reg = Reg::Zero;
-
-        // Since we support full length immediates just turn the upper instructions into a NOP.
-        instruction_overrides.insert(
-            section_text.address() + relative_hi,
-            Inst::RegImm {
-                kind: RegImmKind::Add,
-                dst: Reg::Zero,
-                src: Reg::Zero,
-                imm: 0,
-            },
-        );
-        instruction_overrides.insert(section_text.address() + relative_lo, lo_inst.unwrap());
-
-        log::trace!("Replaced and merged 0x{hi_original:08x} (pc) + 0x{hi_value:08x} (hi) + 0x{old_lo_value:08x} (lo) = 0x{old_merged:08x} to point to 0x{new_merged:08x} (from {hi_kind}, 0x{relative_hi:x} (rel hi), 0x{relative_lo:x} (rel lo))");
-    }
-
-    Ok(())
-}
-
-fn parse_symbols<'a>(elf: &'a Elf, relocation_for_section: &HashMap<SectionIndex, i64>) -> Result<Vec<Fn<'a>>, ProgramFromElfError> {
-    let mut functions = Vec::new();
-    for sym in elf.symbols() {
-        let kind = sym.raw_symbol().st_type();
-        match kind {
-            object::elf::STT_FUNC => {
-                let section_index = sym.section().index().ok_or_else(|| {
-                    ProgramFromElfError::other(format!(
-                        "failed to process symbol table: symbol is for unsupported section: {:?}",
-                        sym.section()
-                    ))
-                })?;
-
-                let section = elf.section_by_index(section_index).map_err(|error| {
-                    ProgramFromElfError::other(format!("failed to process symbol table: failed to fetch section: {}", error))
-                })?;
-
-                let section_relocation_delta = *relocation_for_section.get(&section_index).ok_or_else(|| {
-                    ProgramFromElfError::other(format!(
-                        "failed to process symbol table: no relocation offset for section {:?}",
-                        section.name().ok()
-                    ))
-                })?;
-
-                let name = sym.name()?;
-                let name = if name.is_empty() { None } else { Some(name) };
-
-                let relocated_address = sym.address().wrapping_add(section_relocation_delta as u64);
-                functions.push(Fn {
-                    name,
-                    range: (relocated_address..relocated_address + sym.size()).into(),
-                    frames: Vec::new(),
-                    blocks: Vec::new(),
-                });
-            }
-            object::elf::STT_NOTYPE | object::elf::STT_OBJECT | object::elf::STT_SECTION | object::elf::STT_FILE => {}
-            _ => return Err(ProgramFromElfError::other(format!("unsupported symbol type: {}", kind))),
-        }
-    }
-
-    functions.sort_unstable_by_key(|func| (func.range.start, func.range.end));
-    functions.dedup_by_key(|func| func.range);
-
-    Ok(functions)
-}
-
-fn iterate_in_tandem<T, U>(
-    iter_1: impl IntoIterator<Item = (AddressRange, T)>,
-    iter_2: impl IntoIterator<Item = (AddressRange, U)>,
-) -> impl Iterator<Item = (T, U)> {
-    struct Iter<T, U, TI, UI>
-    where
-        TI: Iterator<Item = (AddressRange, T)>,
-        UI: Iterator<Item = (AddressRange, U)>,
-    {
-        iter_1: core::iter::Peekable<TI>,
-        iter_2: core::iter::Peekable<UI>,
-    }
-
-    impl<T, U, TI, UI> Iterator for Iter<T, U, TI, UI>
-    where
-        TI: Iterator<Item = (AddressRange, T)>,
-        UI: Iterator<Item = (AddressRange, U)>,
-    {
-        type Item = (T, U);
-        fn next(&mut self) -> Option<Self::Item> {
-            loop {
-                let (range_1, _) = self.iter_1.peek()?;
-                let (range_2, _) = self.iter_2.peek()?;
-
-                use core::cmp::Ordering;
-                match range_1.start.cmp(&range_2.start) {
-                    Ordering::Less => {
-                        if range_1.end > range_2.start {
-                            // There is overlap.
-                            break;
-                        } else {
-                            self.iter_1.next();
-                            continue;
-                        }
-                    }
-                    Ordering::Greater => {
-                        self.iter_2.next();
-                        continue;
-                    }
-                    Ordering::Equal => break,
+            match lo_inst {
+                Inst::Load {
+                    kind: LoadKind::U32,
+                    base,
+                    dst,
+                    ..
+                } => (base, InstExt::Basic(BasicInst::LoadAddressIndirect { dst, target })),
+                _ => {
+                    return Err(ProgramFromElfError::other(format!(
+                        "{lo_rel_name} relocation (with {hi_kind} as the upper relocation) for an unsupported instruction: {lo_inst:?}"
+                    )));
                 }
             }
+        } else {
+            match lo_inst {
+                Inst::RegImm {
+                    kind: RegImmKind::Add,
+                    src,
+                    dst,
+                    ..
+                } => (src, InstExt::Basic(BasicInst::LoadAddress { dst, target })),
+                Inst::Load { kind, base, dst, .. } => (base, InstExt::Basic(BasicInst::LoadAbsolute { kind, dst, target })),
+                Inst::Store { kind, base, src, .. } => (base, InstExt::Basic(BasicInst::StoreAbsolute { kind, src, target })),
+                _ => {
+                    return Err(ProgramFromElfError::other(format!(
+                        "{lo_rel_name} relocation (with {hi_kind} as the upper relocation) for an unsupported instruction: {lo_inst:?}"
+                    )));
+                }
+            }
+        };
 
-            let (_, value_1) = self.iter_1.next().unwrap();
-            let (_, value_2) = self.iter_2.next().unwrap();
-
-            Some((value_1, value_2))
-        }
-    }
-
-    Iter {
-        iter_1: iter_1.into_iter().peekable(),
-        iter_2: iter_2.into_iter().peekable(),
-    }
-}
-
-#[allow(clippy::single_range_in_vec_init)]
-#[test]
-fn test_iterate_in_tandem() {
-    fn overlaps(first: impl IntoIterator<Item = Range<u64>>, second: impl IntoIterator<Item = Range<u64>>) -> Vec<(usize, usize)> {
-        let first: Vec<_> = first
-            .into_iter()
-            .map(AddressRange::from)
-            .enumerate()
-            .map(|(index, range)| (range, index))
-            .collect();
-        let second: Vec<_> = second
-            .into_iter()
-            .map(AddressRange::from)
-            .enumerate()
-            .map(|(index, range)| (range, index))
-            .collect();
-        iterate_in_tandem(first, second).collect()
-    }
-
-    assert_eq!(overlaps([], []), vec![]);
-    assert_eq!(overlaps([0..4], [4..8]), vec![]);
-    assert_eq!(overlaps([0..5], [4..8]), vec![(0, 0)]);
-    assert_eq!(overlaps([0..4], [3..8]), vec![(0, 0)]);
-    assert_eq!(overlaps([0..1, 1..2, 2..3], [1..2]), vec![(1, 0)]);
-    assert_eq!(overlaps([1..2], [0..1, 1..2, 2..3]), vec![(0, 1)]);
-}
-
-fn merge_functions_with_dwarf(functions: &mut [Fn], dwarf_info: DwarfInfo) -> Result<(), ProgramFromElfError> {
-    let iter = iterate_in_tandem(
-        functions.iter_mut().map(|func| (func.range, func)),
-        dwarf_info.frames.into_iter().map(|dwarf| {
-            let range: AddressRange = (dwarf.0..dwarf.1).into();
-            (range, (range, dwarf.2))
-        }),
-    );
-
-    for (function, (dwarf_range, frames)) in iter {
-        if function.range != dwarf_range {
-            return Err(ProgramFromElfError::other(
-                "a function defined in DWARF info has inconsistent bounds with the same function in the symbol table",
-            ));
+        if lo_reg != hi_reg {
+            // NOTE: These *can* apparently be sometimes different, so it's not an error if this happens.
+            //
+            // I've seen a case where the whole thing looked roughly like this:
+            //
+            //   auipc   a1,0x2057        # HI
+            //   sw      a1,4(sp)         # Stash the HI part on the stack
+            //   lw      a1,-460(a1)      # LO (1)
+            //   ... a bunch of code ...
+            //   lw      a2,4(sp)         # Reload the HI port from the stack (note different register)
+            //   sw      a0,-460(a2)      # LO (2)
+            log::trace!(
+                "{lo_rel_name} + {hi_kind} relocation pair in '{section_name}' [+0x{relative_lo:x}, +0x{relative_hi:x}] uses different destination registers ({lo_reg:?} and {hi_reg:?})",
+            );
         }
 
-        function.frames = frames;
+        let location_hi = SectionTarget {
+            section_index: section.index(),
+            offset: relative_hi,
+        };
+        let location_lo = SectionTarget {
+            section_index: section.index(),
+            offset: relative_lo,
+        };
+
+        // Since we support full length immediates just turn the upper instructions into a NOP.
+        instruction_overrides.insert(location_hi, InstExt::nop());
+        instruction_overrides.insert(location_lo, new_instruction);
     }
 
     Ok(())
+}
+
+fn parse_function_symbols(elf: &Elf) -> Result<Vec<(Source, String)>, ProgramFromElfError> {
+    let mut functions = Vec::new();
+    for sym in elf.symbols() {
+        match sym.kind() {
+            object::elf::STT_FUNC => {
+                let (section, offset) = sym.section_and_offset()?;
+                let Some(name) = sym.name() else { continue };
+
+                if name.is_empty() {
+                    continue;
+                }
+
+                let source = Source {
+                    section_index: section.index(),
+                    offset_range: (offset..offset + sym.size()).into(),
+                };
+
+                functions.push((source, name.to_owned()));
+            }
+            object::elf::STT_NOTYPE | object::elf::STT_OBJECT | object::elf::STT_SECTION | object::elf::STT_FILE => {}
+            kind => return Err(ProgramFromElfError::other(format!("unsupported symbol type: {}", kind))),
+        }
+    }
+
+    functions.sort_unstable_by_key(|(source, _)| *source);
+    functions.dedup_by_key(|(source, _)| *source);
+
+    Ok(functions)
 }
 
 #[derive(Default)]
@@ -2330,71 +2588,27 @@ impl Config {
     }
 }
 
-fn get_section_range(data: &[u8], section: &ElfSection) -> Result<Range<usize>, ProgramFromElfError> {
-    let name = section.name()?;
-    let section_range = section.file_range().unwrap_or((0, 0));
-    let section_start =
-        usize::try_from(section_range.0).map_err(|_| ProgramFromElfError::other(format!("out of range offset for '{name}' section")))?;
-    let section_size =
-        usize::try_from(section_range.1).map_err(|_| ProgramFromElfError::other(format!("out of range size for '{name}' section")))?;
-    let section_end = section_start
-        .checked_add(section_size)
-        .ok_or_else(|| ProgramFromElfError::other(format!("out of range '{name}' section (overflow)")))?;
-    data.get(section_start..section_end)
-        .ok_or_else(|| ProgramFromElfError::other(format!("out of range '{name}' section (out of bounds of ELF file)")))?;
-    Ok(section_start..section_end)
-}
-
-fn get_section_data<'a>(data: &'a [u8], section: &ElfSection) -> Result<&'a [u8], ProgramFromElfError> {
-    Ok(&data[get_section_range(data, section)?])
-}
-
 pub fn program_from_elf(config: Config, data: &[u8]) -> Result<ProgramBlob, ProgramFromElfError> {
-    let elf = Elf::parse(data)?;
+    let mut elf = Elf::parse(data)?;
 
-    if elf.raw_header().e_ident.data != object::elf::ELFDATA2LSB {
-        return Err(ProgramFromElfError::other("file is not a little endian ELF file"));
+    if elf.section_by_name(".got").is_none() {
+        elf.add_empty_data_section(".got");
     }
 
-    if elf.raw_header().e_ident.os_abi != object::elf::ELFOSABI_SYSV {
-        return Err(ProgramFromElfError::other("file doesn't use the System V ABI"));
-    }
-
-    if !matches!(
-        elf.raw_header().e_type.get(LittleEndian),
-        object::elf::ET_EXEC | object::elf::ET_REL
-    ) {
-        return Err(ProgramFromElfError::other("file is not a supported ELF file (ET_EXEC or ET_REL)"));
-    }
-
-    if elf.raw_header().e_machine.get(LittleEndian) != object::elf::EM_RISCV {
-        return Err(ProgramFromElfError::other("file is not a RISC-V file (EM_RISCV)"));
-    }
+    // TODO: 64-bit support.
+    let bitness = Bitness::B32;
 
     let mut sections_ro_data = Vec::new();
     let mut sections_rw_data = Vec::new();
     let mut sections_bss = Vec::new();
-    let mut sections_text = Vec::new();
-    let mut section_got = None;
+    let mut sections_code = Vec::new();
     let mut sections_import_metadata = Vec::new();
     let mut section_export_metadata = None;
+    let mut sections_other = Vec::new();
 
-    // Relocate code to 0x00000004.
-    let mut text_end = 0x00000004;
-
-    let mut relocation_for_section = HashMap::new();
-    let sections: Vec<_> = elf.sections().collect();
-    for section in &sections {
-        // Make sure the data is accessible.
-        get_section_data(data, section)?;
-
-        let flags = match section.flags() {
-            object::SectionFlags::Elf { sh_flags } => sh_flags,
-            _ => unreachable!(),
-        };
-
-        let is_writable = flags & object::elf::SHF_WRITE as u64 != 0;
-        let name = section.name()?;
+    for section in elf.sections() {
+        let name = section.name();
+        let is_writable = section.is_writable();
         if name == ".rodata"
             || name.starts_with(".rodata.")
             || name == ".data.rel.ro"
@@ -2407,11 +2621,7 @@ pub fn program_from_elf(config: Config, data: &[u8]) -> Result<ProgramBlob, Prog
                 )));
             }
 
-            if name == ".got" {
-                section_got = Some(section);
-            }
-
-            sections_ro_data.push(section);
+            sections_ro_data.push(section.index());
         } else if name == ".data" || name.starts_with(".data.") || name == ".sdata" || name.starts_with(".sdata.") {
             if !is_writable {
                 return Err(ProgramFromElfError::other(format!(
@@ -2419,7 +2629,7 @@ pub fn program_from_elf(config: Config, data: &[u8]) -> Result<ProgramBlob, Prog
                 )));
             }
 
-            sections_rw_data.push(section);
+            sections_rw_data.push(section.index());
         } else if name == ".bss" || name.starts_with(".bss.") || name == ".sbss" || name.starts_with(".sbss.") {
             if !is_writable {
                 return Err(ProgramFromElfError::other(format!(
@@ -2427,7 +2637,7 @@ pub fn program_from_elf(config: Config, data: &[u8]) -> Result<ProgramBlob, Prog
                 )));
             }
 
-            sections_bss.push(section);
+            sections_bss.push(section.index());
         } else if name == ".text" || name.starts_with(".text.") {
             if is_writable {
                 return Err(ProgramFromElfError::other(format!(
@@ -2435,191 +2645,411 @@ pub fn program_from_elf(config: Config, data: &[u8]) -> Result<ProgramBlob, Prog
                 )));
             }
 
-            if let Some(padding) = get_padding(text_end, section) {
-                text_end += padding;
-            }
-
-            #[allow(clippy::neg_multiply)]
-            relocation_for_section.insert(section.index(), (section.address() as i64 * -1).wrapping_add(text_end as i64));
-            text_end += section.size();
-
-            sections_text.push(section);
+            sections_code.push(section.index());
         } else if name == ".polkavm_imports" || name.starts_with(".polkavm_imports.") {
-            relocation_for_section.insert(section.index(), 0);
-            sections_import_metadata.push(section);
+            sections_import_metadata.push(section.index());
+        } else if name == ".polkavm_exports" {
+            section_export_metadata = Some(section.index());
+        } else if name == ".eh_frame" || name == ".got" {
+            continue;
+        } else if section.is_allocated() {
+            // We're supposed to load this section into memory at runtime, but we don't know what it is.
+            return Err(ProgramFromElfErrorKind::UnsupportedSection(name.to_owned()).into());
         } else {
-            match name {
-                ".polkavm_exports" => {
-                    relocation_for_section.insert(section.index(), 0);
-                    section_export_metadata = Some(section);
-                }
-                _ => {
-                    if name != ".eh_frame" && flags & object::elf::SHF_ALLOC as u64 != 0 {
-                        // We're supposed to load this section into memory at runtime, but we don't know what it is.
-                        return Err(ProgramFromElfErrorKind::UnsupportedSection(name.to_owned()).into());
-                    }
-
-                    // For sections which will not be in memory at runtime we just don't relocate them.
-                    relocation_for_section.insert(section.index(), 0);
-                    continue;
-                }
-            }
+            sections_other.push(section.index());
         }
     }
 
-    if sections_text.is_empty() {
+    if sections_code.is_empty() {
         return Err(ProgramFromElfError::other("missing '.text' section"));
     }
 
-    let symbol_to_got_index = if section_got.is_none() {
-        let mut symbol_to_got_index = BTreeSet::new();
-        for section in elf.sections() {
-            if section.name().expect("failed to get section name") == ".eh_frame" {
-                continue;
-            }
+    let code_sections_set: HashSet<SectionIndex> = sections_code.iter().copied().collect();
+    let data_sections = sections_ro_data
+        .iter()
+        .chain(sections_rw_data.iter())
+        .chain(sections_bss.iter()) // Shouldn't need relocations, but just in case.
+        .chain(sections_import_metadata.iter())
+        .chain(section_export_metadata.iter())
+        .chain(sections_other.iter())
+        .copied();
 
-            for (_, relocation) in section.relocations() {
-                if !matches!(relocation.kind(), object::RelocationKind::Elf(object::elf::R_RISCV_GOT_HI20)) {
-                    continue;
-                }
-
-                let object::RelocationTarget::Symbol(target_symbol_index) = relocation.target() else {
-                    return Err(ProgramFromElfError::other(format!(
-                        "unhandled target for R_RISCV_GOT_HI20 relocation: {:?}",
-                        relocation
-                    )));
-                };
-
-                let target_symbol = elf
-                    .symbol_by_index(target_symbol_index)
-                    .map_err(|error| ProgramFromElfError::other(format!("failed to fetch relocation target: {}", error)))?;
-
-                symbol_to_got_index.insert(target_symbol.address());
-            }
-        }
-
-        let symbol_to_got_index: BTreeMap<_, _> = symbol_to_got_index
-            .into_iter()
-            .enumerate()
-            .map(|(index, address)| (address, index))
-            .collect();
-        symbol_to_got_index
-    } else {
-        BTreeMap::new()
-    };
-
-    let memory_config = extract_memory_config(
-        data,
-        &sections_ro_data,
-        symbol_to_got_index.len() as u64 * 4,
-        &sections_rw_data,
-        &sections_bss,
-        &mut relocation_for_section,
-    )?;
-
-    let mut synthetic_got = memory_config.synthetic_got_base.map(|synthetic_got_base| {
-        let mut synthetic_got: Vec<u8> = Vec::new();
-        synthetic_got.resize(symbol_to_got_index.len() * 4, 0);
-        (synthetic_got_base, synthetic_got, symbol_to_got_index)
-    });
-
-    for (index, offset) in &relocation_for_section {
-        if *offset == 0 {
-            continue;
-        }
-        let section = elf.section_by_index(*index).unwrap();
-        let name = section.name().unwrap();
-        log::trace!("Relocation offset: '{name}': 0x{offset:x} ({offset})");
+    let mut relocations = BTreeMap::new();
+    for section_index in data_sections {
+        let section = elf.section_by_index(section_index);
+        harvest_data_relocations(&elf, &code_sections_set, section, &mut relocations)?;
     }
-
-    let mut jump_targets = HashSet::new();
-    if let Some(section) = section_got {
-        let section_range = get_section_range(data, section)?;
-        if section_range.len() % 4 != 0 {
-            return Err(ProgramFromElfError::other("size of the '.got' section is not divisible by 4"));
-        }
-
-        let section_data = &data[section_range];
-        for (index, xs) in section_data.chunks_exact(4).enumerate() {
-            let relative_address = index * 4;
-            let absolute_address = section.address() + relative_address as u64;
-            let target_address = u32::from_le_bytes([xs[0], xs[1], xs[2], xs[3]]) as u64;
-            log::trace!("GOT entry: #{index}: .got[0x{relative_address:x}] (0x{absolute_address:08x}) = 0x{target_address:08x}");
-        }
-    }
-
-    let sections_text_indexes: HashSet<_> = sections_text.iter().map(|section| section.index()).collect();
 
     let mut instruction_overrides = HashMap::new();
-    let mut data = data.to_vec();
-    for section in elf.sections() {
-        if section.name().expect("failed to get section name") == ".eh_frame" {
-            continue;
-        }
-
-        let is_data_section = sections_ro_data
-            .iter()
-            .chain(sections_rw_data.iter())
-            .any(|s| s.index() == section.index());
-
-        let jump_targets = if is_data_section {
-            // If it's one of the data sections then harvest the jump targets from it.
-            Some(&mut jump_targets)
-        } else {
-            // If it's not one of the data sections then the relocations can point to various other stuff, so don't treat those as jump targets.
-            None
-        };
-
-        relocate(
-            &elf,
-            &sections_text_indexes,
-            &sections_text,
-            section_got,
-            synthetic_got.as_mut(),
-            &relocation_for_section,
-            &section,
-            &mut data,
-            jump_targets,
-            &mut instruction_overrides,
-        )?;
+    for &section_index in &sections_code {
+        let section = elf.section_by_index(section_index);
+        harvest_code_relocations(&elf, section, &mut instruction_overrides, &mut relocations)?;
     }
 
-    let import_metadata = extract_import_metadata(&data, sections_import_metadata)?;
-    let export_metadata = if let Some(section) = section_export_metadata {
-        extract_export_metadata(&data, section)?
+    let import_metadata = extract_import_metadata(&elf, &sections_import_metadata)?;
+    let export_metadata = if let Some(section_index) = section_export_metadata {
+        let section = elf.section_by_index(section_index);
+        extract_export_metadata(&relocations, section)?
     } else {
         Default::default()
     };
 
-    for export in &export_metadata {
-        jump_targets.insert(export.address.into());
-    }
-
-    let dwarf = crate::dwarf::load_dwarf(&elf, &data)?;
-    let mut functions = parse_symbols(&elf, &relocation_for_section)?;
-    merge_functions_with_dwarf(&mut functions, dwarf)?;
-
     let mut instructions = Vec::new();
-    for section_text in sections_text {
-        parse_text_section(
-            &data,
-            section_text,
-            &import_metadata,
-            &relocation_for_section,
-            &mut instruction_overrides,
-            &mut instructions,
-        )?;
+    {
+        let import_by_location: HashMap<SectionTarget, &Import> = import_metadata
+            .iter()
+            .flat_map(|import| import.metadata_locations.iter().map(move |&location| (location, import)))
+            .collect();
+
+        for &section_index in &sections_code {
+            let section = elf.section_by_index(section_index);
+            parse_code_section(
+                section,
+                &import_by_location,
+                &relocations,
+                &mut instruction_overrides,
+                &mut instructions,
+            )?;
+        }
+
+        if !instruction_overrides.is_empty() {
+            return Err(ProgramFromElfError::other("internal error: instruction overrides map is not empty"));
+        }
     }
 
-    if !instruction_overrides.is_empty() {
-        return Err(ProgramFromElfError::other("internal error: instruction overrides map is not empty"));
+    let data_sections_set: HashSet<SectionIndex> = sections_ro_data
+        .iter()
+        .chain(sections_rw_data.iter())
+        .chain(sections_bss.iter()) // Shouldn't need relocations, but just in case.
+        .chain(sections_import_metadata.iter())
+        .chain(section_export_metadata.iter())
+        .copied()
+        .collect();
+
+    let all_jump_targets = harvest_all_jump_targets(&elf, &data_sections_set, &code_sections_set, &instructions, &relocations)?;
+    let all_blocks = split_code_into_basic_blocks(&all_jump_targets, instructions)?;
+    let section_to_block = build_section_to_block_map(&all_blocks)?;
+    let mut all_blocks = resolve_basic_block_references(&data_sections_set, &section_to_block, &all_blocks)?;
+    delete_nop_instructions_in_blocks(&mut all_blocks);
+    let (used_block_set, mut used_data_sections) =
+        find_reachable(&section_to_block, &all_blocks, &data_sections_set, &export_metadata, &relocations)?;
+
+    for &section_index in &sections_other {
+        if used_data_sections.contains(&section_index) {
+            return Err(ProgramFromElfError::other(format!(
+                "unsupported section used in program graph: '{name}'",
+                name = elf.section_by_index(section_index).name(),
+            )));
+        }
     }
 
-    harvest_jump_targets(&mut jump_targets, &instructions);
-    let blocks = split_code_into_basic_blocks(&jump_targets, instructions)?;
-    retain_only_non_empty_functions(&blocks, &mut functions)?;
+    log::debug!("Exports found: {}", export_metadata.len());
+    log::debug!("Blocks used: {}/{}", used_block_set.len(), all_blocks.len());
 
-    let code = emit_code(jump_targets, &blocks)?;
+    let section_got = elf.add_empty_data_section(".got");
+    sections_ro_data.push(section_got);
+    used_data_sections.insert(section_got);
+
+    let mut target_to_got_offset: HashMap<AnyTarget, u64> = HashMap::new();
+    let mut got_size = 0;
+
+    let mut used_blocks = Vec::new();
+    let mut used_imports = HashSet::new();
+    for block in &all_blocks {
+        if !used_block_set.contains(&block.target) {
+            continue;
+        }
+
+        used_blocks.push(block.target);
+
+        for (_, instruction) in &block.ops {
+            match instruction {
+                BasicInst::LoadAddressIndirect { target, .. } => {
+                    if target_to_got_offset.contains_key(target) {
+                        continue;
+                    }
+
+                    let offset = target_to_got_offset.len() as u64 * u64::from(bitness);
+                    target_to_got_offset.insert(*target, offset);
+                    got_size = offset + u64::from(bitness);
+
+                    let target = match target {
+                        AnyTarget::Data(target) => *target,
+                        AnyTarget::Code(target) => all_blocks[target.index()].source.begin(),
+                    };
+
+                    relocations.insert(
+                        SectionTarget {
+                            section_index: section_got,
+                            offset,
+                        },
+                        RelocationKind::Abs {
+                            target,
+                            size: bitness.into(),
+                        },
+                    );
+                }
+                BasicInst::Ecalli { syscall } => {
+                    used_imports.insert(*syscall);
+                }
+                _ => {}
+            }
+        }
+    }
+
+    elf.extend_section_to_at_least(section_got, got_size.try_into().expect("overflow"));
+
+    let import_metadata = {
+        let mut import_metadata = import_metadata;
+        import_metadata.retain(|import| used_imports.contains(&import.metadata.index.unwrap()));
+        import_metadata
+    };
+
+    let mut base_address_for_section = HashMap::new();
+    let sections_ro_data: Vec<_> = sections_ro_data
+        .into_iter()
+        .filter(|section_index| used_data_sections.contains(section_index))
+        .collect();
+
+    let sections_rw_data: Vec<_> = sections_rw_data
+        .into_iter()
+        .filter(|section_index| used_data_sections.contains(section_index))
+        .collect();
+
+    let memory_config = extract_memory_config(
+        &elf,
+        &sections_ro_data,
+        &sections_rw_data,
+        &sections_bss,
+        &mut base_address_for_section,
+    )?;
+
+    let jump_target_for_block = assign_jump_targets(&all_blocks, &used_blocks);
+    let code = emit_code(
+        &base_address_for_section,
+        section_got,
+        &target_to_got_offset,
+        &all_blocks,
+        &used_blocks,
+        &used_imports,
+        &jump_target_for_block,
+    )?;
+
+    {
+        // Assign dummy base addresses to all other sections.
+        //
+        // This is mostly used for debug info.
+        for &section_index in &sections_other {
+            let address = elf.section_by_index(section_index).original_address();
+            assert!(!used_data_sections.contains(&section_index));
+            assert!(base_address_for_section.insert(section_index, address).is_none());
+        }
+    }
+
+    for (&relocation_target, &relocation) in &relocations {
+        let section = elf.section_by_index(relocation_target.section_index);
+        log::trace!(
+            "Applying relocation to '{}'[0x{:x}] {relocation_target}: {:?}",
+            section.name(),
+            relocation_target.offset,
+            relocation
+        );
+
+        fn write_generic(size: RelocationSize, data: &mut [u8], relative_address: u64, value: u64) -> Result<(), ProgramFromElfError> {
+            match size {
+                RelocationSize::U32 => {
+                    let Ok(value) = u32::try_from(value) else {
+                        return Err(ProgramFromElfError::other(
+                            "overflow when applying relocations: value doesn't fit in an u32",
+                        ));
+                    };
+
+                    write_u32(data, relative_address, value)
+                }
+                RelocationSize::U16 => {
+                    let Ok(value) = u16::try_from(value) else {
+                        return Err(ProgramFromElfError::other(
+                            "overflow when applying relocations: value doesn't fit in an u16",
+                        ));
+                    };
+
+                    write_u16(data, relative_address, value)
+                }
+                RelocationSize::U8 => {
+                    let Ok(value) = u8::try_from(value) else {
+                        return Err(ProgramFromElfError::other(
+                            "overflow when applying relocations: value doesn't fit in an u8",
+                        ));
+                    };
+
+                    data[relative_address as usize] = value;
+                    Ok(())
+                }
+            }
+        }
+
+        match relocation {
+            RelocationKind::Size {
+                section_index: _,
+                range,
+                size,
+            } => {
+                // These relocations should only be used in debug info sections.
+                if used_data_sections.contains(&section.index()) {
+                    return Err(ProgramFromElfError::other(format!(
+                        "relocation was not expected in section '{name}': {relocation:?}",
+                        name = section.name(),
+                    )));
+                }
+
+                let data = elf.section_data_mut(relocation_target.section_index);
+                let value = range.end - range.start;
+                match size {
+                    SizeRelocationSize::SixBits => {
+                        let mask = 0b00111111;
+                        if value > mask {
+                            return Err(ProgramFromElfError::other("six bit relocation overflow"));
+                        }
+
+                        let output = ((read_u8(data, relocation_target.offset)? as u64) & (!mask)) | (value & mask);
+                        data[relocation_target.offset as usize] = output as u8;
+                    }
+                    SizeRelocationSize::Generic(size) => {
+                        write_generic(size, data, relocation_target.offset, value)?;
+                    }
+                }
+            }
+            RelocationKind::Abs { target, size } => {
+                if let Some(&block_target) = section_to_block.get(&target) {
+                    let Some(jump_target) = jump_target_for_block[block_target.index()] else {
+                        if !used_data_sections.contains(&relocation_target.section_index) {
+                            // Most likely debug info for something that was stripped out.
+                            let data = elf.section_data_mut(relocation_target.section_index);
+                            write_generic(size, data, relocation_target.offset, 0)?;
+                            continue;
+                        }
+
+                        return Err(ProgramFromElfError::other(format!(
+                            "absolute relocation in section '{location_name}' targets section '{target_name}'[0x{target_offset:x}] which has no associated basic block",
+                            location_name = elf.section_by_index(relocation_target.section_index).name(),
+                            target_name = elf.section_by_index(target.section_index).name(),
+                            target_offset = target.offset,
+                        )));
+                    };
+
+                    let Some(jump_target) = jump_target.checked_mul(JUMP_TARGET_MULTIPLIER) else {
+                        return Err(ProgramFromElfError::other("overflow when applying a jump target relocation"));
+                    };
+
+                    let data = elf.section_data_mut(relocation_target.section_index);
+                    write_generic(size, data, relocation_target.offset, jump_target.into())?;
+                } else {
+                    if sections_import_metadata.contains(&target.section_index) {
+                        // TODO: Make this check unnecessary by removing these relocations before we get here.
+                        continue;
+                    }
+
+                    let Some(section_base) = base_address_for_section.get(&target.section_index) else {
+                        if !used_data_sections.contains(&relocation_target.section_index) {
+                            let data = elf.section_data_mut(relocation_target.section_index);
+                            write_generic(size, data, relocation_target.offset, 0)?;
+                            continue;
+                        }
+
+                        return Err(ProgramFromElfError::other(format!(
+                            "absolute relocation in section '{location_name}' targets section '{target_name}'[0x{target_offset:x}] which has no relocated base address assigned",
+                            location_name = elf.section_by_index(relocation_target.section_index).name(),
+                            target_name = elf.section_by_index(target.section_index).name(),
+                            target_offset = target.offset,
+                        )));
+                    };
+
+                    let Some(value) = section_base.checked_add(target.offset) else {
+                        return Err(ProgramFromElfError::other("overflow when applying an absolute relocation"));
+                    };
+
+                    let data = elf.section_data_mut(relocation_target.section_index);
+                    write_generic(size, data, relocation_target.offset, value)?;
+                }
+            }
+            RelocationKind::JumpTable { target_code, target_base } => {
+                let Some(&block_target) = section_to_block.get(&target_code) else {
+                    return Err(ProgramFromElfError::other(
+                        "jump table relocation doesn't refers to a start of a basic block",
+                    ));
+                };
+
+                let Some(jump_target) = jump_target_for_block[block_target.index()] else {
+                    return Err(ProgramFromElfError::other(
+                        "no jump target for block was found when applying a jump table relocation",
+                    ));
+                };
+
+                let Some(jump_target) = jump_target.checked_mul(JUMP_TARGET_MULTIPLIER) else {
+                    return Err(ProgramFromElfError::other(
+                        "overflow when applying a jump table relocation: jump target is too big",
+                    ));
+                };
+
+                let Some(section_base) = base_address_for_section.get(&target_base.section_index) else {
+                    return Err(ProgramFromElfError::other(
+                        "no base address for section when applying a jump table relocation",
+                    ));
+                };
+
+                let Some(base_address) = section_base.checked_add(target_base.offset) else {
+                    return Err(ProgramFromElfError::other(
+                        "overflow when applying a jump table relocation: section base and offset cannot be added together",
+                    ));
+                };
+
+                let Ok(base_address) = u32::try_from(base_address) else {
+                    return Err(ProgramFromElfError::other(
+                        "overflow when applying a jump table relocation: base address doesn't fit in a u32",
+                    ));
+                };
+
+                let value = jump_target.wrapping_sub(base_address);
+                let data = elf.section_data_mut(relocation_target.section_index);
+                write_u32(data, relocation_target.offset, value)?;
+            }
+        }
+    }
+
+    let mut location_map: HashMap<SectionTarget, Arc<[Location]>> = HashMap::new();
+    if !config.strip {
+        let mut string_cache = crate::utils::StringCache::default();
+        let dwarf_info = crate::dwarf::load_dwarf(&mut string_cache, &elf, &relocations)?;
+        location_map = dwarf_info.location_map;
+
+        // If there is no DWARF info present try to use the symbol table as a fallback.
+        for (source, name) in parse_function_symbols(&elf)? {
+            if location_map.contains_key(&source.begin()) {
+                continue;
+            }
+
+            let (namespace, function_name) = split_function_name(&name);
+            let namespace = if namespace.is_empty() {
+                None
+            } else {
+                Some(string_cache.dedup(&namespace))
+            };
+
+            let location = Location {
+                kind: FrameKind::Enter,
+                namespace,
+                function_name: Some(string_cache.dedup(&function_name)),
+                source_code_location: None,
+            };
+
+            let location_stack: Arc<[Location]> = vec![location].into();
+            for target in source.iter() {
+                location_map.insert(target, location_stack.clone());
+            }
+        }
+    }
+
+    log::trace!("Instruction count: {}", code.len());
 
     let mut writer = Writer::default();
     writer.push_raw_bytes(&program::BLOB_MAGIC);
@@ -2633,18 +3063,14 @@ pub fn program_from_elf(config: Config, data: &[u8]) -> Result<ProgramBlob, Prog
     writer.push_section(program::SECTION_RO_DATA, |writer| {
         for range in memory_config.ro_data {
             match range {
-                RangeOrPadding::Range(range) => {
-                    writer.push_raw_bytes(&data[range]);
+                DataRef::Section { section_index, range } => {
+                    let slice = &elf.section_by_index(section_index).data()[range];
+                    writer.push_raw_bytes(slice);
                 }
-                RangeOrPadding::Padding(bytes) => {
+                DataRef::Padding(bytes) => {
                     for _ in 0..bytes {
                         writer.push_byte(0);
                     }
-                }
-                RangeOrPadding::SyntheticGot(size) => {
-                    let (_, bytes, _) = synthetic_got.as_ref().unwrap();
-                    assert_eq!(bytes.len(), size);
-                    writer.push_raw_bytes(bytes);
                 }
             }
         }
@@ -2653,15 +3079,15 @@ pub fn program_from_elf(config: Config, data: &[u8]) -> Result<ProgramBlob, Prog
     writer.push_section(program::SECTION_RW_DATA, |writer| {
         for range in memory_config.rw_data {
             match range {
-                RangeOrPadding::Range(range) => {
-                    writer.push_raw_bytes(&data[range]);
+                DataRef::Section { section_index, range } => {
+                    let slice = &elf.section_by_index(section_index).data()[range];
+                    writer.push_raw_bytes(slice);
                 }
-                RangeOrPadding::Padding(bytes) => {
+                DataRef::Padding(bytes) => {
                     for _ in 0..bytes {
                         writer.push_byte(0);
                     }
                 }
-                RangeOrPadding::SyntheticGot(..) => unreachable!(),
             }
         }
     });
@@ -2693,48 +3119,108 @@ pub fn program_from_elf(config: Config, data: &[u8]) -> Result<ProgramBlob, Prog
 
         writer.push_varint(export_metadata.len() as u32);
         for meta in export_metadata {
-            assert_eq!(meta.address % 4, 0);
-            writer.push_varint(meta.address / 4);
-            writer.push_function_prototype(meta.prototype());
+            let &block_target = section_to_block
+                .get(&meta.location)
+                .expect("internal error: export metadata has a non-block target location");
+            let jump_target = jump_target_for_block[block_target.index()]
+                .expect("internal error: export metadata points to a block without a jump target assigned");
+            writer.push_varint(jump_target);
+            writer.push_function_prototype(&meta.prototype);
         }
     });
 
-    let mut start_address_to_instruction_index: BTreeMap<u64, u32> = Default::default();
-    let mut end_address_to_instruction_index: BTreeMap<u64, u32> = Default::default();
+    let mut locations_for_instruction = Vec::with_capacity(code.len());
     writer.push_section(program::SECTION_CODE, |writer| {
         let mut buffer = [0; program::MAX_INSTRUCTION_LENGTH];
         for (nth_inst, (source, inst)) in code.into_iter().enumerate() {
             let length = inst.serialize_into(&mut buffer);
             writer.push_raw_bytes(&buffer[..length]);
 
-            // Two or more addresses can point to the same instruction (e.g. in case of macro op fusion).
-            // Two or more instructions can also have the same address (e.g. in case of jump targets).
+            let mut function_name = None;
+            if !config.strip {
+                // Two or more addresses can point to the same instruction (e.g. in case of macro op fusion).
+                // Two or more instructions can also have the same address (e.g. in case of jump targets).
+                let mut found = None;
+                for offset in (source.offset_range.start..source.offset_range.end).step_by(4) {
+                    let target = SectionTarget {
+                        section_index: source.section_index,
+                        offset,
+                    };
 
-            assert_ne!(source.start, source.end);
-            for address in (source.start..source.end).step_by(4) {
-                if start_address_to_instruction_index.contains_key(&address) {
-                    continue;
+                    if let Some(locations) = location_map.get(&target) {
+                        function_name = locations[0].function_name.as_deref();
+                        found = Some(locations.clone());
+                        break;
+                    }
                 }
 
-                start_address_to_instruction_index.insert(address, nth_inst.try_into().expect("instruction count overflow"));
+                locations_for_instruction.push(found);
             }
-            end_address_to_instruction_index.insert(source.end, (nth_inst + 1).try_into().expect("instruction count overflow"));
+
+            log::trace!(
+                "Code: 0x{source_address:x} [{function_name}] -> {source} -> #{nth_inst}: {inst}",
+                source_address = {
+                    elf.section_by_index(source.section_index)
+                        .original_address()
+                        .wrapping_add(source.offset_range.start)
+                },
+                function_name = function_name.unwrap_or("")
+            );
         }
     });
 
     if !config.strip {
-        emit_debug_info(
-            &mut writer,
-            functions,
-            start_address_to_instruction_index,
-            end_address_to_instruction_index,
-        );
+        emit_debug_info(&mut writer, &locations_for_instruction);
     }
 
     writer.push_raw_bytes(&[program::SECTION_END_OF_FILE]);
 
-    log::trace!("Built a program of {} bytes", writer.blob.len());
-    Ok(ProgramBlob::parse(writer.blob)?)
+    log::debug!("Built a program of {} bytes", writer.blob.len());
+    let blob = ProgramBlob::parse(writer.blob)?;
+
+    // Sanity check that our debug info was properly emitted and can be parsed.
+    if cfg!(debug_assertions) && !config.strip {
+        'outer: for (instruction_position, locations) in locations_for_instruction.iter().enumerate() {
+            let instruction_position = instruction_position as u32;
+            let line_program = blob.get_debug_line_program_at(instruction_position).unwrap();
+            let Some(locations) = locations else {
+                assert!(line_program.is_none());
+                continue;
+            };
+
+            let mut line_program = line_program.unwrap();
+            while let Some(region_info) = line_program.run().unwrap() {
+                if !region_info.instruction_range().contains(&instruction_position) {
+                    continue;
+                }
+
+                assert_eq!(region_info.frames().len(), locations.len());
+                for (actual, expected) in region_info.frames().zip(locations.iter()) {
+                    assert_eq!(actual.kind(), expected.kind);
+                    assert_eq!(actual.namespace().unwrap(), expected.namespace.as_deref());
+                    assert_eq!(actual.function_name_without_namespace().unwrap(), expected.function_name.as_deref());
+                    assert_eq!(
+                        actual.path().unwrap(),
+                        expected.source_code_location.as_ref().map(|location| &**location.path())
+                    );
+                    assert_eq!(
+                        actual.line(),
+                        expected.source_code_location.as_ref().and_then(|location| location.line())
+                    );
+                    assert_eq!(
+                        actual.column(),
+                        expected.source_code_location.as_ref().and_then(|location| location.column())
+                    );
+                }
+
+                continue 'outer;
+            }
+
+            panic!("internal error: region not found for instruction");
+        }
+    }
+
+    Ok(blob)
 }
 
 #[derive(Default)]
@@ -2807,15 +3293,9 @@ impl Writer {
     }
 }
 
-fn emit_debug_info(
-    writer: &mut Writer,
-    functions: Vec<Fn>,
-    start_address_to_instruction_index: BTreeMap<u64, u32>,
-    end_address_to_instruction_index: BTreeMap<u64, u32>,
-) {
+fn emit_debug_info(writer: &mut Writer, locations_for_instruction: &[Option<Arc<[Location]>>]) {
     #[derive(Default)]
     struct DebugStringsBuilder<'a> {
-        buffer: String,
         map: HashMap<Cow<'a, str>, u32>,
         section: Vec<u8>,
         write_protected: bool,
@@ -2839,22 +3319,6 @@ fn emit_debug_info(
             offset
         }
 
-        fn dedup_namespace(&mut self, chunks: &[impl AsRef<str>]) -> u32 {
-            assert!(self.buffer.is_empty());
-            for (index, chunk) in chunks.iter().enumerate() {
-                if index != 0 {
-                    self.buffer.push_str("::");
-                }
-
-                let chunk = chunk.as_ref();
-                self.buffer.push_str(chunk);
-            }
-
-            let offset = self.dedup_cow(self.buffer.clone().into());
-            self.buffer.clear();
-            offset
-        }
-
         fn dedup(&mut self, s: &'a str) -> u32 {
             self.dedup_cow(s.into())
         }
@@ -2874,145 +3338,302 @@ fn emit_debug_info(
     let mut dbg_strings = DebugStringsBuilder::default();
     let empty_string_id = dbg_strings.dedup("");
 
-    for function in &functions {
-        for frame in &function.frames {
-            dbg_strings.dedup_namespace(&frame.location.namespace);
+    struct Group<'a> {
+        namespace: Option<Arc<str>>,
+        function_name: Option<Arc<str>>,
+        path: Option<Cow<'a, str>>,
+        instruction_position: usize,
+        instruction_count: usize,
+    }
 
-            if let Some(s) = frame.location.function_name.as_ref() {
-                dbg_strings.dedup(s);
-            }
-
-            if let Some(s) = frame.location.path.as_ref() {
-                dbg_strings.dedup_cow(simplify_path(s));
-            }
-
-            for (_, _, _, location) in &frame.inline_frames {
-                dbg_strings.dedup_namespace(&location.namespace);
-
-                if let Some(s) = location.function_name.as_ref() {
-                    dbg_strings.dedup(s);
-                }
-
-                if let Some(s) = location.path.as_ref() {
-                    dbg_strings.dedup_cow(simplify_path(s));
-                }
-            }
-        }
-
-        if function.frames.is_empty() {
-            if let Some((prefix, suffix)) = function.namespace_and_name() {
-                dbg_strings.dedup_cow(prefix.into());
-                dbg_strings.dedup_cow(suffix.into());
-            }
+    impl<'a> Group<'a> {
+        fn key(&self) -> (Option<&str>, Option<&str>, Option<&str>) {
+            (self.namespace.as_deref(), self.function_name.as_deref(), self.path.as_deref())
         }
     }
 
+    let mut groups: Vec<Group> = Vec::new();
+    for (instruction_position, locations) in locations_for_instruction.iter().enumerate() {
+        let group = if let Some(locations) = locations {
+            for location in locations.iter() {
+                if let Some(ref namespace) = location.namespace {
+                    dbg_strings.dedup(namespace);
+                }
+
+                if let Some(ref name) = location.function_name {
+                    dbg_strings.dedup(name);
+                }
+
+                if let Some(ref location) = location.source_code_location {
+                    dbg_strings.dedup_cow(simplify_path(location.path()));
+                }
+            }
+
+            let location = &locations[0];
+            Group {
+                namespace: location.namespace.clone(),
+                function_name: location.function_name.clone(),
+                path: location.source_code_location.as_ref().map(|target| simplify_path(target.path())),
+                instruction_position,
+                instruction_count: 1,
+            }
+        } else {
+            Group {
+                namespace: None,
+                function_name: None,
+                path: None,
+                instruction_position,
+                instruction_count: 1,
+            }
+        };
+
+        if let Some(last_group) = groups.last_mut() {
+            if last_group.key() == group.key() {
+                assert_eq!(last_group.instruction_position + last_group.instruction_count, instruction_position);
+                last_group.instruction_count += 1;
+                continue;
+            }
+        }
+
+        groups.push(group);
+    }
+
+    groups.retain(|group| group.function_name.is_some() || group.path.is_some());
+
+    log::trace!("Location groups: {}", groups.len());
     dbg_strings.write_protected = true;
 
     writer.push_section(program::SECTION_OPT_DEBUG_STRINGS, |writer| {
         writer.push_raw_bytes(&dbg_strings.section);
     });
 
-    let mut function_ranges = Vec::with_capacity(functions.len());
-    writer.push_section(program::SECTION_OPT_DEBUG_FUNCTION_INFO, |writer| {
+    let mut info_offsets = Vec::with_capacity(groups.len());
+    writer.push_section(program::SECTION_OPT_DEBUG_LINE_PROGRAMS, |writer| {
         let offset_base = writer.len();
-        writer.push_byte(program::VERSION_DEBUG_FUNCTION_INFO_V1);
-        let mut last_range = AddressRange { start: 0, end: 0 };
-        for function in &functions {
-            assert!(function.range.start >= last_range.end || function.range == last_range);
-
+        writer.push_byte(program::VERSION_DEBUG_LINE_PROGRAM_V1);
+        for group in &groups {
             let info_offset: u32 = (writer.len() - offset_base).try_into().expect("function info offset overflow");
+            info_offsets.push(info_offset);
 
-            // TODO: These should be handled more intelligently instead of panicking.
-            let function_start_index = *start_address_to_instruction_index
-                .get(&function.range.start)
-                .expect("function start address has no matching instructions");
-            let function_end_index = *end_address_to_instruction_index
-                .get(&function.range.end)
-                .expect("function end address has no matching instructions");
+            #[derive(Default)]
+            struct LineProgramFrame {
+                kind: Option<FrameKind>,
+                namespace: Option<Arc<str>>,
+                function_name: Option<Arc<str>>,
+                path: Option<Arc<str>>,
+                line: Option<u32>,
+                column: Option<u32>,
+            }
 
-            let mut written = false;
-            for frame in &function.frames {
-                let Some(name_offset) = frame.location.function_name.as_ref().map(|s| dbg_strings.dedup(s)) else {
-                    continue;
-                };
-                let namespace_offset = dbg_strings.dedup_namespace(&frame.location.namespace);
-                let file_offset = frame
-                    .location
-                    .path
-                    .as_ref()
-                    .map(|s| dbg_strings.dedup_cow(simplify_path(s)))
-                    .unwrap_or(empty_string_id);
+            #[derive(Default)]
+            struct LineProgramState {
+                stack: Vec<LineProgramFrame>,
+                stack_depth: usize,
+                mutation_depth: usize,
 
-                written = true;
-                writer.push_varint(namespace_offset);
-                writer.push_varint(name_offset);
-                writer.push_varint(file_offset);
-                writer.push_varint(frame.location.line.unwrap_or(0) as u32);
-                writer.push_varint(frame.location.column.unwrap_or(0) as u32);
-                writer.push_varint(frame.inline_frames.len().try_into().expect("function inline frames overflow"));
-                for &(inline_start_address, inline_end_address, inline_depth, ref inline_location) in &frame.inline_frames {
-                    let inline_name_offset = dbg_strings.dedup(inline_location.function_name.as_deref().unwrap_or(""));
-                    let inline_namespace_offset = dbg_strings.dedup_namespace(&inline_location.namespace);
-                    let inline_file_offset = inline_location
-                        .path
-                        .as_ref()
-                        .map(|s| dbg_strings.dedup_cow(simplify_path(s)))
-                        .unwrap_or(empty_string_id);
+                queued_count: u32,
+            }
 
-                    // TODO: These should be handled more intelligently instead of panicking.
-                    let (&next_inline_start_address, &inline_start_index) = start_address_to_instruction_index
-                        .range(inline_start_address..)
-                        .next()
-                        .expect("inline function start address has no matching instructions");
-                    if next_inline_start_address >= inline_end_address {
-                        todo!();
+            impl LineProgramState {
+                fn flush_if_any_are_queued(&mut self, writer: &mut Writer) {
+                    if self.queued_count == 0 {
+                        return;
                     }
-                    let inline_end_index = *end_address_to_instruction_index
-                        .get(&inline_end_address)
-                        .expect("inline function end address has no matching instructions");
 
-                    assert!(inline_start_index <= inline_end_index);
-                    assert!(inline_start_index >= function_start_index);
-                    assert!(inline_end_index <= function_end_index);
+                    if self.queued_count == 1 {
+                        writer.push_byte(LineProgramOp::FinishInstruction as u8);
+                    } else {
+                        writer.push_byte(LineProgramOp::FinishMultipleInstructions as u8);
+                        writer.push_varint(self.queued_count);
+                    }
 
-                    writer.push_varint(inline_start_index - function_start_index);
-                    writer.push_varint(inline_end_index - function_start_index);
-                    writer.push_varint(inline_depth);
-                    writer.push_varint(inline_namespace_offset);
-                    writer.push_varint(inline_name_offset);
-                    writer.push_varint(inline_file_offset);
-                    writer.push_varint(inline_location.line.unwrap_or(0) as u32);
-                    writer.push_varint(inline_location.column.unwrap_or(0) as u32);
+                    self.queued_count = 0;
+                }
+
+                fn set_mutation_depth(&mut self, writer: &mut Writer, depth: usize) {
+                    self.flush_if_any_are_queued(writer);
+
+                    if depth == self.mutation_depth {
+                        return;
+                    }
+
+                    writer.push_byte(LineProgramOp::SetMutationDepth as u8);
+                    writer.push_varint(depth as u32);
+                    self.mutation_depth = depth;
+                }
+
+                fn set_stack_depth(&mut self, writer: &mut Writer, depth: usize) {
+                    if self.stack_depth == depth {
+                        return;
+                    }
+
+                    while depth > self.stack.len() {
+                        self.stack.push(LineProgramFrame::default());
+                    }
+
+                    self.flush_if_any_are_queued(writer);
+
+                    writer.push_byte(LineProgramOp::SetStackDepth as u8);
+                    writer.push_varint(depth as u32);
+                    self.stack_depth = depth;
+                }
+
+                fn finish_instruction(&mut self, writer: &mut Writer, next_depth: usize) {
+                    self.queued_count += 1;
+
+                    enum Direction {
+                        GoDown,
+                        GoUp,
+                    }
+
+                    let dir = if next_depth == self.stack_depth + 1 {
+                        Direction::GoDown
+                    } else if next_depth + 1 == self.stack_depth {
+                        Direction::GoUp
+                    } else {
+                        return;
+                    };
+
+                    while next_depth > self.stack.len() {
+                        self.stack.push(LineProgramFrame::default());
+                    }
+
+                    match (self.queued_count == 1, dir) {
+                        (true, Direction::GoDown) => {
+                            writer.push_byte(LineProgramOp::FinishInstructionAndIncrementStackDepth as u8);
+                        }
+                        (false, Direction::GoDown) => {
+                            writer.push_byte(LineProgramOp::FinishMultipleInstructionsAndIncrementStackDepth as u8);
+                            writer.push_varint(self.queued_count);
+                        }
+                        (true, Direction::GoUp) => {
+                            writer.push_byte(LineProgramOp::FinishInstructionAndDecrementStackDepth as u8);
+                        }
+                        (false, Direction::GoUp) => {
+                            writer.push_byte(LineProgramOp::FinishMultipleInstructionsAndDecrementStackDepth as u8);
+                            writer.push_varint(self.queued_count);
+                        }
+                    }
+
+                    self.stack_depth = next_depth;
+                    self.queued_count = 0;
                 }
             }
 
-            if function.frames.is_empty() {
-                if let Some((prefix, suffix)) = function.namespace_and_name() {
-                    written = true;
-                    let prefix_id = dbg_strings.dedup_cow(prefix.into());
-                    let suffix_id = dbg_strings.dedup_cow(suffix.into());
-                    writer.push_varint(prefix_id);
-                    writer.push_varint(suffix_id);
-                    writer.push_varint(empty_string_id); // File path.
-                    writer.push_varint(0); // Line.
-                    writer.push_varint(0); // Column.
-                    writer.push_varint(0); // Inline frame count.
+            let mut state = LineProgramState::default();
+            for nth_instruction in group.instruction_position..group.instruction_position + group.instruction_count {
+                let locations = locations_for_instruction[nth_instruction].as_ref().unwrap();
+                state.set_stack_depth(writer, locations.len());
+
+                for (depth, location) in locations.iter().enumerate() {
+                    let new_path = location.source_code_location.as_ref().map(|location| location.path());
+                    let new_line = location.source_code_location.as_ref().and_then(|location| location.line());
+                    let new_column = location.source_code_location.as_ref().and_then(|location| location.column());
+
+                    let changed_kind = state.stack[depth].kind != Some(location.kind);
+                    let changed_namespace = state.stack[depth].namespace != location.namespace;
+                    let changed_function_name = state.stack[depth].function_name != location.function_name;
+                    let changed_path = state.stack[depth].path.as_ref() != new_path;
+                    let changed_line = state.stack[depth].line != new_line;
+                    let changed_column = state.stack[depth].column != new_column;
+
+                    if changed_kind {
+                        state.set_mutation_depth(writer, depth);
+                        state.stack[depth].kind = Some(location.kind);
+                        let kind = match location.kind {
+                            FrameKind::Enter => LineProgramOp::SetKindEnter,
+                            FrameKind::Call => LineProgramOp::SetKindCall,
+                            FrameKind::Line => LineProgramOp::SetKindLine,
+                        };
+                        writer.push_byte(kind as u8);
+                    }
+
+                    if changed_namespace {
+                        state.set_mutation_depth(writer, depth);
+                        writer.push_byte(LineProgramOp::SetNamespace as u8);
+                        state.stack[depth].namespace = location.namespace.clone();
+
+                        let namespace_offset = location
+                            .namespace
+                            .as_ref()
+                            .map(|string| dbg_strings.dedup(string))
+                            .unwrap_or(empty_string_id);
+                        writer.push_varint(namespace_offset);
+                    }
+
+                    if changed_function_name {
+                        state.set_mutation_depth(writer, depth);
+                        writer.push_byte(LineProgramOp::SetFunctionName as u8);
+                        state.stack[depth].function_name = location.function_name.clone();
+
+                        let function_name_offset = location
+                            .function_name
+                            .as_ref()
+                            .map(|string| dbg_strings.dedup(string))
+                            .unwrap_or(empty_string_id);
+                        writer.push_varint(function_name_offset);
+                    }
+
+                    if changed_path {
+                        state.set_mutation_depth(writer, depth);
+                        writer.push_byte(LineProgramOp::SetPath as u8);
+                        state.stack[depth].path = location.source_code_location.as_ref().map(|location| location.path().clone());
+
+                        let path_offset = location
+                            .source_code_location
+                            .as_ref()
+                            .map(|location| dbg_strings.dedup(location.path()))
+                            .unwrap_or(empty_string_id);
+                        writer.push_varint(path_offset);
+                    }
+
+                    if changed_line {
+                        state.set_mutation_depth(writer, depth);
+                        match (state.stack[depth].line, new_line) {
+                            (Some(old_value), Some(new_value)) if old_value + 1 == new_value => {
+                                writer.push_byte(LineProgramOp::IncrementLine as u8);
+                            }
+                            (Some(old_value), Some(new_value)) if new_value > old_value => {
+                                writer.push_byte(LineProgramOp::AddLine as u8);
+                                writer.push_varint(new_value - old_value);
+                            }
+                            (Some(old_value), Some(new_value)) if new_value < old_value => {
+                                writer.push_byte(LineProgramOp::SubLine as u8);
+                                writer.push_varint(old_value - new_value);
+                            }
+                            _ => {
+                                writer.push_byte(LineProgramOp::SetLine as u8);
+                                writer.push_varint(new_line.unwrap_or(0));
+                            }
+                        }
+                        state.stack[depth].line = new_line;
+                    }
+
+                    if changed_column {
+                        state.set_mutation_depth(writer, depth);
+                        writer.push_byte(LineProgramOp::SetColumn as u8);
+                        state.stack[depth].column = new_column;
+                        writer.push_varint(new_column.unwrap_or(0));
+                    }
                 }
+
+                let next_depth = locations_for_instruction
+                    .get(nth_instruction + 1)
+                    .and_then(|next_locations| next_locations.as_ref().map(|xs| xs.len()))
+                    .unwrap_or(0);
+                state.finish_instruction(writer, next_depth);
             }
 
-            if written {
-                function_ranges.push((function_start_index, function_end_index, info_offset));
-            }
-
-            last_range = function.range;
+            state.flush_if_any_are_queued(writer);
+            writer.push_byte(LineProgramOp::FinishProgram as u8);
         }
     });
 
-    writer.push_section(program::SECTION_OPT_DEBUG_FUNCTION_RANGES, |writer| {
-        for (function_start_index, function_end_index, info_offset) in function_ranges {
-            writer.push_u32(function_start_index);
-            writer.push_u32(function_end_index);
+    assert_eq!(info_offsets.len(), groups.len());
+    writer.push_section(program::SECTION_OPT_DEBUG_LINE_PROGRAM_RANGES, |writer| {
+        for (group, info_offset) in groups.iter().zip(info_offsets.into_iter()) {
+            writer.push_u32(group.instruction_position.try_into().expect("overflow"));
+            writer.push_u32((group.instruction_position + group.instruction_count).try_into().expect("overflow"));
             writer.push_u32(info_offset);
         }
     });

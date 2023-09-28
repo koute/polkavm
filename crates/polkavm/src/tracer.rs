@@ -5,19 +5,21 @@ use crate::interpreter::{InterpretedInstance, InterpreterContext};
 use crate::source_cache::SourceCache;
 use core::mem::MaybeUninit;
 use polkavm_common::error::Trap;
-use polkavm_common::program::{Opcode, ProgramExport, Reg};
+use polkavm_common::program::{FrameKind, Opcode, ProgramExport, Reg};
 use polkavm_common::utils::Access;
 
 pub(crate) struct Tracer {
     module: Module,
     source_cache: SourceCache,
+    program_counter_history: [u32; 8],
+    program_counter_history_position: usize,
     crosscheck_interpreter: Option<InterpretedInstance>,
     crosscheck_reg: Option<(Reg, u32)>,
     crosscheck_store: Option<(u32, u32)>,
     crosscheck_store_bytes: [u8; 8],
     crosscheck_reset_memory_after_execution: bool,
-    current_function: Option<usize>,
-    current_inline_stack: Vec<usize>,
+    current_line_program_position: Option<(usize, usize)>,
+    current_source_location: Option<(u32, u32)>,
 
     enable_store_crosschecks: bool,
 }
@@ -25,6 +27,8 @@ pub(crate) struct Tracer {
 impl Tracer {
     pub fn new(module: Module) -> Self {
         Tracer {
+            program_counter_history: [!0; 8],
+            program_counter_history_position: 0,
             crosscheck_interpreter: if module.compiled_module().is_some() {
                 InterpretedInstance::new(module.clone()).ok()
             } else {
@@ -36,8 +40,8 @@ impl Tracer {
             crosscheck_store: None,
             crosscheck_store_bytes: Default::default(),
             crosscheck_reset_memory_after_execution: false,
-            current_function: None,
-            current_inline_stack: Vec::new(),
+            current_line_program_position: None,
+            current_source_location: None,
 
             // TODO: Make this configurable.
             enable_store_crosschecks: false,
@@ -73,7 +77,8 @@ impl Tracer {
         let program_counter = access
             .program_counter()
             .expect("internal error: tracer called without valid program counter");
-        self.trace_current_instruction_source(program_counter, access);
+
+        self.trace_current_instruction_source(program_counter);
 
         let instruction = self.module.instructions()[program_counter as usize];
         if let Some(native_address) = access.native_program_counter() {
@@ -105,11 +110,24 @@ impl Tracer {
         Ok(())
     }
 
+    fn debug_print_history(&self) {
+        log::error!("Program counter history:");
+        for nth in (0..self.program_counter_history.len()).rev() {
+            let pc = self.program_counter_history[(self.program_counter_history_position + nth) % self.program_counter_history.len()];
+            if pc == !0 {
+                continue;
+            }
+
+            self.module.debug_print_location(log::Level::Error, pc);
+        }
+    }
+
     fn crosscheck_last_instruction(&mut self, access: &mut BackendAccess) -> Result<(), Trap> {
         if let Some((reg, expected_value)) = self.crosscheck_reg.take() {
             let value = access.get_reg(reg);
             if value != expected_value {
                 log::error!("Register value mismatch! Crosscheck interpreter has {reg} = 0x{expected_value:x}, actual execution has {reg} = 0x{value:x}");
+                self.debug_print_history();
                 return Err(Trap::default());
             }
         }
@@ -135,7 +153,7 @@ impl Tracer {
         Ok(())
     }
 
-    fn trace_current_instruction_source(&mut self, program_counter: u32, access: &mut BackendAccess) {
+    fn trace_current_instruction_source(&mut self, program_counter: u32) {
         #[cfg(not(windows))]
         const VT_DARK: &str = "\x1B[1;30m";
         #[cfg(not(windows))]
@@ -150,85 +168,111 @@ impl Tracer {
         #[cfg(windows)]
         const VT_RESET: &str = "";
 
+        if !log::log_enabled!(log::Level::Trace) {
+            return;
+        }
+
         let Some(blob) = self.module.blob() else { return };
-        let info = match blob.get_function_debug_info(program_counter) {
+        let mut line_program = match blob.get_debug_line_program_at(program_counter) {
             Err(error) => {
-                log::warn!("Failed to get debug info for instruction #{program_counter}: {error}");
-                self.current_function = None;
-                self.current_inline_stack.clear();
+                log::warn!("Failed to get line program for instruction #{program_counter}: {error}");
+                self.current_source_location = None;
                 return;
             }
             Ok(None) => {
                 log::trace!("  (f) (none)");
-                self.current_function = None;
-                self.current_inline_stack.clear();
+                self.current_source_location = None;
                 return;
             }
-            // TODO: The compiler can merge multiple functions into one. Make `get_function_debug_info` return an iterator and handle it.
-            Ok(Some(info)) => info,
+            Ok(Some(line_program)) => line_program,
         };
 
-        if self.current_function != Some(info.entry_index()) {
-            self.current_function = Some(info.entry_index());
-            let offset = program_counter - info.instruction_range().start;
-            let function_name = info.full_name();
-            if let Some(location) = info.location() {
-                log::trace!("  (f) '{function_name}' + {offset} {VT_DARK}[{location}]{VT_RESET}");
-                if offset == 0 {
-                    if let Some(source_line) = self.source_cache.lookup_source_line(location) {
-                        log::trace!("   | {VT_GREEN}{source_line}{VT_RESET}");
-                    }
+        let line_program_index = line_program.entry_index();
 
-                    for reg in [Reg::A0, Reg::A1, Reg::A2, Reg::A3, Reg::A4, Reg::A5] {
-                        let value = access.get_reg(reg);
-                        log::trace!("{reg} = 0x{value:x}");
-                    }
+        // TODO: Running the whole region program on every instruction is horribly inefficient.
+        let location_ref = loop {
+            let region_info = match line_program.run() {
+                Ok(Some(region_info)) => region_info,
+                Ok(None) => {
+                    debug_assert!(false, "region should have been found in line program but wasn't");
+                    break None;
                 }
-            } else {
-                log::trace!("  (f) '{function_name}' + {offset}");
-            }
-        }
-
-        // TODO: This is inefficient.
-        let mut depth = 0;
-        for (nth_inline, inline_info) in info.inlined().enumerate() {
-            let inline_info = match inline_info {
-                Ok(inline_info) => inline_info,
                 Err(error) => {
-                    log::warn!("Failed to get inline frame for instruction #{program_counter}: {error}");
-                    break;
+                    log::warn!("Failed to run line program for instruction #{program_counter}: {error}");
+                    self.current_source_location = None;
+                    return;
                 }
             };
 
-            let inline_range = inline_info.instruction_range();
-            if !inline_range.contains(&program_counter) {
+            if !region_info.instruction_range().contains(&program_counter) {
                 continue;
             }
 
-            if self.current_inline_stack.len() > depth {
-                if self.current_inline_stack[depth] == nth_inline {
-                    depth += 1;
-                    continue;
+            let new_line_program_position = (line_program_index, region_info.entry_index());
+            if self.current_line_program_position == Some(new_line_program_position) {
+                log::trace!("  {VT_DARK}(location unchanged){VT_RESET}");
+                return;
+            }
+
+            self.current_line_program_position = Some(new_line_program_position);
+
+            let mut location_ref = None;
+            for frame in region_info.frames() {
+                let full_name = match frame.full_name() {
+                    Ok(full_name) => full_name,
+                    Err(error) => {
+                        log::warn!("Failed to fetch a frame full name at #{program_counter}: {error}");
+                        self.current_source_location = None;
+                        return;
+                    }
+                };
+
+                let location = match frame.location() {
+                    Ok(location) => location,
+                    Err(error) => {
+                        log::warn!("Failed to fetch a frame location at #{program_counter}: {error}");
+                        self.current_source_location = None;
+                        return;
+                    }
+                };
+
+                let kind = match frame.kind() {
+                    FrameKind::Enter => 'f',
+                    FrameKind::Call => 'c',
+                    FrameKind::Line => 'l',
+                };
+
+                if let Some(location) = location {
+                    log::trace!("  ({kind}) '{full_name}' {VT_DARK}[{location}]{VT_RESET}");
                 } else {
-                    self.current_inline_stack.truncate(depth);
+                    log::trace!("  ({kind}) '{full_name}'");
                 }
+
+                location_ref = if let (Some(offset), Some(line)) = (frame.path_debug_string_offset(), frame.line()) {
+                    Some((offset, line))
+                } else {
+                    None
+                };
             }
 
-            assert_eq!(self.current_inline_stack.len(), depth);
-            self.current_inline_stack.push(nth_inline);
+            break location_ref;
+        };
 
-            let inline_offset = program_counter - inline_info.instruction_range().start;
-            let inline_function_name = inline_info.full_name();
-            if let Some(inline_location) = inline_info.location() {
-                log::trace!("  ({depth}) '{inline_function_name}' + {inline_offset} {VT_DARK}[{inline_location}]{VT_RESET}");
-                if let Some(inline_source_line) = self.source_cache.lookup_source_line(inline_location) {
-                    log::trace!("   | {VT_GREEN}{inline_source_line}{VT_RESET}");
-                }
-            } else {
-                log::trace!("  ({depth}) '{inline_function_name}' + {inline_offset}");
-            }
+        if self.current_source_location == location_ref {
+            return;
+        }
 
-            depth += 1;
+        self.current_source_location = location_ref;
+        let Some((path_offset, line)) = location_ref else {
+            return;
+        };
+
+        let Ok(path) = blob.get_debug_string(path_offset) else {
+            return;
+        };
+
+        if let Some(source_line) = self.source_cache.lookup_source_line(path, line) {
+            log::trace!("   | {VT_GREEN}{source_line}{VT_RESET}");
         }
     }
 
@@ -240,8 +284,14 @@ impl Tracer {
         let expected_program_counter = interpreter.access().program_counter().unwrap();
         if expected_program_counter != program_counter {
             log::error!("Program counter mismatch! Crosscheck interpreter returned #{expected_program_counter}, actual execution returned #{program_counter}");
+            self.module.debug_print_location(log::Level::Error, expected_program_counter);
+            self.module.debug_print_location(log::Level::Error, program_counter);
+            self.debug_print_history();
             return Err(Trap::default());
         }
+
+        self.program_counter_history[self.program_counter_history_position] = program_counter;
+        self.program_counter_history_position = (self.program_counter_history_position + 1) % self.program_counter_history.len();
 
         let instruction = self.module.instructions()[program_counter as usize];
         if matches!(instruction.op(), Opcode::trap) {
@@ -249,7 +299,6 @@ impl Tracer {
         }
 
         let mut on_hostcall = |_hostcall: u64, _access: BackendAccess<'_>| -> Result<(), Trap> { Ok(()) };
-
         let mut on_set_reg = |reg: Reg, value: u32| -> Result<(), Trap> {
             assert!(self.crosscheck_reg.is_none());
             self.crosscheck_reg = Some((reg, value));

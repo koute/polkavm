@@ -36,6 +36,7 @@ polkavm-linux-sandbox   = { version = "0.2.0", path = "crates/polkavm-linux-sand
 clap = "4.4.1"
 env_logger = { version = "0.10.0", default-features = false }
 gimli = { version = "0.28.0", default-features = false }
+hashbrown = { version = "0.14.0", default-features = false }
 iced-x86 = "1.19.0"
 log = "0.4.20"
 object = { version = "0.32.0", default-features = false }

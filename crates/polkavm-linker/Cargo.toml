@@ -15,3 +15,4 @@ object = { workspace = true, features = ["std", "read_core", "elf", "unaligned"]
 gimli = { workspace = true, features = ["std", "read", "endian-reader"] }
 polkavm-common = { workspace = true, features = ["alloc"] }
 rustc-demangle = { workspace = true }
+hashbrown = { workspace = true, features = ["raw"] }

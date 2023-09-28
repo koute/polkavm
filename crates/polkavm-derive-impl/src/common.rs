@@ -211,7 +211,7 @@ pub fn create_fn_prototype(sig: &syn::Signature, bitness: Bitness) -> Result<FnM
 
     let name = sig.ident.to_string();
     Ok(FnMetadata {
-        name: name.into(),
+        name,
         args: {
             let mut args = [None; VM_MAXIMUM_EXTERN_ARG_COUNT];
             for (arg_in, arg_out) in parsed_args.into_iter().zip(args.iter_mut()) {
