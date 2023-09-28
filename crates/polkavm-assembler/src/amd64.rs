@@ -988,6 +988,11 @@ pub mod inst {
             Inst::new(0xf7).modrm_opext(0b111).rex_64b_if(matches!(self.0, RegSize::R64)).modrm_rm_direct(self.1).encode(),
             (fmt.write_fmt(core::format_args!("idiv {}", self.1.name_from(self.0)))),
 
+        // https://www.felixcloutier.com/x86/cwd:cdq:cqo
+        cdq() =>
+            Inst::new(0x99).encode(),
+            (fmt.write_str("cdq")),
+
         // https://www.felixcloutier.com/x86/setcc
         setcc(Condition, Reg) =>
             {
@@ -1519,6 +1524,7 @@ mod tests {
         bts,
         call_reg,
         call_rel32,
+        cdq,
         cmp_imm,
         cmp,
         div,
