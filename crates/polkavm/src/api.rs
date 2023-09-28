@@ -244,7 +244,6 @@ impl Module {
         let compiler_enabled = selected_backend == Backend::Compiler;
         let interpreter_enabled = debug_trace_execution || selected_backend == Backend::Interpreter;
 
-        // TODO: Don't always initialize both.
         let compiled_module = if compiler_enabled {
             Some(CompiledModule::new(&instructions, &exports, init, debug_trace_execution)?)
         } else {
