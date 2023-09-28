@@ -1,7 +1,7 @@
 use crate::api::{BackendAccess, Module, OnHostcall};
 use crate::error::{bail, Error};
 use core::mem::MaybeUninit;
-use polkavm_common::abi::{GuestMemoryConfig, VM_ADDR_RETURN_TO_HOST, VM_ADDR_USER_STACK_HIGH};
+use polkavm_common::abi::{VM_ADDR_RETURN_TO_HOST, VM_ADDR_USER_STACK_HIGH};
 use polkavm_common::error::Trap;
 use polkavm_common::init::GuestProgramInit;
 use polkavm_common::program::{InstructionVisitor, Opcode, Reg};
@@ -10,7 +10,6 @@ use polkavm_common::utils::{byte_slice_init, Access, AsUninitSliceMut};
 type ExecutionError<E = core::convert::Infallible> = polkavm_common::error::ExecutionError<E>;
 
 pub(crate) struct InterpretedModule {
-    config: GuestMemoryConfig,
     ro_data: Vec<u8>,
     rw_data: Vec<u8>,
 }
@@ -18,7 +17,6 @@ pub(crate) struct InterpretedModule {
 impl InterpretedModule {
     pub fn new(init: GuestProgramInit) -> Result<Self, Error> {
         Ok(InterpretedModule {
-            config: init.memory_config().map_err(Error::from_static_str)?,
             ro_data: init.ro_data().into(),
             rw_data: init.rw_data().into(),
         })
@@ -60,15 +58,15 @@ pub(crate) struct InterpretedInstance {
 
 impl InterpretedInstance {
     pub fn new(module: Module) -> Result<Self, Error> {
-        let Some(interpreted_module) = module.interpreted_module() else {
+        if module.interpreted_module().is_none() {
             bail!("an interpreter cannot be created from the given module")
-        };
+        }
 
         let mut heap = Vec::new();
         let mut stack = Vec::new();
 
-        heap.reserve_exact(interpreted_module.config.heap_size() as usize);
-        stack.reserve_exact(interpreted_module.config.stack_size() as usize);
+        heap.reserve_exact(module.memory_config().heap_size() as usize);
+        stack.reserve_exact(module.memory_config().stack_size() as usize);
 
         let mut interpreter = Self {
             heap,
@@ -135,9 +133,9 @@ impl InterpretedInstance {
         let interpreted_module = self.module.interpreted_module().unwrap();
         self.heap.clear();
         self.heap.extend_from_slice(&interpreted_module.rw_data);
-        self.heap.resize(interpreted_module.config.heap_size() as usize, 0);
+        self.heap.resize(self.module.memory_config().heap_size() as usize, 0);
         self.stack.clear();
-        self.stack.resize(interpreted_module.config.stack_size() as usize, 0);
+        self.stack.resize(self.module.memory_config().stack_size() as usize, 0);
     }
 
     pub fn prepare_for_call(&mut self, export_index: usize, args: &[u32]) {
@@ -178,13 +176,14 @@ impl InterpretedInstance {
     }
 
     fn get_memory_slice(&self, address: u32, length: u32) -> Option<&[u8]> {
-        let module = self.module.interpreted_module().unwrap();
-        let (range, memory) = if module.config.ro_data_range().contains(&address) {
-            (module.config.ro_data_range(), &module.ro_data)
-        } else if module.config.heap_range().contains(&address) {
-            (module.config.heap_range(), &self.heap)
-        } else if module.config.stack_range().contains(&address) {
-            (module.config.stack_range(), &self.stack)
+        let memory_config = self.module.memory_config();
+        let (range, memory) = if memory_config.ro_data_range().contains(&address) {
+            let module = self.module.interpreted_module().unwrap();
+            (memory_config.ro_data_range(), &module.ro_data)
+        } else if memory_config.heap_range().contains(&address) {
+            (memory_config.heap_range(), &self.heap)
+        } else if memory_config.stack_range().contains(&address) {
+            (memory_config.stack_range(), &self.stack)
         } else {
             return None;
         };
@@ -194,11 +193,11 @@ impl InterpretedInstance {
     }
 
     fn get_memory_slice_mut(&mut self, address: u32, length: u32) -> Option<&mut [u8]> {
-        let module = self.module.interpreted_module().unwrap();
-        let (range, memory_slice) = if module.config.heap_range().contains(&address) {
-            (module.config.heap_range(), &mut self.heap)
-        } else if module.config.stack_range().contains(&address) {
-            (module.config.stack_range(), &mut self.stack)
+        let memory_config = self.module.memory_config();
+        let (range, memory_slice) = if memory_config.heap_range().contains(&address) {
+            (memory_config.heap_range(), &mut self.heap)
+        } else if memory_config.stack_range().contains(&address) {
+            (memory_config.stack_range(), &mut self.stack)
         } else {
             return None;
         };

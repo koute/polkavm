@@ -84,6 +84,7 @@ struct ModulePrivate {
     blob: Option<ProgramBlob<'static>>,
     compiled_module: Option<CompiledModule>,
     interpreted_module: Option<InterpretedModule>,
+    memory_config: GuestMemoryConfig,
 }
 
 /// A compiled PolkaVM program module.
@@ -117,6 +118,10 @@ impl Module {
 
     pub(crate) fn instruction_by_jump_target(&self, target: u32) -> Option<u32> {
         self.0.jump_target_to_instruction.get(&target).copied()
+    }
+
+    pub(crate) fn memory_config(&self) -> &GuestMemoryConfig {
+        &self.0.memory_config
     }
 
     /// Creates a new module by deserializing the program from the given `bytes`.
@@ -281,6 +286,7 @@ impl Module {
             },
             compiled_module,
             interpreted_module,
+            memory_config: init.memory_config().map_err(Error::from_static_str)?,
         })))
     }
 }
