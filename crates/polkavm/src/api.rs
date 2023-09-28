@@ -945,10 +945,10 @@ impl<T> Linker<T> {
 
     /// Pre-instantiates a new module, linking it with the external functions previously defined on this object.
     pub fn instantiate_pre(&self, module: &Module) -> Result<InstancePre<T>, Error> {
-        let mut host_functions: Vec<ExternFnArc<T>> = Vec::new();
-        host_functions.reserve_exact(module.0.imports.len());
+        let mut host_functions: HashMap<u32, ExternFnArc<T>> = HashMap::new();
+        host_functions.reserve(module.0.imports.len());
 
-        for import in module.0.imports.values() {
+        for (index, import) in &module.0.imports {
             let prototype = import.prototype();
             let host_fn = match self.host_functions.get(prototype.name()) {
                 Some(host_fn) => host_fn,
@@ -962,7 +962,7 @@ impl<T> Linker<T> {
             };
 
             host_fn.0.typecheck(prototype)?;
-            host_functions.push(host_fn.clone());
+            host_functions.insert(*index, host_fn.clone());
         }
 
         Ok(InstancePre(Arc::new(InstancePrePrivate {
@@ -976,7 +976,7 @@ impl<T> Linker<T> {
 
 struct InstancePrePrivate<T> {
     module: Module,
-    host_functions: Vec<ExternFnArc<T>>,
+    host_functions: HashMap<u32, ExternFnArc<T>>,
     fallback_handler: Option<FallbackHandlerArc<T>>,
     _private: core::marker::PhantomData<T>,
 }
@@ -1262,7 +1262,7 @@ impl<T> Clone for Func<T> {
 
 fn on_hostcall<'a, T>(
     user_data: &'a mut T,
-    host_functions: &'a [ExternFnArc<T>],
+    host_functions: &'a HashMap<u32, ExternFnArc<T>>,
     fallback_handler: Option<&'a FallbackHandlerArc<T>>,
     raw: &'a mut CallerRaw,
 ) -> impl for<'r> FnMut(u64, BackendAccess<'r>) -> Result<(), Trap> + 'a {
@@ -1281,7 +1281,7 @@ fn on_hostcall<'a, T>(
             return Err(Trap::default());
         }
 
-        let host_fn = match host_functions.get(hostcall as usize) {
+        let host_fn = match host_functions.get(&(hostcall as u32)) {
             Some(host_fn) => host_fn,
             None => {
                 if let Some(fallback_handler) = fallback_handler {
