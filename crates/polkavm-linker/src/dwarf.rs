@@ -688,7 +688,23 @@ pub(crate) fn load_dwarf(elf: &Elf, data: &[u8]) -> Result<DwarfInfo, ProgramFro
                 None => continue,
             };
 
-            let unit = dwarf.unit(header)?;
+            let unit = match dwarf.unit(header) {
+                Ok(unit) => unit,
+                Err(error @ gimli::Error::UnexpectedEof(reader_offset_id)) => {
+                    if let Some((_, section_id, offset)) = dwarf.lookup_offset_id(reader_offset_id) {
+                        return Err(ProgramFromElfError::other(format!(
+                            "unexpected end of file while parsing DWARF info in section '{}'+{}",
+                            section_id.name(),
+                            offset
+                        )));
+                    } else {
+                        return Err(error.into());
+                    }
+                }
+                Err(error) => {
+                    return Err(error.into());
+                }
+            };
             units.push((offset, unit));
         }
     }
