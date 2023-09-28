@@ -61,6 +61,8 @@ impl ProgramFromElfError {
     }
 }
 
+impl std::error::Error for ProgramFromElfError {}
+
 impl core::fmt::Display for ProgramFromElfError {
     fn fmt(&self, fmt: &mut core::fmt::Formatter) -> core::fmt::Result {
         match &self.0 {
