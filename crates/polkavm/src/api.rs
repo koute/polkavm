@@ -272,6 +272,24 @@ impl Module {
         let exports = exports.into_iter().map(|export| export.into_owned()).collect();
         let imports = imports.into_iter().map(|(index, import)| (index, import.into_owned())).collect();
 
+        let memory_config = init.memory_config().map_err(Error::from_static_str)?;
+        log::debug!("Prepared new module:");
+        log::debug!(
+            "  Memory map: RO data: 0x{:08x}..0x{:08x}",
+            memory_config.ro_data_range().start,
+            memory_config.ro_data_range().end
+        );
+        log::debug!(
+            "  Memory map:    Heap: 0x{:08x}..0x{:08x}",
+            memory_config.heap_range().start,
+            memory_config.heap_range().end
+        );
+        log::debug!(
+            "  Memory map:   Stack: 0x{:08x}..0x{:08x}",
+            memory_config.stack_range().start,
+            memory_config.stack_range().end
+        );
+
         Ok(Module(Arc::new(ModulePrivate {
             debug_trace_execution,
             instructions,
@@ -287,7 +305,7 @@ impl Module {
             },
             compiled_module,
             interpreted_module,
-            memory_config: init.memory_config().map_err(Error::from_static_str)?,
+            memory_config,
         })))
     }
 
