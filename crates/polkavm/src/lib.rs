@@ -42,6 +42,7 @@ mod tests {
 
     #[test]
     fn caller_and_caller_ref_work() {
+        let _ = env_logger::try_init();
         let blob = ProgramBlob::parse(RAW_BLOB).unwrap();
         let config = Config::default();
         let engine = Engine::new(&config).unwrap();
@@ -90,6 +91,7 @@ mod tests {
 
     #[test]
     fn trapping_from_hostcall_handler_works() {
+        let _ = env_logger::try_init();
         let blob = ProgramBlob::parse(RAW_BLOB).unwrap();
         let config = Config::default();
         let engine = Engine::new(&config).unwrap();

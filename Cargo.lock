@@ -445,6 +445,7 @@ dependencies = [
 name = "polkavm"
 version = "0.2.0"
 dependencies = [
+ "env_logger",
  "log",
  "polkavm-assembler",
  "polkavm-common",
