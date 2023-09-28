@@ -1202,6 +1202,15 @@ impl<T> Instance<T> {
 
         mutable.backend.access().write_memory(address, data)
     }
+
+    pub fn get_reg(&self, reg: Reg) -> u32 {
+        let mut mutable = match self.0.mutable.lock() {
+            Ok(mutable) => mutable,
+            Err(poison) => poison.into_inner(),
+        };
+
+        mutable.backend.access().get_reg(reg)
+    }
 }
 
 pub struct ExecutionConfig {
