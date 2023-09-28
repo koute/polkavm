@@ -89,6 +89,43 @@ fn check_reg(reg: Reg) -> Result<(), ProgramFromElfError> {
     }
 }
 
+fn decode_inst(raw_inst: u32) -> Result<Option<Inst>, ProgramFromElfError> {
+    let Some(op) = Inst::decode(raw_inst) else {
+        return Ok(None);
+    };
+
+    match op {
+        Inst::LoadUpperImmediate { dst, .. } | Inst::AddUpperImmediateToPc { dst, .. } | Inst::JumpAndLink { dst, .. } => {
+            check_reg(dst)?;
+        }
+        Inst::JumpAndLinkRegister { dst, base, .. } | Inst::Load { dst, base, .. } => {
+            check_reg(dst)?;
+            check_reg(base)?;
+        }
+        Inst::Store { src, base, .. } => {
+            check_reg(src)?;
+            check_reg(base)?;
+        }
+        Inst::Branch { src1, src2, .. } => {
+            check_reg(src1)?;
+            check_reg(src2)?;
+        }
+        Inst::RegImm { dst, src, .. } | Inst::Shift { dst, src, .. } => {
+            check_reg(dst)?;
+            check_reg(src)?;
+        }
+
+        Inst::RegReg { dst, src1, src2, .. } => {
+            check_reg(dst)?;
+            check_reg(src1)?;
+            check_reg(src2)?;
+        }
+        Inst::Ecall | Inst::Unimplemented => {}
+    }
+
+    Ok(Some(op))
+}
+
 #[derive(Copy, Clone, Debug)]
 enum EndOfBlock {
     Fallthrough { target: u64 },
@@ -786,7 +823,7 @@ fn parse_text_section(
                 text[relative_offset + 3],
             ]);
 
-            if Inst::decode(op) != Some(INST_RET) {
+            if decode_inst(op)? != Some(INST_RET) {
                 return Err(ProgramFromElfError::other("external call shim doesn't end with a 'ret'"));
             }
 
@@ -808,7 +845,7 @@ fn parse_text_section(
         #[allow(unused_variables)]
         let relative_offset = ();
 
-        let op = match Inst::decode(op) {
+        let op = match decode_inst(op)? {
             Some(op) => instruction_overrides.remove(&absolute_address).unwrap_or(op),
             None => {
                 return Err(ProgramFromElfErrorKind::UnsupportedInstruction {
@@ -818,35 +855,6 @@ fn parse_text_section(
                 .into());
             }
         };
-
-        match op {
-            Inst::LoadUpperImmediate { dst, .. } | Inst::AddUpperImmediateToPc { dst, .. } | Inst::JumpAndLink { dst, .. } => {
-                check_reg(dst)?;
-            }
-            Inst::JumpAndLinkRegister { dst, base, .. } | Inst::Load { dst, base, .. } => {
-                check_reg(dst)?;
-                check_reg(base)?;
-            }
-            Inst::Store { src, base, .. } => {
-                check_reg(src)?;
-                check_reg(base)?;
-            }
-            Inst::Branch { src1, src2, .. } => {
-                check_reg(src1)?;
-                check_reg(src2)?;
-            }
-            Inst::RegImm { dst, src, .. } | Inst::Shift { dst, src, .. } => {
-                check_reg(dst)?;
-                check_reg(src)?;
-            }
-
-            Inst::RegReg { dst, src1, src2, .. } => {
-                check_reg(dst)?;
-                check_reg(src1)?;
-                check_reg(src2)?;
-            }
-            Inst::Ecall | Inst::Unimplemented => {}
-        }
 
         let op = match op {
             Inst::LoadUpperImmediate { dst, value } => InstExt::Basic(BasicInst::RegImm {
@@ -1658,14 +1666,14 @@ fn relocate(
                         };
 
                         let hi_inst_raw = u32::from_le_bytes([xs[0], xs[1], xs[2], xs[3]]);
-                        let Some(hi_inst) = Inst::decode(hi_inst_raw) else {
+                        let Some(hi_inst) = decode_inst(hi_inst_raw)? else {
                             return Err(ProgramFromElfError::other(format!(
                                 "R_RISCV_CALL_PLT for an unsupported instruction (1st): 0x{hi_inst_raw:08}"
                             )));
                         };
 
                         let lo_inst_raw = u32::from_le_bytes([xs[4], xs[5], xs[6], xs[7]]);
-                        let Some(lo_inst) = Inst::decode(lo_inst_raw) else {
+                        let Some(lo_inst) = decode_inst(lo_inst_raw)? else {
                             return Err(ProgramFromElfError::other(format!(
                                 "R_RISCV_CALL_PLT for an unsupported instruction (2st): 0x{lo_inst_raw:08}"
                             )));
@@ -1806,7 +1814,7 @@ fn relocate(
                         };
 
                         let inst_raw = read_u32(section_data, relative_address)?;
-                        let Some(inst) = Inst::decode(inst_raw) else {
+                        let Some(inst) = decode_inst(inst_raw)? else {
                             return Err(ProgramFromElfError::other(format!(
                                 "R_RISCV_JAL for an unsupported instruction: 0x{inst_raw:08}"
                             )));
@@ -1837,7 +1845,7 @@ fn relocate(
                         };
 
                         let inst_raw = read_u32(section_data, relative_address)?;
-                        let Some(inst) = Inst::decode(inst_raw) else {
+                        let Some(inst) = decode_inst(inst_raw)? else {
                             return Err(ProgramFromElfError::other(format!(
                                 "R_RISCV_BRANCH for an unsupported instruction: 0x{inst_raw:08}"
                             )));
@@ -1883,14 +1891,14 @@ fn relocate(
                         };
 
                         let hi_inst_raw = u32::from_le_bytes([xs[0], xs[1], xs[2], xs[3]]);
-                        let Some(hi_inst) = Inst::decode(hi_inst_raw) else {
+                        let Some(hi_inst) = decode_inst(hi_inst_raw)? else {
                             return Err(ProgramFromElfError::other(format!(
                                 "R_RISCV_HI20 for an unsupported instruction (1st): 0x{hi_inst_raw:08}"
                             )));
                         };
 
                         let lo_inst_raw = u32::from_le_bytes([xs[4], xs[5], xs[6], xs[7]]);
-                        let Some(lo_inst) = Inst::decode(lo_inst_raw) else {
+                        let Some(lo_inst) = decode_inst(lo_inst_raw)? else {
                             return Err(ProgramFromElfError::other(format!(
                                 "R_RISCV_HI20 for an unsupported instruction (2st): 0x{lo_inst_raw:08}"
                             )));
@@ -1959,7 +1967,7 @@ fn relocate(
                         };
 
                         let inst_raw = read_u32(section_data, relative_address)?;
-                        let Some(inst) = Inst::decode(inst_raw) else {
+                        let Some(inst) = decode_inst(inst_raw)? else {
                             return Err(ProgramFromElfError::other(format!(
                                 "R_RISCV_LO12_I for an unsupported instruction: 0x{inst_raw:08}"
                             )));
@@ -2042,9 +2050,9 @@ fn process_pcrel_pairs(
     for (relative_lo, relative_hi) in reloc_pcrel_lo12 {
         let data_text = &mut data[text_range.clone()];
         let lo_inst_raw = &data_text[relative_lo as usize..][..4];
-        let mut lo_inst = Inst::decode(u32::from_le_bytes([lo_inst_raw[0], lo_inst_raw[1], lo_inst_raw[2], lo_inst_raw[3]]));
+        let mut lo_inst = decode_inst(u32::from_le_bytes([lo_inst_raw[0], lo_inst_raw[1], lo_inst_raw[2], lo_inst_raw[3]]))?;
         let hi_inst_raw = &data_text[relative_hi as usize..][..4];
-        let hi_inst = Inst::decode(u32::from_le_bytes([hi_inst_raw[0], hi_inst_raw[1], hi_inst_raw[2], hi_inst_raw[3]]));
+        let hi_inst = decode_inst(u32::from_le_bytes([hi_inst_raw[0], hi_inst_raw[1], hi_inst_raw[2], hi_inst_raw[3]]))?;
 
         let Some((hi_kind, target)) = pairs.reloc_pcrel_hi20.get(&relative_hi).copied() else {
             return Err(ProgramFromElfError::other(format!("R_RISCV_PCREL_LO12_* relocation at 0x{relative_lo:x} targets 0x{relative_hi:x} which doesn't have a R_RISCV_PCREL_HI20/R_RISCV_GOT_HI20 relocation")));
