@@ -6,6 +6,7 @@ use polkavm_common::abi::{
     GuestMemoryConfig, VM_MAXIMUM_EXPORT_COUNT, VM_MAXIMUM_EXTERN_ARG_COUNT, VM_MAXIMUM_IMPORT_COUNT, VM_MAXIMUM_INSTRUCTION_COUNT,
     VM_MAXIMUM_JUMP_TARGET,
 };
+use polkavm_common::abi::{VM_ADDR_RETURN_TO_HOST, VM_ADDR_USER_STACK_HIGH};
 use polkavm_common::error::Trap;
 use polkavm_common::init::GuestProgramInit;
 use polkavm_common::program::{ExternFnPrototype, ExternTy, ProgramBlob, ProgramExport, ProgramImport};
@@ -1021,10 +1022,10 @@ enum InstanceBackend {
 }
 
 impl InstanceBackend {
-    fn call(&mut self, export_index: usize, on_hostcall: OnHostcall, args: &[u32], config: &ExecutionConfig) -> Result<(), ExecutionError> {
+    fn call(&mut self, export_index: usize, on_hostcall: OnHostcall, config: &ExecutionConfig) -> Result<(), ExecutionError> {
         match self {
-            InstanceBackend::Compiled(ref mut backend) => backend.call(export_index, on_hostcall, args, config),
-            InstanceBackend::Interpreted(ref mut backend) => backend.call(export_index, on_hostcall, args, config),
+            InstanceBackend::Compiled(ref mut backend) => backend.call(export_index, on_hostcall, config),
+            InstanceBackend::Interpreted(ref mut backend) => backend.call(export_index, on_hostcall, config),
         }
     }
 
@@ -1205,13 +1206,18 @@ impl<T> Instance<T> {
 
 pub struct ExecutionConfig {
     pub(crate) reset_memory_after_execution: bool,
+    pub(crate) initial_regs: [u32; Reg::ALL_NON_ZERO.len()],
 }
 
-#[allow(clippy::derivable_impls)]
 impl Default for ExecutionConfig {
     fn default() -> Self {
+        let mut initial_regs = [0; Reg::ALL_NON_ZERO.len()];
+        initial_regs[Reg::SP as usize - 1] = VM_ADDR_USER_STACK_HIGH;
+        initial_regs[Reg::RA as usize - 1] = VM_ADDR_RETURN_TO_HOST;
+
         ExecutionConfig {
             reset_memory_after_execution: false,
+            initial_regs,
         }
     }
 }
@@ -1219,6 +1225,14 @@ impl Default for ExecutionConfig {
 impl ExecutionConfig {
     pub fn set_reset_memory_after_execution(&mut self, value: bool) -> &mut Self {
         self.reset_memory_after_execution = value;
+        self
+    }
+
+    pub fn set_reg(&mut self, reg: Reg, value: u32) -> &mut Self {
+        if !matches!(reg, Reg::Zero) {
+            self.initial_regs[reg as usize - 1] = value;
+        }
+
         self
     }
 }
@@ -1287,7 +1301,7 @@ impl<T> Func<T> {
     }
 
     /// Calls the function with the given configuration.
-    pub fn call_ex(&self, user_data: &mut T, args: &[Val], config: ExecutionConfig) -> Result<Option<Val>, ExecutionError> {
+    pub fn call_ex(&self, user_data: &mut T, args: &[Val], mut config: ExecutionConfig) -> Result<Option<Val>, ExecutionError> {
         let instance_pre = &self.instance.0.instance_pre;
         let export = &instance_pre.0.module.0.exports[self.export_index];
         let prototype = export.prototype();
@@ -1316,7 +1330,6 @@ impl<T> Func<T> {
             return Err(ExecutionError::Error(error.into()));
         }
 
-        let mut arg_regs: [u32; VM_MAXIMUM_EXTERN_ARG_COUNT] = [0; VM_MAXIMUM_EXTERN_ARG_COUNT];
         let mut input_count = 0;
         if prototype.args().len() > 0 {
             let required_count = args
@@ -1334,7 +1347,8 @@ impl<T> Func<T> {
             }
 
             let mut cb = |value: u32| {
-                arg_regs[input_count] = value;
+                assert!(input_count <= VM_MAXIMUM_EXTERN_ARG_COUNT);
+                config.initial_regs[Reg::A0 as usize + input_count - 1] = value;
                 input_count += 1;
             };
 
@@ -1345,7 +1359,6 @@ impl<T> Func<T> {
                 }
             }
         }
-        let arg_regs = &arg_regs[..input_count];
 
         let mutable = &self.instance.0.mutable;
         let mut mutable = match mutable.lock() {
@@ -1355,7 +1368,7 @@ impl<T> Func<T> {
 
         let mutable = &mut *mutable;
         if let Some(ref mut tracer) = mutable.tracer() {
-            tracer.on_before_call(self.export_index, export, arg_regs, &config);
+            tracer.on_before_call(self.export_index, export, &config);
         }
 
         let mut on_hostcall = on_hostcall(
@@ -1365,7 +1378,7 @@ impl<T> Func<T> {
             &mut mutable.raw,
         );
 
-        let result = mutable.backend.call(self.export_index, &mut on_hostcall, arg_regs, &config);
+        let result = mutable.backend.call(self.export_index, &mut on_hostcall, &config);
         core::mem::drop(on_hostcall);
 
         if let Some(ref mut tracer) = mutable.tracer() {
@@ -1425,17 +1438,16 @@ where
     }
 
     /// Calls the function with the given configuration.
-    pub fn call_ex(&self, user_data: &mut T, args: FnArgs, config: ExecutionConfig) -> Result<FnResult, ExecutionError> {
+    pub fn call_ex(&self, user_data: &mut T, args: FnArgs, mut config: ExecutionConfig) -> Result<FnResult, ExecutionError> {
         let instance_pre = &self.instance.0.instance_pre;
         let export = &instance_pre.0.module.0.exports[self.export_index];
 
-        let mut arg_regs: [u32; VM_MAXIMUM_EXTERN_ARG_COUNT] = [0; VM_MAXIMUM_EXTERN_ARG_COUNT];
         let mut input_count = 0;
         args._set(|value| {
-            arg_regs[input_count] = value;
+            assert!(input_count <= VM_MAXIMUM_EXTERN_ARG_COUNT);
+            config.initial_regs[Reg::A0 as usize + input_count - 1] = value;
             input_count += 1;
         });
-        let arg_regs = &arg_regs[..input_count];
 
         let mutable = &self.instance.0.mutable;
         let mut mutable = match mutable.lock() {
@@ -1445,7 +1457,7 @@ where
 
         let mutable = &mut *mutable;
         if let Some(ref mut tracer) = mutable.tracer() {
-            tracer.on_before_call(self.export_index, export, arg_regs, &config);
+            tracer.on_before_call(self.export_index, export, &config);
         }
 
         let mut on_hostcall = on_hostcall(
@@ -1455,7 +1467,7 @@ where
             &mut mutable.raw,
         );
 
-        let result = mutable.backend.call(self.export_index, &mut on_hostcall, arg_regs, &config);
+        let result = mutable.backend.call(self.export_index, &mut on_hostcall, &config);
         core::mem::drop(on_hostcall);
 
         if let Some(ref mut tracer) = mutable.tracer() {

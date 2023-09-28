@@ -44,7 +44,7 @@ impl Tracer {
         }
     }
 
-    pub fn on_before_call(&mut self, export_index: usize, export: &ProgramExport, args: &[u32], config: &ExecutionConfig) {
+    pub fn on_before_call(&mut self, export_index: usize, export: &ProgramExport, config: &ExecutionConfig) {
         let target = self
             .module
             .instruction_by_jump_target(export.address())
@@ -53,7 +53,7 @@ impl Tracer {
 
         if let Some(ref mut interpreter) = self.crosscheck_interpreter {
             self.crosscheck_reset_memory_after_execution = config.reset_memory_after_execution;
-            interpreter.prepare_for_call(export_index, args);
+            interpreter.prepare_for_call(export_index, config);
         }
     }
 

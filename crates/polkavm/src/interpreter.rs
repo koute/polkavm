@@ -1,7 +1,7 @@
 use crate::api::{BackendAccess, ExecutionConfig, Module, OnHostcall};
 use crate::error::{bail, Error};
 use core::mem::MaybeUninit;
-use polkavm_common::abi::{VM_ADDR_RETURN_TO_HOST, VM_ADDR_USER_STACK_HIGH};
+use polkavm_common::abi::VM_ADDR_RETURN_TO_HOST;
 use polkavm_common::error::Trap;
 use polkavm_common::init::GuestProgramInit;
 use polkavm_common::program::{InstructionVisitor, Opcode, Reg};
@@ -81,16 +81,10 @@ impl InterpretedInstance {
         Ok(interpreter)
     }
 
-    pub fn call(
-        &mut self,
-        export_index: usize,
-        on_hostcall: OnHostcall,
-        args: &[u32],
-        config: &ExecutionConfig,
-    ) -> Result<(), ExecutionError<Error>> {
+    pub fn call(&mut self, export_index: usize, on_hostcall: OnHostcall, config: &ExecutionConfig) -> Result<(), ExecutionError<Error>> {
         let mut ctx = InterpreterContext::default();
         ctx.set_on_hostcall(on_hostcall);
-        self.prepare_for_call(export_index, args);
+        self.prepare_for_call(export_index, config);
 
         let result = self.run(ctx);
         if config.reset_memory_after_execution {
@@ -123,12 +117,6 @@ impl InterpretedInstance {
         Ok(())
     }
 
-    fn reset_regs(&mut self) {
-        self.return_to_host = false;
-        self.pc = 0;
-        self.regs.fill(0);
-    }
-
     pub fn reset_memory(&mut self) {
         let interpreted_module = self.module.interpreted_module().unwrap();
         self.heap.clear();
@@ -138,7 +126,7 @@ impl InterpretedInstance {
         self.stack.resize(self.module.memory_config().stack_size() as usize, 0);
     }
 
-    pub fn prepare_for_call(&mut self, export_index: usize, args: &[u32]) {
+    pub fn prepare_for_call(&mut self, export_index: usize, config: &ExecutionConfig) {
         // TODO: If this function becomes public then this needs to return an error.
         let address = self
             .module
@@ -149,15 +137,9 @@ impl InterpretedInstance {
             .module
             .instruction_by_jump_target(address)
             .expect("internal error: invalid export address");
-        self.reset_regs();
-        self.access().set_reg(Reg::SP, VM_ADDR_USER_STACK_HIGH);
-        self.access().set_reg(Reg::RA, VM_ADDR_RETURN_TO_HOST);
 
-        assert!(args.len() <= polkavm_common::abi::VM_MAXIMUM_EXTERN_ARG_COUNT);
-        for (reg, value) in Reg::ARG_REGS.into_iter().zip(args.iter().copied()) {
-            self.access().set_reg(reg, value);
-        }
-
+        self.return_to_host = false;
+        self.regs[1..].copy_from_slice(&config.initial_regs);
         self.pc = target_pc;
     }
 

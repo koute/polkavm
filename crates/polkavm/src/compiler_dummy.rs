@@ -66,13 +66,7 @@ impl CompiledInstance {
         unimplemented!();
     }
 
-    pub fn call(
-        &mut self,
-        _export_index: usize,
-        _on_hostcall: OnHostcall,
-        _args: &[u32],
-        _config: &ExecutionConfig,
-    ) -> Result<(), ExecutionError<Error>> {
+    pub fn call(&mut self, _export_index: usize, _on_hostcall: OnHostcall, _config: &ExecutionConfig) -> Result<(), ExecutionError<Error>> {
         unimplemented!();
     }
 

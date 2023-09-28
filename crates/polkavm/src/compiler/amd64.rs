@@ -4,8 +4,7 @@ use polkavm_assembler::amd64::Reg::*;
 use polkavm_assembler::amd64::{Condition, LoadKind, RegSize, StoreKind};
 use polkavm_assembler::Label;
 
-use polkavm_common::abi::{VM_ADDR_RETURN_TO_HOST, VM_ADDR_USER_STACK_HIGH};
-use polkavm_common::program::{ExternTy, InstructionVisitor, Reg};
+use polkavm_common::program::{InstructionVisitor, Reg};
 use polkavm_common::zygote::{
     VmCtx, SYSCALL_HOSTCALL, SYSCALL_RETURN, SYSCALL_TRACE, SYSCALL_TRAP, VM_ADDR_JUMP_TABLE, VM_ADDR_SYSCALL, VM_ADDR_VMCTX,
 };
@@ -459,55 +458,7 @@ impl<'a> Compiler<'a> {
 
             let trampoline_label = self.asm.create_label();
             self.export_to_label.insert(export.address(), trampoline_label);
-
-            let mut regs_used = 0;
-            for arg_ty in export.prototype().args() {
-                regs_used += match arg_ty {
-                    ExternTy::I32 => 1,
-                    ExternTy::I64 => {
-                        if self.regs_are_64bit {
-                            1
-                        } else {
-                            2
-                        }
-                    }
-                };
-            }
-
-            if regs_used > 0 {
-                self.push(load64_imm(TMP_REG, regs_address()));
-            }
-
-            for (nth, reg) in Reg::ALL_NON_ZERO.iter().copied().enumerate() {
-                match reg {
-                    Reg::SP => {
-                        self.load_imm(reg, VM_ADDR_USER_STACK_HIGH);
-                    }
-                    Reg::RA => {
-                        self.load_imm(reg, VM_ADDR_RETURN_TO_HOST);
-                    }
-                    Reg::A0 | Reg::A1 | Reg::A2 | Reg::A3 | Reg::A4 | Reg::A5 => {
-                        let regs_used_threshold = match reg {
-                            Reg::A0 => 1,
-                            Reg::A1 => 2,
-                            Reg::A2 => 3,
-                            Reg::A3 => 4,
-                            Reg::A4 => 5,
-                            Reg::A5 => 6,
-                            _ => unreachable!(),
-                        };
-
-                        if regs_used >= regs_used_threshold {
-                            self.push(load_indirect(conv_reg(reg), RegSize::R64, TMP_REG, nth as i32 * 4, LoadKind::U32));
-                        } else {
-                            self.clear_reg(reg);
-                        }
-                    }
-                    _ => {
-                        self.clear_reg(reg);
-                    }
-                }
-            }
+            self.restore_registers_from_vmctx();
 
             let target_label = self.get_or_forward_declare_label(export.address());
             self.push(jmp_label32(target_label));
@@ -522,22 +473,7 @@ impl<'a> Compiler<'a> {
         log::trace!("Emitting trampoline: sysreturn");
         let label = self.asm.create_label();
 
-        self.push(load64_imm(TMP_REG, regs_address()));
-        self.push(store_indirect(
-            RegSize::R64,
-            TMP_REG,
-            (Reg::A0 as i32 - 1) * 4,
-            conv_reg(Reg::A0),
-            StoreKind::U32,
-        ));
-        self.push(store_indirect(
-            RegSize::R64,
-            TMP_REG,
-            (Reg::A1 as i32 - 1) * 4,
-            conv_reg(Reg::A1),
-            StoreKind::U32,
-        ));
-
+        self.save_registers_to_vmctx();
         self.push(load64_imm(TMP_REG, VM_ADDR_SYSCALL));
         self.push(load32_imm(rdi, SYSCALL_RETURN));
         self.push(jmp_reg(TMP_REG));

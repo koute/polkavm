@@ -7,7 +7,6 @@
 extern crate polkavm_linux_raw as linux_raw;
 
 use polkavm_common::{
-    abi::VM_MAXIMUM_EXTERN_ARG_COUNT,
     abi::VM_PAGE_SIZE,
     error::{ExecutionError, Trap},
     init::GuestProgramInit,
@@ -1122,10 +1121,7 @@ impl Sandbox {
                 *self.vmctx().new_sysreturn_address.get() = program.sysreturn_address;
             }
 
-            for (reg, value) in Reg::ARG_REGS.into_iter().zip(args.args[..args.arg_count].iter().copied()) {
-                self.access().set_reg(reg, value);
-            }
-
+            (*self.vmctx().regs().get()).copy_from_slice(args.initial_regs);
             self.vmctx().futex.store(VMCTX_FUTEX_BUSY, Ordering::Release);
             linux_raw::sys_futex_wake_one(&self.vmctx().futex)?;
 
@@ -1243,8 +1239,7 @@ pub struct ExecuteArgs<'a> {
     rpc_flags: u32,
     program: Option<&'a SandboxProgram>,
     on_hostcall: Option<OnHostcall<'a>>,
-    args: [u32; VM_MAXIMUM_EXTERN_ARG_COUNT],
-    arg_count: usize,
+    initial_regs: &'a [u32],
 }
 
 impl<'a> Default for ExecuteArgs<'a> {
@@ -1256,13 +1251,13 @@ impl<'a> Default for ExecuteArgs<'a> {
 impl<'a> ExecuteArgs<'a> {
     #[inline]
     pub fn new() -> Self {
+        static EMPTY_REGS: &[u32; Reg::ALL_NON_ZERO.len()] = &[0; Reg::ALL_NON_ZERO.len()];
         ExecuteArgs {
             rpc_address: 0,
             rpc_flags: 0,
             program: None,
             on_hostcall: None,
-            args: [0; VM_MAXIMUM_EXTERN_ARG_COUNT],
-            arg_count: 0,
+            initial_regs: EMPTY_REGS,
         }
     }
 
@@ -1298,12 +1293,9 @@ impl<'a> ExecuteArgs<'a> {
     }
 
     #[inline]
-    pub fn set_args(&mut self, args: &[u32]) {
-        assert!(args.len() <= VM_MAXIMUM_EXTERN_ARG_COUNT);
-        for (dst, src) in self.args.iter_mut().zip(args.iter().copied()) {
-            *dst = src;
-        }
-        self.arg_count = args.len();
+    pub fn set_initial_regs(&mut self, regs: &'a [u32]) {
+        assert_eq!(regs.len(), Reg::ALL_NON_ZERO.len());
+        self.initial_regs = regs;
     }
 }
 
