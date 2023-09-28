@@ -194,7 +194,7 @@ impl<'a> Compiler<'a> {
             (_, Z, _) => match kind {
                 Signedness::Signed => {
                     self.push(cmp_imm(self.reg_size(), conv_reg(s2), 0));
-                    self.push(setcc(Condition::GreaterOrEqual, conv_reg(d)));
+                    self.push(setcc(Condition::Greater, conv_reg(d)));
                     self.push(and_imm(RegSize::R32, conv_reg(d), 1));
                 }
                 Signedness::Unsigned => {
