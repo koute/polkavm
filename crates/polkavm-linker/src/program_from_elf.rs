@@ -3230,11 +3230,19 @@ pub fn program_from_elf(config: Config, data: &[u8]) -> Result<ProgramBlob, Prog
                     );
                     assert_eq!(
                         actual.line(),
-                        expected.source_code_location.as_ref().and_then(|location| location.line())
+                        expected
+                            .source_code_location
+                            .as_ref()
+                            .and_then(|location| location.line())
+                            .and_then(|line| if line != 0 { Some(line) } else { None })
                     );
                     assert_eq!(
                         actual.column(),
-                        expected.source_code_location.as_ref().and_then(|location| location.column())
+                        expected
+                            .source_code_location
+                            .as_ref()
+                            .and_then(|location| location.column())
+                            .and_then(|column| if column != 0 { Some(column) } else { None })
                     );
                 }
 
