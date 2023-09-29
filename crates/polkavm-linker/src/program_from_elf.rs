@@ -545,6 +545,7 @@ fn extract_memory_config(
     sections_ro_data: &[SectionIndex],
     sections_rw_data: &[SectionIndex],
     sections_bss: &[SectionIndex],
+    section_min_stack_size: Option<SectionIndex>,
     base_address_for_section: &mut HashMap<SectionIndex, u64>,
 ) -> Result<MemoryConfig, ProgramFromElfError> {
     let mut memory_end = VM_ADDR_USER_MEMORY as u64;
@@ -686,8 +687,26 @@ fn extract_memory_config(
     bss_size =
         align_to_next_page_u64(VM_PAGE_SIZE as u64, bss_size).ok_or(ProgramFromElfError::other("out of range size for BSS sections"))?;
 
-    // TODO: This should be configurable.
-    let stack_size = VM_PAGE_SIZE as u64;
+    let stack_size = if let Some(section_index) = section_min_stack_size {
+        let section = elf.section_by_index(section_index);
+        let data = section.data();
+        if data.len() % 4 != 0 {
+            return Err(ProgramFromElfError::other(format!("section '{}' has invalid size", section.name())));
+        }
+
+        let mut stack_size = 0;
+        for xs in data.chunks_exact(4) {
+            let value = u32::from_le_bytes([xs[0], xs[1], xs[2], xs[3]]);
+            stack_size = core::cmp::max(stack_size, value);
+        }
+
+        align_to_next_page_u64(VM_PAGE_SIZE as u64, stack_size as u64)
+            .ok_or(ProgramFromElfError::other("out of range size for the stack"))?
+    } else {
+        VM_PAGE_SIZE as u64
+    };
+
+    log::trace!("Configured stack size: 0x{stack_size:x}");
 
     // Sanity check that the memory configuration is actually valid.
     {
@@ -2606,6 +2625,7 @@ pub fn program_from_elf(config: Config, data: &[u8]) -> Result<ProgramBlob, Prog
     let mut sections_code = Vec::new();
     let mut sections_import_metadata = Vec::new();
     let mut section_export_metadata = None;
+    let mut section_min_stack_size = None;
     let mut sections_other = Vec::new();
 
     for section in elf.sections() {
@@ -2652,6 +2672,8 @@ pub fn program_from_elf(config: Config, data: &[u8]) -> Result<ProgramBlob, Prog
             sections_import_metadata.push(section.index());
         } else if name == ".polkavm_exports" {
             section_export_metadata = Some(section.index());
+        } else if name == ".polkavm_min_stack_size" {
+            section_min_stack_size = Some(section.index());
         } else if name == ".eh_frame" || name == ".got" {
             continue;
         } else if section.is_allocated() {
@@ -2823,6 +2845,7 @@ pub fn program_from_elf(config: Config, data: &[u8]) -> Result<ProgramBlob, Prog
         &sections_ro_data,
         &sections_rw_data,
         &sections_bss,
+        section_min_stack_size,
         &mut base_address_for_section,
     )?;
 

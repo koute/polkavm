@@ -167,4 +167,17 @@ static arg_return_ty __attribute__ ((naked)) fn_name(POLKAVM_IMPORT_ARGS_IMPL(__
     ); \
 }
 
+#define POLKAVM_MIN_STACK_SIZE(size) \
+static void __attribute__ ((naked, used)) POLKAVM_UNIQUE(polkavm_stack_size)() { \
+    __asm__( \
+        ".pushsection .polkavm_min_stack_size,\"\",@progbits\n" \
+        ".word %[value]\n" \
+        ".popsection\n" \
+        : \
+        : \
+          [value] "i" (size) \
+        : \
+    ); \
+}
+
 #endif
