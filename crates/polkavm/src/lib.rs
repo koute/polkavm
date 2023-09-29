@@ -11,13 +11,13 @@ mod interpreter;
 mod source_cache;
 mod tracer;
 
-#[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+#[cfg(all(target_arch = "x86_64", target_os = "linux", not(miri)))]
 mod compiler;
 
-#[cfg(not(all(target_arch = "x86_64", target_os = "linux")))]
+#[cfg(not(all(target_arch = "x86_64", target_os = "linux", not(miri))))]
 mod compiler_dummy;
 
-#[cfg(not(all(target_arch = "x86_64", target_os = "linux")))]
+#[cfg(not(all(target_arch = "x86_64", target_os = "linux", not(miri))))]
 use compiler_dummy as compiler;
 
 pub use polkavm_common::{
