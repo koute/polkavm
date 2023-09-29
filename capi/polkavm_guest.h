@@ -180,4 +180,10 @@ static void __attribute__ ((naked, used)) POLKAVM_UNIQUE(polkavm_stack_size)() {
     ); \
 }
 
+#define POLKAVM_TRAP() \
+{ \
+    __asm__("unimp\n" :::); \
+    __builtin_unreachable(); \
+}
+
 #endif
