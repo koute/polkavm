@@ -322,6 +322,7 @@ impl Tracer {
 
         if let Err(error) = interpreter.step_once(ctx) {
             log::error!("Crosscheck interpreter encountered error: {}", error);
+            self.debug_print_history();
             return Err(Trap::default());
         }
 
