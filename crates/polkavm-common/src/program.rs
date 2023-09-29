@@ -1669,32 +1669,37 @@ impl<'a> LineProgram<'a> {
                     continue;
                 }
                 LineProgramOp::SetNamespace => {
+                    let value = self.reader.read_varint()?;
                     if let Some(frame) = self.stack.get_mut(self.mutation_depth as usize) {
-                        frame.namespace_offset = self.reader.read_varint()?;
+                        frame.namespace_offset = value;
                     }
                     continue;
                 }
                 LineProgramOp::SetFunctionName => {
+                    let value = self.reader.read_varint()?;
                     if let Some(frame) = self.stack.get_mut(self.mutation_depth as usize) {
-                        frame.function_name_offset = self.reader.read_varint()?;
+                        frame.function_name_offset = value;
                     }
                     continue;
                 }
                 LineProgramOp::SetPath => {
+                    let value = self.reader.read_varint()?;
                     if let Some(frame) = self.stack.get_mut(self.mutation_depth as usize) {
-                        frame.path_offset = self.reader.read_varint()?;
+                        frame.path_offset = value;
                     }
                     continue;
                 }
                 LineProgramOp::SetLine => {
+                    let value = self.reader.read_varint()?;
                     if let Some(frame) = self.stack.get_mut(self.mutation_depth as usize) {
-                        frame.line = self.reader.read_varint()?;
+                        frame.line = value;
                     }
                     continue;
                 }
                 LineProgramOp::SetColumn => {
+                    let value = self.reader.read_varint()?;
                     if let Some(frame) = self.stack.get_mut(self.mutation_depth as usize) {
-                        frame.column = self.reader.read_varint()?;
+                        frame.column = value;
                     }
                     continue;
                 }
@@ -1709,14 +1714,16 @@ impl<'a> LineProgram<'a> {
                     continue;
                 }
                 LineProgramOp::AddLine => {
+                    let value = self.reader.read_varint()?;
                     if let Some(frame) = self.stack.get_mut(self.mutation_depth as usize) {
-                        frame.line = frame.line.wrapping_add(self.reader.read_varint()?);
+                        frame.line = frame.line.wrapping_add(value);
                     }
                     continue;
                 }
                 LineProgramOp::SubLine => {
+                    let value = self.reader.read_varint()?;
                     if let Some(frame) = self.stack.get_mut(self.mutation_depth as usize) {
-                        frame.line = frame.line.wrapping_sub(self.reader.read_varint()?);
+                        frame.line = frame.line.wrapping_sub(value);
                     }
                     continue;
                 }

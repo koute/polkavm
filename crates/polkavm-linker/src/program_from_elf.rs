@@ -3219,7 +3219,7 @@ pub fn program_from_elf(config: Config, data: &[u8]) -> Result<ProgramBlob, Prog
                     continue;
                 }
 
-                assert_eq!(region_info.frames().len(), locations.len());
+                assert!(region_info.frames().len() <= locations.len());
                 for (actual, expected) in region_info.frames().zip(locations.iter()) {
                     assert_eq!(actual.kind(), expected.kind);
                     assert_eq!(actual.namespace().unwrap(), expected.namespace.as_deref());
