@@ -90,6 +90,48 @@ mod tests {
     }
 
     #[test]
+    fn caller_split_works() {
+        let _ = env_logger::try_init();
+        let blob = ProgramBlob::parse(RAW_BLOB).unwrap();
+        let config = Config::default();
+        let engine = Engine::new(&config).unwrap();
+        let module = Module::from_blob(&engine, &blob).unwrap();
+        let mut linker = Linker::new(&engine);
+
+        #[derive(Default)]
+        struct State {
+            value: u32,
+        }
+
+        linker
+            .func_wrap("get_third_number", move |caller: Caller<State>| -> Result<u32, Trap> {
+                {
+                    let value = caller.read_u32(polkavm_common::abi::VM_ADDR_USER_STACK_HIGH - 4)?;
+                    assert_eq!(value, polkavm_common::abi::VM_ADDR_RETURN_TO_HOST);
+                }
+                {
+                    let (caller, state) = caller.split();
+                    state.value = caller.read_u32(polkavm_common::abi::VM_ADDR_USER_STACK_HIGH - 4)?;
+                }
+
+                Ok(100)
+            })
+            .unwrap();
+
+        let instance_pre = linker.instantiate_pre(&module).unwrap();
+        let instance = instance_pre.instantiate().unwrap();
+        let mut state = State::default();
+        let result = instance
+            .get_typed_func::<(u32, u32), u32>("add_numbers")
+            .unwrap()
+            .call(&mut state, (1, 10))
+            .unwrap();
+
+        assert_eq!(result, 111);
+        assert_eq!(state.value, polkavm_common::abi::VM_ADDR_RETURN_TO_HOST);
+    }
+
+    #[test]
     fn trapping_from_hostcall_handler_works() {
         let _ = env_logger::try_init();
         let blob = ProgramBlob::parse(RAW_BLOB).unwrap();

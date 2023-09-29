@@ -169,6 +169,24 @@ impl<'a, T> Caller<'a, T> {
         }
     }
 
+    pub fn split(self) -> (Caller<'a, ()>, &'a mut T) {
+        let Caller { raw, lifetime, _phantom } = self;
+        let dummy: *mut () = &mut () as *mut ();
+        let dummy: *mut core::ffi::c_void = dummy.cast();
+        let user_data: *mut core::ffi::c_void = core::mem::replace(&mut raw.user_data, dummy);
+        let user_data: *mut T = user_data.cast();
+
+        // SAFETY: This can only be called from inside of `Caller::wrap` so this is always valid.
+        let user_data = unsafe { &mut *user_data };
+        let caller = Caller {
+            raw,
+            lifetime,
+            _phantom: core::marker::PhantomData,
+        };
+
+        (caller, user_data)
+    }
+
     pub fn data(&self) -> &T {
         // SAFETY: This can only be called from inside of `Caller::wrap` so this is always valid.
         unsafe { self.raw.data() }
