@@ -176,11 +176,6 @@ pub const VM_RPC_FLAG_RESET_MEMORY_AFTER_EXECUTION: u32 = 1 << 1;
 /// A flag which will trigger the sandbox to unload its program after execution.
 pub const VM_RPC_FLAG_CLEAR_PROGRAM_AFTER_EXECUTION: u32 = 1 << 2;
 
-/// A flag which will trigger the sandbox to send a SIGSTOP to itself before execution.
-///
-/// Mostly useful for debugging.
-pub const VM_RPC_FLAG_SIGSTOP_BEFORE_EXECUTION: u32 = 1 << 3;
-
 #[repr(C)]
 pub struct VmInit {
     pub stack_address: AtomicU64,
