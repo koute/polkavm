@@ -136,7 +136,9 @@ impl<'a> Compiler<'a> {
         for (pc, label) in self.pc_to_label.drain() {
             let pc = pc as usize;
             let range = pc * native_pointer_size..(pc + 1) * native_pointer_size;
-            let address = VM_ADDR_NATIVE_CODE + self.asm.get_label_offset(label) as u64;
+            let address = VM_ADDR_NATIVE_CODE
+                .checked_add_signed(self.asm.get_label_offset(label) as i64)
+                .expect("overflow");
             log::trace!("Jump table: [0x{:x}] = 0x{:x}", VM_ADDR_JUMP_TABLE + range.start as u64, address);
             self.jump_table[range].copy_from_slice(&address.to_ne_bytes());
         }
@@ -144,7 +146,9 @@ impl<'a> Compiler<'a> {
         self.export_trampolines.reserve(self.exports.len());
         for export in self.exports {
             let label = self.export_to_label.get(&export.address()).unwrap();
-            let native_address = VM_ADDR_NATIVE_CODE + self.asm.get_label_offset(*label) as u64;
+            let native_address = VM_ADDR_NATIVE_CODE
+                .checked_add_signed(self.asm.get_label_offset(*label) as i64)
+                .expect("overflow");
             self.export_trampolines.push(native_address);
         }
 
@@ -156,7 +160,9 @@ impl<'a> Compiler<'a> {
             epilogue_length
         );
 
-        let sysreturn_address = VM_ADDR_NATIVE_CODE + self.asm.get_label_offset(label_sysreturn) as u64;
+        let sysreturn_address = VM_ADDR_NATIVE_CODE
+            .checked_add_signed(self.asm.get_label_offset(label_sysreturn) as i64)
+            .expect("overflow");
         let code = self.asm.finalize();
         Ok(CompilationResult {
             code,

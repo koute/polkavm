@@ -10,7 +10,7 @@ struct Fixup {
 pub struct Assembler {
     origin: u64,
     code: Vec<u8>,
-    labels: Vec<usize>,
+    labels: Vec<isize>,
     fixups: Vec<Fixup>,
 }
 
@@ -41,19 +41,19 @@ impl Assembler {
 
     pub fn forward_declare_label(&mut self) -> Label {
         let label = self.labels.len();
-        self.labels.push(usize::MAX);
+        self.labels.push(isize::MAX);
         Label(label)
     }
 
     pub fn create_label(&mut self) -> Label {
         let label = self.labels.len();
-        self.labels.push(self.code.len());
+        self.labels.push(self.code.len() as isize);
         Label(label)
     }
 
     pub fn define_label(&mut self, label: Label) -> &mut Self {
-        assert_eq!(self.labels[label.0], usize::MAX, "tried to redefine an already defined label");
-        self.labels[label.0] = self.code.len();
+        assert_eq!(self.labels[label.0], isize::MAX, "tried to redefine an already defined label");
+        self.labels[label.0] = self.code.len() as isize;
         self
     }
 
@@ -62,9 +62,9 @@ impl Assembler {
         self.push(inst)
     }
 
-    pub fn get_label_offset(&self, label: Label) -> usize {
+    pub fn get_label_offset(&self, label: Label) -> isize {
         let offset = self.labels[label.0];
-        assert_ne!(offset, usize::MAX, "tried to fetch a label offset for a label that was not defined");
+        assert_ne!(offset, isize::MAX, "tried to fetch a label offset for a label that was not defined");
         offset
     }
 
@@ -106,8 +106,8 @@ impl Assembler {
         for fixup in self.fixups.drain(..) {
             let origin = fixup.instruction_offset + fixup.instruction_length as usize;
             let target_absolute = self.labels[fixup.target_label.0];
-            assert_ne!(target_absolute, usize::MAX);
-            let offset = target_absolute as isize - origin as isize;
+            assert_ne!(target_absolute, isize::MAX);
+            let offset = target_absolute - origin as isize;
             let p = fixup.instruction_offset + fixup.fixup_offset as usize;
             if fixup.fixup_length == 1 {
                 if offset > i8::MAX as isize || offset < i8::MIN as isize {
