@@ -143,19 +143,21 @@ impl GuestMemoryConfig {
 
     /// The address at where the program memory starts inside of the VM.
     #[inline]
-    pub const fn user_memory_address(self) -> u32 {
+    pub const fn user_memory_region_address(self) -> u32 {
         VM_ADDR_USER_MEMORY
     }
 
-    /// The size of the program memory inside of the VM, excluding the stack.
+    /// The size of the region in which the program memory resides inside of the VM, excluding the stack.
+    ///
+    /// This also includes the guard page between the read-only data and read-write data.
     #[inline]
-    pub const fn user_memory_size(self) -> u32 {
-        self.ro_data_size + self.rw_data_size + self.bss_size
+    pub const fn user_memory_region_size(self) -> u32 {
+        (self.bss_address() + self.bss_size()) - self.user_memory_region_address()
     }
 
     /// Resets the size of the program memory to zero, excluding the stack.
     #[inline]
-    pub fn clear_user_memory_size(&mut self) {
+    pub fn clear_user_memory_sizes(&mut self) {
         self.ro_data_size = 0;
         self.rw_data_size = 0;
         self.bss_size = 0;
@@ -164,7 +166,7 @@ impl GuestMemoryConfig {
     /// The address at where the program's read-only data starts inside of the VM.
     #[inline]
     pub const fn ro_data_address(self) -> u32 {
-        self.user_memory_address()
+        self.user_memory_region_address()
     }
 
     /// The size of the program's read-only data.
@@ -199,7 +201,7 @@ impl GuestMemoryConfig {
     #[inline]
     pub const fn rw_data_address(self) -> u32 {
         if self.ro_data_size == 0 {
-            self.user_memory_address()
+            self.user_memory_region_address()
         } else {
             self.ro_data_address() + self.ro_data_size + VM_PAGE_SIZE
         }
