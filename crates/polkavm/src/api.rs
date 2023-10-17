@@ -1275,6 +1275,7 @@ impl<T> Instance<T> {
 
 pub struct ExecutionConfig {
     pub(crate) reset_memory_after_execution: bool,
+    pub(crate) clear_program_after_execution: bool,
     pub(crate) initial_regs: [u32; Reg::ALL_NON_ZERO.len()],
 }
 
@@ -1286,6 +1287,7 @@ impl Default for ExecutionConfig {
 
         ExecutionConfig {
             reset_memory_after_execution: false,
+            clear_program_after_execution: false,
             initial_regs,
         }
     }
@@ -1294,6 +1296,11 @@ impl Default for ExecutionConfig {
 impl ExecutionConfig {
     pub fn set_reset_memory_after_execution(&mut self, value: bool) -> &mut Self {
         self.reset_memory_after_execution = value;
+        self
+    }
+
+    pub fn set_clear_program_after_execution(&mut self, value: bool) -> &mut Self {
+        self.clear_program_after_execution = value;
         self
     }
 
