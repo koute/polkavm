@@ -25,7 +25,7 @@ use linux_raw::{abort, cstr, syscall_readonly, Fd, Mmap, STDERR_FILENO, STDIN_FI
 use std::time::Instant;
 
 pub struct SandboxConfig {
-    pub enable_logger: bool,
+    enable_logger: bool,
 }
 
 impl SandboxConfig {

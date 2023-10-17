@@ -292,7 +292,7 @@ impl CompiledInstance {
             .compiled_module()
             .expect("internal error: tried to spawn a compiled instance without a compiled module");
         let mut sandbox_config = SandboxConfig::new();
-        sandbox_config.enable_logger = cfg!(test) || module.is_debug_trace_execution_enabled();
+        sandbox_config.enable_logger(cfg!(test) || module.is_debug_trace_execution_enabled());
 
         // TODO: This is really slow as it will always spawn a new process from scratch. Cache this.
         let mut sandbox = Sandbox::spawn(&sandbox_config)
