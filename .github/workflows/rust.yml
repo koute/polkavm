@@ -18,10 +18,14 @@ jobs:
       run: sudo apt-get install -y lld
     - name: Install target -- i686-unknown-linux-musl
       run: rustup target add i686-unknown-linux-musl
+    - name: Install target -- x86_64-unknown-freebsd
+      run: rustup target add x86_64-unknown-freebsd
     - name: Build and test (generic)
       run: ./ci/jobs/build-and-test.sh
     - name: Build and test (Linux-only)
       run: ./ci/jobs/build-and-test-linux.sh
+    - name: Check (FreeBSD)
+      run: ./ci/jobs/check-freebsd.sh
   build-and-test-macos:
     runs-on: macos-latest
     steps:
