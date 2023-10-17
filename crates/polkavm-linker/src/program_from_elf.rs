@@ -2873,6 +2873,10 @@ pub fn program_from_elf(config: Config, data: &[u8]) -> Result<ProgramBlob, Prog
 
     for (&relocation_target, &relocation) in &relocations {
         let section = elf.section_by_index(relocation_target.section_index);
+        if !used_data_sections.contains(&relocation_target.section_index) {
+            continue;
+        }
+
         log::trace!(
             "Applying relocation to '{}'[0x{:x}] {relocation_target}: {:?}",
             section.name(),
