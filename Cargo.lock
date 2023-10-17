@@ -455,7 +455,7 @@ dependencies = [
  "log",
  "polkavm-assembler",
  "polkavm-common",
- "polkavm-linux-sandbox",
+ "polkavm-linux-raw",
 ]
 
 [[package]]
@@ -513,17 +513,6 @@ name = "polkavm-linux-raw-generate"
 version = "0.1.0"
 dependencies = [
  "bindgen",
-]
-
-[[package]]
-name = "polkavm-linux-sandbox"
-version = "0.2.0"
-dependencies = [
- "env_logger",
- "log",
- "polkavm-assembler",
- "polkavm-common",
- "polkavm-linux-raw",
 ]
 
 [[package]]

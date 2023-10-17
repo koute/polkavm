@@ -16,7 +16,7 @@ polkavm-assembler = { workspace = true }
 polkavm-common = { workspace = true, features = ["alloc", "logging"] }
 
 [target.'cfg(all(target_arch = "x86_64", target_os = "linux", not(miri)))'.dependencies]
-polkavm-linux-sandbox = { workspace = true }
+polkavm-linux-raw = { workspace = true, features = ["std"] }
 
 [dev-dependencies]
 env_logger = { workspace = true }

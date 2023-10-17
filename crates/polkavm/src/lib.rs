@@ -1,6 +1,6 @@
 #![forbid(unused_must_use)]
 #![forbid(clippy::missing_safety_doc)]
-#![forbid(clippy::undocumented_unsafe_blocks)]
+#![deny(clippy::undocumented_unsafe_blocks)]
 
 mod error;
 
@@ -19,6 +19,8 @@ mod compiler_dummy;
 
 #[cfg(not(all(target_arch = "x86_64", target_os = "linux", not(miri))))]
 use compiler_dummy as compiler;
+
+mod sandbox_linux;
 
 pub use polkavm_common::{
     error::{ExecutionError, Trap},

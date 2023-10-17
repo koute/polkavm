@@ -1,8 +1,6 @@
-#![doc = include_str!("../README.md")]
-#![allow(clippy::collapsible_else_if)]
-#![allow(clippy::len_without_is_empty)]
+#![cfg(all(target_os = "linux", target_arch = "x86_64", not(miri)))]
+#![allow(clippy::undocumented_unsafe_blocks)]
 #![allow(clippy::manual_range_contains)]
-#![cfg(all(target_os = "linux", target_arch = "x86_64"))]
 
 extern crate polkavm_linux_raw as linux_raw;
 
@@ -218,14 +216,12 @@ impl ChildProcess {
             Ok(ok) => unsafe {
                 if ok.si_signo() == 0 && ok.si_pid() == 0 {
                     Ok(ChildStatus::Running)
+                } else if linux_raw::WIFSIGNALED(ok.si_status()) {
+                    Ok(ChildStatus::ExitedDueToSignal(linux_raw::WTERMSIG(ok.si_status())))
+                } else if linux_raw::WIFEXITED(ok.si_status()) {
+                    Ok(ChildStatus::Exited(linux_raw::WEXITSTATUS(ok.si_status())))
                 } else {
-                    if linux_raw::WIFSIGNALED(ok.si_status()) {
-                        Ok(ChildStatus::ExitedDueToSignal(linux_raw::WTERMSIG(ok.si_status())))
-                    } else if linux_raw::WIFEXITED(ok.si_status()) {
-                        Ok(ChildStatus::Exited(linux_raw::WEXITSTATUS(ok.si_status())))
-                    } else {
-                        Err(Error::from_last_os_error("waitid failed: internal error: unexpected state"))
-                    }
+                    Err(Error::from_last_os_error("waitid failed: internal error: unexpected state"))
                 }
             },
             Err(error) => {
