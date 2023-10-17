@@ -313,11 +313,18 @@ impl CompiledInstance {
             .module
             .compiled_module()
             .expect("internal error: tried to call into a compiled instance without a compiled module");
+
         let address = compiled_module.export_trampolines[export_index];
         let mut exec_args = ExecuteArgs::new();
+
         if config.reset_memory_after_execution {
             exec_args.set_reset_memory_after_execution();
         }
+
+        if config.clear_program_after_execution {
+            exec_args.set_clear_program_after_execution();
+        }
+
         exec_args.set_call(address);
         exec_args.set_initial_regs(&config.initial_regs);
         let mut on_hostcall = move |hostcall: u64, access: SandboxAccess| -> Result<(), Trap> {
