@@ -9,7 +9,7 @@ You can find the source code of the guest program [here](https://github.com/kout
 Make sure to have SDL2 installed, and then run:
 
 ```
-cargo run --release
+cargo run --release --no-default-features
 ```
 
 ## Running on macOS
