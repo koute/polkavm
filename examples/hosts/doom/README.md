@@ -6,6 +6,8 @@ You can find the source code of the guest program [here](https://github.com/kout
 
 ## Running on Linux
 
+Make sure to have SDL2 installed, and then run:
+
 ```
 cargo run --release
 ```
@@ -13,7 +15,7 @@ cargo run --release
 ## Running on macOS
 
 ```
-LIBRARY_PATH="$LIBRARY_PATH:$(brew --prefix)/lib" POLKAVM_ALLOW_INSECURE=1 POLKAVM_SANDBOX=generic cargo run --target=x86_64-apple-darwin --release
+LIBRARY_PATH="$LIBRARY_PATH:$(brew --prefix)/lib" POLKAVM_ALLOW_INSECURE=1 POLKAVM_SANDBOX=generic POLKAVM_BACKEND=compiler cargo run --target=x86_64-apple-darwin --release
 ```
 
 ## Running on other operating systems
