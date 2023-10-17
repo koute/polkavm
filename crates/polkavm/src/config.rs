@@ -1,30 +1,30 @@
 use crate::error::{bail, Error};
 
 #[derive(Copy, Clone, PartialEq, Eq, Debug)]
-pub enum Backend {
+pub enum BackendKind {
     Compiler,
     Interpreter,
 }
 
-impl core::fmt::Display for Backend {
+impl core::fmt::Display for BackendKind {
     fn fmt(&self, fmt: &mut core::fmt::Formatter) -> core::fmt::Result {
         let name = match self {
-            Backend::Compiler => "compiler",
-            Backend::Interpreter => "interpreter",
+            BackendKind::Compiler => "compiler",
+            BackendKind::Interpreter => "interpreter",
         };
 
         fmt.write_str(name)
     }
 }
 
-impl Backend {
-    fn from_os_str(s: &std::ffi::OsStr) -> Result<Option<Backend>, Error> {
+impl BackendKind {
+    fn from_os_str(s: &std::ffi::OsStr) -> Result<Option<BackendKind>, Error> {
         if s == "auto" {
             Ok(None)
         } else if s == "interpreter" {
-            Ok(Some(Backend::Interpreter))
+            Ok(Some(BackendKind::Interpreter))
         } else if s == "compiler" {
-            Ok(Some(Backend::Compiler))
+            Ok(Some(BackendKind::Compiler))
         } else {
             Err(Error::from_static_str(
                 "invalid value of POLKAVM_BACKEND; supported values are: 'interpreter', 'compiler'",
@@ -33,18 +33,69 @@ impl Backend {
     }
 }
 
-impl Backend {
+impl BackendKind {
     pub fn is_supported(self) -> bool {
         match self {
-            Backend::Interpreter => true,
-            Backend::Compiler => crate::compiler::IS_SUPPORTED,
+            BackendKind::Interpreter => true,
+            BackendKind::Compiler => if_compiler_is_supported! {
+                { true } else { false }
+            },
+        }
+    }
+}
+
+#[derive(Copy, Clone, PartialEq, Eq, Debug)]
+pub enum SandboxKind {
+    Linux,
+    Generic,
+}
+
+impl core::fmt::Display for SandboxKind {
+    fn fmt(&self, fmt: &mut core::fmt::Formatter) -> core::fmt::Result {
+        let name = match self {
+            SandboxKind::Linux => "linux",
+            SandboxKind::Generic => "generic",
+        };
+
+        fmt.write_str(name)
+    }
+}
+
+impl SandboxKind {
+    fn from_os_str(s: &std::ffi::OsStr) -> Result<Option<SandboxKind>, Error> {
+        if s == "auto" {
+            Ok(None)
+        } else if s == "linux" {
+            Ok(Some(SandboxKind::Linux))
+        } else if s == "generic" {
+            Ok(Some(SandboxKind::Generic))
+        } else {
+            Err(Error::from_static_str(
+                "invalid value of POLKAVM_SANDBOX; supported values are: 'linux', 'generic'",
+            ))
+        }
+    }
+}
+
+impl SandboxKind {
+    pub fn is_supported(self) -> bool {
+        if_compiler_is_supported! {
+            {
+                match self {
+                    SandboxKind::Linux => cfg!(target_os = "linux"),
+                    SandboxKind::Generic => true
+                }
+            } else {
+                false
+            }
         }
     }
 }
 
 #[derive(Clone)]
 pub struct Config {
-    pub(crate) backend: Option<Backend>,
+    pub(crate) backend: Option<BackendKind>,
+    pub(crate) sandbox: Option<SandboxKind>,
     pub(crate) trace_execution: bool,
     pub(crate) allow_insecure: bool,
 }
@@ -74,6 +125,7 @@ impl Config {
     pub fn new() -> Self {
         Config {
             backend: None,
+            sandbox: None,
             trace_execution: false,
             allow_insecure: false,
         }
@@ -83,7 +135,11 @@ impl Config {
     pub fn from_env() -> Result<Self, Error> {
         let mut config = Self::new();
         if let Some(value) = std::env::var_os("POLKAVM_BACKEND") {
-            config.backend = Backend::from_os_str(&value)?;
+            config.backend = BackendKind::from_os_str(&value)?;
+        }
+
+        if let Some(value) = std::env::var_os("POLKAVM_SANDBOX") {
+            config.sandbox = SandboxKind::from_os_str(&value)?;
         }
 
         if let Some(value) = env_bool("POLKAVM_TRACE_EXECUTION")? {
@@ -102,8 +158,18 @@ impl Config {
     /// Default: `None` (automatically pick the best available backend)
     ///
     /// Corresponding environment variable: `POLKAVM_BACKEND` (`auto`, `compiler`, `interpreter`)
-    pub fn set_backend(&mut self, backend: Option<Backend>) -> &mut Self {
+    pub fn set_backend(&mut self, backend: Option<BackendKind>) -> &mut Self {
         self.backend = backend;
+        self
+    }
+
+    /// Forces the use of a given sandbox.
+    ///
+    /// Default: `None` (automatically pick the best available sandbox)
+    ///
+    /// Corresponding environment variable: `POLKAVM_SANDBOX` (`auto`, `linux`, `generic`)
+    pub fn set_sandbox(&mut self, sandbox: Option<SandboxKind>) -> &mut Self {
+        self.sandbox = sandbox;
         self
     }
 

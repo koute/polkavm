@@ -1,4 +1,4 @@
-use crate::api::{BackendAccess, ExecutionConfig, Module, OnHostcall};
+use crate::api::{BackendAccess, ExecutionConfig, MemoryAccessError, Module, OnHostcall};
 use crate::error::{bail, Error};
 use core::mem::MaybeUninit;
 use polkavm_common::abi::VM_ADDR_RETURN_TO_HOST;
@@ -211,7 +211,7 @@ pub struct InterpretedAccess<'a> {
 }
 
 impl<'a> Access<'a> for InterpretedAccess<'a> {
-    type Error = Trap;
+    type Error = MemoryAccessError<&'static str>;
 
     fn get_reg(&self, reg: Reg) -> u32 {
         if reg == Reg::Zero {
@@ -235,13 +235,11 @@ impl<'a> Access<'a> for InterpretedAccess<'a> {
     {
         let buffer: &mut [MaybeUninit<u8>] = buffer.as_uninit_slice_mut();
         let Some(slice) = self.instance.get_memory_slice(address, buffer.len() as u32) else {
-            log::error!(
-                "Out of range read in 0x{:x}-0x{:x} ({} bytes)",
+            return Err(MemoryAccessError {
                 address,
-                (address as u64 + buffer.len() as u64) as u32,
-                buffer.len()
-            );
-            return Err(Trap::default());
+                length: buffer.len() as u64,
+                error: "out of range read",
+            });
         };
 
         Ok(byte_slice_init(buffer, slice))
@@ -249,13 +247,11 @@ impl<'a> Access<'a> for InterpretedAccess<'a> {
 
     fn write_memory(&mut self, address: u32, data: &[u8]) -> Result<(), Self::Error> {
         let Some(slice) = self.instance.get_memory_slice_mut(address, data.len() as u32) else {
-            log::error!(
-                "Out of range write in 0x{:x}-0x{:x} ({} bytes)",
+            return Err(MemoryAccessError {
                 address,
-                (address as u64 + data.len() as u64) as u32,
-                data.len()
-            );
-            return Err(Trap::default());
+                length: data.len() as u64,
+                error: "out of range write",
+            });
         };
 
         slice.copy_from_slice(data);

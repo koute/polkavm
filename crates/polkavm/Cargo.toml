@@ -15,8 +15,11 @@ log = { workspace = true }
 polkavm-assembler = { workspace = true }
 polkavm-common = { workspace = true, features = ["alloc", "logging"] }
 
-[target.'cfg(all(target_arch = "x86_64", target_os = "linux", not(miri)))'.dependencies]
+[target.'cfg(all(not(miri), target_arch = "x86_64", target_os = "linux"))'.dependencies]
 polkavm-linux-raw = { workspace = true, features = ["std"] }
+
+[target.'cfg(all(not(miri), target_arch = "x86_64", any(target_os = "linux", target_os = "macos", target_os = "freebsd")))'.dependencies]
+libc = { workspace = true }
 
 [dev-dependencies]
 env_logger = { workspace = true }

@@ -182,7 +182,7 @@ impl<const N: usize> AsUninitSliceMut for [u8; N] {
 }
 
 pub trait Access<'a> {
-    type Error;
+    type Error: core::fmt::Display;
 
     fn get_reg(&self, reg: Reg) -> u32;
     fn set_reg(&mut self, reg: Reg, value: u32);

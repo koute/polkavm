@@ -1,28 +1,29 @@
-#![cfg(all(target_os = "linux", target_arch = "x86_64", not(miri)))]
 #![allow(clippy::undocumented_unsafe_blocks)]
 #![allow(clippy::manual_range_contains)]
 
 extern crate polkavm_linux_raw as linux_raw;
 
 use polkavm_common::{
-    abi::VM_PAGE_SIZE,
     error::{ExecutionError, Trap},
-    init::GuestProgramInit,
     program::Reg,
     utils::{align_to_next_page_usize, slice_assume_init_mut, Access, AsUninitSliceMut},
     zygote::{
         SandboxMemoryConfig, VmCtx, SANDBOX_EMPTY_NATIVE_PROGRAM_COUNTER, SANDBOX_EMPTY_NTH_INSTRUCTION, VMCTX_FUTEX_BUSY,
-        VMCTX_FUTEX_HOSTCALL, VMCTX_FUTEX_IDLE, VMCTX_FUTEX_INIT, VMCTX_FUTEX_TRAP, VM_RPC_FLAG_CLEAR_PROGRAM_AFTER_EXECUTION,
-        VM_RPC_FLAG_RECONFIGURE, VM_RPC_FLAG_RESET_MEMORY_AFTER_EXECUTION,
+        VMCTX_FUTEX_HOSTCALL, VMCTX_FUTEX_IDLE, VMCTX_FUTEX_INIT, VMCTX_FUTEX_TRAP, VM_ADDR_NATIVE_CODE,
     },
 };
 
+use super::ExecuteArgs;
+
 pub use linux_raw::Error;
 
-use core::ffi::{c_int, c_long, c_uint};
+use core::ffi::{c_int, c_uint};
 use core::sync::atomic::Ordering;
 use linux_raw::{abort, cstr, syscall_readonly, Fd, Mmap, STDERR_FILENO, STDIN_FILENO};
 use std::time::Instant;
+
+use super::{OnHostcall, SandboxKind, SandboxProgramInit, get_native_page_size};
+use crate::api::{BackendAccess, MemoryAccessError};
 
 pub struct SandboxConfig {
     enable_logger: bool,
@@ -32,8 +33,10 @@ impl SandboxConfig {
     pub fn new() -> Self {
         SandboxConfig { enable_logger: false }
     }
+}
 
-    pub fn enable_logger(&mut self, value: bool) {
+impl super::SandboxConfig for SandboxConfig {
+    fn enable_logger(&mut self, value: bool) {
         self.enable_logger = value;
     }
 }
@@ -253,18 +256,6 @@ impl Drop for ChildProcess {
             let _ = self.check_status(false);
         }
     }
-}
-
-fn get_native_page_size() -> usize {
-    // This is literally the only thing we need from `libc`, so instead of including
-    // the whole crate let's just define these ourselves.
-
-    const _SC_PAGESIZE: c_int = 30;
-    extern "C" {
-        fn sysconf(name: c_int) -> c_long;
-    }
-
-    unsafe { sysconf(_SC_PAGESIZE) as usize }
 }
 
 #[cfg(polkavm_dev_use_built_zygote)]
@@ -500,103 +491,6 @@ pub struct SandboxProgram {
     sysreturn_address: u64,
 }
 
-#[derive(Copy, Clone)]
-pub struct SandboxProgramInit<'a> {
-    guest_init: GuestProgramInit<'a>,
-    code: &'a [u8],
-    jump_table: &'a [u8],
-    sysreturn_address: u64,
-}
-
-impl<'a> Default for SandboxProgramInit<'a> {
-    fn default() -> Self {
-        Self::new(Default::default())
-    }
-}
-
-impl<'a> core::ops::Deref for SandboxProgramInit<'a> {
-    type Target = GuestProgramInit<'a>;
-    fn deref(&self) -> &Self::Target {
-        &self.guest_init
-    }
-}
-
-impl<'a> SandboxProgramInit<'a> {
-    pub fn new(guest_init: GuestProgramInit<'a>) -> Self {
-        Self {
-            guest_init,
-            code: &[],
-            jump_table: &[],
-            sysreturn_address: 0,
-        }
-    }
-
-    pub fn with_code(mut self, code: &'a [u8]) -> Self {
-        self.code = code;
-        self
-    }
-
-    pub fn with_jump_table(mut self, jump_table: &'a [u8]) -> Self {
-        self.jump_table = jump_table;
-        self
-    }
-
-    pub fn with_sysreturn_address(mut self, address: u64) -> Self {
-        self.sysreturn_address = address;
-        self
-    }
-
-    fn memory_config(&self, native_page_size: usize) -> Result<SandboxMemoryConfig, Error> {
-        let mut config = SandboxMemoryConfig::empty();
-        config.set_guest_config(self.guest_init.memory_config()?);
-        config.set_code_size(native_page_size, self.code.len())?;
-        config.set_jump_table_size(native_page_size, self.jump_table.len())?;
-
-        Ok(config)
-    }
-}
-
-impl SandboxProgram {
-    pub fn new(init: SandboxProgramInit) -> Result<Self, Error> {
-        let native_page_size = get_native_page_size();
-        assert!(
-            native_page_size <= VM_PAGE_SIZE as usize && VM_PAGE_SIZE as usize % native_page_size == 0,
-            "unsupported native page size: {}",
-            native_page_size
-        );
-
-        let cfg = init.memory_config(native_page_size)?;
-        let memfd = prepare_sealed_memfd(
-            cstr!("polkavm_program"),
-            cfg.ro_data_size() as usize + cfg.rw_data_size() as usize + cfg.code_size() + cfg.jump_table_size(),
-            |buffer| {
-                let mut offset = 0;
-                macro_rules! append {
-                    ($slice:expr, $length:expr) => {
-                        assert!($slice.len() <= $length as usize);
-                        buffer[offset..offset + $slice.len()].copy_from_slice($slice);
-                        #[allow(unused_assignments)]
-                        {
-                            offset += $length as usize;
-                        }
-                    };
-                }
-
-                append!(init.ro_data(), cfg.ro_data_size());
-                append!(init.rw_data(), cfg.rw_data_size());
-                append!(init.code, cfg.code_size());
-                append!(init.jump_table, cfg.jump_table_size());
-            },
-        )?;
-
-        Ok(Self {
-            memfd,
-            memory_config: cfg,
-            sysreturn_address: init.sysreturn_address,
-        })
-    }
-}
-
 #[derive(Clone, PartialEq, Eq, Hash, Debug)]
 pub struct Map<'a> {
     pub start: u64,
@@ -725,8 +619,6 @@ unsafe fn set_message(vmctx: &VmCtx, message: core::fmt::Arguments) {
     *vmctx.message_length.get() = length as u32;
 }
 
-pub type OnHostcall<'a> = &'a mut dyn for<'r> FnMut(u64, SandboxAccess<'r>) -> Result<(), Trap>;
-
 pub struct Sandbox {
     vmctx_mmap: Mmap,
     child: ChildProcess,
@@ -756,8 +648,59 @@ impl Drop for Sandbox {
     }
 }
 
-impl Sandbox {
-    pub fn spawn(config: &SandboxConfig) -> Result<Self, Error> {
+impl super::SandboxAddressSpace for () {
+    fn native_code_address(&self) -> u64 {
+        VM_ADDR_NATIVE_CODE
+    }
+}
+
+impl super::Sandbox for Sandbox {
+    const KIND: SandboxKind = SandboxKind::Linux;
+
+    type Access<'r> = SandboxAccess<'r>;
+    type Config = SandboxConfig;
+    type Error = Error;
+    type Program = SandboxProgram;
+    type AddressSpace = ();
+
+    fn reserve_address_space() -> Result<Self::AddressSpace, Self::Error> {
+        Ok(())
+    }
+
+    fn prepare_program(init: SandboxProgramInit, _: Self::AddressSpace) -> Result<Self::Program, Self::Error> {
+        let native_page_size = get_native_page_size();
+        let cfg = init.memory_config(native_page_size)?;
+        let memfd = prepare_sealed_memfd(
+            cstr!("polkavm_program"),
+            cfg.ro_data_size() as usize + cfg.rw_data_size() as usize + cfg.code_size() + cfg.jump_table_size(),
+            |buffer| {
+                let mut offset = 0;
+                macro_rules! append {
+                    ($slice:expr, $length:expr) => {
+                        assert!($slice.len() <= $length as usize);
+                        buffer[offset..offset + $slice.len()].copy_from_slice($slice);
+                        #[allow(unused_assignments)]
+                        {
+                            offset += $length as usize;
+                        }
+                    };
+                }
+
+                append!(init.ro_data(), cfg.ro_data_size());
+                append!(init.rw_data(), cfg.rw_data_size());
+                append!(init.code, cfg.code_size());
+                append!(init.jump_table, cfg.jump_table_size());
+            },
+        )?;
+
+        Ok(SandboxProgram {
+            memfd,
+            memory_config: cfg,
+            sysreturn_address: init.sysreturn_address,
+        })
+    }
+
+    fn spawn(config: &SandboxConfig) -> Result<Self, Error> {
         let sigset = Sigmask::block_all_signals()?;
         let zygote_memfd = prepare_zygote()?;
         let (vmctx_memfd, vmctx_mmap) = prepare_vmctx()?;
@@ -994,6 +937,41 @@ impl Sandbox {
         })
     }
 
+    fn execute(&mut self, mut args: ExecuteArgs<Self>) -> Result<(), ExecutionError<Error>> {
+        self.wait_if_necessary(match args.on_hostcall {
+            Some(ref mut on_hostcall) => Some(&mut *on_hostcall),
+            None => None,
+        })?;
+
+        unsafe {
+            *self.vmctx().rpc_address.get() = args.rpc_address;
+            *self.vmctx().rpc_flags.get() = args.rpc_flags;
+            if let Some(program) = args.program {
+                *self.vmctx().new_memory_config.get() = program.memory_config;
+                *self.vmctx().new_sysreturn_address.get() = program.sysreturn_address;
+            }
+
+            (*self.vmctx().regs().get()).copy_from_slice(args.initial_regs);
+            self.vmctx().futex.store(VMCTX_FUTEX_BUSY, Ordering::Release);
+            linux_raw::sys_futex_wake_one(&self.vmctx().futex)?;
+
+            if let Some(program) = args.program {
+                // TODO: This can block forever.
+                linux_raw::sendfd(self.socket.borrow(), program.memfd.borrow())?;
+            }
+        }
+
+        self.wait_if_necessary(args.on_hostcall)?;
+        Ok(())
+    }
+
+    #[inline]
+    fn access(&mut self) -> SandboxAccess {
+        SandboxAccess { sandbox: self }
+    }
+}
+
+impl Sandbox {
     #[inline]
     fn vmctx(&self) -> &VmCtx {
         unsafe { &*self.vmctx_mmap.as_ptr().cast::<VmCtx>() }
@@ -1001,7 +979,7 @@ impl Sandbox {
 
     #[inline(never)]
     #[cold]
-    fn wait(&mut self, mut on_hostcall: Option<OnHostcall>) -> Result<(), ExecutionError<Error>> {
+    fn wait(&mut self, mut on_hostcall: Option<OnHostcall<Self>>) -> Result<(), ExecutionError<Error>> {
         let mut spin_target = 0;
         'outer: loop {
             self.count_wait_loop_start += 1;
@@ -1043,7 +1021,7 @@ impl Sandbox {
                     spin_target = 512;
                 }
 
-                match on_hostcall(hostcall, self.access()) {
+                match on_hostcall(hostcall, super::Sandbox::access(self)) {
                     Ok(()) => {
                         self.vmctx().futex.store(VMCTX_FUTEX_BUSY, Ordering::Release);
                         linux_raw::sys_futex_wake_one(&self.vmctx().futex)?;
@@ -1095,45 +1073,12 @@ impl Sandbox {
     }
 
     #[inline]
-    fn wait_if_necessary(&mut self, on_hostcall: Option<OnHostcall>) -> Result<(), ExecutionError<Error>> {
+    fn wait_if_necessary(&mut self, on_hostcall: Option<OnHostcall<Self>>) -> Result<(), ExecutionError<Error>> {
         if self.vmctx().futex.load(Ordering::Relaxed) != VMCTX_FUTEX_IDLE {
             self.wait(on_hostcall)?;
         }
 
         Ok(())
-    }
-
-    pub fn execute(&mut self, mut args: ExecuteArgs) -> Result<(), ExecutionError<Error>> {
-        self.wait_if_necessary(match args.on_hostcall {
-            Some(ref mut on_hostcall) => Some(&mut *on_hostcall),
-            None => None,
-        })?;
-
-        unsafe {
-            *self.vmctx().rpc_address.get() = args.rpc_address;
-            *self.vmctx().rpc_flags.get() = args.rpc_flags;
-            if let Some(program) = args.program {
-                *self.vmctx().new_memory_config.get() = program.memory_config;
-                *self.vmctx().new_sysreturn_address.get() = program.sysreturn_address;
-            }
-
-            (*self.vmctx().regs().get()).copy_from_slice(args.initial_regs);
-            self.vmctx().futex.store(VMCTX_FUTEX_BUSY, Ordering::Release);
-            linux_raw::sys_futex_wake_one(&self.vmctx().futex)?;
-
-            if let Some(program) = args.program {
-                // TODO: This can block forever.
-                linux_raw::sendfd(self.socket.borrow(), program.memfd.borrow())?;
-            }
-        }
-
-        self.wait_if_necessary(args.on_hostcall)?;
-        Ok(())
-    }
-
-    #[inline]
-    pub fn access(&mut self) -> SandboxAccess {
-        SandboxAccess { sandbox: self }
     }
 }
 
@@ -1141,8 +1086,14 @@ pub struct SandboxAccess<'a> {
     sandbox: &'a mut Sandbox,
 }
 
+impl<'a> From<SandboxAccess<'a>> for BackendAccess<'a> {
+    fn from(access: SandboxAccess<'a>) -> Self {
+        BackendAccess::CompiledLinux(access)
+    }
+}
+
 impl<'a> Access<'a> for SandboxAccess<'a> {
-    type Error = linux_raw::Error;
+    type Error = MemoryAccessError<linux_raw::Error>;
 
     fn get_reg(&self, reg: Reg) -> u32 {
         if reg == Reg::Zero {
@@ -1164,7 +1115,7 @@ impl<'a> Access<'a> for SandboxAccess<'a> {
         }
     }
 
-    fn read_memory_into_slice<'slice, T>(&self, address: u32, buffer: &'slice mut T) -> Result<&'slice mut [u8], Error>
+    fn read_memory_into_slice<'slice, T>(&self, address: u32, buffer: &'slice mut T) -> Result<&'slice mut [u8], Self::Error>
     where
         T: ?Sized + AsUninitSliceMut,
     {
@@ -1177,36 +1128,71 @@ impl<'a> Access<'a> for SandboxAccess<'a> {
         );
 
         if address as usize + slice.len() > 0xffffffff {
-            return Err(Error::from_str("out of range read"));
+            return Err(MemoryAccessError {
+                address,
+                length: slice.len() as u64,
+                error: Error::from_str("out of range read"),
+            });
         }
 
         let length = slice.len();
-        let actual_length = linux_raw::vm_read_memory(self.sandbox.child.pid, [slice], [(address as usize, length)])?;
-        if length != actual_length {
-            return Err(Error::from_str("incomplete read"));
+        match linux_raw::vm_read_memory(self.sandbox.child.pid, [slice], [(address as usize, length)]) {
+            Ok(actual_length) if actual_length == length => {
+                unsafe { Ok(slice_assume_init_mut(slice)) }
+            },
+            Ok(_) => {
+                Err(MemoryAccessError {
+                    address,
+                    length: slice.len() as u64,
+                    error: Error::from_str("incomplete read"),
+                })
+            },
+            Err(error) => {
+                Err(MemoryAccessError {
+                    address,
+                    length: slice.len() as u64,
+                    error,
+                })
+            }
         }
-
-        unsafe { Ok(slice_assume_init_mut(slice)) }
     }
 
-    fn write_memory(&mut self, address: u32, data: &[u8]) -> Result<(), Error> {
+    fn write_memory(&mut self, address: u32, data: &[u8]) -> Result<(), Self::Error> {
         log::trace!(
             "Writing memory: 0x{:x}-0x{:x} ({} bytes)",
             address,
             address as usize + data.len(),
             data.len()
         );
+
         if address as usize + data.len() > 0xffffffff {
-            return Err(Error::from_str("out of range write"));
+            return Err(MemoryAccessError {
+                address,
+                length: data.len() as u64,
+                error: Error::from_str("out of range write"),
+            });
         }
 
         let length = data.len();
-        let actual_length = linux_raw::vm_write_memory(self.sandbox.child.pid, [data], [(address as usize, length)])?;
-        if length != actual_length {
-            return Err(Error::from_str("incomplete write"));
+        match linux_raw::vm_write_memory(self.sandbox.child.pid, [data], [(address as usize, length)]) {
+            Ok(actual_length) if actual_length == length => {
+                Ok(())
+            },
+            Ok(_) => {
+                Err(MemoryAccessError {
+                    address,
+                    length: data.len() as u64,
+                    error: Error::from_str("incomplete write"),
+                })
+            },
+            Err(error) => {
+                Err(MemoryAccessError {
+                    address,
+                    length: data.len() as u64,
+                    error,
+                })
+            }
         }
-
-        Ok(())
     }
 
     fn program_counter(&self) -> Option<u32> {
@@ -1226,277 +1212,6 @@ impl<'a> Access<'a> for SandboxAccess<'a> {
             None
         } else {
             Some(value)
-        }
-    }
-}
-
-pub struct ExecuteArgs<'a> {
-    rpc_address: u64,
-    rpc_flags: u32,
-    program: Option<&'a SandboxProgram>,
-    on_hostcall: Option<OnHostcall<'a>>,
-    initial_regs: &'a [u32],
-}
-
-impl<'a> Default for ExecuteArgs<'a> {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-impl<'a> ExecuteArgs<'a> {
-    #[inline]
-    pub fn new() -> Self {
-        static EMPTY_REGS: &[u32; Reg::ALL_NON_ZERO.len()] = &[0; Reg::ALL_NON_ZERO.len()];
-        ExecuteArgs {
-            rpc_address: 0,
-            rpc_flags: 0,
-            program: None,
-            on_hostcall: None,
-            initial_regs: EMPTY_REGS,
-        }
-    }
-
-    #[inline]
-    pub fn set_program(&mut self, program: &'a SandboxProgram) {
-        self.rpc_flags |= VM_RPC_FLAG_RECONFIGURE;
-        self.program = Some(program);
-    }
-
-    #[inline]
-    pub fn set_reset_memory_after_execution(&mut self) {
-        self.rpc_flags |= VM_RPC_FLAG_RESET_MEMORY_AFTER_EXECUTION;
-    }
-
-    #[inline]
-    pub fn set_clear_program_after_execution(&mut self) {
-        self.rpc_flags |= VM_RPC_FLAG_CLEAR_PROGRAM_AFTER_EXECUTION;
-    }
-
-    #[inline]
-    pub fn set_call(&mut self, address: u64) {
-        self.rpc_address = address;
-    }
-
-    #[inline]
-    pub fn set_on_hostcall(&mut self, callback: OnHostcall<'a>) {
-        self.on_hostcall = Some(callback);
-    }
-
-    #[inline]
-    pub fn set_initial_regs(&mut self, regs: &'a [u32]) {
-        assert_eq!(regs.len(), Reg::ALL_NON_ZERO.len());
-        self.initial_regs = regs;
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use polkavm_assembler::amd64::inst::*;
-    use polkavm_assembler::amd64::Reg::*;
-    use polkavm_assembler::amd64::{LoadKind, RegSize, StoreKind};
-    use polkavm_assembler::Assembler;
-    use polkavm_common::zygote::VM_ADDR_NATIVE_CODE;
-
-    #[test]
-    fn basic_execution_works() {
-        let _ = env_logger::try_init();
-
-        let init = GuestProgramInit::new().with_ro_data(&[0xaa, 0xbb]).with_bss(1);
-        let init = SandboxProgramInit::new(init);
-
-        let mem = init.memory_config(get_native_page_size()).unwrap();
-        let mut asm = Assembler::new();
-        let code = asm
-            .push(load_abs(rax, mem.ro_data_address().try_into().unwrap(), LoadKind::U32))
-            .push(store_abs(i32::try_from(mem.rw_data_address()).unwrap(), rax, StoreKind::U8))
-            .push(store_abs(i32::try_from(mem.rw_data_address()).unwrap() + 4, rax, StoreKind::U16))
-            .push(ret())
-            .finalize();
-
-        let program = SandboxProgram::new(init.with_code(code)).unwrap();
-        let mut args = ExecuteArgs::new();
-        args.set_program(&program);
-        args.set_call(VM_ADDR_NATIVE_CODE);
-
-        let mut config = SandboxConfig::default();
-        config.enable_logger(true);
-
-        let mut sandbox = Sandbox::spawn(&config).unwrap();
-        sandbox.execute(args).unwrap();
-
-        assert_eq!(
-            sandbox.access().read_memory_into_new_vec(mem.rw_data_address(), 8).unwrap(),
-            [0xaa, 0x00, 0x00, 0x00, 0xaa, 0xbb, 0x00, 0x00,]
-        );
-    }
-
-    #[test]
-    fn program_memory_can_be_reused_and_cleared() {
-        let _ = env_logger::try_init();
-
-        let init = GuestProgramInit::new().with_bss(1);
-        let init = SandboxProgramInit::new(init);
-        let mem = init.memory_config(get_native_page_size()).unwrap();
-        let mut asm = Assembler::new();
-        let code = asm
-            .push(load_abs(rax, mem.rw_data_address().try_into().unwrap(), LoadKind::U32))
-            .push(add_imm(RegSize::R64, rax, 1))
-            .push(store_abs(i32::try_from(mem.rw_data_address()).unwrap(), rax, StoreKind::U32))
-            .push(ret())
-            .finalize();
-
-        let program = SandboxProgram::new(init.with_code(code)).unwrap();
-
-        let mut sandbox = Sandbox::spawn(&Default::default()).unwrap();
-        assert!(sandbox.access().read_memory_into_new_vec(mem.rw_data_address(), 4).is_err());
-
-        {
-            let mut args = ExecuteArgs::new();
-            args.set_program(&program);
-            sandbox.execute(args).unwrap();
-            assert_eq!(
-                sandbox.access().read_memory_into_new_vec(mem.rw_data_address(), 4).unwrap(),
-                [0x00, 0x00, 0x00, 0x00]
-            );
-        }
-
-        {
-            let mut args = ExecuteArgs::new();
-            args.set_call(VM_ADDR_NATIVE_CODE);
-            sandbox.execute(args).unwrap();
-            assert_eq!(
-                sandbox.access().read_memory_into_new_vec(mem.rw_data_address(), 4).unwrap(),
-                [0x01, 0x00, 0x00, 0x00]
-            );
-        }
-
-        {
-            let mut args = ExecuteArgs::new();
-            args.set_call(VM_ADDR_NATIVE_CODE);
-            sandbox.execute(args).unwrap();
-            assert_eq!(
-                sandbox.access().read_memory_into_new_vec(mem.rw_data_address(), 4).unwrap(),
-                [0x02, 0x00, 0x00, 0x00]
-            );
-        }
-
-        {
-            let mut args = ExecuteArgs::new();
-            args.set_call(VM_ADDR_NATIVE_CODE);
-            args.set_reset_memory_after_execution();
-            sandbox.execute(args).unwrap();
-            assert_eq!(
-                sandbox.access().read_memory_into_new_vec(mem.rw_data_address(), 4).unwrap(),
-                [0x00, 0x00, 0x00, 0x00]
-            );
-        }
-
-        {
-            let mut args = ExecuteArgs::new();
-            args.set_call(VM_ADDR_NATIVE_CODE);
-            sandbox.execute(args).unwrap();
-            assert_eq!(
-                sandbox.access().read_memory_into_new_vec(mem.rw_data_address(), 4).unwrap(),
-                [0x01, 0x00, 0x00, 0x00]
-            );
-        }
-
-        {
-            let mut args = ExecuteArgs::new();
-            args.set_clear_program_after_execution();
-            sandbox.execute(args).unwrap();
-            assert!(sandbox.access().read_memory_into_new_vec(mem.rw_data_address(), 4).is_err());
-        }
-    }
-
-    #[test]
-    fn out_of_bounds_memory_access_generates_a_trap() {
-        let _ = env_logger::try_init();
-
-        let init = GuestProgramInit::new().with_bss(1);
-        let init = SandboxProgramInit::new(init);
-        let mem = init.memory_config(get_native_page_size()).unwrap();
-        let mut asm = Assembler::new();
-        let code = asm
-            .push(load_abs(rax, mem.rw_data_address().try_into().unwrap(), LoadKind::U32))
-            .push(add_imm(RegSize::R64, rax, 1))
-            .push(store_abs(i32::try_from(mem.rw_data_address()).unwrap(), rax, StoreKind::U32))
-            .push(load_abs(rax, 0, LoadKind::U32))
-            .push(ret())
-            .finalize();
-
-        let program = SandboxProgram::new(init.with_code(code)).unwrap();
-
-        let mut sandbox = Sandbox::spawn(&Default::default()).unwrap();
-        {
-            let mut args = ExecuteArgs::new();
-            args.set_program(&program);
-            args.set_call(VM_ADDR_NATIVE_CODE);
-            match sandbox.execute(args) {
-                Err(ExecutionError::Trap(_)) => {}
-                _ => panic!(),
-            }
-
-            assert_eq!(
-                sandbox.access().read_memory_into_new_vec(mem.rw_data_address(), 4).unwrap(),
-                [0x01, 0x00, 0x00, 0x00]
-            );
-        }
-
-        // The VM still works even though it got hit with a SIGSEGV.
-        {
-            let mut args = ExecuteArgs::new();
-            args.set_call(VM_ADDR_NATIVE_CODE);
-            match sandbox.execute(args) {
-                Err(ExecutionError::Trap(_)) => {}
-                _ => panic!(),
-            }
-
-            assert_eq!(
-                sandbox.access().read_memory_into_new_vec(mem.rw_data_address(), 4).unwrap(),
-                [0x02, 0x00, 0x00, 0x00]
-            );
-        }
-    }
-
-    #[test]
-    fn divide_by_zero_generates_a_trap() {
-        let _ = env_logger::try_init();
-
-        let init = GuestProgramInit::new().with_bss(4);
-        let init = SandboxProgramInit::new(init);
-        let mem = init.memory_config(get_native_page_size()).unwrap();
-        let mut asm = Assembler::new();
-        let code = asm
-            .push(load32_imm(rdx, 0))
-            .push(load32_imm(rax, 1))
-            .push(load32_imm(rcx, 0))
-            .push(load32_imm(r8, 0x11223344))
-            .push(store_abs(i32::try_from(mem.rw_data_address()).unwrap(), r8, StoreKind::U32))
-            .push(idiv(RegSize::R32, rcx))
-            .push(load32_imm(r8, 0x12345678))
-            .push(store_abs(i32::try_from(mem.rw_data_address()).unwrap(), r8, StoreKind::U32))
-            .push(ret())
-            .finalize();
-
-        let program = SandboxProgram::new(init.with_code(code)).unwrap();
-        let mut sandbox = Sandbox::spawn(&Default::default()).unwrap();
-
-        {
-            let mut args = ExecuteArgs::new();
-            args.set_program(&program);
-            args.set_call(VM_ADDR_NATIVE_CODE);
-            match sandbox.execute(args) {
-                Err(ExecutionError::Trap(_)) => {}
-                _ => panic!(),
-            }
-
-            assert_eq!(
-                sandbox.access().read_memory_into_new_vec(mem.rw_data_address(), 4).unwrap(),
-                [0x44, 0x33, 0x22, 0x11]
-            );
         }
     }
 }

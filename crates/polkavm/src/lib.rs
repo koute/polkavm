@@ -2,6 +2,42 @@
 #![forbid(clippy::missing_safety_doc)]
 #![deny(clippy::undocumented_unsafe_blocks)]
 
+#[cfg(all(
+    not(miri),
+    target_arch = "x86_64",
+    any(target_os = "linux", target_os = "macos", target_os = "freebsd")
+))]
+macro_rules! if_compiler_is_supported {
+    ({
+        $($if_true:tt)*
+    } else {
+        $($if_false:tt)*
+    }) => {
+        $($if_true)*
+    };
+
+    ($($if_true:tt)*) => {
+        $($if_true)*
+    }
+}
+
+#[cfg(not(all(
+    not(miri),
+    target_arch = "x86_64",
+    any(target_os = "linux", target_os = "macos", target_os = "freebsd")
+)))]
+macro_rules! if_compiler_is_supported {
+    ({
+        $($if_true:tt)*
+    } else {
+        $($if_false:tt)*
+    }) => {
+        $($if_false)*
+    };
+
+    ($($if_true:tt)*) => {}
+}
+
 mod error;
 
 mod api;
@@ -11,16 +47,10 @@ mod interpreter;
 mod source_cache;
 mod tracer;
 
-#[cfg(all(target_arch = "x86_64", target_os = "linux", not(miri)))]
-mod compiler;
-
-#[cfg(not(all(target_arch = "x86_64", target_os = "linux", not(miri))))]
-mod compiler_dummy;
-
-#[cfg(not(all(target_arch = "x86_64", target_os = "linux", not(miri))))]
-use compiler_dummy as compiler;
-
-mod sandbox_linux;
+if_compiler_is_supported! {
+    mod compiler;
+    mod sandbox;
+}
 
 pub use polkavm_common::{
     error::{ExecutionError, Trap},
@@ -30,7 +60,7 @@ pub use polkavm_common::{
 
 pub use crate::api::{Engine, Func, FuncType, Instance, InstancePre, IntoExternFn, Linker, Module, TypedFunc, Val, ValType};
 pub use crate::caller::{Caller, CallerRef};
-pub use crate::config::Config;
+pub use crate::config::{BackendKind, Config, SandboxKind};
 pub use crate::error::Error;
 
 #[cfg(test)]

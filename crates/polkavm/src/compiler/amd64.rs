@@ -6,14 +6,30 @@ use polkavm_assembler::Label;
 
 use polkavm_common::program::{InstructionVisitor, Reg};
 use polkavm_common::zygote::{
-    VmCtx, SYSCALL_HOSTCALL, SYSCALL_RETURN, SYSCALL_TRACE, SYSCALL_TRAP, VM_ADDR_JUMP_TABLE, VM_ADDR_SYSCALL, VM_ADDR_VMCTX,
+    VmCtx as LinuxVmCtx,
+    SYSCALL_HOSTCALL, SYSCALL_RETURN, SYSCALL_TRACE, SYSCALL_TRAP, VM_ADDR_JUMP_TABLE, VM_ADDR_SYSCALL, VM_ADDR_VMCTX,
 };
 
-use crate::compiler::Compiler;
+use crate::compiler::{Compiler, SandboxKind};
+use crate::sandbox::generic::VmCtx as GenericVmCtx;
 
 use Reg::Zero as Z;
 
+macro_rules! get_field_offset {
+    ($struct:expr, |$struct_ident:ident| $get_field:expr) => {{
+        let $struct_ident = $struct;
+        let struct_ref = &$struct_ident;
+        let field_ref = $get_field;
+        let struct_addr = struct_ref as *const _ as usize;
+        let field_addr = field_ref as *const _ as usize;
+        field_addr - struct_addr
+    }}
+}
+
 const TMP_REG: NativeReg = rcx;
+
+// The register used for the embedded sandbox to hold the base address of the guest's linear memory.
+const GUEST_MEMORY_REG: NativeReg = r15;
 
 const fn conv_reg(reg: Reg) -> NativeReg {
     match reg {
@@ -34,19 +50,6 @@ const fn conv_reg(reg: Reg) -> NativeReg {
     }
 }
 
-fn regs_address() -> u64 {
-    let regs_offset: usize = {
-        let base = VmCtx::new();
-        let base_ref = &base;
-        let field_ref = base.regs().get();
-        let base_addr = base_ref as *const _ as usize;
-        let field_addr = field_ref as *const _ as usize;
-        field_addr - base_addr
-    };
-
-    VM_ADDR_VMCTX + regs_offset as u64
-}
-
 enum Signedness {
     Signed,
     Unsigned,
@@ -64,6 +67,8 @@ enum ShiftKind {
 }
 
 impl<'a> Compiler<'a> {
+    pub const PADDING_BYTE: u8 = 0x90; // NOP
+
     fn reg_size(&self) -> RegSize {
         if !self.regs_are_64bit {
             RegSize::R32
@@ -80,60 +85,98 @@ impl<'a> Compiler<'a> {
         self.push(load32_imm(conv_reg(reg), imm));
     }
 
+    fn embedded_load_store(
+        &mut self,
+        src_or_dst: Reg,
+        base: Reg,
+        offset: u32,
+        cb: impl FnOnce(&mut Self, NativeReg, NativeReg)
+    ) {
+        // TODO: This could be more efficient.
+        if base != Reg::Zero {
+            self.push(mov(RegSize::R32, TMP_REG, conv_reg(base)));
+        } else {
+            self.push(xor(RegSize::R32, TMP_REG, TMP_REG));
+        }
+
+        if offset != 0 {
+            self.push(add_imm(RegSize::R32, TMP_REG, offset as i32));
+        }
+
+        self.push(add(RegSize::R64, TMP_REG, GUEST_MEMORY_REG));
+        if src_or_dst != Reg::Zero {
+            cb(self, TMP_REG, conv_reg(src_or_dst));
+        } else {
+            self.push(push(GUEST_MEMORY_REG));
+            self.push(xor(RegSize::R32, GUEST_MEMORY_REG, GUEST_MEMORY_REG));
+            cb(self, TMP_REG, GUEST_MEMORY_REG);
+            self.push(pop(GUEST_MEMORY_REG));
+        }
+    }
+
     fn store(&mut self, src: Reg, base: Reg, offset: u32, kind: StoreKind) {
         if self.regs_are_64bit {
             todo!();
         }
 
-        match (src, base, (offset as i32 >= 0)) {
-            // [address] = 0
-            // (address is in the lower 2GB of the address space)
-            (Z, Z, true) => match kind {
-                StoreKind::U8 => self.push(store8_abs_imm(offset as i32, 0)),
-                StoreKind::U16 => self.push(store16_abs_imm(offset as i32, 0)),
-                StoreKind::U32 => self.push(store32_abs_imm(offset as i32, 0)),
-                StoreKind::U64 => {
-                    self.push(xor(RegSize::R32, TMP_REG, TMP_REG));
-                    self.push(store_abs(offset as i32, TMP_REG, StoreKind::U64));
+        match self.sandbox_kind {
+            SandboxKind::Linux => {
+                match (src, base, (offset as i32 >= 0)) {
+                    // [address] = 0
+                    // (address is in the lower 2GB of the address space)
+                    (Z, Z, true) => match kind {
+                        StoreKind::U8 => self.push(store8_abs_imm(offset as i32, 0)),
+                        StoreKind::U16 => self.push(store16_abs_imm(offset as i32, 0)),
+                        StoreKind::U32 => self.push(store32_abs_imm(offset as i32, 0)),
+                        StoreKind::U64 => {
+                            self.push(xor(RegSize::R32, TMP_REG, TMP_REG));
+                            self.push(store_abs(offset as i32, TMP_REG, StoreKind::U64));
+                        }
+                    },
+
+                    // [address] = src
+                    // (address is in the lower 2GB of the address space)
+                    (_, Z, true) => {
+                        self.push(store_abs(offset as i32, conv_reg(src), kind));
+                    }
+
+                    // [address] = 0
+                    // (address is in the upper 2GB of the address space)
+                    (Z, Z, false) => {
+                        // The offset would get sign extended to full 64-bits if we'd use it
+                        // in a displacement, so we need to do an indirect store here.
+                        self.push(load32_imm(TMP_REG, offset));
+                        self.push(store32_indirect_imm(RegSize::R32, TMP_REG, 0, 0));
+                    }
+
+                    // [address] = src
+                    // (address is in the upper 2GB of the address space)
+                    (_, Z, false) => {
+                        self.push(load32_imm(TMP_REG, offset));
+                        self.push(store_indirect(RegSize::R32, TMP_REG, 0, conv_reg(src), kind));
+                    }
+
+                    // [base + offset] = 0
+                    (Z, _, _) => match kind {
+                        StoreKind::U8 => self.push(store8_indirect_imm(RegSize::R32, conv_reg(base), offset as i32, 0)),
+                        StoreKind::U16 => self.push(store16_indirect_imm(RegSize::R32, conv_reg(base), offset as i32, 0)),
+                        StoreKind::U32 => self.push(store32_indirect_imm(RegSize::R32, conv_reg(base), offset as i32, 0)),
+                        StoreKind::U64 => {
+                            self.push(xor(RegSize::R32, TMP_REG, TMP_REG));
+                            self.push(store_indirect(RegSize::R32, conv_reg(base), offset as i32, TMP_REG, kind));
+                        }
+                    },
+
+                    // [base + offset] = src
+                    (_, _, _) => {
+                        self.push(store_indirect(RegSize::R32, conv_reg(base), offset as i32, conv_reg(src), kind));
+                    }
                 }
             },
-
-            // [address] = src
-            // (address is in the lower 2GB of the address space)
-            (_, Z, true) => {
-                self.push(store_abs(offset as i32, conv_reg(src), kind));
-            }
-
-            // [address] = 0
-            // (address is in the upper 2GB of the address space)
-            (Z, Z, false) => {
-                // The offset would get sign extended to full 64-bits if we'd use it
-                // in a displacement, so we need to do an indirect store here.
-                self.push(load32_imm(TMP_REG, offset));
-                self.push(store32_indirect_imm(RegSize::R32, TMP_REG, 0, 0));
-            }
-
-            // [address] = src
-            // (address is in the upper 2GB of the address space)
-            (_, Z, false) => {
-                self.push(load32_imm(TMP_REG, offset));
-                self.push(store_indirect(RegSize::R32, TMP_REG, 0, conv_reg(src), kind));
-            }
-
-            // [base + offset] = 0
-            (Z, _, _) => match kind {
-                StoreKind::U8 => self.push(store8_indirect_imm(RegSize::R32, conv_reg(base), offset as i32, 0)),
-                StoreKind::U16 => self.push(store16_indirect_imm(RegSize::R32, conv_reg(base), offset as i32, 0)),
-                StoreKind::U32 => self.push(store32_indirect_imm(RegSize::R32, conv_reg(base), offset as i32, 0)),
-                StoreKind::U64 => {
-                    self.push(xor(RegSize::R32, TMP_REG, TMP_REG));
-                    self.push(store_indirect(RegSize::R32, conv_reg(base), offset as i32, TMP_REG, kind));
-                }
-            },
-
-            // [base + offset] = src
-            (_, _, _) => {
-                self.push(store_indirect(RegSize::R32, conv_reg(base), offset as i32, conv_reg(src), kind));
+            SandboxKind::Generic => {
+                self.embedded_load_store(src, base, offset, move |itself, address_reg, value_reg| {
+                    itself.push(store_indirect(RegSize::R64, address_reg, 0, value_reg, kind));
+                });
             }
         }
     }
@@ -143,22 +186,31 @@ impl<'a> Compiler<'a> {
             todo!();
         }
 
-        let dst_native = if dst == Reg::Zero {
-            // Do a dummy load. We can't just skip this since an invalid load can trigger a trap.
-            TMP_REG
-        } else {
-            conv_reg(dst)
-        };
+        match self.sandbox_kind {
+            SandboxKind::Linux => {
+                let dst_native = if dst == Reg::Zero {
+                    // Do a dummy load. We can't just skip this since an invalid load can trigger a trap.
+                    TMP_REG
+                } else {
+                    conv_reg(dst)
+                };
 
-        if base == Reg::Zero {
-            if (offset as i32) < 0 {
-                self.push(load32_imm(TMP_REG, offset));
-                self.push(load_indirect(dst_native, RegSize::R32, TMP_REG, 0, kind));
-            } else {
-                self.push(load_abs(dst_native, offset as i32, kind));
+                if base == Reg::Zero {
+                    if (offset as i32) < 0 {
+                        self.push(load32_imm(TMP_REG, offset));
+                        self.push(load_indirect(dst_native, RegSize::R32, TMP_REG, 0, kind));
+                    } else {
+                        self.push(load_abs(dst_native, offset as i32, kind));
+                    }
+                } else {
+                    self.push(load_indirect(dst_native, RegSize::R32, conv_reg(base), offset as i32, kind));
+                }
+            },
+            SandboxKind::Generic => {
+                self.embedded_load_store(dst, base, offset, move |itself, address_reg, value_reg| {
+                    itself.push(load_indirect(value_reg, RegSize::R64, address_reg, 0, kind));
+                });
             }
-        } else {
-            self.push(load_indirect(dst_native, RegSize::R32, conv_reg(base), offset as i32, kind));
         }
     }
 
@@ -462,14 +514,41 @@ impl<'a> Compiler<'a> {
         }
     }
 
+    fn load_vmctx_field_address(&mut self, reg: NativeReg, offset: usize) {
+        match self.sandbox_kind {
+            SandboxKind::Linux => {
+                let address = VM_ADDR_VMCTX + offset as u64;
+                self.push(load64_imm(reg, address));
+            },
+            SandboxKind::Generic => {
+                let offset = crate::sandbox::generic::GUEST_MEMORY_TO_VMCTX_OFFSET as i32 + offset as i32;
+                self.push(lea(RegSize::R64, reg, RegSize::R64, GUEST_MEMORY_REG, offset));
+            }
+        }
+    }
+
+    fn load_regs_address(&mut self, reg: NativeReg) {
+        let regs_offset: usize = match self.sandbox_kind {
+            SandboxKind::Linux => {
+                get_field_offset!(LinuxVmCtx::new(), |base| base.regs().get())
+            },
+            SandboxKind::Generic => {
+                get_field_offset!(GenericVmCtx::new(), |base| base.regs())
+            }
+        };
+
+        self.load_vmctx_field_address(reg, regs_offset);
+    }
+
     fn save_registers_to_vmctx(&mut self) {
         if self.regs_are_64bit {
             todo!();
         }
 
-        assert_eq!(Reg::ALL_NON_ZERO.len(), core::mem::size_of_val(VmCtx::new().regs()) / 4);
+        assert_eq!(Reg::ALL_NON_ZERO.len(), core::mem::size_of_val(LinuxVmCtx::new().regs()) / 4);
+        assert_eq!(Reg::ALL_NON_ZERO.len(), core::mem::size_of_val(GenericVmCtx::new().regs()) / 4);
 
-        self.push(load64_imm(TMP_REG, regs_address()));
+        self.load_regs_address(TMP_REG);
         for (nth, reg) in Reg::ALL_NON_ZERO.iter().copied().enumerate() {
             self.push(store_indirect(RegSize::R64, TMP_REG, nth as i32 * 4, conv_reg(reg), StoreKind::U32));
         }
@@ -480,7 +559,7 @@ impl<'a> Compiler<'a> {
             todo!();
         }
 
-        self.push(load64_imm(TMP_REG, regs_address()));
+        self.load_regs_address(TMP_REG);
         for (nth, reg) in Reg::ALL_NON_ZERO.iter().copied().enumerate() {
             self.push(load_indirect(conv_reg(reg), RegSize::R64, TMP_REG, nth as i32 * 4, LoadKind::U32));
         }
@@ -512,9 +591,16 @@ impl<'a> Compiler<'a> {
         let label = self.asm.create_label();
 
         self.save_registers_to_vmctx();
-        self.push(load64_imm(TMP_REG, VM_ADDR_SYSCALL));
-        self.push(load32_imm(rdi, SYSCALL_RETURN));
-        self.push(jmp_reg(TMP_REG));
+        match self.sandbox_kind {
+            SandboxKind::Linux => {
+                self.push(load64_imm(TMP_REG, VM_ADDR_SYSCALL));
+                self.push(load32_imm(rdi, SYSCALL_RETURN));
+                self.push(jmp_reg(TMP_REG));
+            },
+            SandboxKind::Generic => {
+                self.push(ret());
+            }
+        }
 
         label
     }
@@ -523,29 +609,59 @@ impl<'a> Compiler<'a> {
         log::trace!("Emitting trampoline: ecall");
         self.define_label(self.ecall_label);
 
-        self.push(push(TMP_REG)); // Save the ecall number.
-        self.save_registers_to_vmctx();
-        self.push(load64_imm(TMP_REG, VM_ADDR_SYSCALL));
-        self.push(load32_imm(rdi, SYSCALL_HOSTCALL));
-        self.push(pop(rsi)); // Pop the ecall number as an argument.
-        self.push(call_reg(TMP_REG));
-        self.restore_registers_from_vmctx();
-        self.push(ret());
+        match self.sandbox_kind {
+            SandboxKind::Linux => {
+                self.push(push(TMP_REG)); // Save the ecall number.
+                self.save_registers_to_vmctx();
+                self.push(load64_imm(TMP_REG, VM_ADDR_SYSCALL));
+                self.push(load32_imm(rdi, SYSCALL_HOSTCALL));
+                self.push(pop(rsi)); // Pop the ecall number as an argument.
+                self.push(call_reg(TMP_REG));
+                self.restore_registers_from_vmctx();
+                self.push(ret());
+            },
+            SandboxKind::Generic => {
+                let handler_address = crate::sandbox::generic::handle_ecall as usize as u64;
+                self.push(push(TMP_REG)); // Save the ecall number.
+                self.save_registers_to_vmctx();
+                self.push(load64_imm(TMP_REG, handler_address));
+                self.push(mov(RegSize::R64, rdi, GUEST_MEMORY_REG));
+                self.push(pop(rsi)); // Pop the ecall number as an argument.
+                self.push(call_reg(TMP_REG));
+                self.restore_registers_from_vmctx();
+                self.push(ret());
+            }
+        }
     }
 
     pub(crate) fn emit_trace_trampoline(&mut self) {
         log::trace!("Emitting trampoline: trace");
         self.define_label(self.trace_label);
 
-        self.push(push(TMP_REG)); // Save the instruction number.
-        self.save_registers_to_vmctx();
-        self.push(load64_imm(TMP_REG, VM_ADDR_SYSCALL));
-        self.push(load32_imm(rdi, SYSCALL_TRACE));
-        self.push(pop(rsi)); // Pop the instruction number as an argument.
-        self.push(load_indirect(rdx, RegSize::R64, rsp, -8, LoadKind::U64)); // Grab the return address.
-        self.push(call_reg(TMP_REG));
-        self.restore_registers_from_vmctx();
-        self.push(ret());
+        match self.sandbox_kind {
+            SandboxKind::Linux => {
+                self.push(push(TMP_REG)); // Save the instruction number.
+                self.save_registers_to_vmctx();
+                self.push(load64_imm(TMP_REG, VM_ADDR_SYSCALL));
+                self.push(load32_imm(rdi, SYSCALL_TRACE));
+                self.push(pop(rsi)); // Pop the instruction number as an argument.
+                self.push(load_indirect(rdx, RegSize::R64, rsp, -8, LoadKind::U64)); // Grab the return address.
+                self.push(call_reg(TMP_REG));
+                self.restore_registers_from_vmctx();
+                self.push(ret());
+            },
+            SandboxKind::Generic => {
+                let handler_address = crate::sandbox::generic::handle_trace as usize as u64;
+                self.push(push(TMP_REG)); // Save the instruction number.
+                self.save_registers_to_vmctx();
+                self.push(load64_imm(TMP_REG, handler_address));
+                self.push(mov(RegSize::R64, rdi, GUEST_MEMORY_REG));
+                self.push(pop(rsi)); // Pop the instruction number as an argument.
+                self.push(call_reg(TMP_REG));
+                self.restore_registers_from_vmctx();
+                self.push(ret());
+            }
+        }
     }
 
     pub(crate) fn emit_trap_trampoline(&mut self) {
@@ -553,9 +669,16 @@ impl<'a> Compiler<'a> {
         self.define_label(self.trap_label);
 
         self.save_registers_to_vmctx();
-        self.push(load64_imm(TMP_REG, VM_ADDR_SYSCALL));
-        self.push(load32_imm(rdi, SYSCALL_TRAP));
-        self.push(jmp_reg(TMP_REG));
+        match self.sandbox_kind {
+            SandboxKind::Linux => {
+                self.push(load64_imm(TMP_REG, VM_ADDR_SYSCALL));
+                self.push(load32_imm(rdi, SYSCALL_TRAP));
+                self.push(jmp_reg(TMP_REG));
+            },
+            SandboxKind::Generic => {
+                self.push(ud2()); // TODO: FIXME
+            }
+        }
     }
 
     pub(crate) fn trace_execution(&mut self, nth_instruction: usize) {
@@ -1140,18 +1263,36 @@ impl<'a> InstructionVisitor for Compiler<'a> {
 
             self.push(jmp_label32(label));
         } else {
-            let offset = offset.wrapping_mul(4);
+            match self.sandbox_kind {
+                SandboxKind::Linux => {
+                    // TODO: This could be more efficient. Maybe use fs/gs selector?
+                    if offset == 0 {
+                        self.push(mov(RegSize::R32, TMP_REG, conv_reg(base)));
+                    } else {
+                        let offset = offset.wrapping_mul(4);
+                        self.push(lea(RegSize::R32, TMP_REG, RegSize::R32, conv_reg(base), offset as i32));
+                    }
 
-            // TODO: This could be more efficient. Maybe use fs/gs selector?
-            if offset == 0 {
-                self.push(mov(RegSize::R32, TMP_REG, conv_reg(base)));
-            } else {
-                self.push(lea(RegSize::R32, TMP_REG, RegSize::R32, conv_reg(base), offset as i32));
+                    self.push(ror_imm(RegSize::R32, TMP_REG, 2));
+                    self.push(shl_imm(RegSize::R64, TMP_REG, 3));
+                    self.push(bts(RegSize::R64, TMP_REG, VM_ADDR_JUMP_TABLE.trailing_zeros() as u8));
+                    self.push(load_indirect(TMP_REG, RegSize::R64, TMP_REG, 0, LoadKind::U64));
+                },
+                SandboxKind::Generic => {
+                    // TODO: This also could be more efficient.
+                    // TODO: FIXME: This is broken if the offset is unaligned!
+                    self.push(lea_rip_label(TMP_REG, self.jump_table_label));
+                    self.push(push(conv_reg(base)));
+                    self.push(shl_imm(RegSize::R64, conv_reg(base), 1));
+                    if offset > 0 {
+                        let offset = offset.wrapping_mul(8);
+                        self.push(add_imm(RegSize::R32, conv_reg(base), offset as i32));
+                    }
+                    self.push(add(RegSize::R64, TMP_REG, conv_reg(base)));
+                    self.push(pop(conv_reg(base)));
+                    self.push(load_indirect(TMP_REG, RegSize::R64, TMP_REG, 0, LoadKind::U64));
+                }
             }
-            self.push(ror_imm(RegSize::R32, TMP_REG, 2));
-            self.push(shl_imm(RegSize::R64, TMP_REG, 3));
-            self.push(bts(RegSize::R64, TMP_REG, VM_ADDR_JUMP_TABLE.trailing_zeros() as u8));
-            self.push(load_indirect(TMP_REG, RegSize::R64, TMP_REG, 0, LoadKind::U64));
 
             if ra != Reg::Zero {
                 match self.next_instruction_jump_target() {
