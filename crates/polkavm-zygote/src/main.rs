@@ -13,7 +13,7 @@ use polkavm_common::{
         VmCtx as VmCtxInner, SANDBOX_EMPTY_NATIVE_PROGRAM_COUNTER, SANDBOX_EMPTY_NTH_INSTRUCTION, VMCTX_FUTEX_BUSY, VMCTX_FUTEX_HOSTCALL,
         VMCTX_FUTEX_IDLE, VMCTX_FUTEX_INIT, VMCTX_FUTEX_TRAP, VM_ADDR_JUMP_TABLE, VM_ADDR_JUMP_TABLE_RETURN_TO_HOST, VM_ADDR_NATIVE_CODE,
         VM_ADDR_SIGSTACK, VM_RPC_FLAG_CLEAR_PROGRAM_AFTER_EXECUTION, VM_RPC_FLAG_RECONFIGURE, VM_RPC_FLAG_RESET_MEMORY_AFTER_EXECUTION,
-        VM_RPC_FLAG_SIGSTOP_BEFORE_EXECUTION, VM_SANDBOX_MAXIMUM_JUMP_TABLE_SIZE, VM_SANDBOX_MAXIMUM_NATIVE_CODE_SIZE,
+        VM_SANDBOX_MAXIMUM_JUMP_TABLE_SIZE, VM_SANDBOX_MAXIMUM_NATIVE_CODE_SIZE,
     },
 };
 use polkavm_linux_raw as linux_raw;
@@ -481,7 +481,6 @@ unsafe fn initialize(mut stack: *mut usize) -> linux_raw::Fd {
         (if a == linux_raw::SYS_write => jump @3),
         (if a == linux_raw::SYS_recvmsg => jump @2),
         (if a == linux_raw::SYS_rt_sigreturn => jump @1),
-        (if a == linux_raw::SYS_kill => jump @7),
         (seccomp_kill_thread),
 
         // SYS_recvmsg
@@ -508,13 +507,6 @@ unsafe fn initialize(mut stack: *mut usize) -> linux_raw::Fd {
         // SYS_mmap + PROT_EXEC
         ([6]: a = syscall_arg[2]),
         (if a != linux_raw::PROT_EXEC => jump @0),
-        (seccomp_allow),
-
-        // SYS_kill
-        ([7]: a = syscall_arg[0]),
-        (if a != 0 => jump @0),
-        (a = syscall_arg[1]),
-        (if a != linux_raw::SIGSTOP => jump @0),
         (seccomp_allow),
 
         ([0]: seccomp_kill_thread),
@@ -566,10 +558,6 @@ unsafe fn main_loop(socket: linux_raw::Fd) -> ! {
             reconfigure(socket.borrow());
         }
 
-        if rpc_flags & VM_RPC_FLAG_SIGSTOP_BEFORE_EXECUTION != 0 {
-            send_sigstop_to_self();
-        }
-
         if let Some(rpc_address) = rpc_address {
             trace!("jumping to: 0x{:x}", rpc_address as usize);
             rpc_address();
@@ -581,10 +569,6 @@ unsafe fn main_loop(socket: linux_raw::Fd) -> ! {
         VMCTX.futex.store(VMCTX_FUTEX_IDLE, Ordering::Release);
         linux_raw::sys_futex_wake_one(&VMCTX.futex).unwrap_or_else(|error| abort_with_error("failed to wake up the host process", error));
     }
-}
-
-fn send_sigstop_to_self() {
-    linux_raw::sys_kill(0, linux_raw::SIGSTOP).unwrap_or_else(|error| abort_with_error("failed to send SIGSTOP to itself", error));
 }
 
 unsafe fn handle_flags_after_jump(rpc_flags: u32) {

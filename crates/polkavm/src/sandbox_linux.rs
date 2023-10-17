@@ -13,7 +13,7 @@ use polkavm_common::{
     zygote::{
         SandboxMemoryConfig, VmCtx, SANDBOX_EMPTY_NATIVE_PROGRAM_COUNTER, SANDBOX_EMPTY_NTH_INSTRUCTION, VMCTX_FUTEX_BUSY,
         VMCTX_FUTEX_HOSTCALL, VMCTX_FUTEX_IDLE, VMCTX_FUTEX_INIT, VMCTX_FUTEX_TRAP, VM_RPC_FLAG_CLEAR_PROGRAM_AFTER_EXECUTION,
-        VM_RPC_FLAG_RECONFIGURE, VM_RPC_FLAG_RESET_MEMORY_AFTER_EXECUTION, VM_RPC_FLAG_SIGSTOP_BEFORE_EXECUTION,
+        VM_RPC_FLAG_RECONFIGURE, VM_RPC_FLAG_RESET_MEMORY_AFTER_EXECUTION,
     },
 };
 
@@ -1271,11 +1271,6 @@ impl<'a> ExecuteArgs<'a> {
     #[inline]
     pub fn set_clear_program_after_execution(&mut self) {
         self.rpc_flags |= VM_RPC_FLAG_CLEAR_PROGRAM_AFTER_EXECUTION;
-    }
-
-    #[inline]
-    pub fn set_send_sigstop_before_execution(&mut self) {
-        self.rpc_flags |= VM_RPC_FLAG_SIGSTOP_BEFORE_EXECUTION;
     }
 
     #[inline]
