@@ -14,6 +14,10 @@ fi
 case "$OSTYPE" in
   linux*)
     ./ci/jobs/build-and-test-linux.sh
+  ;;
+  darwin*)
+    ./ci/jobs/build-and-test-macos.sh
+  ;;
 esac
 ./ci/jobs/clippy.sh
 ./ci/jobs/rustfmt.sh
