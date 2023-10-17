@@ -8,10 +8,10 @@ use polkavm_common::utils::{Access, AsUninitSliceMut};
 use polkavm_common::zygote::{
     VM_ADDR_JUMP_TABLE, VM_ADDR_NATIVE_CODE, VM_COMPILER_MAXIMUM_EPILOGUE_LENGTH, VM_COMPILER_MAXIMUM_INSTRUCTION_LENGTH,
 };
-use polkavm_linux_sandbox::{ExecuteArgs, Sandbox, SandboxAccess, SandboxConfig, SandboxProgram, SandboxProgramInit};
 
 use crate::api::{BackendAccess, ExecutionConfig, Module, OnHostcall};
 use crate::error::{bail, Error};
+use crate::sandbox_linux::{ExecuteArgs, Sandbox, SandboxAccess, SandboxConfig, SandboxProgram, SandboxProgramInit};
 
 pub const IS_SUPPORTED: bool = true;
 
