@@ -29,6 +29,7 @@ impl Mmap {
             }
 
             self.length = 0;
+            self.pointer = core::ptr::NonNull::<c_void>::dangling().as_ptr();
         }
 
         Ok(())
@@ -62,7 +63,7 @@ impl Mmap {
 impl Default for Mmap {
     fn default() -> Self {
         Self {
-            pointer: core::ptr::null_mut(),
+            pointer: core::ptr::NonNull::<u8>::dangling().as_ptr() as *mut c_void,
             length: 0,
         }
     }
