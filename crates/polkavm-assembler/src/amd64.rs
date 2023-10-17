@@ -1197,6 +1197,30 @@ pub mod inst {
             Some((self.1, 2, 4))
         }
     }
+
+    #[derive(Copy, Clone, PartialEq, Eq, Debug)]
+    pub struct lea_rip_label(pub Reg, pub Label);
+    impl lea_rip_label {
+        const fn encode_const(self) -> EncInst {
+            lea_rip(RegSize::R64, self.0, 0).encode_const()
+        }
+    }
+
+    impl core::fmt::Display for lea_rip_label {
+        fn fmt(&self, fmt: &mut core::fmt::Formatter) -> core::fmt::Result {
+            fmt.write_fmt(core::format_args!("lea {}, [{}]", self.0, self.1))
+        }
+    }
+
+    impl crate::Instruction for lea_rip_label {
+        fn encode(self) -> EncInst {
+            self.encode_const()
+        }
+
+        fn target_fixup(self) -> Option<(Label, u8, u8)> {
+            Some((self.1, 3, 4))
+        }
+    }
 }
 
 #[derive(Copy, Clone, PartialEq, Eq, Debug)]
@@ -1692,5 +1716,26 @@ mod tests {
                 )
             );
         });
+    }
+
+    #[test]
+    fn lea_rip_label_infinite_loop() {
+        use super::inst::*;
+        let mut asm = crate::Assembler::new();
+        let label = asm.forward_declare_label();
+        asm.push_with_label(label, lea_rip_label(super::Reg::rax, label));
+        let disassembly = disassemble(asm.finalize());
+        assert_eq!(disassembly, "00000000 488d05f9ffffff lea rax, [rip-0x7]");
+    }
+
+    #[test]
+    fn lea_rip_label_next_instruction() {
+        use super::inst::*;
+        let mut asm = crate::Assembler::new();
+        let label = asm.forward_declare_label();
+        asm.push(lea_rip_label(super::Reg::rax, label));
+        asm.push_with_label(label, nop());
+        let disassembly = disassemble(asm.finalize());
+        assert_eq!(disassembly, "00000000 488d0500000000 lea rax, [rip]\n00000007 90 nop");
     }
 }
