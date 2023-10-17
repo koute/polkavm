@@ -6,6 +6,7 @@ mod dwarf;
 mod elf;
 mod fast_range_map;
 mod program_from_elf;
+mod reader_wrapper;
 mod riscv;
 mod utils;
 

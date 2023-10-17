@@ -1,9 +1,10 @@
 use crate::elf::{Elf, Section, SectionIndex};
 use crate::fast_range_map::RangeMap;
 use crate::program_from_elf::{AddressRange, RelocationKind, RelocationSize, SectionTarget, SizeRelocationSize, Source};
+use crate::reader_wrapper::ReaderWrapper;
 use crate::utils::StringCache;
 use crate::ProgramFromElfError;
-use gimli::{Reader, ReaderOffset};
+use gimli::{LineInstruction, Reader, ReaderOffset};
 use polkavm_common::program::FrameKind;
 use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
@@ -54,6 +55,118 @@ struct AttributeParser<R: gimli::Reader> {
     recursion_limit: usize,
 }
 
+fn parse_ranges<R>(
+    sections: &Sections,
+    relocations: &BTreeMap<SectionTarget, RelocationKind>,
+    unit: &gimli::Unit<R>,
+    mut base: Option<SectionTarget>,
+    ranges_offset: gimli::RangeListsOffset<<R as gimli::Reader>::Offset>,
+    mut callback: impl FnMut(Source),
+) -> Result<(), ProgramFromElfError>
+where
+    R: gimli::Reader,
+{
+    if unit.encoding().version <= 4 {
+        let Some(section) = sections.debug_ranges else {
+            return Err(ProgramFromElfError::other(
+                "failed to process DWARF: missing '.debug_ranges' section",
+            ));
+        };
+
+        let mut reader = gimli::read::EndianSlice::new(section.data(), gimli::LittleEndian);
+        let start = reader;
+        reader.skip(ranges_offset.0.into_u64() as usize)?;
+
+        let address_size = unit.encoding().address_size;
+        let offset_start = reader.offset_from(start);
+        let _ = reader.read_address(address_size)?;
+        let offset_end = reader.offset_from(start);
+        let _ = reader.read_address(address_size)?;
+
+        let relocation_start = SectionTarget {
+            section_index: section.index(),
+            offset: offset_start.into_u64(),
+        };
+
+        let relocation_end = SectionTarget {
+            section_index: section.index(),
+            offset: offset_end.into_u64(),
+        };
+
+        let (start_section, start_range) = fetch_size_relocation(relocations, relocation_start)?;
+        let (end_section, end_range) = fetch_size_relocation(relocations, relocation_end)?;
+
+        if start_section != end_section {
+            return Err(ProgramFromElfError::other(
+                "failed to process DWARF: '.debug_ranges' has a pair of relocations pointing to different sections",
+            ));
+        }
+
+        let source = Source {
+            section_index: start_section,
+            offset_range: (start_range.end..end_range.end).into(),
+        };
+
+        log::trace!("  Range from debug ranges: {}", source);
+        callback(source);
+    } else {
+        let Some(section) = sections.debug_rnglists else {
+            return Err(ProgramFromElfError::other(
+                "failed to process DWARF: missing '.debug_rnglists' section",
+            ));
+        };
+
+        let mut reader = gimli::read::EndianSlice::new(section.data(), gimli::LittleEndian);
+        reader.skip(ranges_offset.0.into_u64() as usize)?;
+
+        loop {
+            let kind = gimli::constants::DwRle(reader.read_u8()?);
+            match kind {
+                gimli::constants::DW_RLE_end_of_list => break,
+                gimli::constants::DW_RLE_offset_pair => {
+                    let offset_start = reader.read_uleb128()?;
+                    let offset_end = reader.read_uleb128()?;
+                    if let Some(base) = base {
+                        let source = Source {
+                            section_index: base.section_index,
+                            offset_range: (base.offset + offset_start..base.offset + offset_end).into(),
+                        };
+
+                        log::trace!("  Range from low_pc + high_pc (rel): {}", source);
+                        callback(source);
+                    } else if false {
+                        return Err(ProgramFromElfError::other(
+                            "failed to process DWARF: found DW_RLE_offset_pair yet we have no base address",
+                        ));
+                    }
+                }
+                gimli::constants::DW_RLE_startx_length => {
+                    let begin = gimli::DebugAddrIndex(reader.read_uleb128().and_then(R::Offset::from_u64)?);
+                    let length = reader.read_uleb128()?;
+                    if let Some(target) = resolve_debug_addr_index(sections.debug_addr, relocations, unit, begin)? {
+                        let source = Source {
+                            section_index: target.section_index,
+                            offset_range: (target.offset..target.offset + length).into(),
+                        };
+                        callback(source)
+                    }
+                }
+                gimli::constants::DW_RLE_base_addressx => {
+                    let begin = gimli::DebugAddrIndex(reader.read_uleb128().and_then(R::Offset::from_u64)?);
+                    base = resolve_debug_addr_index(sections.debug_addr, relocations, unit, begin)?;
+                }
+                _ => {
+                    return Err(ProgramFromElfError::other(format!(
+                        "failed to process DWARF: unhandled entry kind in '.debug_rnglists': {kind}"
+                    )));
+                }
+            }
+        }
+    }
+
+    Ok(())
+}
+
 impl<R: gimli::Reader> AttributeParser<R> {
     fn new(depth: usize) -> Self {
         AttributeParser {
@@ -83,82 +196,7 @@ impl<R: gimli::Reader> AttributeParser<R> {
         mut callback: impl FnMut(Source),
     ) -> Result<(), ProgramFromElfError> {
         if let Some(ranges_offset) = self.ranges_offset {
-            if unit.raw_unit.encoding().version <= 4 {
-                let Some(section) = sections.debug_ranges else {
-                    return Err(ProgramFromElfError::other(
-                        "failed to process DWARF: missing '.debug_ranges' section",
-                    ));
-                };
-
-                let mut reader = gimli::read::EndianSlice::new(section.data(), gimli::LittleEndian);
-                let start = reader;
-                reader.skip(ranges_offset.0.into_u64() as usize)?;
-
-                let address_size = unit.raw_unit.encoding().address_size;
-                let offset_start = reader.offset_from(start);
-                let _ = reader.read_address(address_size)?;
-                let offset_end = reader.offset_from(start);
-                let _ = reader.read_address(address_size)?;
-
-                let relocation_start = SectionTarget {
-                    section_index: section.index(),
-                    offset: offset_start.into_u64(),
-                };
-
-                let relocation_end = SectionTarget {
-                    section_index: section.index(),
-                    offset: offset_end.into_u64(),
-                };
-
-                let (start_section, start_range) = fetch_size_relocation(relocations, relocation_start)?;
-                let (end_section, end_range) = fetch_size_relocation(relocations, relocation_end)?;
-
-                if start_section != end_section {
-                    return Err(ProgramFromElfError::other(
-                        "failed to process DWARF: '.debug_ranges' has a pair of relocations pointing to different sections",
-                    ));
-                }
-
-                let source = Source {
-                    section_index: start_section,
-                    offset_range: (start_range.end..end_range.end).into(),
-                };
-
-                log::trace!("  Range from debug ranges: {}", source);
-                callback(source);
-            } else {
-                let Some(section) = sections.debug_rnglists else {
-                    return Err(ProgramFromElfError::other(
-                        "failed to process DWARF: missing '.debug_rnglists' section",
-                    ));
-                };
-
-                let mut reader = gimli::read::EndianSlice::new(section.data(), gimli::LittleEndian);
-                reader.skip(ranges_offset.0.into_u64() as usize)?;
-
-                loop {
-                    let kind = gimli::constants::DwRle(reader.read_u8()?);
-                    match kind {
-                        gimli::constants::DW_RLE_end_of_list => break,
-                        gimli::constants::DW_RLE_offset_pair => {
-                            let offset_start = reader.read_uleb128()?;
-                            let offset_end = reader.read_uleb128()?;
-                            let source = Source {
-                                section_index: unit.low_pc.section_index,
-                                offset_range: (unit.low_pc.offset + offset_start..unit.low_pc.offset + offset_end).into(),
-                            };
-
-                            log::trace!("  Range from low_pc + high_pc (rel): {}", source);
-                            callback(source);
-                        }
-                        _ => {
-                            return Err(ProgramFromElfError::other(format!(
-                                "failed to process DWARF: unhandled entry kind in '.debug_rnglists': {kind}"
-                            )));
-                        }
-                    }
-                }
-            };
+            parse_ranges::<R>(sections, relocations, &unit.raw_unit, unit.low_pc, ranges_offset, callback)?;
         } else if let (Some(low_pc), Some(high_pc)) = (self.low_pc, self.high_pc) {
             if low_pc.section_index != high_pc.section_index {
                 return Err(ProgramFromElfError::other(
@@ -209,16 +247,16 @@ impl<R: gimli::Reader> AttributeParser<R> {
         dwarf: &gimli::Dwarf<R>,
         unit: &Unit<R>,
         name: gimli::constants::DwAt,
-        value: ValueOrOffset<R>,
+        value: AttributeValue<R>,
     ) -> Result<(), ProgramFromElfError> {
         log::trace!("{:->depth$}{name}", ">", depth = self.depth);
 
-        struct UnsupportedValue<R>(ValueOrOffset<R>)
+        struct UnsupportedValue<R>(AttributeValue<R>)
         where
             R: gimli::Reader;
         match name {
             gimli::DW_AT_low_pc => match value.clone() {
-                ValueOrOffset::Offset(offset) => {
+                AttributeValue { offset: Some(offset), .. } => {
                     let relocation_target = SectionTarget {
                         section_index: sections.debug_info.index(),
                         offset: offset.into_u64(),
@@ -230,16 +268,23 @@ impl<R: gimli::Reader> AttributeParser<R> {
 
                     Ok(())
                 }
-                ValueOrOffset::Value(gimli::AttributeValue::DebugAddrIndex(index)) => {
-                    let value = resolve_debug_addr_index(sections.debug_addr, relocations, &unit.raw_unit, index)?;
-                    self.low_pc = Some(value);
-                    log::trace!("  = {value} ({index:?})");
+                AttributeValue {
+                    value: gimli::AttributeValue::DebugAddrIndex(index),
+                    ..
+                } => {
+                    self.low_pc = resolve_debug_addr_index(sections.debug_addr, relocations, &unit.raw_unit, index)?;
+                    if let Some(value) = self.low_pc {
+                        log::trace!("  = {value} ({index:?})");
+                    } else {
+                        log::trace!("  = None ({index:?})");
+                    }
+
                     Ok(())
                 }
                 _ => Err(UnsupportedValue(value)),
             },
             gimli::DW_AT_high_pc => match value {
-                ValueOrOffset::Offset(offset) => {
+                AttributeValue { offset: Some(offset), .. } => {
                     let relocation_target = SectionTarget {
                         section_index: sections.debug_info.index(),
                         offset: offset.into_u64(),
@@ -251,18 +296,31 @@ impl<R: gimli::Reader> AttributeParser<R> {
 
                     Ok(())
                 }
-                ValueOrOffset::Value(gimli::AttributeValue::DebugAddrIndex(index)) => {
-                    let value = resolve_debug_addr_index(sections.debug_addr, relocations, &unit.raw_unit, index)?;
-                    self.high_pc = Some(value);
-                    log::trace!("  = {value} ({index:?})");
+                AttributeValue {
+                    value: gimli::AttributeValue::DebugAddrIndex(index),
+                    ..
+                } => {
+                    self.high_pc = resolve_debug_addr_index(sections.debug_addr, relocations, &unit.raw_unit, index)?;
+                    if let Some(value) = self.high_pc {
+                        log::trace!("  = {value} ({index:?})");
+                    } else {
+                        log::trace!("  = None ({index:?})");
+                    }
+
                     Ok(())
                 }
-                ValueOrOffset::Value(gimli::AttributeValue::Udata(value)) => {
+                AttributeValue {
+                    value: gimli::AttributeValue::Udata(value),
+                    ..
+                } => {
                     log::trace!("  = DW_AT_low_pc + {value} (size/udata)");
                     self.size = Some(value);
                     Ok(())
                 }
-                ValueOrOffset::Value(gimli::AttributeValue::Data4(value)) => {
+                AttributeValue {
+                    value: gimli::AttributeValue::Data4(value),
+                    ..
+                } => {
                     log::trace!("  = DW_AT_low_pc + {value} (size/data4)");
                     self.size = Some(value as u64);
                     Ok(())
@@ -270,22 +328,31 @@ impl<R: gimli::Reader> AttributeParser<R> {
                 _ => Err(UnsupportedValue(value)),
             },
             gimli::DW_AT_ranges => match value {
-                ValueOrOffset::Value(gimli::AttributeValue::RangeListsRef(offset)) => {
+                AttributeValue {
+                    value: gimli::AttributeValue::RangeListsRef(offset),
+                    ..
+                } => {
                     self.ranges_offset = Some(dwarf.ranges_offset_from_raw(&unit.raw_unit, offset));
                     Ok(())
                 }
-                ValueOrOffset::Value(gimli::AttributeValue::DebugRngListsIndex(index)) => {
+                AttributeValue {
+                    value: gimli::AttributeValue::DebugRngListsIndex(index),
+                    ..
+                } => {
                     self.ranges_offset = Some(dwarf.ranges_offset(&unit.raw_unit, index)?);
                     Ok(())
                 }
-                ValueOrOffset::Value(gimli::AttributeValue::SecOffset(offset)) => {
+                AttributeValue {
+                    value: gimli::AttributeValue::SecOffset(offset),
+                    ..
+                } => {
                     self.ranges_offset = Some(dwarf.ranges_offset_from_raw(&unit.raw_unit, gimli::RawRangeListsOffset(offset)));
                     Ok(())
                 }
                 _ => Err(UnsupportedValue(value)),
             },
             gimli::DW_AT_linkage_name | gimli::DW_AT_MIPS_linkage_name => {
-                if let ValueOrOffset::Value(value) = value {
+                if let AttributeValue { value, offset: None } = value {
                     self.linkage_name = Some(value);
                     Ok(())
                 } else {
@@ -293,7 +360,7 @@ impl<R: gimli::Reader> AttributeParser<R> {
                 }
             }
             gimli::DW_AT_name => {
-                if let ValueOrOffset::Value(value) = value {
+                if let AttributeValue { value, offset: None } = value {
                     self.name = Some(value);
                     Ok(())
                 } else {
@@ -305,11 +372,17 @@ impl<R: gimli::Reader> AttributeParser<R> {
                 log::trace!("  = {:?}", value);
 
                 match value {
-                    ValueOrOffset::Value(gimli::AttributeValue::UnitRef(offset)) => {
+                    AttributeValue {
+                        value: gimli::AttributeValue::UnitRef(offset),
+                        ..
+                    } => {
                         self.abstract_origin = Some(offset.to_debug_info_offset(&unit.raw_unit.header).unwrap());
                         Ok(())
                     }
-                    ValueOrOffset::Value(gimli::AttributeValue::DebugInfoRef(target_offset)) => {
+                    AttributeValue {
+                        value: gimli::AttributeValue::DebugInfoRef(target_offset),
+                        ..
+                    } => {
                         self.abstract_origin = Some(target_offset);
                         Ok(())
                     }
@@ -317,29 +390,45 @@ impl<R: gimli::Reader> AttributeParser<R> {
                 }
             }
             gimli::DW_AT_decl_file => match value {
-                ValueOrOffset::Value(gimli::AttributeValue::FileIndex(index)) => {
+                AttributeValue {
+                    value: gimli::AttributeValue::FileIndex(index),
+                    ..
+                } => {
                     self.decl_file = Some(index as usize);
                     Ok(())
                 }
-                ValueOrOffset::Value(gimli::AttributeValue::Data1(index)) => {
+                AttributeValue {
+                    value: gimli::AttributeValue::Data1(index),
+                    ..
+                } => {
                     self.decl_file = Some(index as usize);
                     Ok(())
                 }
                 _ => Err(UnsupportedValue(value)),
             },
             gimli::DW_AT_call_file => match value {
-                ValueOrOffset::Value(gimli::AttributeValue::FileIndex(index)) => {
+                AttributeValue {
+                    value: gimli::AttributeValue::FileIndex(index),
+                    ..
+                } => {
                     self.call_file = Some(index as usize);
                     Ok(())
                 }
-                ValueOrOffset::Value(gimli::AttributeValue::Data1(index)) => {
+                AttributeValue {
+                    value: gimli::AttributeValue::Data1(index),
+                    ..
+                } => {
                     self.call_file = Some(index as usize);
                     Ok(())
                 }
                 _ => Err(UnsupportedValue(value)),
             },
             gimli::DW_AT_decl_line => {
-                if let ValueOrOffset::Value(ref inner) = value {
+                if let AttributeValue {
+                    value: ref inner,
+                    offset: None,
+                } = value
+                {
                     if let Some(value) = inner.udata_value() {
                         self.decl_line = Some(value as u32);
                         Ok(())
@@ -351,7 +440,11 @@ impl<R: gimli::Reader> AttributeParser<R> {
                 }
             }
             gimli::DW_AT_call_line => {
-                if let ValueOrOffset::Value(ref inner) = value {
+                if let AttributeValue {
+                    value: ref inner,
+                    offset: None,
+                } = value
+                {
                     if let Some(value) = inner.udata_value() {
                         self.call_line = Some(value as u32);
                         Ok(())
@@ -363,7 +456,11 @@ impl<R: gimli::Reader> AttributeParser<R> {
                 }
             }
             gimli::DW_AT_call_column => {
-                if let ValueOrOffset::Value(ref inner) = value {
+                if let AttributeValue {
+                    value: ref inner,
+                    offset: None,
+                } = value
+                {
                     if let Some(value) = inner.udata_value() {
                         self.call_column = Some(value as u32);
                         Ok(())
@@ -375,7 +472,10 @@ impl<R: gimli::Reader> AttributeParser<R> {
                 }
             }
             gimli::DW_AT_declaration => match value {
-                ValueOrOffset::Value(gimli::AttributeValue::Flag(value)) => {
+                AttributeValue {
+                    value: gimli::AttributeValue::Flag(value),
+                    ..
+                } => {
                     self.is_declaration = value;
                     Ok(())
                 }
@@ -459,16 +559,15 @@ struct Sections<'a> {
     debug_addr: Option<&'a Section<'a>>,
     debug_ranges: Option<&'a Section<'a>>,
     debug_rnglists: Option<&'a Section<'a>>,
+    debug_line: Option<&'a Section<'a>>,
 }
 
-fn fetch_relocation(
+fn try_fetch_relocation(
     relocations: &BTreeMap<SectionTarget, RelocationKind>,
     relocation_target: SectionTarget,
-) -> Result<SectionTarget, ProgramFromElfError> {
+) -> Result<Option<SectionTarget>, ProgramFromElfError> {
     let Some(relocation) = relocations.get(&relocation_target) else {
-        return Err(ProgramFromElfError::other(format!(
-            "failed to process DWARF: {relocation_target} has no relocation"
-        )));
+        return Ok(None);
     };
 
     let RelocationKind::Abs {
@@ -481,23 +580,34 @@ fn fetch_relocation(
         )));
     };
 
-    Ok(*target)
+    Ok(Some(*target))
 }
 
-fn fetch_size_relocation(
+fn fetch_relocation(
     relocations: &BTreeMap<SectionTarget, RelocationKind>,
     relocation_target: SectionTarget,
-) -> Result<(SectionIndex, AddressRange), ProgramFromElfError> {
-    let Some(relocation) = relocations.get(&relocation_target) else {
-        return Err(ProgramFromElfError::other(format!(
+) -> Result<SectionTarget, ProgramFromElfError> {
+    if let Some(target) = try_fetch_relocation(relocations, relocation_target)? {
+        Ok(target)
+    } else {
+        Err(ProgramFromElfError::other(format!(
             "failed to process DWARF: {relocation_target} has no relocation"
-        )));
+        )))
+    }
+}
+
+fn try_fetch_size_relocation(
+    relocations: &BTreeMap<SectionTarget, RelocationKind>,
+    relocation_target: SectionTarget,
+) -> Result<Option<(SectionIndex, AddressRange)>, ProgramFromElfError> {
+    let Some(relocation) = relocations.get(&relocation_target) else {
+        return Ok(None);
     };
 
     let RelocationKind::Size {
         section_index,
         range,
-        size: SizeRelocationSize::Generic(RelocationSize::U32),
+        size: SizeRelocationSize::Generic(..),
     } = relocation
     else {
         return Err(ProgramFromElfError::other(format!(
@@ -505,7 +615,20 @@ fn fetch_size_relocation(
         )));
     };
 
-    Ok((*section_index, *range))
+    Ok(Some((*section_index, *range)))
+}
+
+fn fetch_size_relocation(
+    relocations: &BTreeMap<SectionTarget, RelocationKind>,
+    relocation_target: SectionTarget,
+) -> Result<(SectionIndex, AddressRange), ProgramFromElfError> {
+    if let Some(target) = try_fetch_size_relocation(relocations, relocation_target)? {
+        Ok(target)
+    } else {
+        Err(ProgramFromElfError::other(format!(
+            "failed to process DWARF: {relocation_target} has no relocation"
+        )))
+    }
 }
 
 fn resolve_debug_addr_index<R>(
@@ -513,7 +636,7 @@ fn resolve_debug_addr_index<R>(
     relocations: &BTreeMap<SectionTarget, RelocationKind>,
     unit: &gimli::Unit<R>,
     index: gimli::DebugAddrIndex<R::Offset>,
-) -> Result<SectionTarget, ProgramFromElfError>
+) -> Result<Option<SectionTarget>, ProgramFromElfError>
 where
     R: gimli::Reader,
 {
@@ -525,7 +648,7 @@ where
             offset,
         };
 
-        fetch_relocation(relocations, relocation_target)
+        try_fetch_relocation(relocations, relocation_target)
     } else {
         Err(ProgramFromElfError::other("failed to process DWARF: missing '.debug_addr' section"))
     }
@@ -632,18 +755,90 @@ where
 {
     offset: gimli::DebugInfoOffset<R::Offset>,
     raw_unit: gimli::Unit<R>,
-    low_pc: SectionTarget,
+    low_pc: Option<SectionTarget>,
     paths: Vec<Arc<str>>,
 }
 
-fn extract_lines<R>(unit: &Unit<R>) -> Result<Vec<LineEntry>, ProgramFromElfError>
+fn extract_lines<R>(
+    section_index: SectionIndex,
+    relocations: &BTreeMap<SectionTarget, RelocationKind>,
+    unit: &Unit<ReaderWrapper<R>>,
+) -> Result<Vec<LineEntry>, ProgramFromElfError>
 where
     R: gimli::Reader,
 {
     let mut lines = Vec::new();
-    if let Some(program) = unit.raw_unit.line_program.clone() {
-        let mut iter = program.rows();
-        while let Some((_, row)) = iter.next_row()? {
+    if let Some(mut program) = unit.raw_unit.line_program.clone() {
+        let mut row = gimli::LineRow::new(program.header());
+        let mut iter = program.header().instructions();
+
+        let input = program.header().raw_program_buf();
+        let mut target = None;
+        loop {
+            row.reset(program.header());
+            let tracker = input.start_tracking();
+            let Some(instruction) = iter.next_instruction(program.header())? else {
+                break;
+            };
+
+            match instruction {
+                LineInstruction::Special(..)
+                | LineInstruction::Copy
+                | LineInstruction::AdvanceLine(..)
+                | LineInstruction::SetFile(..)
+                | LineInstruction::SetColumn(..)
+                | LineInstruction::NegateStatement
+                | LineInstruction::SetBasicBlock
+                | LineInstruction::SetPrologueEnd
+                | LineInstruction::SetEpilogueBegin
+                | LineInstruction::SetIsa(..)
+                | LineInstruction::EndSequence
+                | LineInstruction::DefineFile(..)
+                | LineInstruction::SetDiscriminator(..)
+                | LineInstruction::UnknownStandard0(..)
+                | LineInstruction::UnknownStandard1(..)
+                | LineInstruction::UnknownStandardN(..)
+                | LineInstruction::UnknownExtended(..) => {}
+
+                LineInstruction::AdvancePc(..) | LineInstruction::ConstAddPc => {
+                    return Err(ProgramFromElfError::other(
+                        "failed to process DWARF: unsupported line program instruction: {instruction:?}",
+                    ));
+                }
+
+                LineInstruction::SetAddress(..) => {
+                    let relocation_target = SectionTarget {
+                        section_index,
+                        offset: *tracker.list().last().unwrap(),
+                    };
+
+                    target = try_fetch_relocation(relocations, relocation_target)?;
+                }
+
+                LineInstruction::FixedAddPc(..) => {
+                    let relocation_target = SectionTarget {
+                        section_index,
+                        offset: *tracker.list().last().unwrap(),
+                    };
+
+                    target = try_fetch_size_relocation(relocations, relocation_target)?.map(|(target_section_index, target_range)| {
+                        SectionTarget {
+                            section_index: target_section_index,
+                            offset: target_range.end,
+                        }
+                    });
+                }
+            }
+
+            if !row.execute(instruction, &mut program) {
+                continue;
+            }
+
+            let tombstone_address = !0 >> (64 - program.header().encoding().address_size * 8);
+            if row.address() == tombstone_address {
+                continue;
+            }
+
             let Some(path) = unit.paths.get(row.file_index() as usize) else {
                 return Err(ProgramFromElfError::other(
                     "failed to process DWARF: out of bounds file index encountered when processing line programs",
@@ -662,13 +857,6 @@ where
                     column: column.get() as u32,
                 },
             };
-
-            let offset = row
-                .address()
-                .checked_sub(unit.raw_unit.low_pc)
-                .expect("address underflow when parsing line program")
-                .checked_add(unit.low_pc.offset)
-                .expect("address overflow when parsing line program");
 
             struct Flags<'a>(&'a gimli::LineRow);
             impl<'a> core::fmt::Display for Flags<'a> {
@@ -712,15 +900,38 @@ where
                 }
             }
 
-            log::trace!("Line entry: 0x{:x} (0x{offset:x}) {location:?} {}", row.address(), Flags(row),);
+            let Some(target) = target else {
+                // Sometimes the entries seem to not have any relocation attached to them
+                // and have all zeros set by the compiler, e.g. I've seen this as the end
+                // of the line program:
+                //
+                //   0x0009b494  [ 197,26] NS
+                //   0x0009b49c  [ 215,36] NS
+                //   0x0009b4a0  [ 215, 5]
+                //   0x0009b4a4  [ 215, 5] ET
+                //   0x00000000  [2046, 0] NS uri: "libs/libcxx/include/string"
+                //   0x00000000  [2047, 9] NS PE
+                //   0x00000000  [2047, 9] NS ET
+                //   0x00000000  [ 259, 0] NS uri: "libs/libcxx/include/stdexcept"
+                //   0x00000000  [ 263, 5] NS PE
+                //   0x00000000  [ 263, 5] NS ET
+                log::trace!("Line entry without a relocation: {row:?}");
+                continue;
+            };
 
-            let entry = LineEntry { offset, location };
+            log::trace!(
+                "Line entry: 0x{:x} (0x{offset:x}) {location:?} {}",
+                row.address(),
+                Flags(&row),
+                offset = target.offset
+            );
+            let entry = LineEntry { target, location };
             lines.push(entry);
         }
     }
 
     // These should already be sorted, but sort them anyway.
-    lines.sort_by_key(|entry| entry.offset);
+    lines.sort_by_key(|entry| entry.target.offset);
 
     Ok(lines)
 }
@@ -770,8 +981,8 @@ where
 {
     sections: Sections<'a>,
     relocations: &'a BTreeMap<SectionTarget, RelocationKind>,
-    dwarf: &'a gimli::Dwarf<R>,
-    units: &'a [Unit<R>],
+    dwarf: &'a gimli::Dwarf<ReaderWrapper<R>>,
+    units: &'a [Unit<ReaderWrapper<R>>],
     depth: usize,
     inline_depth: usize,
     namespace_buffer: Vec<String>,
@@ -811,7 +1022,12 @@ where
             });
             subprograms_for_unit.push(subprograms);
 
-            let lines = extract_lines(unit)?;
+            let lines = if let Some(debug_line) = self.sections.debug_line {
+                extract_lines(debug_line.index(), self.relocations, unit)?
+            } else {
+                Default::default()
+            };
+
             lines_for_unit.push(lines);
         }
 
@@ -885,17 +1101,23 @@ where
         }
 
         let mut location_map: HashMap<SectionTarget, Arc<[Location]>> = HashMap::new();
-        for ((subprograms, lines), unit) in subprograms_for_unit
-            .into_iter()
-            .zip(lines_for_unit.into_iter())
-            .zip(self.units.iter())
-        {
-            let line_boundaries: Vec<u64> = lines.iter().map(|entry| entry.offset).collect();
+        for (subprograms, lines) in subprograms_for_unit.into_iter().zip(lines_for_unit.into_iter()) {
+            if !lines
+                .iter()
+                .all(|entry| entry.target.section_index == lines[0].target.section_index)
+            {
+                return Err(ProgramFromElfError::other(
+                    "failed to process DWARF: inconsistent target section in line program entries",
+                ));
+            }
+
+            let line_boundaries: Vec<u64> = lines.iter().map(|entry| entry.target.offset).collect();
             let line_ranges = line_boundaries.windows(2).map(|w| w[0]..w[1]);
             let line_range_map: RangeMap<LineEntry> = line_ranges.zip(lines.into_iter()).collect();
 
             for subprogram in subprograms {
                 let source = subprogram.sources[0];
+                let section_index = source.section_index;
                 log::trace!("  Frame: {}", source);
 
                 let mut map: LocationsForOffset<R> = BTreeMap::new();
@@ -1057,10 +1279,7 @@ where
                         }
                     }
 
-                    let target = SectionTarget {
-                        section_index: unit.low_pc.section_index,
-                        offset,
-                    };
+                    let target = SectionTarget { section_index, offset };
 
                     if let Some((ref last_list, ref last_arc_list)) = last_emitted {
                         if list == *last_list {
@@ -1117,7 +1336,7 @@ where
         Ok(location_map)
     }
 
-    fn parse_tree(&mut self, unit: &Unit<R>) -> Result<Vec<SubProgram<R>>, ProgramFromElfError> {
+    fn parse_tree(&mut self, unit: &Unit<ReaderWrapper<R>>) -> Result<Vec<SubProgram<R>>, ProgramFromElfError> {
         assert!(self.namespace_buffer.is_empty());
         assert!(self.subprograms.is_empty());
         assert_eq!(self.depth, 0);
@@ -1139,7 +1358,11 @@ where
         }
     }
 
-    fn walk(&mut self, unit: &Unit<R>, node: gimli::EntriesTreeNode<R>) -> Result<Vec<Inlined<R>>, ProgramFromElfError> {
+    fn walk(
+        &mut self,
+        unit: &Unit<ReaderWrapper<R>>,
+        node: gimli::EntriesTreeNode<ReaderWrapper<R>>,
+    ) -> Result<Vec<Inlined<R>>, ProgramFromElfError> {
         let buffer_initial_length = self.namespace_buffer.len();
         let node_entry = node.entry();
         let Some(node_offset) = node_entry.offset().to_debug_info_offset(&unit.raw_unit.header) else {
@@ -1412,9 +1635,7 @@ where
                 })?;
 
                 if current_inlined.is_empty() {
-                    return Err(ProgramFromElfError::other(
-                        "failed to process DWARF: inline subroutine with no source",
-                    ));
+                    log::trace!("Found inline subroutine with no source! (name = {name:?})");
                 }
             }
             _ => {}
@@ -1597,7 +1818,7 @@ where
 
 #[derive(Clone, PartialEq, Eq)]
 struct LineEntry {
-    offset: u64,
+    target: SectionTarget,
     location: SourceCodeLocation,
 }
 
@@ -1608,24 +1829,35 @@ pub(crate) struct DwarfInfo {
     pub location_map: HashMap<SectionTarget, Arc<[Location]>>,
 }
 
-#[derive(Clone)]
-enum ValueOrOffset<R>
+struct AttributeValue<R>
 where
     R: gimli::Reader,
 {
-    Value(gimli::AttributeValue<R>),
-    Offset(R::Offset),
+    value: gimli::AttributeValue<R>,
+    offset: Option<R::Offset>,
 }
 
-impl<R> core::fmt::Debug for ValueOrOffset<R>
+impl<R> Clone for AttributeValue<R>
+where
+    R: gimli::Reader,
+{
+    fn clone(&self) -> Self {
+        AttributeValue {
+            value: self.value.clone(),
+            offset: self.offset,
+        }
+    }
+}
+
+impl<R> core::fmt::Debug for AttributeValue<R>
 where
     R: gimli::Reader,
 {
     fn fmt(&self, fmt: &mut core::fmt::Formatter) -> core::fmt::Result {
-        match self {
-            Self::Value(value) => value.fmt(fmt),
-            Self::Offset(value) => write!(fmt, "Offset({value:?})"),
-        }
+        fmt.debug_struct("AttributeValue")
+            .field("value", &self.value)
+            .field("offset", &self.offset)
+            .finish()
     }
 }
 
@@ -1635,7 +1867,7 @@ fn parse_attribute<R>(
     input: &mut R,
     encoding: gimli::Encoding,
     attribute: gimli::AttributeSpecification,
-) -> Result<ValueOrOffset<R>, ProgramFromElfError>
+) -> Result<AttributeValue<R>, ProgramFromElfError>
 where
     R: gimli::Reader,
 {
@@ -1694,8 +1926,11 @@ where
             }
             gimli::constants::DW_FORM_addr => {
                 let offset = input.offset_from(input_base);
-                let _ = input.read_address(encoding.address_size)?; // AttributeValue::Addr
-                break Ok(ValueOrOffset::Offset(offset));
+                let value = AttributeValue::Addr(input.read_address(encoding.address_size)?);
+                break Ok(self::AttributeValue {
+                    value,
+                    offset: Some(offset),
+                });
             }
             gimli::constants::DW_FORM_block1 => {
                 let block = length_u8_value(input)?;
@@ -1902,7 +2137,7 @@ where
             }
         };
 
-        break Ok(ValueOrOffset::Value(value));
+        break Ok(self::AttributeValue { value, offset: None });
     }
 }
 
@@ -1910,7 +2145,7 @@ fn iter_attributes<'a, R>(
     dwarf: &gimli::Dwarf<R>,
     unit: &'a gimli::Unit<R>,
     entry_offset: gimli::UnitOffset<R::Offset>,
-) -> Result<impl Iterator<Item = Result<(gimli::constants::DwAt, ValueOrOffset<R>), ProgramFromElfError>> + 'a, ProgramFromElfError>
+) -> Result<impl Iterator<Item = Result<(gimli::constants::DwAt, AttributeValue<R>), ProgramFromElfError>> + 'a, ProgramFromElfError>
 where
     R: gimli::Reader,
 {
@@ -1956,24 +2191,52 @@ where
     let entry = cursor.current().ok_or(gimli::Error::MissingUnitDie)?;
     let entry_offset = entry.offset();
 
+    log::trace!("Extracting low PC for unit at offset {entry_offset:?}...");
     for pair in iter_attributes(dwarf, unit, entry_offset)? {
         let (name, value) = pair?;
         if name != gimli::constants::DW_AT_low_pc {
             continue;
         }
-
         match value {
-            ValueOrOffset::Value(gimli::AttributeValue::DebugAddrIndex(gimli::DebugAddrIndex(index))) => {
+            AttributeValue {
+                value: gimli::AttributeValue::DebugAddrIndex(gimli::DebugAddrIndex(index)),
+                ..
+            } => {
                 let index = gimli::DebugAddrIndex(index);
-                return Ok(Some(resolve_debug_addr_index(sections.debug_addr, relocations, unit, index)?));
+                return resolve_debug_addr_index(sections.debug_addr, relocations, unit, index);
             }
-            ValueOrOffset::Offset(offset) => {
+            AttributeValue {
+                value: gimli::AttributeValue::Addr(address),
+                offset: Some(offset),
+                ..
+            } => {
                 let relocation_target = SectionTarget {
                     section_index: sections.debug_info.index(),
                     offset: offset.into_u64(),
                 };
 
-                return fetch_relocation(relocations, relocation_target).map(Some);
+                let Some(relocation) = relocations.get(&relocation_target) else {
+                    if address == 0 {
+                        // Clang likes to emit these when compiling C++.
+                        continue;
+                    }
+
+                    return Err(ProgramFromElfError::other(format!(
+                        "failed to process DWARF: failed to fetch DW_AT_low_pc for a unit: {relocation_target} has no relocation"
+                    )));
+                };
+
+                let RelocationKind::Abs {
+                    target,
+                    size: RelocationSize::U32,
+                } = relocation
+                else {
+                    return Err(ProgramFromElfError::other(format!(
+                        "failed to process DWARF: failed to fetch DW_AT_low_pc for a unit: unexpected relocation at {relocation_target}: {relocation:?}"
+                    )));
+                };
+
+                return Ok(Some(*target));
             }
             value => {
                 return Err(ProgramFromElfError::other(format!(
@@ -2002,6 +2265,7 @@ pub(crate) fn load_dwarf(
         debug_addr: elf.section_by_name(".debug_addr"),
         debug_ranges: elf.section_by_name(".debug_ranges"),
         debug_rnglists: elf.section_by_name(".debug_rnglists"),
+        debug_line: elf.section_by_name(".debug_line"),
     };
 
     let mut load_section = |id: gimli::SectionId| -> Result<_, ProgramFromElfError> {
@@ -2012,10 +2276,12 @@ pub(crate) fn load_dwarf(
         };
 
         let data: std::rc::Rc<[u8]> = data.into();
-        Ok(gimli::read::EndianRcSlice::new(data, gimli::LittleEndian))
+        let reader = gimli::read::EndianRcSlice::new(data, gimli::LittleEndian);
+        let reader = ReaderWrapper::wrap(reader);
+        Ok(reader)
     };
 
-    let dwarf: gimli::Dwarf<gimli::read::EndianRcSlice<gimli::LittleEndian>> = gimli::Dwarf::load(&mut load_section)?;
+    let dwarf: gimli::Dwarf<ReaderWrapper<gimli::read::EndianRcSlice<gimli::LittleEndian>>> = gimli::Dwarf::load(&mut load_section)?;
     let mut units = Vec::new();
     {
         let mut iter = dwarf.units();
@@ -2043,10 +2309,8 @@ pub(crate) fn load_dwarf(
                 }
             };
 
-            let Some(low_pc) = extract_symbolic_low_pc(&dwarf, &sections, relocations, &unit)? else {
-                continue;
-            };
-
+            log::trace!("Processing unit: {offset:?}");
+            let low_pc = extract_symbolic_low_pc(&dwarf, &sections, relocations, &unit)?;
             let paths = extract_paths(&dwarf, string_cache, &unit)?;
             units.push(Unit {
                 low_pc,
