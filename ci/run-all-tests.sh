@@ -19,6 +19,9 @@ case "$OSTYPE" in
     ./ci/jobs/build-and-test-macos.sh
   ;;
 esac
+
+./ci/jobs/check-freebsd.sh
+
 ./ci/jobs/clippy.sh
 ./ci/jobs/rustfmt.sh
 
