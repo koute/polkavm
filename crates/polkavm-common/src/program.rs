@@ -1625,7 +1625,7 @@ impl<'a> LineProgram<'a> {
         }
 
         // Put an upper limit to how many instructions we'll process.
-        const INSTRUCTION_LIMIT_PER_REGION: usize = 128;
+        const INSTRUCTION_LIMIT_PER_REGION: usize = 256;
 
         let mark_as_finished_on_drop = SetTrueOnDrop(&mut self.is_finished);
         for _ in 0..INSTRUCTION_LIMIT_PER_REGION {
