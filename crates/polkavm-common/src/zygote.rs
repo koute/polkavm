@@ -189,7 +189,7 @@ pub struct VmInit {
 const MESSAGE_BUFFER_SIZE: usize = 512;
 
 #[repr(align(64))]
-pub struct CacheAligned<T>(T);
+pub struct CacheAligned<T>(pub T);
 
 impl<T> core::ops::Deref for CacheAligned<T> {
     type Target = T;
