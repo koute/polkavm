@@ -12,6 +12,7 @@ members = [
     "tools/polkavm-linux-raw-generate",
 
     "examples/hosts/hello-world",
+    "examples/hosts/doom",
 ]
 
 [workspace.package]
