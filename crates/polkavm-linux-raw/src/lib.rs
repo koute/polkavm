@@ -51,6 +51,9 @@ use std::borrow::Cow;
 #[allow(non_camel_case_types)]
 type c_size_t = usize;
 
+#[allow(non_camel_case_types)]
+pub type size_t = c_size_t;
+
 // Doesn't appear in public headers.
 pub const MNT_FORCE: u32 = 1;
 pub const MNT_DETACH: u32 = 2;
