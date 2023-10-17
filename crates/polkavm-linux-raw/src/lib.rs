@@ -56,6 +56,9 @@ pub const MNT_FORCE: u32 = 1;
 pub const MNT_DETACH: u32 = 2;
 pub const MNT_EXPIRE: u32 = 4;
 
+pub const SIG_DFL: usize = 0;
+pub const SIG_IGN: usize = 1;
+
 pub use crate::arch_amd64_bindings::{
     __NR_capset as SYS_capset, __NR_chdir as SYS_chdir, __NR_clock_gettime as SYS_clock_gettime, __NR_clone as SYS_clone,
     __NR_clone3 as SYS_clone3, __NR_close as SYS_close, __NR_close_range as SYS_close_range, __NR_dup3 as SYS_dup3,
