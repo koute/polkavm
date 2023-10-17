@@ -68,6 +68,10 @@ impl Assembler {
         offset
     }
 
+    pub fn set_label_offset(&mut self, label: Label, offset: isize) {
+        self.labels[label.0] = offset;
+    }
+
     fn add_fixup_if_necessary(&mut self, bytes: &[u8], inst: impl Instruction) {
         let (target_label, fixup_offset, fixup_length) = match inst.target_fixup() {
             Some(fixup) => fixup,
@@ -132,6 +136,10 @@ impl Assembler {
 
     pub fn len(&self) -> usize {
         self.code.len()
+    }
+
+    pub fn resize(&mut self, size: usize, fill_with: u8) {
+        self.code.resize(size, fill_with)
     }
 
     pub fn clear(&mut self) {

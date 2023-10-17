@@ -36,6 +36,7 @@ env_logger = { version = "0.10.0", default-features = false }
 gimli = { version = "0.28.0", default-features = false }
 hashbrown = { version = "0.14.0", default-features = false }
 iced-x86 = "1.19.0"
+libc = "0.2.146"
 log = "0.4.20"
 object = { version = "0.32.0", default-features = false }
 proc-macro2 = "1.0.63"

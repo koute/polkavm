@@ -14,11 +14,19 @@ use polkavm_common::program::{FrameKind, Opcode, RawInstruction, Reg};
 use polkavm_common::utils::{Access, AsUninitSliceMut};
 
 use crate::caller::{Caller, CallerRaw};
-use crate::compiler::{CompiledAccess, CompiledInstance, CompiledModule};
-use crate::config::{Backend, Config};
+use crate::config::{BackendKind, Config, SandboxKind};
 use crate::error::{bail, Error, ExecutionError};
 use crate::interpreter::{InterpretedAccess, InterpretedInstance, InterpretedModule};
 use crate::tracer::Tracer;
+
+if_compiler_is_supported! {
+    use crate::sandbox::Sandbox;
+    use crate::sandbox::generic::Sandbox as SandboxGeneric;
+    use crate::compiler::{CompiledInstance, CompiledModule};
+
+    #[cfg(target_os = "linux")]
+    use crate::sandbox::linux::Sandbox as SandboxLinux;
+}
 
 struct DisplayFn<'a, Args> {
     name: &'a str,
@@ -63,14 +71,47 @@ impl Engine {
             }
         }
 
+        if let Some(sandbox) = config.sandbox {
+            if !sandbox.is_supported() {
+                bail!("the '{sandbox}' backend is not supported on this platform")
+            }
+        }
+
         #[allow(clippy::collapsible_if)]
         if !config.allow_insecure {
             if config.trace_execution {
                 bail!("cannot enable trace execution: `set_allow_insecure`/`POLKAVM_ALLOW_INSECURE` is not enabled");
             }
+
+            if let Some(sandbox) = config.sandbox {
+                if matches!(sandbox, SandboxKind::Generic) {
+                    bail!("cannot use the '{sandbox}' sandbox: this sandbox is not secure yet, and `set_allow_insecure`/`POLKAVM_ALLOW_INSECURE` is not enabled");
+                }
+            }
         }
 
         Ok(Engine { config: config.clone() })
+    }
+}
+
+if_compiler_is_supported! {
+    {
+        pub(crate) enum CompiledModuleKind {
+            #[cfg(target_os = "linux")]
+            Linux(CompiledModule<SandboxLinux>),
+            Generic(CompiledModule<SandboxGeneric>),
+            Unavailable,
+        }
+    } else {
+        pub(crate) enum CompiledModuleKind {
+            Unavailable,
+        }
+    }
+}
+
+impl CompiledModuleKind {
+    pub fn is_some(&self) -> bool {
+        !matches!(self, CompiledModuleKind::Unavailable)
     }
 }
 
@@ -83,9 +124,34 @@ struct ModulePrivate {
     jump_target_to_instruction: HashMap<u32, u32>,
 
     blob: Option<ProgramBlob<'static>>,
-    compiled_module: Option<CompiledModule>,
+    compiled_module: CompiledModuleKind,
     interpreted_module: Option<InterpretedModule>,
     memory_config: GuestMemoryConfig,
+}
+
+if_compiler_is_supported! {
+    pub(crate) trait AsCompiledModule<S> where S: Sandbox {
+        fn as_compiled_module(&self) -> Option<&CompiledModule<S>>;
+    }
+
+    #[cfg(target_os = "linux")]
+    impl AsCompiledModule<SandboxLinux> for Module {
+        fn as_compiled_module(&self) -> Option<&CompiledModule<SandboxLinux>> {
+            match self.0.compiled_module {
+                CompiledModuleKind::Linux(ref module) => Some(module),
+                _ => None
+            }
+        }
+    }
+
+    impl AsCompiledModule<SandboxGeneric> for Module {
+        fn as_compiled_module(&self) -> Option<&CompiledModule<SandboxGeneric>> {
+            match self.0.compiled_module {
+                CompiledModuleKind::Generic(ref module) => Some(module),
+                _ => None
+            }
+        }
+    }
 }
 
 /// A compiled PolkaVM program module.
@@ -101,8 +167,8 @@ impl Module {
         &self.0.instructions
     }
 
-    pub(crate) fn compiled_module(&self) -> Option<&CompiledModule> {
-        self.0.compiled_module.as_ref()
+    pub(crate) fn compiled_module(&self) -> &CompiledModuleKind {
+        &self.0.compiled_module
     }
 
     pub(crate) fn interpreted_module(&self) -> Option<&InterpretedModule> {
@@ -240,20 +306,51 @@ impl Module {
             .with_bss(blob.bss_size())
             .with_stack(blob.stack_size());
 
-        let default_backend = if Backend::Compiler.is_supported() {
-            Backend::Compiler
+        let default_backend = if BackendKind::Compiler.is_supported() && SandboxKind::Linux.is_supported() {
+            BackendKind::Compiler
         } else {
-            Backend::Interpreter
+            BackendKind::Interpreter
         };
+
         let selected_backend = engine.config.backend.unwrap_or(default_backend);
 
-        let compiler_enabled = selected_backend == Backend::Compiler;
-        let interpreter_enabled = debug_trace_execution || selected_backend == Backend::Interpreter;
+        let compiler_enabled = selected_backend == BackendKind::Compiler;
+        let interpreter_enabled = debug_trace_execution || selected_backend == BackendKind::Interpreter;
 
         let compiled_module = if compiler_enabled {
-            Some(CompiledModule::new(&instructions, &exports, init, debug_trace_execution)?)
+            if_compiler_is_supported! {
+                {
+                    let default_sandbox = if SandboxKind::Linux.is_supported() {
+                        SandboxKind::Linux
+                    } else {
+                        SandboxKind::Generic
+                    };
+
+                    let selected_sandbox = engine.config.sandbox.unwrap_or(default_sandbox);
+                    match selected_sandbox {
+                        SandboxKind::Linux => {
+                            #[cfg(target_os = "linux")]
+                            {
+                                let module = CompiledModule::new(&instructions, &exports, init, debug_trace_execution)?;
+                                CompiledModuleKind::Linux(module)
+                            }
+
+                            #[cfg(not(target_os = "linux"))]
+                            {
+                                CompiledModuleKind::Unavailable
+                            }
+                        },
+                        SandboxKind::Generic => {
+                            let module = CompiledModule::new(&instructions, &exports, init, debug_trace_execution)?;
+                            CompiledModuleKind::Generic(module)
+                        }
+                    }
+                } else {
+                    CompiledModuleKind::Unavailable
+                }
+            }
         } else {
-            None
+            CompiledModuleKind::Unavailable
         };
 
         let interpreted_module = if interpreter_enabled {
@@ -298,7 +395,7 @@ impl Module {
             export_index_by_name,
             jump_target_to_instruction,
 
-            blob: if debug_trace_execution || selected_backend == Backend::Interpreter {
+            blob: if debug_trace_execution || selected_backend == BackendKind::Interpreter {
                 Some(blob.clone().into_owned())
             } else {
                 None
@@ -1052,12 +1149,34 @@ impl<T> Clone for InstancePre<T> {
 impl<T> InstancePre<T> {
     /// Instantiates a new module.
     pub fn instantiate(&self) -> Result<Instance<T>, Error> {
-        let backend = if self.0.module.0.compiled_module.is_some() {
-            let compiled_instance = CompiledInstance::new(self.0.module.clone())?;
-            InstanceBackend::Compiled(compiled_instance)
-        } else {
-            let interpreted_instance = InterpretedInstance::new(self.0.module.clone())?;
-            InstanceBackend::Interpreted(interpreted_instance)
+        let compiled_module = &self.0.module.0.compiled_module;
+        let backend = if_compiler_is_supported! {
+            {
+                match compiled_module {
+                    #[cfg(target_os = "linux")]
+                    CompiledModuleKind::Linux(..) => {
+                        let compiled_instance = CompiledInstance::new(self.0.module.clone())?;
+                        Some(InstanceBackend::CompiledLinux(compiled_instance))
+                    },
+                    CompiledModuleKind::Generic(..) => {
+                        let compiled_instance = CompiledInstance::new(self.0.module.clone())?;
+                        Some(InstanceBackend::CompiledGeneric(compiled_instance))
+                    },
+                    CompiledModuleKind::Unavailable => None
+                }
+            } else {
+                match compiled_module {
+                    CompiledModuleKind::Unavailable => None
+                }
+            }
+        };
+
+        let backend = match backend {
+            Some(backend) => backend,
+            None => {
+                let interpreted_instance = InterpretedInstance::new(self.0.module.clone())?;
+                InstanceBackend::Interpreted(interpreted_instance)
+            }
         };
 
         let tracer = if self.0.module.0.debug_trace_execution {
@@ -1076,79 +1195,156 @@ impl<T> InstancePre<T> {
     }
 }
 
-enum InstanceBackend {
-    Compiled(CompiledInstance),
-    Interpreted(InterpretedInstance),
+if_compiler_is_supported! {
+    {
+        enum InstanceBackend {
+            #[cfg(target_os = "linux")]
+            CompiledLinux(CompiledInstance<SandboxLinux>),
+            CompiledGeneric(CompiledInstance<SandboxGeneric>),
+            Interpreted(InterpretedInstance),
+        }
+    } else {
+        enum InstanceBackend {
+            Interpreted(InterpretedInstance),
+        }
+    }
 }
 
 impl InstanceBackend {
     fn call(&mut self, export_index: usize, on_hostcall: OnHostcall, config: &ExecutionConfig) -> Result<(), ExecutionError> {
-        match self {
-            InstanceBackend::Compiled(ref mut backend) => backend.call(export_index, on_hostcall, config),
-            InstanceBackend::Interpreted(ref mut backend) => backend.call(export_index, on_hostcall, config),
+        if_compiler_is_supported! {
+            {
+                match self {
+                    #[cfg(target_os = "linux")]
+                    InstanceBackend::CompiledLinux(ref mut backend) => backend.call(export_index, on_hostcall, config),
+                    InstanceBackend::CompiledGeneric(ref mut backend) => backend.call(export_index, on_hostcall, config),
+                    InstanceBackend::Interpreted(ref mut backend) => backend.call(export_index, on_hostcall, config),
+                }
+            } else {
+                match self {
+                    InstanceBackend::Interpreted(ref mut backend) => backend.call(export_index, on_hostcall, config),
+                }
+            }
         }
     }
 
     fn access(&mut self) -> BackendAccess {
-        match self {
-            InstanceBackend::Compiled(ref mut backend) => BackendAccess::Compiled(backend.access()),
-            InstanceBackend::Interpreted(ref mut backend) => BackendAccess::Interpreted(backend.access()),
+        if_compiler_is_supported! {
+            {
+                match self {
+                    #[cfg(target_os = "linux")]
+                    InstanceBackend::CompiledLinux(ref mut backend) => BackendAccess::CompiledLinux(backend.access()),
+                    InstanceBackend::CompiledGeneric(ref mut backend) => BackendAccess::CompiledGeneric(backend.access()),
+                    InstanceBackend::Interpreted(ref mut backend) => BackendAccess::Interpreted(backend.access()),
+                }
+            } else {
+                match self {
+                    InstanceBackend::Interpreted(ref mut backend) => BackendAccess::Interpreted(backend.access()),
+                }
+            }
         }
     }
 }
 
-pub enum BackendAccess<'a> {
-    #[allow(dead_code)]
-    Compiled(CompiledAccess<'a>),
-    Interpreted(InterpretedAccess<'a>),
+#[derive(Debug)]
+pub struct MemoryAccessError<T> {
+    pub address: u32,
+    pub length: u64,
+    pub error: T,
+}
+
+impl<T> core::fmt::Display for MemoryAccessError<T>
+where
+    T: core::fmt::Display,
+{
+    fn fmt(&self, fmt: &mut core::fmt::Formatter) -> core::fmt::Result {
+        write!(
+            fmt,
+            "out of range memory access in 0x{:x}-0x{:x} ({} bytes): {}",
+            self.address,
+            (self.address as u64) + self.length,
+            self.length,
+            self.error
+        )
+    }
+}
+
+fn map_access_error<T>(error: MemoryAccessError<T>) -> Trap
+where
+    T: core::fmt::Display,
+{
+    log::warn!("{error}");
+    Trap::default()
+}
+
+if_compiler_is_supported! {
+    {
+        pub enum BackendAccess<'a> {
+            #[cfg(target_os = "linux")]
+            CompiledLinux(<SandboxLinux as Sandbox>::Access<'a>),
+            CompiledGeneric(<SandboxGeneric as Sandbox>::Access<'a>),
+            Interpreted(InterpretedAccess<'a>),
+        }
+    } else {
+        pub enum BackendAccess<'a> {
+            Interpreted(InterpretedAccess<'a>),
+        }
+    }
+}
+
+if_compiler_is_supported! {
+    {
+        macro_rules! access_backend {
+            ($itself:ident, |$access:ident| $e:expr) => {
+                match $itself {
+                    #[cfg(target_os = "linux")]
+                    BackendAccess::CompiledLinux($access) => $e,
+                    BackendAccess::CompiledGeneric($access) => $e,
+                    BackendAccess::Interpreted($access) => $e,
+                }
+            }
+        }
+    } else {
+        macro_rules! access_backend {
+            ($itself:ident, |$access:ident| $e:expr) => {
+                match $itself {
+                    BackendAccess::Interpreted($access) => $e,
+                }
+            }
+        }
+    }
 }
 
 impl<'a> Access<'a> for BackendAccess<'a> {
     type Error = Trap;
 
     fn get_reg(&self, reg: Reg) -> u32 {
-        match self {
-            BackendAccess::Compiled(access) => access.get_reg(reg),
-            BackendAccess::Interpreted(access) => access.get_reg(reg),
-        }
+        access_backend!(self, |access| access.get_reg(reg))
     }
 
     fn set_reg(&mut self, reg: Reg, value: u32) {
-        match self {
-            BackendAccess::Compiled(access) => access.set_reg(reg, value),
-            BackendAccess::Interpreted(access) => access.set_reg(reg, value),
-        }
+        access_backend!(self, |access| access.set_reg(reg, value))
     }
 
     fn read_memory_into_slice<'slice, B>(&self, address: u32, buffer: &'slice mut B) -> Result<&'slice mut [u8], Self::Error>
     where
         B: ?Sized + AsUninitSliceMut,
     {
-        match self {
-            BackendAccess::Compiled(access) => Ok(access.read_memory_into_slice(address, buffer)?),
-            BackendAccess::Interpreted(access) => Ok(access.read_memory_into_slice(address, buffer)?),
-        }
+        access_backend!(self, |access| Ok(access
+            .read_memory_into_slice(address, buffer)
+            .map_err(map_access_error)?))
     }
 
     fn write_memory(&mut self, address: u32, data: &[u8]) -> Result<(), Self::Error> {
-        match self {
-            BackendAccess::Compiled(access) => Ok(access.write_memory(address, data)?),
-            BackendAccess::Interpreted(access) => Ok(access.write_memory(address, data)?),
-        }
+        access_backend!(self, |access| Ok(access.write_memory(address, data).map_err(map_access_error)?))
     }
 
     fn program_counter(&self) -> Option<u32> {
-        match self {
-            BackendAccess::Compiled(access) => access.program_counter(),
-            BackendAccess::Interpreted(access) => access.program_counter(),
-        }
+        access_backend!(self, |access| access.program_counter())
     }
 
     fn native_program_counter(&self) -> Option<u64> {
-        match self {
-            BackendAccess::Compiled(access) => access.native_program_counter(),
-            BackendAccess::Interpreted(access) => access.native_program_counter(),
-        }
+        access_backend!(self, |access| access.native_program_counter())
     }
 }
 
