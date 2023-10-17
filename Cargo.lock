@@ -718,8 +718,7 @@ dependencies = [
 [[package]]
 name = "sdl2"
 version = "0.35.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f7959277b623f1fb9e04aea73686c3ca52f01b2145f8ea16f4ff30d8b7623b1a"
+source = "git+https://github.com/Rust-SDL2/rust-sdl2.git?rev=76748c530d4ca1fe195d3da57da7610723afb6ac#76748c530d4ca1fe195d3da57da7610723afb6ac"
 dependencies = [
  "bitflags 1.3.2",
  "lazy_static",
@@ -730,8 +729,7 @@ dependencies = [
 [[package]]
 name = "sdl2-sys"
 version = "0.35.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e3586be2cf6c0a8099a79a12b4084357aa9b3e0b0d7980e3b67aaf7a9d55f9f0"
+source = "git+https://github.com/Rust-SDL2/rust-sdl2.git?rev=76748c530d4ca1fe195d3da57da7610723afb6ac#76748c530d4ca1fe195d3da57da7610723afb6ac"
 dependencies = [
  "cfg-if",
  "cmake",
