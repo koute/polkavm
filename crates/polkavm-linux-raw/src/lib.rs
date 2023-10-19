@@ -821,7 +821,8 @@ impl Fd {
             return Ok(());
         }
 
-        let result = unsafe { syscall_readonly!(SYS_close, self.raw()) };
+        let fd = core::mem::replace(&mut self.0, -1);
+        let result = unsafe { syscall_readonly!(SYS_close, fd) };
         Error::from_syscall("close", result)
     }
 }
