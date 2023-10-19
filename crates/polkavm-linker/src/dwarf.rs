@@ -93,22 +93,23 @@ where
             offset: offset_end.into_u64(),
         };
 
-        let (start_section, start_range) = fetch_size_relocation(relocations, relocation_start)?;
-        let (end_section, end_range) = fetch_size_relocation(relocations, relocation_end)?;
+        if let Some((start_section, start_range)) = try_fetch_size_relocation(relocations, relocation_start)? {
+            let (end_section, end_range) = fetch_size_relocation(relocations, relocation_end)?;
 
-        if start_section != end_section {
-            return Err(ProgramFromElfError::other(
-                "failed to process DWARF: '.debug_ranges' has a pair of relocations pointing to different sections",
-            ));
+            if start_section != end_section {
+                return Err(ProgramFromElfError::other(
+                    "failed to process DWARF: '.debug_ranges' has a pair of relocations pointing to different sections",
+                ));
+            }
+
+            let source = Source {
+                section_index: start_section,
+                offset_range: (start_range.end..end_range.end).into(),
+            };
+
+            log::trace!("  Range from debug ranges: {}", source);
+            callback(source);
         }
-
-        let source = Source {
-            section_index: start_section,
-            offset_range: (start_range.end..end_range.end).into(),
-        };
-
-        log::trace!("  Range from debug ranges: {}", source);
-        callback(source);
     } else {
         let Some(section) = sections.debug_rnglists else {
             return Err(ProgramFromElfError::other(
@@ -262,9 +263,10 @@ impl<R: gimli::Reader> AttributeParser<R> {
                         offset: offset.into_u64(),
                     };
 
-                    let target = fetch_relocation(relocations, relocation_target)?;
-                    log::trace!("  = {target} (address)");
-                    self.low_pc = Some(target);
+                    if let Some(target) = try_fetch_relocation(relocations, relocation_target)? {
+                        log::trace!("  = {target} (address)");
+                        self.low_pc = Some(target);
+                    }
 
                     Ok(())
                 }
@@ -290,9 +292,10 @@ impl<R: gimli::Reader> AttributeParser<R> {
                         offset: offset.into_u64(),
                     };
 
-                    let target = fetch_relocation(relocations, relocation_target)?;
-                    log::trace!("  = {target} (address)");
-                    self.high_pc = Some(target);
+                    if let Some(target) = try_fetch_relocation(relocations, relocation_target)? {
+                        log::trace!("  = {target} (address)");
+                        self.high_pc = Some(target);
+                    }
 
                     Ok(())
                 }
@@ -583,19 +586,6 @@ fn try_fetch_relocation(
     Ok(Some(*target))
 }
 
-fn fetch_relocation(
-    relocations: &BTreeMap<SectionTarget, RelocationKind>,
-    relocation_target: SectionTarget,
-) -> Result<SectionTarget, ProgramFromElfError> {
-    if let Some(target) = try_fetch_relocation(relocations, relocation_target)? {
-        Ok(target)
-    } else {
-        Err(ProgramFromElfError::other(format!(
-            "failed to process DWARF: {relocation_target} has no relocation"
-        )))
-    }
-}
-
 fn try_fetch_size_relocation(
     relocations: &BTreeMap<SectionTarget, RelocationKind>,
     relocation_target: SectionTarget,
@@ -604,18 +594,20 @@ fn try_fetch_size_relocation(
         return Ok(None);
     };
 
-    let RelocationKind::Size {
-        section_index,
-        range,
-        size: SizeRelocationSize::Generic(..),
-    } = relocation
-    else {
-        return Err(ProgramFromElfError::other(format!(
+    match relocation {
+        RelocationKind::Size {
+            section_index,
+            range,
+            size: SizeRelocationSize::Generic(..),
+        } => Ok(Some((*section_index, *range))),
+        RelocationKind::Abs {
+            target,
+            size: RelocationSize::U32,
+        } => Ok(Some((target.section_index, (target.offset..target.offset).into()))),
+        _ => Err(ProgramFromElfError::other(format!(
             "failed to process DWARF: unexpected relocation at {relocation_target}: {relocation:?}"
-        )));
-    };
-
-    Ok(Some((*section_index, *range)))
+        ))),
+    }
 }
 
 fn fetch_size_relocation(
