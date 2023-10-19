@@ -209,6 +209,52 @@ macro_rules! sandbox_tests {
             use crate::sandbox::$sandbox_kind::{Sandbox, SandboxConfig};
 
             #[test]
+            fn spawn_stress_test() {
+                let _ = env_logger::try_init();
+                let init = GuestProgramInit::new().with_ro_data(&[0x00]).with_bss(1);
+                let init = SandboxProgramInit::new(init);
+
+                let mut asm = Assembler::new();
+                let code = asm.push(ret()).finalize();
+                let address_space = Sandbox::reserve_address_space().unwrap();
+                let native_code_address = address_space.native_code_address();
+                let program = Sandbox::prepare_program(init.with_code(code), address_space).unwrap();
+
+                const THREAD_COUNT: usize = 32;
+                let barrier = std::sync::Arc::new(std::sync::Barrier::new(THREAD_COUNT));
+
+                let mut threads = Vec::new();
+                for _ in 0..THREAD_COUNT {
+                    let program = program.clone();
+                    let barrier = barrier.clone();
+                    let thread = std::thread::spawn(move || {
+                        barrier.wait();
+                        for _ in 0..32 {
+                            let mut args = ExecuteArgs::new();
+                            args.set_program(&program);
+                            args.set_call(native_code_address);
+
+                            let mut config = SandboxConfig::default();
+                            config.enable_logger(true);
+
+                            let mut sandbox = Sandbox::spawn(&config).unwrap();
+                            sandbox.execute(args).unwrap();
+                        }
+                    });
+                    threads.push(thread);
+                }
+
+                let mut results = Vec::new();
+                for thread in threads {
+                    results.push(thread.join());
+                }
+
+                for result in results {
+                    result.unwrap();
+                }
+            }
+
+            #[test]
             fn basic_execution_works() {
                 let _ = env_logger::try_init();
 
