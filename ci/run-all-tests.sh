@@ -4,7 +4,7 @@ set -euo pipefail
 cd -- "$(dirname -- "${BASH_SOURCE[0]}")"
 cd ..
 
-if [[ "$(rustup toolchain list)" =~ "rv32e-nightly-2023-04-05-x86_64-unknown-linux-gnu" ]]; then
+if [[ "$(rustup toolchain list)" =~ "riscv32em-nightly-2023-04-05-r0-x86_64-unknown-linux-gnu" ]]; then
     export CI_RV32E_TOOLCHAIN_AVAILABLE=1
 fi
 
