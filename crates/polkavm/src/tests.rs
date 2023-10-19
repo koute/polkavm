@@ -2,14 +2,86 @@ use crate::{Caller, CallerRef, Config, Engine, ExecutionError, Linker, Module, P
 use std::cell::RefCell;
 use std::rc::Rc;
 
+macro_rules! run_tests {
+    ($($test_name:ident)+) => {
+        if_compiler_is_supported! {
+            mod compiler {
+                #[cfg(target_os = "linux")]
+                mod linux {
+                    $(
+                        #[test]
+                        fn $test_name() {
+                            let mut config = crate::Config::default();
+                            config.set_backend(Some(crate::BackendKind::Compiler));
+                            config.set_sandbox(Some(crate::SandboxKind::Linux));
+                            super::super::$test_name(config);
+                        }
+                    )+
+                }
+
+                #[cfg(target_os = "linux")]
+                mod linux_tracing {
+                    $(
+                        #[test]
+                        fn $test_name() {
+                            let mut config = crate::Config::default();
+                            config.set_backend(Some(crate::BackendKind::Compiler));
+                            config.set_sandbox(Some(crate::SandboxKind::Linux));
+                            config.set_allow_insecure(true);
+                            config.set_trace_execution(true);
+                            super::super::$test_name(config);
+                        }
+                    )+
+                }
+
+                mod generic {
+                    $(
+                        #[test]
+                        fn $test_name() {
+                            let mut config = crate::Config::default();
+                            config.set_backend(Some(crate::BackendKind::Compiler));
+                            config.set_sandbox(Some(crate::SandboxKind::Generic));
+                            config.set_allow_insecure(true);
+                            super::super::$test_name(config);
+                        }
+                    )+
+                }
+
+                mod generic_tracing {
+                    $(
+                        #[test]
+                        fn $test_name() {
+                            let mut config = crate::Config::default();
+                            config.set_backend(Some(crate::BackendKind::Compiler));
+                            config.set_sandbox(Some(crate::SandboxKind::Generic));
+                            config.set_allow_insecure(true);
+                            config.set_trace_execution(true);
+                            super::super::$test_name(config);
+                        }
+                    )+
+                }
+            }
+        }
+
+        mod interpreter {
+            $(
+                #[test]
+                fn $test_name() {
+                    let mut config = crate::Config::default();
+                    config.set_backend(Some(crate::BackendKind::Interpreter));
+                    super::$test_name(config);
+                }
+            )+
+        }
+    }
+}
+
 // TODO: Add a dedicated test blob.
 const RAW_BLOB: &[u8] = include_bytes!("../../../guest-programs/output/example-hello-world.polkavm");
 
-#[test]
-fn caller_and_caller_ref_work() {
+fn caller_and_caller_ref_work(config: Config) {
     let _ = env_logger::try_init();
     let blob = ProgramBlob::parse(RAW_BLOB).unwrap();
-    let config = Config::default();
     let engine = Engine::new(&config).unwrap();
     let module = Module::from_blob(&engine, &blob).unwrap();
     let mut linker = Linker::new(&engine);
@@ -54,11 +126,9 @@ fn caller_and_caller_ref_work() {
     assert!(result.is_err());
 }
 
-#[test]
-fn caller_split_works() {
+fn caller_split_works(config: Config) {
     let _ = env_logger::try_init();
     let blob = ProgramBlob::parse(RAW_BLOB).unwrap();
-    let config = Config::default();
     let engine = Engine::new(&config).unwrap();
     let module = Module::from_blob(&engine, &blob).unwrap();
     let mut linker = Linker::new(&engine);
@@ -96,11 +166,9 @@ fn caller_split_works() {
     assert_eq!(state.value, polkavm_common::abi::VM_ADDR_RETURN_TO_HOST);
 }
 
-#[test]
-fn trapping_from_hostcall_handler_works() {
+fn trapping_from_hostcall_handler_works(config: Config) {
     let _ = env_logger::try_init();
     let blob = ProgramBlob::parse(RAW_BLOB).unwrap();
-    let config = Config::default();
     let engine = Engine::new(&config).unwrap();
     let module = Module::from_blob(&engine, &blob).unwrap();
     let mut linker = Linker::new(&engine);
@@ -145,4 +213,10 @@ fn trapping_from_hostcall_handler_works() {
         .unwrap()
         .call(&mut Kind::Trap, &[Val::from(1), Val::from(10)]);
     assert!(matches!(result, Err(ExecutionError::Trap(..))));
+}
+
+run_tests! {
+    caller_and_caller_ref_work
+    caller_split_works
+    trapping_from_hostcall_handler_works
 }
