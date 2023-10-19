@@ -385,18 +385,21 @@ unsafe fn child_main(zygote_memfd: Fd, child_socket: Fd, uid_map: &str, gid_map:
     fd.close()?;
     proc_self.close()?;
 
-    if zygote_memfd.raw() == STDIN_FILENO {
-        // This should never happen in practice, but can in theory if the user closes STDIN manually.
-        return Err(Error::from_str("internal error: zygote memfd was allocated as STDIN"));
+    // This should never happen in practice, but can in theory if the user closes stdin or stderr manually.
+    // TODO: Actually support this?
+    for fd in [zygote_memfd.raw(), child_socket.raw()].into_iter().chain(logging_pipe.as_ref().map(|fd| fd.raw())) {
+        if fd == STDIN_FILENO {
+            return Err(Error::from_str("internal error: fd overlaps with stdin"));
+        }
+
+        if fd == STDERR_FILENO {
+            return Err(Error::from_str("internal error: fd overlaps with stderr"));
+        }
     }
 
     // Replace the stdin fd (which we don't need).
-    if child_socket.raw() != STDIN_FILENO {
-        linux_raw::sys_dup3(child_socket.raw(), STDIN_FILENO, 0)?;
-        child_socket.close()?;
-    } else {
-        child_socket.leak();
-    }
+    linux_raw::sys_dup3(child_socket.raw(), STDIN_FILENO, 0)?;
+    child_socket.close()?;
 
     // Clean up any file descriptors which might have been opened by the host process.
     let mut fds_to_keep = [core::ffi::c_int::MAX; 3];
@@ -404,13 +407,8 @@ unsafe fn child_main(zygote_memfd: Fd, child_socket: Fd, uid_map: &str, gid_map:
         let mut index = 1;
         fds_to_keep[0] = STDIN_FILENO;
         if let Some(logging_pipe) = logging_pipe {
-            if logging_pipe.raw() != STDERR_FILENO {
-                linux_raw::sys_dup3(logging_pipe.raw(), STDERR_FILENO, 0)?;
-                logging_pipe.close()?;
-            } else {
-                logging_pipe.leak();
-            }
-
+            linux_raw::sys_dup3(logging_pipe.raw(), STDERR_FILENO, 0)?;
+            logging_pipe.close()?;
             fds_to_keep[index] = STDERR_FILENO;
             index += 1;
         }
@@ -708,7 +706,7 @@ impl super::Sandbox for Sandbox {
         let sigset = Sigmask::block_all_signals()?;
         let zygote_memfd = prepare_zygote()?;
         let (vmctx_memfd, vmctx_mmap) = prepare_vmctx()?;
-        let (socket, child_socket) = linux_raw::sys_socketpair(linux_raw::AF_UNIX, linux_raw::SOCK_SEQPACKET, 0)?;
+        let (socket, child_socket) = linux_raw::sys_socketpair(linux_raw::AF_UNIX, linux_raw::SOCK_SEQPACKET | linux_raw::SOCK_CLOEXEC, 0)?;
 
         let sandbox_flags = linux_raw::CLONE_NEWCGROUP as u64
             | linux_raw::CLONE_NEWIPC as u64
