@@ -6,4 +6,4 @@ publish = false
 
 [dependencies]
 env_logger = { version = "0.10.0", default-features = false }
-polkavm = { path = "../../../crates/polkavm" }
+polkavm = { path = "../../crates/polkavm" }

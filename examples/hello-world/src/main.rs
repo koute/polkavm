@@ -3,7 +3,7 @@ use polkavm::{Config, Engine, Linker, Module, ProgramBlob, Val};
 fn main() {
     env_logger::init();
 
-    let raw_blob = include_bytes!("guest.polkavm");
+    let raw_blob = include_bytes!("../../../guest-programs/output/example-hello-world.polkavm");
     let blob = ProgramBlob::parse(&raw_blob[..]).unwrap();
 
     let config = Config::from_env().unwrap();

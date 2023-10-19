@@ -8,5 +8,5 @@ debug = true
 [workspace]
 resolver = "2"
 members = [
-    "hello-world"
+    "example-hello-world"
 ]
