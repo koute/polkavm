@@ -26,8 +26,8 @@ PolkaVM is a general purpose user-level RISC-V based virtual machine.
 ## Non-goals
 
 - System level emulation. This VM will never be able to run a normal operating system.
-- Full support for architectures other than amd64 (also known as x86_64) and aarch64 (also known as arm64). Anything else will run in an interpreted mode.
-- Full support for operating systems other than Linux, macOS and Windows. On any other OS the VM will run in an interpreted mode.
+- Full support for architectures in addition to amd64 (also known as x86_64) and aarch64 (also known as arm64). Anything else will run in an interpreted mode.
+- Full support for operating systems in addition to Linux, macOS and Windows. On any other OS the VM will run in an interpreted mode.
 - Floating point support, SIMD, and other more niche RISC-V extensions. These could be added as an opt-in feature in the future if necessary, but this is not currently planned.
 - Support for full 32-register RISC-V ISA. This VM currently only targets the RV32EM.
 
