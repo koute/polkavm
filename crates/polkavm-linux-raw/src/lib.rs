@@ -510,6 +510,7 @@ pub const STDERR_FILENO: c_int = 2;
 pub const AF_UNIX: u32 = 1;
 pub const SOCK_STREAM: u32 = 1;
 pub const SOCK_SEQPACKET: u32 = 5;
+pub const SOCK_CLOEXEC: u32 = 0x80000;
 pub const SOL_SOCKET: c_int = 1;
 pub const SCM_RIGHTS: c_int = 1;
 pub const MSG_NOSIGNAL: u32 = 0x4000;
