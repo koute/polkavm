@@ -16,6 +16,8 @@ jobs:
     - uses: actions/checkout@v4
     - name: Install LLD
       run: sudo apt-get install -y lld
+    - name: Install target -- riscv32em-unknown-none-elf
+      run: ./ci/jobs/detect-or-install-riscv-toolchain.sh
     - name: Install target -- i686-unknown-linux-musl
       run: rustup target add i686-unknown-linux-musl
     - name: Install target -- x86_64-unknown-freebsd

@@ -12,9 +12,10 @@ cd crates/polkavm-zygote
 cargo fmt --check --all
 cd ../..
 
-if [ "${CI_RV32E_TOOLCHAIN_AVAILABLE:-}" == 1 ]; then
+source ./ci/jobs/detect-or-install-riscv-toolchain.sh
+if [ "${RV32E_TOOLCHAIN:-}" != "" ]; then
     echo ">> cargo fmt (guests)"
     cd guest-programs
-    cargo fmt --check --all
+    rustup run $RV32E_TOOLCHAIN cargo fmt --check --all
     cd ../..
 fi
