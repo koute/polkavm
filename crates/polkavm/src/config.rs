@@ -163,6 +163,11 @@ impl Config {
         self
     }
 
+    /// Gets the currently set backend, if any.
+    pub fn backend(&self) -> Option<BackendKind> {
+        self.backend
+    }
+
     /// Forces the use of a given sandbox.
     ///
     /// Default: `None` (automatically pick the best available sandbox)
@@ -171,6 +176,11 @@ impl Config {
     pub fn set_sandbox(&mut self, sandbox: Option<SandboxKind>) -> &mut Self {
         self.sandbox = sandbox;
         self
+    }
+
+    /// Gets the currently set sandbox, if any.
+    pub fn sandbox(&self) -> Option<SandboxKind> {
+        self.sandbox
     }
 
     /// Enables execution tracing.
@@ -183,6 +193,11 @@ impl Config {
     pub fn set_trace_execution(&mut self, value: bool) -> &mut Self {
         self.trace_execution = value;
         self
+    }
+
+    /// Returns whether the execution tracing is enabled.
+    pub fn trace_execution(&self) -> bool {
+        self.trace_execution
     }
 
     /// Enabling this makes it possible to enable other settings
