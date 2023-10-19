@@ -687,9 +687,6 @@ where
 }
 
 pub trait FuncArgs: Send {
-    // #[doc(hidden)]
-    // const _PRIVATE_ARG_COUNT: usize;
-
     #[doc(hidden)]
     const _PRIVATE_EXTERN_TY: &'static [ExternTy];
 
