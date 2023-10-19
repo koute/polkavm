@@ -13,8 +13,8 @@ RUSTFLAGS="-D warnings" cargo clippy --all
 cd ../..
 
 if [ "${CI_RV32E_TOOLCHAIN_AVAILABLE:-}" == 1 ]; then
-    echo ">> cargo clippy (example guests)"
-    cd examples/guests
+    echo ">> cargo clippy (guests)"
+    cd guest-programs
     RUSTFLAGS="-D warnings" cargo clippy --all
     cd ../..
 fi

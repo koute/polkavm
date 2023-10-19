@@ -1,0 +1,8 @@
+[package]
+name = "example-hello-world"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[dependencies]
+polkavm-derive = { path = "../../crates/polkavm-derive" }

@@ -70,7 +70,7 @@ mod tests {
     use std::rc::Rc;
 
     // TODO: Add a dedicated test blob.
-    const RAW_BLOB: &[u8] = include_bytes!("../../../examples/hosts/hello-world/src/guest.polkavm");
+    const RAW_BLOB: &[u8] = include_bytes!("../../../guest-programs/output/example-hello-world.polkavm");
 
     #[test]
     fn caller_and_caller_ref_work() {

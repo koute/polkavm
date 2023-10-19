@@ -3,7 +3,7 @@
 version = 3
 
 [[package]]
-name = "hello-world-guest"
+name = "example-hello-world"
 version = "0.1.0"
 dependencies = [
  "polkavm-derive",
