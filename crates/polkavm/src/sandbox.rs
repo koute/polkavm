@@ -62,7 +62,7 @@ pub trait Sandbox: Sized {
     type Access<'r>: Access<'r> + Into<BackendAccess<'r>> where Self: 'r;
     type Config: SandboxConfig;
     type Error: core::fmt::Debug + core::fmt::Display;
-    type Program;
+    type Program: Clone;
     type AddressSpace: SandboxAddressSpace;
 
     fn reserve_address_space() -> Result<Self::AddressSpace, Self::Error>;

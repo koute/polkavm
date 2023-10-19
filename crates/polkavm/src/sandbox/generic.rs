@@ -514,6 +514,7 @@ pub extern "C" fn handle_trace(guest_memory: *mut c_void, instruction_number: u3
     }
 }
 
+#[derive(Clone)]
 pub struct SandboxProgram(Arc<SandboxProgramInner>);
 
 struct SandboxProgramInner {

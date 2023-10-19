@@ -21,6 +21,7 @@ use core::ffi::{c_int, c_uint};
 use core::sync::atomic::Ordering;
 use linux_raw::{abort, cstr, syscall_readonly, Fd, Mmap, STDERR_FILENO, STDIN_FILENO};
 use std::time::Instant;
+use std::sync::Arc;
 
 use super::{OnHostcall, SandboxKind, SandboxProgramInit, get_native_page_size};
 use crate::api::{BackendAccess, MemoryAccessError};
@@ -485,7 +486,10 @@ unsafe fn child_main(zygote_memfd: Fd, child_socket: Fd, uid_map: &str, gid_map:
     Ok(())
 }
 
-pub struct SandboxProgram {
+#[derive(Clone)]
+pub struct SandboxProgram(Arc<SandboxProgramInner>);
+
+struct SandboxProgramInner {
     memfd: Fd,
     memory_config: SandboxMemoryConfig,
     sysreturn_address: u64,
@@ -693,11 +697,11 @@ impl super::Sandbox for Sandbox {
             },
         )?;
 
-        Ok(SandboxProgram {
+        Ok(SandboxProgram(Arc::new(SandboxProgramInner {
             memfd,
             memory_config: cfg,
             sysreturn_address: init.sysreturn_address,
-        })
+        })))
     }
 
     fn spawn(config: &SandboxConfig) -> Result<Self, Error> {
@@ -947,8 +951,8 @@ impl super::Sandbox for Sandbox {
             *self.vmctx().rpc_address.get() = args.rpc_address;
             *self.vmctx().rpc_flags.get() = args.rpc_flags;
             if let Some(program) = args.program {
-                *self.vmctx().new_memory_config.get() = program.memory_config;
-                *self.vmctx().new_sysreturn_address.get() = program.sysreturn_address;
+                *self.vmctx().new_memory_config.get() = program.0.memory_config;
+                *self.vmctx().new_sysreturn_address.get() = program.0.sysreturn_address;
             }
 
             (*self.vmctx().regs().get()).copy_from_slice(args.initial_regs);
@@ -957,7 +961,7 @@ impl super::Sandbox for Sandbox {
 
             if let Some(program) = args.program {
                 // TODO: This can block forever.
-                linux_raw::sendfd(self.socket.borrow(), program.memfd.borrow())?;
+                linux_raw::sendfd(self.socket.borrow(), program.0.memfd.borrow())?;
             }
         }
 
