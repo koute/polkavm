@@ -12,9 +12,10 @@ cd crates/polkavm-zygote
 RUSTFLAGS="-D warnings" cargo clippy --all
 cd ../..
 
-if [ "${CI_RV32E_TOOLCHAIN_AVAILABLE:-}" == 1 ]; then
+source ./ci/jobs/detect-or-install-riscv-toolchain.sh
+if [ "${RV32E_TOOLCHAIN:-}" != "" ]; then
     echo ">> cargo clippy (guests)"
     cd guest-programs
-    RUSTFLAGS="-D warnings" cargo clippy --all
+    RUSTFLAGS="-D warnings" rustup run $RV32E_TOOLCHAIN cargo clippy --all
     cd ../..
 fi
