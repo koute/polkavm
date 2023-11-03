@@ -1,6 +1,6 @@
 #![allow(clippy::unusual_byte_groupings)]
 
-#[derive(Copy, Clone, PartialEq, Eq, Debug, Hash)]
+#[derive(Copy, Clone, PartialEq, Eq, PartialOrd, Ord, Debug, Hash)]
 #[repr(u8)]
 pub enum Reg {
     Zero = 0,
@@ -35,6 +35,23 @@ pub enum Reg {
     T4,
     T5,
     T6,
+}
+
+impl Reg {
+    pub const NAMES: &'static [&'static str] = &[
+        "zero", "ra", "sp", "gp", "tp", "t0", "t1", "t2", "s0", "s1", "a0", "a1", "a2", "a3", "a4", "a5", "a6", "a7", "s2", "s3", "s4",
+        "s5", "s6", "s7", "s8", "s9", "s10", "s11", "t3", "t4", "t5", "t6",
+    ];
+
+    pub fn name(self) -> &'static str {
+        Self::NAMES[self as usize]
+    }
+}
+
+impl core::fmt::Display for Reg {
+    fn fmt(&self, fmt: &mut core::fmt::Formatter) -> core::fmt::Result {
+        fmt.write_str(self.name())
+    }
 }
 
 #[derive(Copy, Clone, PartialEq, Eq, Debug, Hash)]
