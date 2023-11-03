@@ -937,9 +937,11 @@ where
 {
     for child in &mut inlined.inlined {
         let Some(namespace) = subprogram_offset_to_namespace.get(&inlined.abstract_origin) else {
-            return Err(ProgramFromElfError::other(
-                "failed to process DWARF: inline subroutine found with no corresponding subprogram",
-            ));
+            return Err(ProgramFromElfError::other(format!(
+                "failed to process DWARF: inline subroutine '{}' found with no corresponding subprogram (abstract origin = {:?})",
+                inlined.function_name.as_deref().unwrap_or(""),
+                inlined.abstract_origin
+            )));
         };
 
         child.namespace = namespace.clone();
