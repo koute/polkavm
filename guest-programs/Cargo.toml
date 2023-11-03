@@ -8,5 +8,10 @@ debug = true
 [workspace]
 resolver = "2"
 members = [
-    "example-hello-world"
+    # Examples:
+    "example-hello-world",
+
+    # Benchmarks:
+    "bench-pinky",
+    "bench-prime-sieve",
 ]

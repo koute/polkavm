@@ -1,0 +1,19 @@
+[package]
+name = "bench-pinky"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[lib]
+name = "bench_pinky"
+path = "src/main.rs"
+crate-type = ["cdylib"]
+
+[[bin]]
+name = "bench-pinky"
+path = "src/main.rs"
+
+[dependencies]
+polkavm-derive = { path = "../../crates/polkavm-derive" }
+simplealloc = { path = "../../crates/simplealloc" }
+nes = { git = "https://github.com/koute/pinky.git", rev = "1a557db8867c253cc50a38655e764abcc737fa9b", default-features = false, features = ["softfloat"] }

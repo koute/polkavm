@@ -8,6 +8,9 @@ members = [
     "crates/polkavm-linux-raw",
     "crates/polkavm",
 
+    "crates/simplealloc",
+
+    "tools/benchtool",
     "tools/polkatool",
     "tools/polkavm-linux-raw-generate",
 
