@@ -18,8 +18,10 @@ use super::ExecuteArgs;
 pub use linux_raw::Error;
 
 use core::ffi::{c_int, c_uint};
+use core::ops::Range;
 use core::sync::atomic::Ordering;
 use linux_raw::{abort, cstr, syscall_readonly, Fd, Mmap, STDERR_FILENO, STDIN_FILENO};
+use std::borrow::Cow;
 use std::time::Instant;
 use std::sync::Arc;
 
@@ -491,6 +493,31 @@ struct SandboxProgramInner {
     memfd: Fd,
     memory_config: SandboxMemoryConfig,
     sysreturn_address: u64,
+    code_range: Range<usize>,
+}
+
+impl super::SandboxProgram for SandboxProgram {
+    fn machine_code(&self) -> Cow<[u8]> {
+        // The code is kept inside of the memfd and we don't have it readily accessible.
+        // So if necessary just read it back from the memfd.
+        let mut buffer = Vec::new();
+        buffer.resize(self.0.code_range.len(), 0);
+        linux_raw::sys_lseek(self.0.memfd.borrow(), self.0.code_range.start as i64, linux_raw::SEEK_SET).expect("failed to get machine code of the program: seek failed");
+
+        let mut position = 0;
+        while position < self.0.code_range.len() {
+            let count = match linux_raw::sys_read(self.0.memfd.borrow(), &mut buffer[position..]) {
+                Ok(count) => count,
+                Err(error) if error.errno() == linux_raw::EINTR => continue,
+                Err(error) => panic!("failed to get machine code of the program: read failed: {error}")
+            };
+
+            assert_ne!(count, 0);
+            position += count as usize;
+        }
+
+        Cow::Owned(buffer)
+    }
 }
 
 #[derive(Clone, PartialEq, Eq, Hash, Debug)]
@@ -672,6 +699,7 @@ impl super::Sandbox for Sandbox {
     fn prepare_program(init: SandboxProgramInit, _: Self::AddressSpace) -> Result<Self::Program, Self::Error> {
         let native_page_size = get_native_page_size();
         let cfg = init.memory_config(native_page_size)?;
+        let mut code_range = 0..0;
         let memfd = prepare_sealed_memfd(
             cstr!("polkavm_program"),
             cfg.ro_data_size() as usize + cfg.rw_data_size() as usize + cfg.code_size() + cfg.jump_table_size(),
@@ -690,6 +718,8 @@ impl super::Sandbox for Sandbox {
 
                 append!(init.ro_data(), cfg.ro_data_size());
                 append!(init.rw_data(), cfg.rw_data_size());
+
+                code_range = offset..offset + init.code.len();
                 append!(init.code, cfg.code_size());
                 append!(init.jump_table, cfg.jump_table_size());
             },
@@ -699,6 +729,7 @@ impl super::Sandbox for Sandbox {
             memfd,
             memory_config: cfg,
             sysreturn_address: init.sysreturn_address,
+            code_range,
         })))
     }
 

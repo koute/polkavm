@@ -1,3 +1,4 @@
+use std::borrow::Cow;
 use std::collections::BTreeMap;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -424,6 +425,19 @@ impl Module {
     /// The address at where the program's stack ends inside of the VM.
     pub fn stack_address_high(&self) -> u32 {
         self.0.memory_config.stack_address_high()
+    }
+
+    /// The raw machine code of the compiled module.
+    ///
+    /// Will return `None` when running under an interpreter.
+    /// Mostly only useful for debugging.
+    pub fn machine_code(&self) -> Option<Cow<[u8]>> {
+        match self.0.compiled_module {
+            #[cfg(target_os = "linux")]
+            CompiledModuleKind::Linux(ref module) => Some(module.machine_code()),
+            CompiledModuleKind::Generic(ref module) => Some(module.machine_code()),
+            CompiledModuleKind::Unavailable => None,
+        }
     }
 
     pub(crate) fn debug_print_location(&self, log_level: log::Level, pc: u32) {
