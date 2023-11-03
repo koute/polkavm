@@ -10,4 +10,7 @@ description = "A swiss knife toolkit for PolkaVM"
 [dependencies]
 clap = { workspace = true, features = ["derive"] }
 env_logger = { workspace = true }
+iced-x86 = { workspace = true, features = ["code_asm"] }
+polkavm = { workspace = true }
+polkavm-common = { workspace = true }
 polkavm-linker = { workspace = true }
