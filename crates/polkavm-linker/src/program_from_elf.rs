@@ -3229,8 +3229,11 @@ pub fn program_from_elf(config: Config, data: &[u8]) -> Result<ProgramBlob, Prog
                     assert_eq!(actual.namespace().unwrap(), expected.namespace.as_deref());
                     assert_eq!(actual.function_name_without_namespace().unwrap(), expected.function_name.as_deref());
                     assert_eq!(
-                        actual.path().unwrap(),
-                        expected.source_code_location.as_ref().map(|location| &**location.path())
+                        actual.path().unwrap().map(Cow::Borrowed),
+                        expected
+                            .source_code_location
+                            .as_ref()
+                            .map(|location| simplify_path(location.path()))
                     );
                     assert_eq!(
                         actual.line(),
@@ -3330,6 +3333,17 @@ impl Writer {
     }
 }
 
+fn simplify_path(path: &str) -> Cow<str> {
+    // TODO: Sanitize macOS and Windows paths.
+    if let Some(p) = path.strip_prefix("/home/") {
+        if let Some(index) = p.bytes().position(|byte| byte == b'/') {
+            return format!("~{}", &p[index..]).into();
+        }
+    }
+
+    path.into()
+}
+
 fn emit_debug_info(writer: &mut Writer, locations_for_instruction: &[Option<Arc<[Location]>>]) {
     #[derive(Default)]
     struct DebugStringsBuilder<'a> {
@@ -3359,17 +3373,6 @@ fn emit_debug_info(writer: &mut Writer, locations_for_instruction: &[Option<Arc<
         fn dedup(&mut self, s: &'a str) -> u32 {
             self.dedup_cow(s.into())
         }
-    }
-
-    fn simplify_path(path: &str) -> Cow<str> {
-        // TODO: Sanitize macOS and Windows paths.
-        if let Some(p) = path.strip_prefix("/home/") {
-            if let Some(index) = p.bytes().position(|byte| byte == b'/') {
-                return format!("~{}", &p[index..]).into();
-            }
-        }
-
-        path.into()
     }
 
     let mut dbg_strings = DebugStringsBuilder::default();
@@ -3563,14 +3566,17 @@ fn emit_debug_info(writer: &mut Writer, locations_for_instruction: &[Option<Arc<
                 state.set_stack_depth(writer, locations.len());
 
                 for (depth, location) in locations.iter().enumerate() {
-                    let new_path = location.source_code_location.as_ref().map(|location| location.path());
+                    let new_path = location
+                        .source_code_location
+                        .as_ref()
+                        .map(|location| simplify_path(location.path()));
                     let new_line = location.source_code_location.as_ref().and_then(|location| location.line());
                     let new_column = location.source_code_location.as_ref().and_then(|location| location.column());
 
                     let changed_kind = state.stack[depth].kind != Some(location.kind);
                     let changed_namespace = state.stack[depth].namespace != location.namespace;
                     let changed_function_name = state.stack[depth].function_name != location.function_name;
-                    let changed_path = state.stack[depth].path.as_ref() != new_path;
+                    let changed_path = state.stack[depth].path.as_deref().map(Cow::Borrowed) != new_path;
                     let changed_line = state.stack[depth].line != new_line;
                     let changed_column = state.stack[depth].column != new_column;
 
@@ -3614,12 +3620,19 @@ fn emit_debug_info(writer: &mut Writer, locations_for_instruction: &[Option<Arc<
                     if changed_path {
                         state.set_mutation_depth(writer, depth);
                         writer.push_byte(LineProgramOp::SetPath as u8);
-                        state.stack[depth].path = location.source_code_location.as_ref().map(|location| location.path().clone());
+                        state.stack[depth].path =
+                            location
+                                .source_code_location
+                                .as_ref()
+                                .map(|location| match simplify_path(location.path()) {
+                                    Cow::Borrowed(_) => location.path().clone(),
+                                    Cow::Owned(path) => path.into(),
+                                });
 
                         let path_offset = location
                             .source_code_location
                             .as_ref()
-                            .map(|location| dbg_strings.dedup(location.path()))
+                            .map(|location| dbg_strings.dedup_cow(simplify_path(location.path())))
                             .unwrap_or(empty_string_id);
                         writer.push_varint(path_offset);
                     }
