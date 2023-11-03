@@ -1385,10 +1385,7 @@ where
         let mut current_subprogram = None;
         let mut current_inlined = Vec::new();
         match node_tag {
-            gimli::DW_TAG_structure_type | gimli::DW_TAG_enumeration_type => {
-                return Ok(Default::default());
-            }
-            gimli::DW_TAG_namespace => {
+            gimli::DW_TAG_namespace | gimli::DW_TAG_structure_type | gimli::DW_TAG_enumeration_type => {
                 let mut attrs = node_entry.attrs();
                 while let Some(attribute) = attrs.next()? {
                     #[allow(clippy::single_match)]
