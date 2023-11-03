@@ -53,3 +53,6 @@ hashbrown = { opt-level = 3 }
 gimli = { opt-level = 3 }
 image = { opt-level = 3 }
 ruzstd = { opt-level = 3 }
+
+# To speed up the tests.
+polkavm-assembler = { opt-level = 3 }
