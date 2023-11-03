@@ -21,6 +21,7 @@ use core::ops::Range;
 use core::cell::UnsafeCell;
 use core::sync::atomic::{AtomicUsize, Ordering};
 use core::mem::MaybeUninit;
+use std::borrow::Cow;
 use std::sync::Arc;
 
 use super::{OnHostcall, SandboxKind, SandboxProgramInit, get_native_page_size};
@@ -522,8 +523,14 @@ struct SandboxProgramInner {
     ro_data: Vec<u8>,
     rw_data: Vec<u8>,
 
-    #[allow(dead_code)]
     code_memory: Mmap,
+    code_length: usize,
+}
+
+impl super::SandboxProgram for SandboxProgram {
+    fn machine_code(&self) -> Cow<[u8]> {
+        Cow::Borrowed(&self.0.code_memory.as_slice()[..self.0.code_length])
+    }
 }
 
 enum Poison {
@@ -934,6 +941,7 @@ impl super::Sandbox for Sandbox {
             ro_data: init.ro_data().to_vec(),
             rw_data: init.rw_data().to_vec(),
             code_memory: map,
+            code_length: init.code.len(),
         })))
     }
 

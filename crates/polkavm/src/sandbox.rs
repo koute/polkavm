@@ -1,3 +1,5 @@
+use std::borrow::Cow;
+
 use polkavm_common::{
     abi::VM_PAGE_SIZE,
     error::{ExecutionError, Trap},
@@ -56,13 +58,17 @@ pub trait SandboxAddressSpace {
     fn native_code_address(&self) -> u64;
 }
 
+pub trait SandboxProgram: Clone {
+    fn machine_code(&self) -> Cow<[u8]>;
+}
+
 pub trait Sandbox: Sized {
     const KIND: SandboxKind;
 
     type Access<'r>: Access<'r> + Into<BackendAccess<'r>> where Self: 'r;
     type Config: SandboxConfig;
     type Error: core::fmt::Debug + core::fmt::Display;
-    type Program: Clone;
+    type Program: SandboxProgram;
     type AddressSpace: SandboxAddressSpace;
 
     fn reserve_address_space() -> Result<Self::AddressSpace, Self::Error>;

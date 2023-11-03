@@ -1,3 +1,4 @@
+use std::borrow::Cow;
 use std::collections::HashMap;
 
 use polkavm_assembler::{Assembler, Label};
@@ -11,7 +12,7 @@ use polkavm_common::zygote::{
 use crate::api::{BackendAccess, ExecutionConfig, Module, OnHostcall, AsCompiledModule};
 use crate::error::{bail, Error};
 
-use crate::sandbox::{Sandbox, SandboxConfig, SandboxProgramInit, ExecuteArgs};
+use crate::sandbox::{Sandbox, SandboxConfig, SandboxProgram, SandboxProgramInit, ExecuteArgs};
 use crate::config::SandboxKind;
 
 #[cfg(target_arch = "x86_64")]
@@ -255,6 +256,10 @@ impl<S> CompiledModule<S> where S: Sandbox {
             sandbox_program,
             export_trampolines,
         })
+    }
+
+    pub fn machine_code(&self) -> Cow<[u8]> {
+        self.sandbox_program.machine_code()
     }
 }
 
