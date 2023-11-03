@@ -506,27 +506,27 @@ impl<'a> InstructionVisitor for core::fmt::Formatter<'a> {
     }
 
     fn branch_less_unsigned(&mut self, s1: Reg, s2: Reg, imm: u32) -> Self::ReturnTy {
-        write!(self, "if {} <u {} -> jump @{:x}", s1, s2, imm * 4)
+        write!(self, "if {} <u {}: jump @{:x}", s1, s2, imm * 4)
     }
 
     fn branch_less_signed(&mut self, s1: Reg, s2: Reg, imm: u32) -> Self::ReturnTy {
-        write!(self, "if {} <s {} -> jump @{:x}", s1, s2, imm * 4)
+        write!(self, "if {} <s {}: jump @{:x}", s1, s2, imm * 4)
     }
 
     fn branch_greater_or_equal_unsigned(&mut self, s1: Reg, s2: Reg, imm: u32) -> Self::ReturnTy {
-        write!(self, "if {} >=u {} -> jump @{:x}", s1, s2, imm * 4)
+        write!(self, "if {} >=u {}: jump @{:x}", s1, s2, imm * 4)
     }
 
     fn branch_greater_or_equal_signed(&mut self, s1: Reg, s2: Reg, imm: u32) -> Self::ReturnTy {
-        write!(self, "if {} >=s {} -> jump @{:x}", s1, s2, imm * 4)
+        write!(self, "if {} >=s {}: jump @{:x}", s1, s2, imm * 4)
     }
 
     fn branch_eq(&mut self, s1: Reg, s2: Reg, imm: u32) -> Self::ReturnTy {
-        write!(self, "if {} == {} -> jump @{:x}", s1, s2, imm * 4)
+        write!(self, "if {} == {}: jump @{:x}", s1, s2, imm * 4)
     }
 
     fn branch_not_eq(&mut self, s1: Reg, s2: Reg, imm: u32) -> Self::ReturnTy {
-        write!(self, "if {} != {} -> jump @{:x}", s1, s2, imm * 4)
+        write!(self, "if {} != {}: jump @{:x}", s1, s2, imm * 4)
     }
 
     fn jump_and_link_register(&mut self, ra: Reg, base: Reg, offset: u32) -> Self::ReturnTy {
