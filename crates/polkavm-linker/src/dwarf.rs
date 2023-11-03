@@ -1095,23 +1095,29 @@ where
         }
 
         let mut location_map: HashMap<SectionTarget, Arc<[Location]>> = HashMap::new();
-        for (subprograms, lines) in subprograms_for_unit.into_iter().zip(lines_for_unit.into_iter()) {
-            if !lines
-                .iter()
-                .all(|entry| entry.target.section_index == lines[0].target.section_index)
-            {
-                return Err(ProgramFromElfError::other(
-                    "failed to process DWARF: inconsistent target section in line program entries",
-                ));
+        for (subprograms, all_lines) in subprograms_for_unit.into_iter().zip(lines_for_unit.into_iter()) {
+            let mut lines_for_section: HashMap<SectionIndex, Vec<&LineEntry>> = HashMap::new();
+            for entry in &all_lines {
+                lines_for_section
+                    .entry(entry.target.section_index)
+                    .or_insert_with(Vec::new)
+                    .push(entry);
             }
 
-            let line_boundaries: Vec<u64> = lines.iter().map(|entry| entry.target.offset).collect();
-            let line_ranges = line_boundaries.windows(2).map(|w| w[0]..w[1]);
-            let line_range_map: RangeMap<LineEntry> = line_ranges.zip(lines.into_iter()).collect();
+            let line_range_map_for_section: HashMap<SectionIndex, RangeMap<&LineEntry>> = lines_for_section
+                .into_iter()
+                .map(|(section_index, local_lines)| {
+                    let line_boundaries: Vec<u64> = local_lines.iter().map(|entry| entry.target.offset).collect();
+                    let line_ranges = line_boundaries.windows(2).map(|w| w[0]..w[1]);
+                    let line_range_map: RangeMap<&LineEntry> = line_ranges.zip(local_lines.into_iter()).collect();
+                    (section_index, line_range_map)
+                })
+                .collect();
 
             for subprogram in subprograms {
                 let source = subprogram.sources[0];
                 let section_index = source.section_index;
+                let line_range_map = line_range_map_for_section.get(&section_index).unwrap();
                 log::trace!("  Frame: {}", source);
 
                 let mut map: LocationsForOffset<R> = BTreeMap::new();
