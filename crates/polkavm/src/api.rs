@@ -313,6 +313,7 @@ impl Module {
         };
 
         let selected_backend = engine.config.backend.unwrap_or(default_backend);
+        log::debug!("Selected backend: '{selected_backend}'");
 
         let compiler_enabled = selected_backend == BackendKind::Compiler;
         let interpreter_enabled = debug_trace_execution || selected_backend == BackendKind::Interpreter;
@@ -327,6 +328,8 @@ impl Module {
                     };
 
                     let selected_sandbox = engine.config.sandbox.unwrap_or(default_sandbox);
+                    log::debug!("Selected sandbox: '{selected_sandbox}'");
+
                     match selected_sandbox {
                         SandboxKind::Linux => {
                             #[cfg(target_os = "linux")]
@@ -337,6 +340,7 @@ impl Module {
 
                             #[cfg(not(target_os = "linux"))]
                             {
+                                log::debug!("Selected sandbox unavailable!");
                                 CompiledModuleKind::Unavailable
                             }
                         },
@@ -360,6 +364,12 @@ impl Module {
         };
 
         assert!(compiled_module.is_some() || interpreted_module.is_some());
+
+        if compiled_module.is_some() {
+            log::debug!("Backend used: 'compiled'");
+        } else {
+            log::debug!("Backend used: 'interpreted'");
+        }
 
         let export_index_by_name = exports
             .iter()
