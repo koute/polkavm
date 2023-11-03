@@ -1188,8 +1188,7 @@ impl<'a> InstructionVisitor for Compiler<'a> {
             (_, _, _) if d == s => self.push(add((conv_reg(d), imm32(imm)))),
             // d = s + imm
             (_, _, _) => {
-                self.mov(d, s);
-                self.push(add((conv_reg(d), imm32(imm))));
+                self.push(lea(self.reg_size(), conv_reg(d), reg_indirect(self.reg_size(), conv_reg(s) + imm as i32)));
             }
         }
 
