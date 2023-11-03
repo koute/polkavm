@@ -507,6 +507,9 @@ version = "0.2.0"
 dependencies = [
  "clap",
  "env_logger",
+ "iced-x86",
+ "polkavm",
+ "polkavm-common",
  "polkavm-linker",
 ]
 
