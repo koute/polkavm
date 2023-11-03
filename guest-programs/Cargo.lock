@@ -3,10 +3,72 @@
 version = 3
 
 [[package]]
+name = "bench-pinky"
+version = "0.1.0"
+dependencies = [
+ "nes",
+ "polkavm-derive",
+ "simplealloc",
+]
+
+[[package]]
+name = "bench-prime-sieve"
+version = "0.1.0"
+dependencies = [
+ "helper-macros",
+ "polkavm-derive",
+ "simplealloc",
+ "softfloat",
+]
+
+[[package]]
+name = "bitflags"
+version = "2.4.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "327762f6e5a765692301e5bb513e0d9fef63be86bbc14528052b1cd3e6f03e07"
+
+[[package]]
+name = "emumisc"
+version = "0.1.0"
+source = "git+https://github.com/koute/pinky.git?rev=1a557db8867c253cc50a38655e764abcc737fa9b#1a557db8867c253cc50a38655e764abcc737fa9b"
+dependencies = [
+ "unreachable",
+]
+
+[[package]]
 name = "example-hello-world"
 version = "0.1.0"
 dependencies = [
  "polkavm-derive",
+]
+
+[[package]]
+name = "helper-macros"
+version = "0.1.0"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn 1.0.109",
+]
+
+[[package]]
+name = "mos6502"
+version = "0.1.0"
+source = "git+https://github.com/koute/pinky.git?rev=1a557db8867c253cc50a38655e764abcc737fa9b#1a557db8867c253cc50a38655e764abcc737fa9b"
+dependencies = [
+ "bitflags",
+ "emumisc",
+]
+
+[[package]]
+name = "nes"
+version = "0.1.0"
+source = "git+https://github.com/koute/pinky.git?rev=1a557db8867c253cc50a38655e764abcc737fa9b#1a557db8867c253cc50a38655e764abcc737fa9b"
+dependencies = [
+ "bitflags",
+ "emumisc",
+ "mos6502",
+ "softfloat",
 ]
 
 [[package]]
@@ -18,7 +80,7 @@ name = "polkavm-derive"
 version = "0.2.0"
 dependencies = [
  "polkavm-derive-impl",
- "syn",
+ "syn 2.0.38",
 ]
 
 [[package]]
@@ -28,7 +90,7 @@ dependencies = [
  "polkavm-common",
  "proc-macro2",
  "quote",
- "syn",
+ "syn 2.0.38",
 ]
 
 [[package]]
@@ -50,10 +112,31 @@ dependencies = [
 ]
 
 [[package]]
-name = "syn"
-version = "2.0.29"
+name = "simplealloc"
+version = "0.2.0"
+
+[[package]]
+name = "softfloat"
+version = "1.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c324c494eba9d92503e6f1ef2e6df781e78f6a7705a0202d9801b198807d518a"
+checksum = "359a2aa2309eed307acc397678f7fbb43989db6ee417a11752248fc98451e696"
+
+[[package]]
+name = "syn"
+version = "1.0.109"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "72b64191b275b66ffe2469e8af2c1cfe3bafa67b529ead792a6d0160888b4237"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "unicode-ident",
+]
+
+[[package]]
+name = "syn"
+version = "2.0.38"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e96b79aaa137db8f61e26363a0c9b47d8b4ec75da28b7d1d614c2303e232408b"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -65,3 +148,18 @@ name = "unicode-ident"
 version = "1.0.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "301abaae475aa91687eb82514b328ab47a211a533026cb25fc3e519b86adfc3c"
+
+[[package]]
+name = "unreachable"
+version = "0.1.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1f2ae5ddb18e1c92664717616dd9549dde73f539f01bd7b77c2edb2446bdff91"
+dependencies = [
+ "void",
+]
+
+[[package]]
+name = "void"
+version = "1.0.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6a02e4885ed3bc0f2de90ea6dd45ebcbb66dacffe03547fadbb0eeae2770887d"

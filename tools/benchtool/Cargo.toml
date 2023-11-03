@@ -1,0 +1,28 @@
+[package]
+name = "benchtool"
+version.workspace = true
+authors.workspace = true
+license.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+publish = false
+
+[dependencies]
+clap = { workspace = true, features = ["derive"] }
+criterion = { version = "0.5.1", default-features = false }
+env_logger = { workspace = true }
+libc = { workspace = true }
+libloading = "0.8.1"
+linux-perf-data = "0.8.2"
+log = { workspace = true }
+polkavm = { workspace = true }
+wasmer = { version = "4.2.2", default-features = false, features = ["std", "singlepass"] }
+pvf-executor = { git = "https://github.com/paritytech/pvf-executor.git", rev = "07194b6f821193c3945c2f66ad496a1f76c01f7a" }
+
+[target.'cfg(not(target_arch = "x86"))'.dependencies]
+wasmtime = { version = "13.0.0", default-features = false, features = ["cranelift"], optional = true }
+
+[features]
+default = ["wasmtime"]
+wasmtime = ["dep:wasmtime"]

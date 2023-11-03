@@ -1,6 +1,8 @@
 use crate::{Caller, CallerRef, Config, Engine, ExecutionError, Linker, Module, ProgramBlob, Reg, Trap, Val};
 use std::cell::RefCell;
+use std::collections::HashMap;
 use std::rc::Rc;
+use std::sync::Mutex;
 
 macro_rules! run_tests {
     ($($test_name:ident)+) => {
@@ -215,20 +217,37 @@ fn trapping_from_hostcall_handler_works(config: Config) {
     assert!(matches!(result, Err(ExecutionError::Trap(..))));
 }
 
+fn decompress_zstd(mut bytes: &[u8]) -> Vec<u8> {
+    use std::io::Read;
+    let mut output = Vec::new();
+    ruzstd::streaming_decoder::StreamingDecoder::new(&mut bytes)
+        .unwrap()
+        .read_to_end(&mut output)
+        .unwrap();
+    output
+}
+
+static BLOB_MAP: Mutex<Option<HashMap<&'static [u8], ProgramBlob>>> = Mutex::new(None);
+
+fn get_blob(elf: &'static [u8]) -> ProgramBlob {
+    let mut blob_map = match BLOB_MAP.lock() {
+        Ok(blob_map) => blob_map,
+        Err(error) => error.into_inner(),
+    };
+
+    let blob_map = blob_map.get_or_insert_with(HashMap::new);
+    blob_map
+        .entry(elf)
+        .or_insert_with(|| {
+            // This is slow, so cache it.
+            let elf = decompress_zstd(elf);
+            let blob = polkavm_linker::program_from_elf(Default::default(), &elf).unwrap();
+            blob.into_owned()
+        })
+        .clone()
+}
+
 fn doom(config: Config, elf: &'static [u8]) {
-    use std::collections::HashMap;
-    use std::sync::Mutex;
-
-    fn decompress_zstd(mut bytes: &[u8]) -> Vec<u8> {
-        use std::io::Read;
-        let mut output = Vec::new();
-        ruzstd::streaming_decoder::StreamingDecoder::new(&mut bytes)
-            .unwrap()
-            .read_to_end(&mut output)
-            .unwrap();
-        output
-    }
-
     if config.backend() == Some(crate::BackendKind::Interpreter) || config.trace_execution() {
         // The interpreter is currently too slow to run doom.
         return;
@@ -240,24 +259,11 @@ fn doom(config: Config, elf: &'static [u8]) {
     }
 
     const DOOM_WAD: &[u8] = include_bytes!("../../../examples/doom/roms/doom1.wad");
-    static DOOM_BLOB_MAP: Mutex<Option<HashMap<&'static [u8], ProgramBlob>>> = Mutex::new(None);
 
     let _ = env_logger::try_init();
-    let mut blob_map = match DOOM_BLOB_MAP.lock() {
-        Ok(blob_map) => blob_map,
-        Err(error) => error.into_inner(),
-    };
-
-    let blob_map = blob_map.get_or_insert_with(HashMap::new);
-    let blob = blob_map.entry(elf).or_insert_with(|| {
-        // This is slow, so cache it.
-        let elf = decompress_zstd(elf);
-        let blob = polkavm_linker::program_from_elf(Default::default(), &elf).unwrap();
-        blob.into_owned()
-    });
-
+    let blob = get_blob(elf);
     let engine = Engine::new(&config).unwrap();
-    let module = Module::from_blob(&engine, blob).unwrap();
+    let module = Module::from_blob(&engine, &blob).unwrap();
     let mut linker = Linker::new(&engine);
 
     struct State {
@@ -380,6 +386,42 @@ fn doom_o3_dwarf2(config: Config) {
     doom(config, include_bytes!("../../../test-data/doom_O3_dwarf2.elf.zst"));
 }
 
+fn pinky(config: Config) {
+    if config.backend() == Some(crate::BackendKind::Interpreter) || config.trace_execution() {
+        // The interpreter is currently too slow to run this.
+        return;
+    }
+
+    let _ = env_logger::try_init();
+    let blob = get_blob(include_bytes!("../../../test-data/bench-pinky.elf.zst"));
+
+    let engine = Engine::new(&config).unwrap();
+    let module = Module::from_blob(&engine, &blob).unwrap();
+    let linker = Linker::new(&engine);
+    let instance_pre = linker.instantiate_pre(&module).unwrap();
+    let instance = instance_pre.instantiate().unwrap();
+    let ext_initialize = instance.get_typed_func::<(), ()>("initialize").unwrap();
+    let ext_run = instance.get_typed_func::<(), ()>("run").unwrap();
+    let ext_get_framebuffer = instance.get_typed_func::<(), u32>("get_framebuffer").unwrap();
+
+    ext_initialize.call(&mut (), ()).unwrap();
+    for _ in 0..256 {
+        ext_run.call(&mut (), ()).unwrap();
+    }
+
+    let address = ext_get_framebuffer.call(&mut (), ()).unwrap();
+    let framebuffer = instance.read_memory_into_new_vec(address, 256 * 240 * 4).unwrap();
+
+    let expected_frame_raw = decompress_zstd(include_bytes!("../../../test-data/pinky_00256.tga.zst"));
+    let expected_frame = image::load_from_memory_with_format(&expected_frame_raw, image::ImageFormat::Tga)
+        .unwrap()
+        .to_rgba8();
+
+    if framebuffer != *expected_frame.as_raw() {
+        panic!("frames doesn't match!");
+    }
+}
+
 run_tests! {
     caller_and_caller_ref_work
     caller_split_works
@@ -387,4 +429,5 @@ run_tests! {
     doom_o3_dwarf5
     doom_o1_dwarf5
     doom_o3_dwarf2
+    pinky
 }

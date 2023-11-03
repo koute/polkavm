@@ -1,0 +1,20 @@
+[package]
+name = "bench-prime-sieve"
+version = "0.1.0"
+edition = "2021"
+authors = ["Michael Barber <60610888+mike-barber@users.noreply.github.com>"]
+
+[lib]
+name = "bench_prime_sieve"
+path = "src/main.rs"
+crate-type = ["cdylib"]
+
+[[bin]]
+name = "bench-prime-sieve"
+path = "src/main.rs"
+
+[dependencies]
+polkavm-derive = { path = "../../crates/polkavm-derive" }
+simplealloc = { path = "../../crates/simplealloc" }
+helper-macros = { path = "helper-macros" }
+softfloat = "1.0.0"

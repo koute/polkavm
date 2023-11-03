@@ -8,6 +8,6 @@ source ./ci/jobs/detect-or-install-riscv-toolchain.sh
 if [ "${RV32E_TOOLCHAIN:-}" != "" ]; then
     echo ">> cargo build (guests)"
     cd guest-programs
-    ./build-all.sh
+    ./build-examples.sh
     cd ..
 fi
