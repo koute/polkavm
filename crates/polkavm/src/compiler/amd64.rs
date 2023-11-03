@@ -1,7 +1,8 @@
+use polkavm_assembler::amd64::addr::*;
 use polkavm_assembler::amd64::inst::*;
 use polkavm_assembler::amd64::Reg as NativeReg;
 use polkavm_assembler::amd64::Reg::*;
-use polkavm_assembler::amd64::{Condition, LoadKind, RegSize, StoreKind};
+use polkavm_assembler::amd64::{Condition, LoadKind, RegSize, Size, ImmKind};
 use polkavm_assembler::Label;
 
 use polkavm_common::program::{InstructionVisitor, Reg};
@@ -77,12 +78,19 @@ impl<'a> Compiler<'a> {
         }
     }
 
+    fn imm_zero(&self) -> ImmKind {
+        match self.reg_size() {
+            RegSize::R32 => imm32(0),
+            RegSize::R64 => imm64(0)
+        }
+    }
+
     fn nop(&mut self) {
         self.push(nop());
     }
 
     fn load_imm(&mut self, reg: Reg, imm: u32) {
-        self.push(load32_imm(conv_reg(reg), imm));
+        self.push(mov_imm(conv_reg(reg), imm32(imm)));
     }
 
     fn embedded_load_store(
@@ -96,25 +104,25 @@ impl<'a> Compiler<'a> {
         if base != Reg::Zero {
             self.push(mov(RegSize::R32, TMP_REG, conv_reg(base)));
         } else {
-            self.push(xor(RegSize::R32, TMP_REG, TMP_REG));
+            self.push(xor((RegSize::R32, TMP_REG, TMP_REG)));
         }
 
         if offset != 0 {
-            self.push(add_imm(RegSize::R32, TMP_REG, offset as i32));
+            self.push(add((TMP_REG, imm32(offset))));
         }
 
-        self.push(add(RegSize::R64, TMP_REG, GUEST_MEMORY_REG));
+        self.push(add((RegSize::R64, TMP_REG, GUEST_MEMORY_REG)));
         if src_or_dst != Reg::Zero {
             cb(self, TMP_REG, conv_reg(src_or_dst));
         } else {
             self.push(push(GUEST_MEMORY_REG));
-            self.push(xor(RegSize::R32, GUEST_MEMORY_REG, GUEST_MEMORY_REG));
+            self.push(xor((RegSize::R32, GUEST_MEMORY_REG, GUEST_MEMORY_REG)));
             cb(self, TMP_REG, GUEST_MEMORY_REG);
             self.push(pop(GUEST_MEMORY_REG));
         }
     }
 
-    fn store(&mut self, src: Reg, base: Reg, offset: u32, kind: StoreKind) {
+    fn store(&mut self, src: Reg, base: Reg, offset: u32, kind: Size) {
         if self.regs_are_64bit {
             todo!();
         }
@@ -125,19 +133,19 @@ impl<'a> Compiler<'a> {
                     // [address] = 0
                     // (address is in the lower 2GB of the address space)
                     (Z, Z, true) => match kind {
-                        StoreKind::U8 => self.push(store8_abs_imm(offset as i32, 0)),
-                        StoreKind::U16 => self.push(store16_abs_imm(offset as i32, 0)),
-                        StoreKind::U32 => self.push(store32_abs_imm(offset as i32, 0)),
-                        StoreKind::U64 => {
-                            self.push(xor(RegSize::R32, TMP_REG, TMP_REG));
-                            self.push(store_abs(offset as i32, TMP_REG, StoreKind::U64));
+                        Size::U8 => self.push(mov_imm(abs(offset as i32), imm8(0))),
+                        Size::U16 => self.push(mov_imm(abs(offset as i32), imm16(0))),
+                        Size::U32 => self.push(mov_imm(abs(offset as i32), imm32(0))),
+                        Size::U64 => {
+                            self.push(xor((RegSize::R32, TMP_REG, TMP_REG)));
+                            self.push(store(Size::U64, abs(offset as i32), TMP_REG));
                         }
                     },
 
                     // [address] = src
                     // (address is in the lower 2GB of the address space)
                     (_, Z, true) => {
-                        self.push(store_abs(offset as i32, conv_reg(src), kind));
+                        self.push(store(kind, abs(offset as i32), conv_reg(src)));
                     }
 
                     // [address] = 0
@@ -145,37 +153,45 @@ impl<'a> Compiler<'a> {
                     (Z, Z, false) => {
                         // The offset would get sign extended to full 64-bits if we'd use it
                         // in a displacement, so we need to do an indirect store here.
-                        self.push(load32_imm(TMP_REG, offset));
-                        self.push(store32_indirect_imm(RegSize::R32, TMP_REG, 0, 0));
+                        self.push(mov_imm(TMP_REG, imm32(offset)));
+                        match kind {
+                            Size::U8 => self.push(mov_imm(reg_indirect(RegSize::R32, TMP_REG), imm8(0))),
+                            Size::U16 => self.push(mov_imm(reg_indirect(RegSize::R32, TMP_REG), imm16(0))),
+                            Size::U32 => self.push(mov_imm(reg_indirect(RegSize::R32, TMP_REG), imm32(0))),
+                            Size::U64 => {
+                                self.push(mov_imm(reg_indirect(RegSize::R32, TMP_REG), imm32(0)));
+                                self.push(mov_imm(reg_indirect(RegSize::R32, TMP_REG + 4), imm32(0)));
+                            }
+                        }
                     }
 
                     // [address] = src
                     // (address is in the upper 2GB of the address space)
                     (_, Z, false) => {
-                        self.push(load32_imm(TMP_REG, offset));
-                        self.push(store_indirect(RegSize::R32, TMP_REG, 0, conv_reg(src), kind));
+                        self.push(mov_imm(TMP_REG, imm32(offset)));
+                        self.push(store(kind, reg_indirect(RegSize::R32, TMP_REG), conv_reg(src)));
                     }
 
                     // [base + offset] = 0
                     (Z, _, _) => match kind {
-                        StoreKind::U8 => self.push(store8_indirect_imm(RegSize::R32, conv_reg(base), offset as i32, 0)),
-                        StoreKind::U16 => self.push(store16_indirect_imm(RegSize::R32, conv_reg(base), offset as i32, 0)),
-                        StoreKind::U32 => self.push(store32_indirect_imm(RegSize::R32, conv_reg(base), offset as i32, 0)),
-                        StoreKind::U64 => {
-                            self.push(xor(RegSize::R32, TMP_REG, TMP_REG));
-                            self.push(store_indirect(RegSize::R32, conv_reg(base), offset as i32, TMP_REG, kind));
+                        Size::U8 => self.push(mov_imm(reg_indirect(RegSize::R32, conv_reg(base) + offset as i32), imm8(0))),
+                        Size::U16 => self.push(mov_imm(reg_indirect(RegSize::R32, conv_reg(base) + offset as i32), imm16(0))),
+                        Size::U32 => self.push(mov_imm(reg_indirect(RegSize::R32, conv_reg(base) + offset as i32), imm32(0))),
+                        Size::U64 => {
+                            self.push(xor((RegSize::R32, TMP_REG, TMP_REG)));
+                            self.push(store(kind, reg_indirect(RegSize::R32, conv_reg(base) + offset as i32), TMP_REG));
                         }
                     },
 
                     // [base + offset] = src
                     (_, _, _) => {
-                        self.push(store_indirect(RegSize::R32, conv_reg(base), offset as i32, conv_reg(src), kind));
+                        self.push(store(kind, reg_indirect(RegSize::R32, conv_reg(base) + offset as i32), conv_reg(src)));
                     }
                 }
             },
             SandboxKind::Generic => {
                 self.embedded_load_store(src, base, offset, move |itself, address_reg, value_reg| {
-                    itself.push(store_indirect(RegSize::R64, address_reg, 0, value_reg, kind));
+                    itself.push(store(kind, reg_indirect(RegSize::R64, address_reg), value_reg));
                 });
             }
         }
@@ -197,18 +213,18 @@ impl<'a> Compiler<'a> {
 
                 if base == Reg::Zero {
                     if (offset as i32) < 0 {
-                        self.push(load32_imm(TMP_REG, offset));
-                        self.push(load_indirect(dst_native, RegSize::R32, TMP_REG, 0, kind));
+                        self.push(mov_imm(TMP_REG, imm32(offset)));
+                        self.push(load(kind, dst_native, reg_indirect(RegSize::R32, TMP_REG)));
                     } else {
-                        self.push(load_abs(dst_native, offset as i32, kind));
+                        self.push(load(kind, dst_native, abs(offset as i32)));
                     }
                 } else {
-                    self.push(load_indirect(dst_native, RegSize::R32, conv_reg(base), offset as i32, kind));
+                    self.push(load(kind, dst_native, reg_indirect(RegSize::R32, conv_reg(base) + offset as i32)));
                 }
             },
             SandboxKind::Generic => {
                 self.embedded_load_store(dst, base, offset, move |itself, address_reg, value_reg| {
-                    itself.push(load_indirect(value_reg, RegSize::R64, address_reg, 0, kind));
+                    itself.push(load(kind, value_reg, reg_indirect(RegSize::R64, address_reg)));
                 });
             }
         }
@@ -220,7 +236,7 @@ impl<'a> Compiler<'a> {
         }
 
         let reg = conv_reg(reg);
-        self.push(xor(RegSize::R32, reg, reg));
+        self.push(xor((RegSize::R32, reg, reg)));
     }
 
     fn fill_with_ones(&mut self, reg: Reg) {
@@ -229,10 +245,10 @@ impl<'a> Compiler<'a> {
         }
 
         if !self.regs_are_64bit {
-            self.push(load32_imm(conv_reg(reg), 0xffffffff));
+            self.push(mov_imm(conv_reg(reg), imm32(0xffffffff)));
         } else {
             self.clear_reg(reg);
-            self.push(not(RegSize::R64, conv_reg(reg)));
+            self.push(not(Size::U64, conv_reg(reg)));
         }
     }
 
@@ -245,14 +261,14 @@ impl<'a> Compiler<'a> {
             // d = 0 < s2
             (_, Z, _) => match kind {
                 Signedness::Signed => {
-                    self.push(cmp_imm(self.reg_size(), conv_reg(s2), 0));
+                    self.push(cmp((conv_reg(s2), self.imm_zero())));
                     self.push(setcc(Condition::Greater, conv_reg(d)));
-                    self.push(and_imm(RegSize::R32, conv_reg(d), 1));
+                    self.push(and((conv_reg(d), imm32(1))));
                 }
                 Signedness::Unsigned => {
-                    self.push(test(self.reg_size(), conv_reg(s2), conv_reg(s2)));
+                    self.push(test((self.reg_size(), conv_reg(s2), conv_reg(s2))));
                     self.push(setcc(Condition::NotEqual, conv_reg(d)));
-                    self.push(and_imm(RegSize::R32, conv_reg(d), 1));
+                    self.push(and((conv_reg(d), imm32(1))));
                 }
             },
             // d = s1 < 0
@@ -261,13 +277,13 @@ impl<'a> Compiler<'a> {
             }
             // d = s1 < s2
             _ => {
-                self.push(cmp(self.reg_size(), conv_reg(s1), conv_reg(s2)));
+                self.push(cmp((self.reg_size(), conv_reg(s1), conv_reg(s2))));
                 let condition = match kind {
                     Signedness::Signed => Condition::Less,
                     Signedness::Unsigned => Condition::Below,
                 };
                 self.push(setcc(condition, conv_reg(d)));
-                self.push(and_imm(RegSize::R32, conv_reg(d), 1));
+                self.push(and((conv_reg(d), imm32(1))));
             }
         }
     }
@@ -296,9 +312,17 @@ impl<'a> Compiler<'a> {
                     Signedness::Unsigned => Condition::Below,
                 };
 
-                self.push(cmp_imm(self.reg_size(), conv_reg(s), imm as i32));
+                match self.reg_size() {
+                    RegSize::R32 => {
+                        self.push(cmp((conv_reg(s), imm32(imm))));
+                    },
+                    RegSize::R64 => {
+                        self.push(cmp((conv_reg(s), imm64(imm as i32))));
+                    }
+                }
+
                 self.push(setcc(condition, conv_reg(d)));
-                self.push(and_imm(RegSize::R32, conv_reg(d), 1));
+                self.push(and((conv_reg(d), imm32(1))));
             }
         }
     }
@@ -382,10 +406,10 @@ impl<'a> Compiler<'a> {
                 return;
             }
             (_, Z) => {
-                self.push(cmp_imm(self.reg_size(), conv_reg(s1), 0));
+                self.push(cmp((conv_reg(s1), self.imm_zero())));
             }
             (Z, _) => {
-                self.push(cmp_imm(self.reg_size(), conv_reg(s2), 0));
+                self.push(cmp((conv_reg(s2), self.imm_zero())));
                 condition = match condition {
                     Condition::Equal => Condition::Equal,
                     Condition::NotEqual => Condition::NotEqual,
@@ -397,7 +421,7 @@ impl<'a> Compiler<'a> {
                 };
             }
             (_, _) => {
-                self.push(cmp(self.reg_size(), conv_reg(s1), conv_reg(s2)));
+                self.push(cmp((self.reg_size(), conv_reg(s1), conv_reg(s2))));
             }
         }
 
@@ -427,16 +451,16 @@ impl<'a> Compiler<'a> {
                 let label_divisor_is_zero = self.asm.forward_declare_label();
                 let label_next = self.asm.forward_declare_label();
 
-                self.push(test(self.reg_size(), conv_reg(s2), conv_reg(s2)));
+                self.push(test((self.reg_size(), conv_reg(s2), conv_reg(s2))));
                 self.push(jcc_label8(Condition::Equal, label_divisor_is_zero));
 
                 if matches!(kind, Signedness::Signed) {
                     let label_normal = self.asm.forward_declare_label();
                     match self.reg_size() {
                         RegSize::R32 => {
-                            self.push(cmp_imm(RegSize::R32, conv_reg(s1), i32::MIN));
+                            self.push(cmp((conv_reg(s1), imm32(i32::MIN as u32))));
                             self.push(jcc_label8(Condition::NotEqual, label_normal));
-                            self.push(cmp_imm(RegSize::R32, conv_reg(s2), -1));
+                            self.push(cmp((conv_reg(s2), imm32(-1_i32 as u32))));
                             self.push(jcc_label8(Condition::NotEqual, label_normal));
                             match div_rem {
                                 DivRem::Div => self.mov(d, s1),
@@ -474,7 +498,7 @@ impl<'a> Compiler<'a> {
                     self.push(pop(TMP_REG));
 
                     // Pop the dividend.
-                    self.push(xor(RegSize::R32, rdx, rdx));
+                    self.push(xor((RegSize::R32, rdx, rdx)));
                     self.push(pop(rax));
 
                     match kind {
@@ -518,11 +542,11 @@ impl<'a> Compiler<'a> {
         match self.sandbox_kind {
             SandboxKind::Linux => {
                 let address = VM_ADDR_VMCTX + offset as u64;
-                self.push(load64_imm(reg, address));
+                self.push(mov_imm64(reg, address));
             },
             SandboxKind::Generic => {
                 let offset = crate::sandbox::generic::GUEST_MEMORY_TO_VMCTX_OFFSET as i32 + offset as i32;
-                self.push(lea(RegSize::R64, reg, RegSize::R64, GUEST_MEMORY_REG, offset));
+                self.push(lea(RegSize::R64, reg, reg_indirect(RegSize::R64, GUEST_MEMORY_REG + offset)));
             }
         }
     }
@@ -550,7 +574,7 @@ impl<'a> Compiler<'a> {
 
         self.load_regs_address(TMP_REG);
         for (nth, reg) in Reg::ALL_NON_ZERO.iter().copied().enumerate() {
-            self.push(store_indirect(RegSize::R64, TMP_REG, nth as i32 * 4, conv_reg(reg), StoreKind::U32));
+            self.push(store(Size::U32, reg_indirect(RegSize::R64, TMP_REG + nth as i32 * 4), conv_reg(reg)));
         }
     }
 
@@ -561,7 +585,7 @@ impl<'a> Compiler<'a> {
 
         self.load_regs_address(TMP_REG);
         for (nth, reg) in Reg::ALL_NON_ZERO.iter().copied().enumerate() {
-            self.push(load_indirect(conv_reg(reg), RegSize::R64, TMP_REG, nth as i32 * 4, LoadKind::U32));
+            self.push(load(LoadKind::U32, conv_reg(reg), reg_indirect(RegSize::R64, TMP_REG + nth as i32 * 4)));
         }
     }
 
@@ -593,9 +617,9 @@ impl<'a> Compiler<'a> {
         self.save_registers_to_vmctx();
         match self.sandbox_kind {
             SandboxKind::Linux => {
-                self.push(load64_imm(TMP_REG, VM_ADDR_SYSCALL));
-                self.push(load32_imm(rdi, SYSCALL_RETURN));
-                self.push(jmp_reg(TMP_REG));
+                self.push(mov_imm64(TMP_REG, VM_ADDR_SYSCALL));
+                self.push(mov_imm(rdi, imm32(SYSCALL_RETURN)));
+                self.push(jmp(TMP_REG));
             },
             SandboxKind::Generic => {
                 self.push(ret());
@@ -613,10 +637,10 @@ impl<'a> Compiler<'a> {
             SandboxKind::Linux => {
                 self.push(push(TMP_REG)); // Save the ecall number.
                 self.save_registers_to_vmctx();
-                self.push(load64_imm(TMP_REG, VM_ADDR_SYSCALL));
-                self.push(load32_imm(rdi, SYSCALL_HOSTCALL));
+                self.push(mov_imm64(TMP_REG, VM_ADDR_SYSCALL));
+                self.push(mov_imm(rdi, imm32(SYSCALL_HOSTCALL)));
                 self.push(pop(rsi)); // Pop the ecall number as an argument.
-                self.push(call_reg(TMP_REG));
+                self.push(call(TMP_REG));
                 self.restore_registers_from_vmctx();
                 self.push(ret());
             },
@@ -624,10 +648,10 @@ impl<'a> Compiler<'a> {
                 let handler_address = crate::sandbox::generic::handle_ecall as usize as u64;
                 self.push(push(TMP_REG)); // Save the ecall number.
                 self.save_registers_to_vmctx();
-                self.push(load64_imm(TMP_REG, handler_address));
+                self.push(mov_imm64(TMP_REG, handler_address));
                 self.push(mov(RegSize::R64, rdi, GUEST_MEMORY_REG));
                 self.push(pop(rsi)); // Pop the ecall number as an argument.
-                self.push(call_reg(TMP_REG));
+                self.push(call(TMP_REG));
                 self.restore_registers_from_vmctx();
                 self.push(ret());
             }
@@ -642,11 +666,11 @@ impl<'a> Compiler<'a> {
             SandboxKind::Linux => {
                 self.push(push(TMP_REG)); // Save the instruction number.
                 self.save_registers_to_vmctx();
-                self.push(load64_imm(TMP_REG, VM_ADDR_SYSCALL));
-                self.push(load32_imm(rdi, SYSCALL_TRACE));
+                self.push(mov_imm64(TMP_REG, VM_ADDR_SYSCALL));
+                self.push(mov_imm(rdi, imm32(SYSCALL_TRACE)));
                 self.push(pop(rsi)); // Pop the instruction number as an argument.
-                self.push(load_indirect(rdx, RegSize::R64, rsp, -8, LoadKind::U64)); // Grab the return address.
-                self.push(call_reg(TMP_REG));
+                self.push(load(LoadKind::U64, rdx, reg_indirect(RegSize::R64, rsp - 8))); // Grab the return address.
+                self.push(call(TMP_REG));
                 self.restore_registers_from_vmctx();
                 self.push(ret());
             },
@@ -654,10 +678,10 @@ impl<'a> Compiler<'a> {
                 let handler_address = crate::sandbox::generic::handle_trace as usize as u64;
                 self.push(push(TMP_REG)); // Save the instruction number.
                 self.save_registers_to_vmctx();
-                self.push(load64_imm(TMP_REG, handler_address));
+                self.push(mov_imm64(TMP_REG, handler_address));
                 self.push(mov(RegSize::R64, rdi, GUEST_MEMORY_REG));
                 self.push(pop(rsi)); // Pop the instruction number as an argument.
-                self.push(call_reg(TMP_REG));
+                self.push(call(TMP_REG));
                 self.restore_registers_from_vmctx();
                 self.push(ret());
             }
@@ -671,9 +695,9 @@ impl<'a> Compiler<'a> {
         self.save_registers_to_vmctx();
         match self.sandbox_kind {
             SandboxKind::Linux => {
-                self.push(load64_imm(TMP_REG, VM_ADDR_SYSCALL));
-                self.push(load32_imm(rdi, SYSCALL_TRAP));
-                self.push(jmp_reg(TMP_REG));
+                self.push(mov_imm64(TMP_REG, VM_ADDR_SYSCALL));
+                self.push(mov_imm(rdi, imm32(SYSCALL_TRAP)));
+                self.push(jmp(TMP_REG));
             },
             SandboxKind::Generic => {
                 self.push(ud2()); // TODO: FIXME
@@ -682,7 +706,7 @@ impl<'a> Compiler<'a> {
     }
 
     pub(crate) fn trace_execution(&mut self, nth_instruction: usize) {
-        self.push(load32_imm(TMP_REG, nth_instruction as u32));
+        self.push(mov_imm(TMP_REG, imm32(nth_instruction as u32)));
         self.push(call_label32(self.trace_label));
     }
 
@@ -718,7 +742,7 @@ impl<'a> InstructionVisitor for Compiler<'a> {
     }
 
     fn ecalli(&mut self, imm: u32) -> Self::ReturnTy {
-        self.push(load32_imm(TMP_REG, imm));
+        self.push(mov_imm(TMP_REG, imm32(imm)));
         self.push(call_label32(self.ecall_label));
 
         Ok(())
@@ -764,13 +788,13 @@ impl<'a> InstructionVisitor for Compiler<'a> {
             // d = s1 ^ 0
             (_, _, Z) => self.mov(d, s1),
             // d = d ^ s2
-            (_, _, _) if d == s1 => self.push(xor(self.reg_size(), conv_reg(d), conv_reg(s2))),
+            (_, _, _) if d == s1 => self.push(xor((self.reg_size(), conv_reg(d), conv_reg(s2)))),
             // d = s1 ^ d
-            (_, _, _) if d == s2 => self.push(xor(self.reg_size(), conv_reg(d), conv_reg(s1))),
+            (_, _, _) if d == s2 => self.push(xor((self.reg_size(), conv_reg(d), conv_reg(s1)))),
             // d = s1 ^ s2
             _ => {
                 self.mov(d, s1);
-                self.push(xor(self.reg_size(), conv_reg(d), conv_reg(s2)));
+                self.push(xor((self.reg_size(), conv_reg(d), conv_reg(s2))));
             }
         }
 
@@ -790,13 +814,13 @@ impl<'a> InstructionVisitor for Compiler<'a> {
             // d = s & s
             (_, _, _) if s1 == s2 => self.mov(d, s1),
             // d = d & s2
-            (_, _, _) if d == s1 => self.push(and(self.reg_size(), conv_reg(d), conv_reg(s2))),
+            (_, _, _) if d == s1 => self.push(and((self.reg_size(), conv_reg(d), conv_reg(s2)))),
             // d = s1 & d
-            (_, _, _) if d == s2 => self.push(and(self.reg_size(), conv_reg(d), conv_reg(s1))),
+            (_, _, _) if d == s2 => self.push(and((self.reg_size(), conv_reg(d), conv_reg(s1)))),
             // d = s1 & s2
             _ => {
                 self.mov(d, s1);
-                self.push(and(self.reg_size(), conv_reg(d), conv_reg(s2)));
+                self.push(and((self.reg_size(), conv_reg(d), conv_reg(s2))));
             }
         }
 
@@ -822,13 +846,13 @@ impl<'a> InstructionVisitor for Compiler<'a> {
             // d = s | s
             (_, _, _) if s1 == s2 => self.mov(d, s1),
             // d = d | s2
-            (_, _, _) if d == s1 => self.push(or(self.reg_size(), conv_reg(d), conv_reg(s2))),
+            (_, _, _) if d == s1 => self.push(or((self.reg_size(), conv_reg(d), conv_reg(s2)))),
             // d = s1 | d
-            (_, _, _) if d == s2 => self.push(or(self.reg_size(), conv_reg(d), conv_reg(s1))),
+            (_, _, _) if d == s2 => self.push(or((self.reg_size(), conv_reg(d), conv_reg(s1)))),
             // d = s1 | s2
             _ => {
                 self.mov(d, s1);
-                self.push(or(self.reg_size(), conv_reg(d), conv_reg(s2)));
+                self.push(or((self.reg_size(), conv_reg(d), conv_reg(s2))));
             }
         }
 
@@ -850,15 +874,15 @@ impl<'a> InstructionVisitor for Compiler<'a> {
             // d = s1 + 0
             (_, _, Z) => self.mov(d, s1),
             // d = d + s2
-            (_, _, _) if d == s1 => self.push(add(self.reg_size(), conv_reg(d), conv_reg(s2))),
+            (_, _, _) if d == s1 => self.push(add((self.reg_size(), conv_reg(d), conv_reg(s2)))),
             // d = s1 + d
-            (_, _, _) if d == s2 => self.push(add(self.reg_size(), conv_reg(d), conv_reg(s1))),
+            (_, _, _) if d == s2 => self.push(add((self.reg_size(), conv_reg(d), conv_reg(s1)))),
             // d = s1 + s2
             _ => {
                 if d != s1 {
                     self.mov(d, s1);
                 }
-                self.push(add(self.reg_size(), conv_reg(d), conv_reg(s2)));
+                self.push(add((self.reg_size(), conv_reg(d), conv_reg(s2))));
             }
         }
 
@@ -885,16 +909,16 @@ impl<'a> InstructionVisitor for Compiler<'a> {
             // d = d - d
             (_, _, _) if d == s1 && d == s2 => self.clear_reg(d),
             // d = d - s2
-            (_, _, _) if d == s1 => self.push(sub(self.reg_size(), conv_reg(d), conv_reg(s2))),
+            (_, _, _) if d == s1 => self.push(sub((self.reg_size(), conv_reg(d), conv_reg(s2)))),
             // d = s1 - d
             (_, _, _) if d == s2 => {
                 self.push(neg(self.reg_size(), conv_reg(d)));
-                self.push(add(self.reg_size(), conv_reg(d), conv_reg(s1)));
+                self.push(add((self.reg_size(), conv_reg(d), conv_reg(s1))));
             }
             // d = s1 - s2
             _ => {
                 self.mov(d, s1);
-                self.push(sub(self.reg_size(), conv_reg(d), conv_reg(s2)));
+                self.push(sub((self.reg_size(), conv_reg(d), conv_reg(s2))));
             }
         }
 
@@ -1080,11 +1104,11 @@ impl<'a> InstructionVisitor for Compiler<'a> {
             // d = s | 0
             (_, _, 0) => self.mov(d, s),
             // d = d | imm
-            (_, _, _) if d == s => self.push(or_imm(self.reg_size(), conv_reg(d), imm as i32)),
+            (_, _, _) if d == s => self.push(or((conv_reg(d), imm32(imm)))),
             // d = s | imm
             (_, _, _) => {
                 self.mov(d, s);
-                self.push(or_imm(self.reg_size(), conv_reg(d), imm as i32));
+                self.push(or((conv_reg(d), imm32(imm))));
             }
         }
 
@@ -1104,11 +1128,11 @@ impl<'a> InstructionVisitor for Compiler<'a> {
             // d = s & 0
             (_, _, 0) => self.clear_reg(d),
             // d = d & imm
-            (_, _, _) if d == s => self.push(and_imm(self.reg_size(), conv_reg(d), imm as i32)),
+            (_, _, _) if d == s => self.push(and((conv_reg(d), imm32(imm)))),
             // d = s & imm
             (_, _, _) => {
                 self.mov(d, s);
-                self.push(and_imm(self.reg_size(), conv_reg(d), imm as i32));
+                self.push(and((conv_reg(d), imm32(imm))));
             }
         }
 
@@ -1135,11 +1159,11 @@ impl<'a> InstructionVisitor for Compiler<'a> {
                 self.push(not(self.reg_size(), conv_reg(d)))
             }
             // d = d ^ imm
-            (_, _, _) if d == s => self.push(xor_imm(self.reg_size(), conv_reg(d), imm as i32)),
+            (_, _, _) if d == s => self.push(xor((conv_reg(d), imm32(imm)))),
             // d = s ^ imm
             (_, _, _) => {
                 self.mov(d, s);
-                self.push(xor_imm(self.reg_size(), conv_reg(d), imm as i32));
+                self.push(xor((conv_reg(d), imm32(imm))));
             }
         }
 
@@ -1161,11 +1185,11 @@ impl<'a> InstructionVisitor for Compiler<'a> {
             // d = d + 1
             (_, _, 1) if d == s => self.push(inc(self.reg_size(), conv_reg(d))),
             // d = d + imm
-            (_, _, _) if d == s => self.push(add_imm(self.reg_size(), conv_reg(d), imm as i32)),
+            (_, _, _) if d == s => self.push(add((conv_reg(d), imm32(imm)))),
             // d = s + imm
             (_, _, _) => {
                 self.mov(d, s);
-                self.push(add_imm(self.reg_size(), conv_reg(d), imm as i32));
+                self.push(add((conv_reg(d), imm32(imm))));
             }
         }
 
@@ -1173,17 +1197,17 @@ impl<'a> InstructionVisitor for Compiler<'a> {
     }
 
     fn store_u8(&mut self, src: Reg, base: Reg, offset: u32) -> Self::ReturnTy {
-        self.store(src, base, offset, StoreKind::U8);
+        self.store(src, base, offset, Size::U8);
         Ok(())
     }
 
     fn store_u16(&mut self, src: Reg, base: Reg, offset: u32) -> Self::ReturnTy {
-        self.store(src, base, offset, StoreKind::U16);
+        self.store(src, base, offset, Size::U16);
         Ok(())
     }
 
     fn store_u32(&mut self, src: Reg, base: Reg, offset: u32) -> Self::ReturnTy {
-        self.store(src, base, offset, StoreKind::U32);
+        self.store(src, base, offset, Size::U32);
         Ok(())
     }
 
@@ -1270,13 +1294,13 @@ impl<'a> InstructionVisitor for Compiler<'a> {
                         self.push(mov(RegSize::R32, TMP_REG, conv_reg(base)));
                     } else {
                         let offset = offset.wrapping_mul(4);
-                        self.push(lea(RegSize::R32, TMP_REG, RegSize::R32, conv_reg(base), offset as i32));
+                        self.push(lea(RegSize::R32, TMP_REG, reg_indirect(RegSize::R32, conv_reg(base) + offset as i32)));
                     }
 
                     self.push(ror_imm(RegSize::R32, TMP_REG, 2));
                     self.push(shl_imm(RegSize::R64, TMP_REG, 3));
                     self.push(bts(RegSize::R64, TMP_REG, VM_ADDR_JUMP_TABLE.trailing_zeros() as u8));
-                    self.push(load_indirect(TMP_REG, RegSize::R64, TMP_REG, 0, LoadKind::U64));
+                    self.push(load(LoadKind::U64, TMP_REG, reg_indirect(RegSize::R64, TMP_REG)));
                 },
                 SandboxKind::Generic => {
                     // TODO: This also could be more efficient.
@@ -1286,11 +1310,11 @@ impl<'a> InstructionVisitor for Compiler<'a> {
                     self.push(shl_imm(RegSize::R64, conv_reg(base), 1));
                     if offset > 0 {
                         let offset = offset.wrapping_mul(8);
-                        self.push(add_imm(RegSize::R32, conv_reg(base), offset as i32));
+                        self.push(add((conv_reg(base), imm32(offset))));
                     }
-                    self.push(add(RegSize::R64, TMP_REG, conv_reg(base)));
+                    self.push(add((RegSize::R64, TMP_REG, conv_reg(base))));
                     self.push(pop(conv_reg(base)));
-                    self.push(load_indirect(TMP_REG, RegSize::R64, TMP_REG, 0, LoadKind::U64));
+                    self.push(load(LoadKind::U64, TMP_REG, reg_indirect(RegSize::R64, TMP_REG)));
                 }
             }
 
@@ -1306,7 +1330,7 @@ impl<'a> InstructionVisitor for Compiler<'a> {
                 }
             }
 
-            self.push(jmp_reg(TMP_REG));
+            self.push(jmp(TMP_REG));
         }
 
         Ok(())
