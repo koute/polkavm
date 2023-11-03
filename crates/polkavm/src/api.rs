@@ -432,11 +432,17 @@ impl Module {
     /// Will return `None` when running under an interpreter.
     /// Mostly only useful for debugging.
     pub fn machine_code(&self) -> Option<Cow<[u8]>> {
-        match self.0.compiled_module {
-            #[cfg(target_os = "linux")]
-            CompiledModuleKind::Linux(ref module) => Some(module.machine_code()),
-            CompiledModuleKind::Generic(ref module) => Some(module.machine_code()),
-            CompiledModuleKind::Unavailable => None,
+        if_compiler_is_supported! {
+            {
+                match self.0.compiled_module {
+                    #[cfg(target_os = "linux")]
+                    CompiledModuleKind::Linux(ref module) => Some(module.machine_code()),
+                    CompiledModuleKind::Generic(ref module) => Some(module.machine_code()),
+                    CompiledModuleKind::Unavailable => None,
+                }
+            } else {
+                None
+            }
         }
     }
 
@@ -452,11 +458,17 @@ impl Module {
     /// Will return `None` when running under an interpreter.
     /// Mostly only useful for debugging.
     pub fn nth_instruction_to_code_offset_map(&self) -> Option<&[u32]> {
-        match self.0.compiled_module {
-            #[cfg(target_os = "linux")]
-            CompiledModuleKind::Linux(ref module) => Some(module.nth_instruction_to_code_offset_map()),
-            CompiledModuleKind::Generic(ref module) => Some(module.nth_instruction_to_code_offset_map()),
-            CompiledModuleKind::Unavailable => None,
+        if_compiler_is_supported! {
+            {
+                match self.0.compiled_module {
+                    #[cfg(target_os = "linux")]
+                    CompiledModuleKind::Linux(ref module) => Some(module.nth_instruction_to_code_offset_map()),
+                    CompiledModuleKind::Generic(ref module) => Some(module.nth_instruction_to_code_offset_map()),
+                    CompiledModuleKind::Unavailable => None,
+                }
+            } else {
+                None
+            }
         }
     }
 
