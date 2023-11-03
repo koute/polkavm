@@ -838,6 +838,10 @@ macro_rules! impl_inst {
         impl_inst!(@ctor_impl $name, (a0: $a0), (a1: $a1), (a2: $a2));
     };
 
+    (@ctor $name:ident, $a0:tt, $a1:tt, $a2:tt, $a3:tt) => {
+        impl_inst!(@ctor_impl $name, (a0: $a0), (a1: $a1), (a2: $a2), (a3: $a3));
+    };
+
     (|$self:ident, $fmt:ident| $($name:ident($($arg:tt),*) => $body:expr, ($fmt_body:expr),)+) => {
         impl_inst!(@impl |$self, $fmt| $($name($($arg),*) => $body, ($fmt_body),)+);
         $(
@@ -1202,6 +1206,18 @@ pub mod inst {
 
                 fmt.write_fmt(core::format_args!("mov{} {}, {}{}", kind, name, size, self.2))
             }),
+
+        // https://www.felixcloutier.com/x86/cmovcc
+        cmov(Condition, RegSize, Reg, RegMem) =>
+            {
+                Inst::new(0x40 | self.0 as u8)
+                    .op_alt()
+                    .rex_64b_if(matches!(self.1, RegSize::R64))
+                    .modrm_reg(self.2)
+                    .regmem(self.3)
+                    .encode()
+            },
+            (fmt.write_fmt(core::format_args!("cmov{} {}, {}", self.0.suffix(), self.2.name_from(self.1), self.3.display_without_prefix(Size::from(self.1))))),
 
         // https://www.felixcloutier.com/x86/add
         add(Operands) =>
@@ -2038,6 +2054,7 @@ mod tests {
         call_rel32,
         call,
         cdq,
+        cmov,
         cmp,
         div,
         endbr64,
