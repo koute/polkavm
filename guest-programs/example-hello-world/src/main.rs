@@ -4,9 +4,8 @@
 #[panic_handler]
 fn panic(_info: &core::panic::PanicInfo) -> ! {
     unsafe {
-        core::arch::asm!("unimp");
+        core::arch::asm!("unimp", options(noreturn));
     }
-    loop {}
 }
 
 #[polkavm_derive::polkavm_import]
