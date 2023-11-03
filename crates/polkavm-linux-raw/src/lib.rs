@@ -67,7 +67,7 @@ pub use crate::arch_amd64_bindings::{
     __NR_clone3 as SYS_clone3, __NR_close as SYS_close, __NR_close_range as SYS_close_range, __NR_dup3 as SYS_dup3,
     __NR_execveat as SYS_execveat, __NR_exit as SYS_exit, __NR_fchdir as SYS_fchdir, __NR_fcntl as SYS_fcntl,
     __NR_ftruncate as SYS_ftruncate, __NR_futex as SYS_futex, __NR_getdents64 as SYS_getdents64, __NR_getgid as SYS_getgid,
-    __NR_getpid as SYS_getpid, __NR_getuid as SYS_getuid, __NR_kill as SYS_kill, __NR_madvise as SYS_madvise,
+    __NR_getpid as SYS_getpid, __NR_getuid as SYS_getuid, __NR_kill as SYS_kill, __NR_lseek as SYS_lseek, __NR_madvise as SYS_madvise,
     __NR_memfd_create as SYS_memfd_create, __NR_mmap as SYS_mmap, __NR_mount as SYS_mount, __NR_mprotect as SYS_mprotect,
     __NR_mremap as SYS_mremap, __NR_munmap as SYS_munmap, __NR_open as SYS_open, __NR_openat as SYS_openat,
     __NR_pidfd_send_signal as SYS_pidfd_send_signal, __NR_pipe2 as SYS_pipe2, __NR_pivot_root as SYS_pivot_root, __NR_prctl as SYS_prctl,
@@ -514,6 +514,10 @@ pub const SOCK_CLOEXEC: u32 = 0x80000;
 pub const SOL_SOCKET: c_int = 1;
 pub const SCM_RIGHTS: c_int = 1;
 pub const MSG_NOSIGNAL: u32 = 0x4000;
+
+pub const SEEK_SET: u32 = 0;
+pub const SEEK_CUR: u32 = 1;
+pub const SEEK_END: u32 = 2;
 
 #[allow(non_snake_case)]
 const fn CMSG_ALIGN(len: usize) -> usize {
@@ -1026,6 +1030,12 @@ pub fn sys_write(fd: FdRef, buffer: &[u8]) -> Result<c_size_t, Error> {
     let result = unsafe { syscall_readonly!(SYS_write, fd.raw(), buffer.as_ptr(), buffer.len()) };
     Error::from_syscall("write", result)?;
     Ok(result as c_size_t)
+}
+
+pub fn sys_lseek(fd: FdRef, offset: i64, whence: u32) -> Result<u64, Error> {
+    let result = unsafe { syscall_readonly!(SYS_lseek, fd.raw(), offset, whence) };
+    Error::from_syscall("lseek", result)?;
+    Ok(result as u64)
 }
 
 pub unsafe fn sys_process_vm_readv(pid: pid_t, local_iovec: &[iovec], remote_iovec: &[iovec]) -> Result<usize, Error> {
