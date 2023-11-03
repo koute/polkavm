@@ -440,6 +440,26 @@ impl Module {
         }
     }
 
+    /// A map which makes it possible to map a position within the guest program
+    /// into the exact range of native machine code instructions.
+    ///
+    /// The returned slice has as many elements as there were instructions in the
+    /// original guest program, plus one extra to make it possible to figure out
+    /// the length of the machine code corresponding to the very last instruction.
+    ///
+    /// This slice is guaranteed to be sorted, so you can binary search through it.
+    ///
+    /// Will return `None` when running under an interpreter.
+    /// Mostly only useful for debugging.
+    pub fn nth_instruction_to_code_offset_map(&self) -> Option<&[u32]> {
+        match self.0.compiled_module {
+            #[cfg(target_os = "linux")]
+            CompiledModuleKind::Linux(ref module) => Some(module.nth_instruction_to_code_offset_map()),
+            CompiledModuleKind::Generic(ref module) => Some(module.nth_instruction_to_code_offset_map()),
+            CompiledModuleKind::Unavailable => None,
+        }
+    }
+
     pub(crate) fn debug_print_location(&self, log_level: log::Level, pc: u32) {
         log::log!(log_level, "  At #{pc}:");
 

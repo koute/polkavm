@@ -47,6 +47,7 @@ struct CompilationResult<'a> {
     jump_table: &'a [u8],
     export_trampolines: &'a [u64],
     sysreturn_address: u64,
+    nth_instruction_to_code_offset_map: Vec<u32>,
 }
 
 impl<'a> Compiler<'a> {
@@ -89,10 +90,15 @@ impl<'a> Compiler<'a> {
         assert_eq!(self.asm.len(), 0);
         self.asm.set_origin(self.native_code_address);
 
+        let mut nth_instruction_to_code_offset_map: Vec<u32> = Vec::with_capacity(self.instructions.len());
+        polkavm_common::static_assert!(polkavm_common::zygote::VM_SANDBOX_MAXIMUM_NATIVE_CODE_SIZE < u32::MAX);
+
         for nth_instruction in 0..self.instructions.len() {
             self.next_instruction = self.instructions.get(nth_instruction + 1).copied();
 
             let initial_length = self.asm.len();
+            nth_instruction_to_code_offset_map.push(initial_length as u32);
+
             let instruction = self.instructions[nth_instruction];
             log::trace!("Compiling {}/{}: {}", nth_instruction, self.instructions.len() - 1, instruction);
 
@@ -119,6 +125,7 @@ impl<'a> Compiler<'a> {
         }
 
         let epilogue_start = self.asm.len();
+        nth_instruction_to_code_offset_map.push(epilogue_start as u32);
 
         log::trace!("Emitting trampolines");
 
@@ -194,6 +201,7 @@ impl<'a> Compiler<'a> {
             jump_table: &self.jump_table,
             export_trampolines: &self.export_trampolines,
             sysreturn_address,
+            nth_instruction_to_code_offset_map,
         })
     }
 
@@ -228,6 +236,7 @@ impl<'a> Compiler<'a> {
 pub struct CompiledModule<S> where S: Sandbox {
     sandbox_program: S::Program,
     export_trampolines: Vec<u64>,
+    nth_instruction_to_code_offset_map: Vec<u32>,
 }
 
 impl<S> CompiledModule<S> where S: Sandbox {
@@ -255,11 +264,16 @@ impl<S> CompiledModule<S> where S: Sandbox {
         Ok(CompiledModule {
             sandbox_program,
             export_trampolines,
+            nth_instruction_to_code_offset_map: result.nth_instruction_to_code_offset_map,
         })
     }
 
     pub fn machine_code(&self) -> Cow<[u8]> {
         self.sandbox_program.machine_code()
+    }
+
+    pub fn nth_instruction_to_code_offset_map(&self) -> &[u32] {
+        &self.nth_instruction_to_code_offset_map
     }
 }
 
