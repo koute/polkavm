@@ -198,9 +198,10 @@ macro_rules! sandbox_tests {
             use crate::sandbox::SandboxConfig as _;
             use crate::sandbox::SandboxAddressSpace as _;
             use crate::sandbox::{SandboxKind, SandboxProgramInit, ExecuteArgs, get_native_page_size};
+            use polkavm_assembler::amd64::addr::*;
             use polkavm_assembler::amd64::inst::*;
             use polkavm_assembler::amd64::Reg::*;
-            use polkavm_assembler::amd64::{LoadKind, RegSize, StoreKind};
+            use polkavm_assembler::amd64::{LoadKind, RegSize, Size};
             use polkavm_assembler::Assembler;
             use polkavm_common::init::GuestProgramInit;
             use polkavm_common::utils::Access;
@@ -264,13 +265,13 @@ macro_rules! sandbox_tests {
                 let mem = init.memory_config(get_native_page_size()).unwrap();
                 let mut asm = Assembler::new();
                 if Sandbox::KIND != SandboxKind::Generic {
-                    asm.push(load32_imm(r15, 0));
+                    asm.push(mov_imm(r15, imm32(0)));
                 }
 
                 asm
-                    .push(load_indirect(rax, RegSize::R64, r15, mem.ro_data_address().try_into().unwrap(), LoadKind::U32))
-                    .push(store_indirect(RegSize::R64, r15, i32::try_from(mem.rw_data_address()).unwrap(), rax, StoreKind::U8))
-                    .push(store_indirect(RegSize::R64, r15, i32::try_from(mem.rw_data_address()).unwrap() + 4, rax, StoreKind::U16))
+                    .push(load(LoadKind::U32, rax, reg_indirect(RegSize::R64, r15 + mem.ro_data_address().try_into().unwrap())))
+                    .push(store(Size::U8, reg_indirect(RegSize::R64, r15 + i32::try_from(mem.rw_data_address()).unwrap()), rax))
+                    .push(store(Size::U16, reg_indirect(RegSize::R64, r15 + (i32::try_from(mem.rw_data_address()).unwrap() + 4)), rax))
                     .push(ret());
 
                 let code = asm.finalize();
@@ -302,13 +303,13 @@ macro_rules! sandbox_tests {
                 let mem = init.memory_config(get_native_page_size()).unwrap();
                 let mut asm = Assembler::new();
                 if Sandbox::KIND != SandboxKind::Generic {
-                    asm.push(load32_imm(r15, 0));
+                    asm.push(mov_imm(r15, imm32(0)));
                 }
 
                 asm
-                    .push(load_indirect(rax, RegSize::R64, r15, mem.rw_data_address().try_into().unwrap(), LoadKind::U32))
-                    .push(add_imm(RegSize::R64, rax, 1))
-                    .push(store_indirect(RegSize::R64, r15, i32::try_from(mem.rw_data_address()).unwrap(), rax, StoreKind::U32))
+                    .push(load(LoadKind::U32, rax, reg_indirect(RegSize::R64, r15 + mem.rw_data_address().try_into().unwrap())))
+                    .push(add((rax, imm64(1))))
+                    .push(store(Size::U32, reg_indirect(RegSize::R64, r15 + i32::try_from(mem.rw_data_address()).unwrap()), rax))
                     .push(ret());
 
                 let code = asm.finalize();
@@ -387,14 +388,14 @@ macro_rules! sandbox_tests {
                 let mem = init.memory_config(get_native_page_size()).unwrap();
                 let mut asm = Assembler::new();
                 if Sandbox::KIND != SandboxKind::Generic {
-                    asm.push(load32_imm(r15, 0));
+                    asm.push(mov_imm(r15, imm32(0)));
                 }
 
                 asm
-                    .push(load_indirect(rax, RegSize::R64, r15, mem.rw_data_address().try_into().unwrap(), LoadKind::U32))
-                    .push(add_imm(RegSize::R64, rax, 1))
-                    .push(store_indirect(RegSize::R64, r15, i32::try_from(mem.rw_data_address()).unwrap(), rax, StoreKind::U32))
-                    .push(load_indirect(rax, RegSize::R64, r15, 0, LoadKind::U32))
+                    .push(load(LoadKind::U32, rax, reg_indirect(RegSize::R64, r15 + mem.rw_data_address().try_into().unwrap())))
+                    .push(add((rax, imm64(1))))
+                    .push(store(Size::U32, reg_indirect(RegSize::R64, r15 + i32::try_from(mem.rw_data_address()).unwrap()), rax))
+                    .push(load(LoadKind::U32, rax, reg_indirect(RegSize::R64, r15)))
                     .push(ret());
 
                 let code = asm.finalize();
@@ -447,14 +448,14 @@ macro_rules! sandbox_tests {
                 let mem = init.memory_config(get_native_page_size()).unwrap();
                 let mut asm = Assembler::new();
                 let code = asm
-                    .push(load32_imm(rdx, 0))
-                    .push(load32_imm(rax, 1))
-                    .push(load32_imm(rcx, 0))
-                    .push(load32_imm(r8, 0x11223344))
-                    .push(store_abs(i32::try_from(mem.rw_data_address()).unwrap(), r8, StoreKind::U32))
+                    .push(mov_imm(rdx, imm32(0)))
+                    .push(mov_imm(rax, imm32(1)))
+                    .push(mov_imm(rcx, imm32(0)))
+                    .push(mov_imm(r8, imm32(0x11223344)))
+                    .push(store(Size::U32, abs(i32::try_from(mem.rw_data_address()).unwrap()), r8))
                     .push(idiv(RegSize::R32, rcx))
-                    .push(load32_imm(r8, 0x12345678))
-                    .push(store_abs(i32::try_from(mem.rw_data_address()).unwrap(), r8, StoreKind::U32))
+                    .push(mov_imm(r8, imm32(0x12345678)))
+                    .push(store(Size::U32, abs(i32::try_from(mem.rw_data_address()).unwrap()), r8))
                     .push(ret())
                     .finalize();
 
