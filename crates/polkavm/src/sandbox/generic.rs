@@ -983,6 +983,10 @@ impl super::Sandbox for Sandbox {
     fn access(&mut self) -> SandboxAccess {
         SandboxAccess { sandbox: self }
     }
+
+    fn pid(&self) -> Option<u32> {
+        None
+    }
 }
 
 pub struct SandboxAccess<'a> {

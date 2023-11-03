@@ -328,4 +328,8 @@ impl<S> CompiledInstance<S> where S: Sandbox, Module: AsCompiledModule<S> {
     pub fn access(&'_ mut self) -> S::Access<'_> {
         self.sandbox.access()
     }
+
+    pub fn sandbox(&self) -> &S {
+        &self.sandbox
+    }
 }
