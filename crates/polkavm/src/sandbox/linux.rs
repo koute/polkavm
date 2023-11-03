@@ -971,6 +971,10 @@ impl super::Sandbox for Sandbox {
     fn access(&mut self) -> SandboxAccess {
         SandboxAccess { sandbox: self }
     }
+
+    fn pid(&self) -> Option<u32> {
+        Some(self.child.pid as u32)
+    }
 }
 
 impl Sandbox {

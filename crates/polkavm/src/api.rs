@@ -1251,6 +1251,23 @@ impl InstanceBackend {
             }
         }
     }
+
+    fn pid(&self) -> Option<u32> {
+        if_compiler_is_supported! {
+            {
+                match self {
+                    #[cfg(target_os = "linux")]
+                    InstanceBackend::CompiledLinux(ref backend) => backend.sandbox().pid(),
+                    InstanceBackend::CompiledGeneric(ref backend) => backend.sandbox().pid(),
+                    InstanceBackend::Interpreted(..) => None,
+                }
+            } else {
+                match self {
+                    InstanceBackend::Interpreted(..) => None,
+                }
+            }
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -1473,6 +1490,19 @@ impl<T> Instance<T> {
         };
 
         mutable.backend.access().get_reg(reg)
+    }
+
+    /// Returns the PID of the sandbox corresponding to this instance.
+    ///
+    /// Will be `None` if the instance doesn't run in a separate process.
+    /// Mostly only useful for debugging.
+    pub fn pid(&self) -> Option<u32> {
+        let mutable = match self.0.mutable.lock() {
+            Ok(mutable) => mutable,
+            Err(poison) => poison.into_inner(),
+        };
+
+        mutable.backend.pid()
     }
 }
 

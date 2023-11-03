@@ -70,6 +70,7 @@ pub trait Sandbox: Sized {
     fn spawn(config: &Self::Config) -> Result<Self, Self::Error>;
     fn execute(&mut self, args: ExecuteArgs<Self>) -> Result<(), ExecutionError<Self::Error>>;
     fn access(&'_ mut self) -> Self::Access<'_>;
+    fn pid(&self) -> Option<u32>;
 }
 
 pub type OnHostcall<'a, T> = &'a mut dyn for<'r> FnMut(u64, <T as Sandbox>::Access<'r>) -> Result<(), Trap>;
