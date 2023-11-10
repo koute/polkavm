@@ -597,17 +597,17 @@ impl RawInstruction {
     }
 
     #[inline]
-    fn reg1(self) -> Reg {
+    pub fn reg1(self) -> Reg {
         Reg::from_u8(self.regs & 0b00001111).unwrap_or_else(|| unreachable!())
     }
 
     #[inline]
-    fn reg2(self) -> Reg {
+    pub fn reg2(self) -> Reg {
         Reg::from_u8(self.regs >> 4).unwrap_or_else(|| unreachable!())
     }
 
     #[inline]
-    fn reg3(self) -> Reg {
+    pub fn reg3(self) -> Reg {
         Reg::from_u8(self.imm_or_reg as u8).unwrap_or_else(|| unreachable!())
     }
 
