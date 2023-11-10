@@ -2755,6 +2755,37 @@ fn optimize_program(
         }
 
         perform_nop_elimination(all_blocks, current);
+
+        let block = &mut all_blocks[current.index()];
+        block.next.instruction = match block.next.instruction {
+            ControlInst::Call { ra, target, target_return } => {
+                block.ops.push((
+                    block.next.source.clone(),
+                    BasicInst::LoadAddress {
+                        dst: ra,
+                        target: AnyTarget::Code(target_return),
+                    },
+                ));
+                ControlInst::Jump { target }
+            }
+            ControlInst::CallIndirect {
+                ra,
+                target_return,
+                base,
+                offset,
+            } => {
+                block.ops.push((
+                    block.next.source.clone(),
+                    BasicInst::LoadAddress {
+                        dst: ra,
+                        target: AnyTarget::Code(target_return),
+                    },
+                ));
+                ControlInst::JumpIndirect { base, offset }
+            }
+            instruction => instruction,
+        };
+
         optimize_queue.push(current);
     }
 
