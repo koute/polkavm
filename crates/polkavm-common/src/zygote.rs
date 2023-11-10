@@ -19,7 +19,7 @@ pub const VM_ADDR_NATIVE_CODE: u64 = 0x100000000;
 pub const VM_ADDR_JUMP_TABLE: u64 = 0x800000000;
 
 /// The address where the return-to-host jump table vector physically resides.
-pub const VM_ADDR_JUMP_TABLE_RETURN_TO_HOST: u64 = 0x9ffff8000;
+pub const VM_ADDR_JUMP_TABLE_RETURN_TO_HOST: u64 = 0xffffe0000;
 
 /// The address of the native entry point used for triggering syscalls.
 pub const VM_ADDR_SYSCALL: u64 = 0x3ffffc000;
@@ -73,7 +73,12 @@ pub const VM_COMPILER_MAXIMUM_INSTRUCTION_LENGTH: u32 = 53;
 pub const VM_COMPILER_MAXIMUM_EPILOGUE_LENGTH: u32 = 1024 * 1024;
 
 /// The maximum number of bytes the jump table can be.
-pub const VM_SANDBOX_MAXIMUM_JUMP_TABLE_SIZE: u32 = (crate::abi::VM_MAXIMUM_JUMP_TARGET + 1) * core::mem::size_of::<u64>() as u32;
+const VM_SANDBOX_MAXIMUM_JUMP_TABLE_SIZE: u64 = (crate::abi::VM_MAXIMUM_INSTRUCTION_COUNT as u64 + 1)
+    * core::mem::size_of::<u64>() as u64
+    * crate::abi::VM_CODE_ADDRESS_ALIGNMENT as u64;
+
+/// The maximum number of bytes the jump table can span in virtual memory.
+pub const VM_SANDBOX_MAXIMUM_JUMP_TABLE_VIRTUAL_SIZE: u64 = 0x100000000 * core::mem::size_of::<u64>() as u64;
 
 /// The maximum number of bytes the native code can be.
 pub const VM_SANDBOX_MAXIMUM_NATIVE_CODE_SIZE: u32 = 512 * 1024 * 1024 - 1;
@@ -345,10 +350,12 @@ impl VmCtx {
     }
 }
 
-static_assert!(VM_ADDR_JUMP_TABLE_RETURN_TO_HOST == VM_ADDR_JUMP_TABLE + ((crate::abi::VM_ADDR_RETURN_TO_HOST as u64) << 1));
-static_assert!((VM_ADDR_JUMP_TABLE + 0x100000000 - crate::abi::VM_ADDR_RETURN_TO_HOST as u64) % 0x4000 == 0);
-static_assert!(VM_ADDR_JUMP_TABLE + (VM_SANDBOX_MAXIMUM_JUMP_TABLE_SIZE as u64) < VM_ADDR_JUMP_TABLE_RETURN_TO_HOST);
-static_assert!(VM_ADDR_JUMP_TABLE_RETURN_TO_HOST < VM_ADDR_JUMP_TABLE + 0x200000000);
+static_assert!(VM_ADDR_JUMP_TABLE_RETURN_TO_HOST == VM_ADDR_JUMP_TABLE + ((crate::abi::VM_ADDR_RETURN_TO_HOST as u64) << 3));
+static_assert!(VM_ADDR_JUMP_TABLE_RETURN_TO_HOST > VM_ADDR_JUMP_TABLE);
+static_assert!(VM_ADDR_JUMP_TABLE_RETURN_TO_HOST % 0x4000 == 0);
+static_assert!(VM_SANDBOX_MAXIMUM_JUMP_TABLE_SIZE <= VM_SANDBOX_MAXIMUM_JUMP_TABLE_VIRTUAL_SIZE);
+static_assert!(VM_ADDR_JUMP_TABLE + VM_SANDBOX_MAXIMUM_JUMP_TABLE_SIZE < VM_ADDR_JUMP_TABLE_RETURN_TO_HOST);
+static_assert!(VM_ADDR_JUMP_TABLE_RETURN_TO_HOST < VM_ADDR_JUMP_TABLE + VM_SANDBOX_MAXIMUM_JUMP_TABLE_VIRTUAL_SIZE);
 static_assert!(VM_ADDR_JUMP_TABLE.count_ones() == 1);
 static_assert!((1 << VM_ADDR_JUMP_TABLE.trailing_zeros()) == VM_ADDR_JUMP_TABLE);
 

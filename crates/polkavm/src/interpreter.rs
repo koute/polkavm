@@ -1,10 +1,10 @@
 use crate::api::{BackendAccess, ExecutionConfig, MemoryAccessError, Module, OnHostcall};
 use crate::error::{bail, Error};
 use core::mem::MaybeUninit;
-use polkavm_common::abi::VM_ADDR_RETURN_TO_HOST;
+use polkavm_common::abi::{VM_ADDR_RETURN_TO_HOST, VM_CODE_ADDRESS_ALIGNMENT};
 use polkavm_common::error::Trap;
 use polkavm_common::init::GuestProgramInit;
-use polkavm_common::program::{InstructionVisitor, Opcode, Reg};
+use polkavm_common::program::{InstructionVisitor, Reg};
 use polkavm_common::utils::{byte_slice_init, Access, AsUninitSliceMut};
 
 type ExecutionError<E = core::convert::Infallible> = polkavm_common::error::ExecutionError<E>;
@@ -56,7 +56,8 @@ pub(crate) struct InterpretedInstance {
     heap: Vec<u8>,
     stack: Vec<u8>,
     regs: [u32; Reg::ALL_NON_ZERO.len() + 1],
-    pc: u32,
+    nth_instruction: u32,
+    nth_basic_block: u32,
     return_to_host: bool,
     cycle_counter: u64,
 }
@@ -78,7 +79,8 @@ impl InterpretedInstance {
             stack,
             module,
             regs: [0; Reg::ALL_NON_ZERO.len() + 1],
-            pc: VM_ADDR_RETURN_TO_HOST,
+            nth_instruction: VM_ADDR_RETURN_TO_HOST,
+            nth_basic_block: 0,
             return_to_host: true,
             cycle_counter: 0,
         };
@@ -104,7 +106,13 @@ impl InterpretedInstance {
         let mut visitor = Visitor { inner: self, ctx };
         loop {
             visitor.inner.cycle_counter += 1;
-            let Some(instruction) = visitor.inner.module.instructions().get(visitor.inner.pc as usize).copied() else {
+            let Some(instruction) = visitor
+                .inner
+                .module
+                .instructions()
+                .get(visitor.inner.nth_instruction as usize)
+                .copied()
+            else {
                 return Err(ExecutionError::Trap(Default::default()));
             };
 
@@ -135,24 +143,26 @@ impl InterpretedInstance {
 
     pub fn prepare_for_call(&mut self, export_index: usize, config: &ExecutionConfig) {
         // TODO: If this function becomes public then this needs to return an error.
-        let address = self
+        let nth_basic_block = self
             .module
             .get_export(export_index)
             .expect("internal error: invalid export index")
             .address();
-        let target_pc = self
+
+        let nth_instruction = self
             .module
-            .instruction_by_jump_target(address)
+            .instruction_by_basic_block(nth_basic_block)
             .expect("internal error: invalid export address");
 
         self.return_to_host = false;
         self.regs[1..].copy_from_slice(&config.initial_regs);
-        self.pc = target_pc;
+        self.nth_instruction = nth_instruction;
+        self.nth_basic_block = nth_basic_block
     }
 
     pub fn step_once(&mut self, ctx: InterpreterContext) -> Result<(), ExecutionError> {
         self.cycle_counter += 1;
-        let Some(instruction) = self.module.instructions().get(self.pc as usize).copied() else {
+        let Some(instruction) = self.module.instructions().get(self.nth_instruction as usize).copied() else {
             return Err(ExecutionError::Trap(Default::default()));
         };
 
@@ -194,15 +204,6 @@ impl InterpretedInstance {
 
         let offset = (address - range.start) as usize;
         memory_slice.get_mut(offset..offset + length as usize)
-    }
-
-    fn next_instruction_jump_target(&self) -> Option<u32> {
-        let inst = self.module.instructions().get(self.pc as usize + 1).copied()?;
-        if inst.raw_op() == Opcode::jump_target as u8 {
-            Some(inst.raw_imm_or_reg().checked_mul(4)?)
-        } else {
-            None
-        }
     }
 }
 
@@ -259,7 +260,7 @@ impl<'a> Access<'a> for InterpretedAccess<'a> {
     }
 
     fn program_counter(&self) -> Option<u32> {
-        Some(self.instance.pc)
+        Some(self.instance.nth_instruction)
     }
 
     fn native_program_counter(&self) -> Option<u64> {
@@ -293,14 +294,14 @@ impl<'a, 'b> Visitor<'a, 'b> {
         let s1 = self.inner.regs[s1 as usize];
         let s2 = self.inner.regs[s2 as usize];
         self.set(dst, callback(s1, s2))?;
-        self.inner.pc += 1;
+        self.inner.nth_instruction += 1;
         Ok(())
     }
 
     fn set2(&mut self, dst: Reg, src: Reg, callback: impl Fn(u32) -> u32) -> Result<(), ExecutionError> {
         let src = self.inner.regs[src as usize];
         self.set(dst, callback(src))?;
-        self.inner.pc += 1;
+        self.inner.nth_instruction += 1;
         Ok(())
     }
 
@@ -308,10 +309,15 @@ impl<'a, 'b> Visitor<'a, 'b> {
         let s1 = self.inner.regs[s1 as usize];
         let s2 = self.inner.regs[s2 as usize];
         if callback(s1, s2) {
-            self.inner.pc = self.inner.module.instruction_by_jump_target(target).unwrap();
-        // TODO
+            self.inner.nth_instruction = self
+                .inner
+                .module
+                .instruction_by_basic_block(target)
+                .expect("internal error: couldn't fetch the instruction index for a branch");
+            self.inner.nth_basic_block = target;
         } else {
-            self.inner.pc += 1;
+            self.inner.nth_instruction += 1;
+            self.inner.nth_basic_block += 1;
         }
 
         Ok(())
@@ -325,10 +331,12 @@ impl<'a, 'b> Visitor<'a, 'b> {
         let Some(slice) = self.inner.get_memory_slice(address, length) else {
             log::debug!(
                 "Load of {length} bytes from 0x{address:x} failed! (pc = #{pc}, cycle = {cycle})",
-                pc = self.inner.pc,
+                pc = self.inner.nth_instruction,
                 cycle = self.inner.cycle_counter
             );
-            self.inner.module.debug_print_location(log::Level::Debug, self.inner.pc);
+            self.inner
+                .module
+                .debug_print_location(log::Level::Debug, self.inner.nth_instruction);
             return Err(ExecutionError::Trap(Default::default()));
         };
 
@@ -336,7 +344,7 @@ impl<'a, 'b> Visitor<'a, 'b> {
 
         let value = T::from_slice(slice);
         self.set(dst, value)?;
-        self.inner.pc += 1;
+        self.inner.nth_instruction += 1;
         Ok(())
     }
 
@@ -349,10 +357,12 @@ impl<'a, 'b> Visitor<'a, 'b> {
         let Some(slice) = self.inner.get_memory_slice_mut(address, length) else {
             log::debug!(
                 "Store of {length} bytes to 0x{address:x} failed! (pc = #{pc}, cycle = {cycle})",
-                pc = self.inner.pc,
+                pc = self.inner.nth_instruction,
                 cycle = self.inner.cycle_counter
             );
-            self.inner.module.debug_print_location(log::Level::Debug, self.inner.pc);
+            self.inner
+                .module
+                .debug_print_location(log::Level::Debug, self.inner.nth_instruction);
             return Err(ExecutionError::Trap(Default::default()));
         };
 
@@ -365,7 +375,7 @@ impl<'a, 'b> Visitor<'a, 'b> {
             (on_store)(address, value.as_ref()).map_err(ExecutionError::Trap)?;
         }
 
-        self.inner.pc += 1;
+        self.inner.nth_instruction += 1;
         Ok(())
     }
 }
@@ -473,8 +483,9 @@ impl<'a, 'b> InstructionVisitor for Visitor<'a, 'b> {
         Err(ExecutionError::Trap(Default::default()))
     }
 
-    fn jump_target(&mut self, _: u32) -> Self::ReturnTy {
-        self.inner.pc += 1;
+    fn fallthrough(&mut self) -> Self::ReturnTy {
+        self.inner.nth_instruction += 1;
+        self.inner.nth_basic_block += 1;
         Ok(())
     }
 
@@ -482,7 +493,7 @@ impl<'a, 'b> InstructionVisitor for Visitor<'a, 'b> {
         if let Some(on_hostcall) = self.ctx.on_hostcall.as_mut() {
             let access = BackendAccess::Interpreted(self.inner.access());
             (on_hostcall)(imm as u64, access).map_err(ExecutionError::Trap)?;
-            self.inner.pc += 1;
+            self.inner.nth_instruction += 1;
             Ok(())
         } else {
             log::debug!("Hostcall called without any hostcall handler set!");
@@ -674,34 +685,81 @@ impl<'a, 'b> InstructionVisitor for Visitor<'a, 'b> {
     }
 
     fn jump_and_link_register(&mut self, ra: Reg, base: Reg, offset: u32) -> Self::ReturnTy {
-        let offset = offset.wrapping_mul(4);
-        let target = self.inner.regs[base as usize].wrapping_add(offset);
-
-        if ra != Reg::Zero {
-            if let Some(return_target) = self.inner.next_instruction_jump_target() {
-                self.set(ra, return_target)?;
-            } else {
-                log::error!("Found a jump instruction which is not followed by a jump target instruction!");
-                return Err(ExecutionError::Trap(Default::default()));
-            }
-        }
-
-        if target % 4 != 0 {
-            log::error!("Found a jump with a misaligned target: target = {target}");
-            return Err(ExecutionError::Trap(Default::default()));
-        }
-
-        if target == VM_ADDR_RETURN_TO_HOST {
-            self.inner.return_to_host = true;
-            return Ok(());
-        }
-
-        let Some(next_pc) = self.inner.module.instruction_by_jump_target(target / 4) else {
-            log::debug!("Return to 0x{target:x} failed: no such jump target");
-            return Err(ExecutionError::Trap(Default::default()));
+        let return_address = if ra != Reg::Zero {
+            Some(
+                self.inner
+                    .module
+                    .jump_table_index_by_basic_block(self.inner.nth_basic_block + 1)
+                    .expect("internal error: couldn't fetch the jump table index for the return basic block")
+                    * VM_CODE_ADDRESS_ALIGNMENT,
+            )
+        } else {
+            None
         };
 
-        self.inner.pc = next_pc;
+        if let Some(return_address) = return_address {
+            log::trace!(
+                "Setting a call's return address: {ra} = @dyn {:x} (@{:x})",
+                return_address / VM_CODE_ADDRESS_ALIGNMENT,
+                self.inner.nth_basic_block + 1
+            );
+        }
+
+        if base == Reg::Zero {
+            // A static jump.
+            if let Some(return_address) = return_address {
+                self.set(ra, return_address)?;
+            }
+
+            let nth_instruction = self
+                .inner
+                .module
+                .instruction_by_basic_block(offset)
+                .expect("internal error: couldn't fetch the instruction index for a jump");
+
+            log::trace!("Static jump to: #{nth_instruction}: @{offset:x}");
+            self.inner.nth_basic_block = offset;
+            self.inner.nth_instruction = nth_instruction;
+        } else {
+            // A dynamic jump.
+            let target = self.inner.regs[base as usize].wrapping_add(offset);
+            if let Some(return_address) = return_address {
+                self.set(ra, return_address)?;
+            }
+
+            if target == VM_ADDR_RETURN_TO_HOST {
+                self.inner.return_to_host = true;
+                return Ok(());
+            }
+
+            if target == 0 {
+                return Err(ExecutionError::Trap(Default::default()));
+            }
+
+            if target % VM_CODE_ADDRESS_ALIGNMENT != 0 {
+                log::error!("Found a dynamic jump with a misaligned target: target = {target}");
+                return Err(ExecutionError::Trap(Default::default()));
+            }
+
+            let Some(nth_basic_block) = self
+                .inner
+                .module
+                .basic_block_by_jump_table_index(target / VM_CODE_ADDRESS_ALIGNMENT)
+            else {
+                return Err(ExecutionError::Trap(Default::default()));
+            };
+
+            let nth_instruction = self
+                .inner
+                .module
+                .instruction_by_basic_block(nth_basic_block)
+                .expect("internal error: couldn't fetch the instruction index for a dynamic jump");
+
+            log::trace!("Dynamic jump to: #{nth_instruction}: @{nth_basic_block:x}");
+            self.inner.nth_basic_block = nth_basic_block;
+            self.inner.nth_instruction = nth_instruction;
+        }
+
         Ok(())
     }
 }

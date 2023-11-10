@@ -189,12 +189,12 @@ define_opcodes! {
     // Instructions with no args.
     [
         trap                            = 0b00_000000,
+        fallthrough                     = 0b00_000001,
     ]
 
     // 1-6 byte instructions
     // Instructions with args: imm
     [
-        jump_target                     = 0b01_000000,
         ecalli                          = 0b01_111111,
     ]
 
@@ -278,8 +278,8 @@ impl<'a> InstructionVisitor for core::fmt::Formatter<'a> {
         write!(self, "trap")
     }
 
-    fn jump_target(&mut self, pcrel: u32) -> Self::ReturnTy {
-        write!(self, "@{:x}:", pcrel * 4)
+    fn fallthrough(&mut self) -> Self::ReturnTy {
+        write!(self, "@:")
     }
 
     fn ecalli(&mut self, imm: u32) -> Self::ReturnTy {
@@ -506,42 +506,42 @@ impl<'a> InstructionVisitor for core::fmt::Formatter<'a> {
     }
 
     fn branch_less_unsigned(&mut self, s1: Reg, s2: Reg, imm: u32) -> Self::ReturnTy {
-        write!(self, "if {} <u {}: jump @{:x}", s1, s2, imm * 4)
+        write!(self, "if {} <u {}: jump @{:x}", s1, s2, imm)
     }
 
     fn branch_less_signed(&mut self, s1: Reg, s2: Reg, imm: u32) -> Self::ReturnTy {
-        write!(self, "if {} <s {}: jump @{:x}", s1, s2, imm * 4)
+        write!(self, "if {} <s {}: jump @{:x}", s1, s2, imm)
     }
 
     fn branch_greater_or_equal_unsigned(&mut self, s1: Reg, s2: Reg, imm: u32) -> Self::ReturnTy {
-        write!(self, "if {} >=u {}: jump @{:x}", s1, s2, imm * 4)
+        write!(self, "if {} >=u {}: jump @{:x}", s1, s2, imm)
     }
 
     fn branch_greater_or_equal_signed(&mut self, s1: Reg, s2: Reg, imm: u32) -> Self::ReturnTy {
-        write!(self, "if {} >=s {}: jump @{:x}", s1, s2, imm * 4)
+        write!(self, "if {} >=s {}: jump @{:x}", s1, s2, imm)
     }
 
     fn branch_eq(&mut self, s1: Reg, s2: Reg, imm: u32) -> Self::ReturnTy {
-        write!(self, "if {} == {}: jump @{:x}", s1, s2, imm * 4)
+        write!(self, "if {} == {}: jump @{:x}", s1, s2, imm)
     }
 
     fn branch_not_eq(&mut self, s1: Reg, s2: Reg, imm: u32) -> Self::ReturnTy {
-        write!(self, "if {} != {}: jump @{:x}", s1, s2, imm * 4)
+        write!(self, "if {} != {}: jump @{:x}", s1, s2, imm)
     }
 
     fn jump_and_link_register(&mut self, ra: Reg, base: Reg, offset: u32) -> Self::ReturnTy {
         use Reg::*;
         match (ra, base, offset) {
             (Zero, RA, 0) => write!(self, "ret"),
-            (Zero, Zero, _) => write!(self, "jump @{:x}", offset * 4),
+            (Zero, Zero, _) => write!(self, "jump @{:x}", offset),
             (Zero, _, 0) => write!(self, "jump [{}]", base),
-            (Zero, _, _) => write!(self, "jump [{} + {}]", base, offset * 4),
-            (RA, Zero, _) => write!(self, "call @{:x}", offset * 4),
+            (Zero, _, _) => write!(self, "jump [{} + {}]", base, offset),
+            (RA, Zero, _) => write!(self, "call @{:x}", offset),
             (RA, _, 0) => write!(self, "call [{}]", base),
-            (RA, _, _) => write!(self, "call [{} + {}]", base, offset * 4),
-            (_, Zero, _) => write!(self, "call @{:x}, {}", offset * 4, ra),
+            (RA, _, _) => write!(self, "call [{} + {}]", base, offset),
+            (_, Zero, _) => write!(self, "call @{:x}, {}", offset, ra),
             (_, _, 0) => write!(self, "call [{}], {}", base, ra),
-            (_, _, _) => write!(self, "call [{} + {}], {}", base, offset * 4, ra),
+            (_, _, _) => write!(self, "call [{} + {}], {}", base, offset, ra),
         }
     }
 }
@@ -935,6 +935,7 @@ pub struct ProgramBlob<'a> {
     exports: Range<usize>,
     imports: Range<usize>,
     code: Range<usize>,
+    jump_table: Range<usize>,
 
     debug_strings: Range<usize>,
     debug_line_program_ranges: Range<usize>,
@@ -1101,6 +1102,7 @@ impl<'a> ProgramBlob<'a> {
         reader.read_section_range_into(&mut section, &mut program.rw_data, SECTION_RW_DATA)?;
         reader.read_section_range_into(&mut section, &mut program.imports, SECTION_IMPORTS)?;
         reader.read_section_range_into(&mut section, &mut program.exports, SECTION_EXPORTS)?;
+        reader.read_section_range_into(&mut section, &mut program.jump_table, SECTION_JUMP_TABLE)?;
         reader.read_section_range_into(&mut section, &mut program.code, SECTION_CODE)?;
         reader.read_section_range_into(&mut section, &mut program.debug_strings, SECTION_OPT_DEBUG_STRINGS)?;
         reader.read_section_range_into(&mut section, &mut program.debug_line_programs, SECTION_OPT_DEBUG_LINE_PROGRAMS)?;
@@ -1316,6 +1318,34 @@ impl<'a> ProgramBlob<'a> {
         }
     }
 
+    /// The upper bound of how many entries there might be in this program's jump table, excluding the very first implicit entry.
+    pub fn jump_table_upper_bound(&self) -> usize {
+        self.jump_table.len()
+    }
+
+    /// Returns an iterator over the jump table entries, excluding the very first implicit entry.
+    pub fn jump_table(&'_ self) -> impl Iterator<Item = Result<u32, ProgramParseError>> + Clone + '_ {
+        #[derive(Clone)]
+        struct JumpTableIterator<'a> {
+            reader: Reader<'a>,
+        }
+
+        impl<'a> Iterator for JumpTableIterator<'a> {
+            type Item = Result<u32, ProgramParseError>;
+            fn next(&mut self) -> Option<Self::Item> {
+                if self.reader.is_eof() {
+                    return None;
+                }
+
+                Some(self.reader.read_varint())
+            }
+        }
+
+        JumpTableIterator {
+            reader: self.get_section_reader(self.jump_table.clone()),
+        }
+    }
+
     /// Returns the debug string for the given relative offset.
     pub fn get_debug_string(&self, offset: u32) -> Result<&str, ProgramParseError> {
         let mut reader = self.get_section_reader(self.debug_strings.clone());
@@ -1401,6 +1431,7 @@ impl<'a> ProgramBlob<'a> {
             exports: self.exports,
             imports: self.imports,
             code: self.code,
+            jump_table: self.jump_table,
 
             debug_strings: self.debug_strings,
             debug_line_program_ranges: self.debug_line_program_ranges,
@@ -1879,7 +1910,8 @@ pub const SECTION_RO_DATA: u8 = 2;
 pub const SECTION_RW_DATA: u8 = 3;
 pub const SECTION_IMPORTS: u8 = 4;
 pub const SECTION_EXPORTS: u8 = 5;
-pub const SECTION_CODE: u8 = 6;
+pub const SECTION_JUMP_TABLE: u8 = 6;
+pub const SECTION_CODE: u8 = 7;
 pub const SECTION_OPT_DEBUG_STRINGS: u8 = 128;
 pub const SECTION_OPT_DEBUG_LINE_PROGRAMS: u8 = 129;
 pub const SECTION_OPT_DEBUG_LINE_PROGRAM_RANGES: u8 = 130;

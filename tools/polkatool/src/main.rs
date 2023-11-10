@@ -244,26 +244,46 @@ fn disassemble_into(
             .push((nth_export, export));
     }
 
+    let mut jump_table_map = HashMap::new();
+    let mut jump_table = Vec::new();
+    for maybe_target in blob.jump_table() {
+        let target = match maybe_target {
+            Ok(target) => target,
+            Err(error) => {
+                bail!("failed to parse the jump table: {error}");
+            }
+        };
+
+        let jump_table_index = jump_table.len() + 1;
+        jump_table.push(target);
+        assert!(jump_table_map.insert(target, jump_table_index).is_none());
+    }
+
+    let format_jump_target = |jump_target_counter: u32| {
+        if let Some(jump_table_index) = jump_table_map.get(&jump_target_counter) {
+            if !matches!(format, DisassemblyFormat::DiffFriendly) {
+                format!("@{jump_target_counter:x}: [@dyn {jump_table_index:x}]")
+            } else {
+                "@_: [_]".to_string()
+            }
+        } else if !matches!(format, DisassemblyFormat::DiffFriendly) {
+            format!("@{jump_target_counter:x}:")
+        } else {
+            "@_:".to_string()
+        }
+    };
+
     let mut fmt = AssemblyFormatter::default();
     let mut last_line_program_entry = None;
     let mut last_full_name = String::new();
+    let mut jump_target_counter = 0;
+    let mut pending_label = true;
     for (nth_instruction, instruction) in instructions.iter().enumerate() {
-        if polkavm_common::program::Opcode::jump_target == instruction.op() {
-            let target = instruction.raw_imm_or_reg();
-            if let Some(exports) = exports_for_jump_target.get(&target) {
-                if nth_instruction != 0 {
-                    if let Err(error) = writeln!(&mut writer) {
-                        bail!("failed to write to output: {error}");
-                    }
-                }
-
-                for (nth_export, export) in exports {
-                    if let Err(error) = writeln!(&mut writer, "(export #{nth_export}: {})", export.prototype().name()) {
-                        bail!("failed to write to output: {error}");
-                    }
-                }
-            };
-        }
+        let instruction_s = if instruction.op() == polkavm_common::program::Opcode::fallthrough {
+            format_jump_target(jump_target_counter + 1)
+        } else {
+            instruction.to_string()
+        };
 
         let line_program = match blob.get_debug_line_program_at(nth_instruction as u32) {
             Ok(line_program) => line_program,
@@ -323,8 +343,21 @@ fn disassemble_into(
             last_full_name.clear();
         }
 
+        if pending_label {
+            pending_label = false;
+            let result = if !matches!(format, DisassemblyFormat::DiffFriendly) {
+                writeln!(&mut writer, "      : {}", format_jump_target(jump_target_counter))
+            } else {
+                writeln!(&mut writer, "    {}", format_jump_target(jump_target_counter))
+            };
+
+            if let Err(error) = result {
+                bail!("failed to write to output: {error}");
+            }
+        }
+
         if matches!(format, DisassemblyFormat::DiffFriendly) {
-            let mut string = instruction.to_string();
+            let mut string = instruction_s;
             if instruction.op() == polkavm_common::program::Opcode::add_imm && instruction.reg2() == polkavm_common::program::Reg::Zero {
                 string = format!("{} = _", instruction.reg1());
             }
@@ -346,7 +379,7 @@ fn disassemble_into(
                 bail!("failed to write to output: {error}");
             }
         } else if matches!(format, DisassemblyFormat::Guest | DisassemblyFormat::GuestAndNative) {
-            if let Err(error) = writeln!(&mut writer, "{nth_instruction:6}: {instruction}") {
+            if let Err(error) = writeln!(&mut writer, "{nth_instruction:6}: {instruction_s}") {
                 bail!("failed to write to output: {error}");
             }
         }
@@ -356,19 +389,35 @@ fn disassemble_into(
             let code_position = map[nth_instruction] as usize;
             let next_code_position = map[nth_instruction + 1] as usize;
             let length = next_code_position - code_position;
-            if length == 0 {
-                continue;
+            if length != 0 {
+                let code_chunk = &code[code_position..next_code_position];
+                if let Err(error) = fmt.emit(
+                    matches!(format, DisassemblyFormat::GuestAndNative),
+                    code_chunk,
+                    code_position,
+                    &mut writer,
+                ) {
+                    bail!("failed to write to output: {error}");
+                }
             }
+        }
 
-            let code_chunk = &code[code_position..next_code_position];
-            if let Err(error) = fmt.emit(
-                matches!(format, DisassemblyFormat::GuestAndNative),
-                code_chunk,
-                code_position,
-                &mut writer,
-            ) {
-                bail!("failed to write to output: {error}");
+        match instruction.op() {
+            polkavm_common::program::Opcode::fallthrough
+            | polkavm_common::program::Opcode::jump_and_link_register
+            | polkavm_common::program::Opcode::trap
+            | polkavm_common::program::Opcode::branch_less_unsigned
+            | polkavm_common::program::Opcode::branch_less_signed
+            | polkavm_common::program::Opcode::branch_greater_or_equal_unsigned
+            | polkavm_common::program::Opcode::branch_greater_or_equal_signed
+            | polkavm_common::program::Opcode::branch_eq
+            | polkavm_common::program::Opcode::branch_not_eq => {
+                if instruction.op() != polkavm_common::program::Opcode::fallthrough && nth_instruction + 1 != instructions.len() {
+                    pending_label = true;
+                }
+                jump_target_counter += 1;
             }
+            _ => {}
         }
     }
 

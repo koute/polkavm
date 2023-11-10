@@ -6,6 +6,7 @@ use polkavm_assembler::amd64::{Condition, LoadKind, RegSize, Size, ImmKind};
 use polkavm_assembler::Label;
 
 use polkavm_common::program::{InstructionVisitor, Reg};
+use polkavm_common::abi::VM_CODE_ADDRESS_ALIGNMENT;
 use polkavm_common::zygote::{
     VmCtx as LinuxVmCtx,
     SYSCALL_HOSTCALL, SYSCALL_RETURN, SYSCALL_TRACE, SYSCALL_TRAP, VM_ADDR_JUMP_TABLE, VM_ADDR_SYSCALL, VM_ADDR_VMCTX,
@@ -403,6 +404,7 @@ impl<'a> Compiler<'a> {
                     self.nop();
                 }
 
+                self.start_new_basic_block();
                 return;
             }
             (_, Z) => {
@@ -427,6 +429,7 @@ impl<'a> Compiler<'a> {
 
         let label = self.get_or_forward_declare_label(imm);
         self.push(jcc_label32(condition, label));
+        self.start_new_basic_block();
     }
 
     fn div_rem(&mut self, d: Reg, s1: Reg, s2: Reg, div_rem: DivRem, kind: Signedness) {
@@ -709,11 +712,6 @@ impl<'a> Compiler<'a> {
         self.push(mov_imm(TMP_REG, imm32(nth_instruction as u32)));
         self.push(call_label32(self.trace_label));
     }
-
-    fn define_label(&mut self, label: Label) {
-        log::trace!("label: {}", label);
-        self.asm.define_label(label);
-    }
 }
 
 impl<'a> InstructionVisitor for Compiler<'a> {
@@ -721,23 +719,12 @@ impl<'a> InstructionVisitor for Compiler<'a> {
 
     fn trap(&mut self) -> Self::ReturnTy {
         self.push(jmp_label32(self.trap_label));
+        self.start_new_basic_block();
         Ok(())
     }
 
-    fn jump_target(&mut self, pcrel: u32) -> Self::ReturnTy {
-        let label = self
-            .pc_to_label_pending
-            .remove(&pcrel)
-            .unwrap_or_else(|| self.asm.forward_declare_label());
-
-        self.define_label(label);
-        if self.pc_to_label.insert(pcrel, label).is_some() {
-            // TODO: Make the jump target numbering implicit, and then this won't be necessary.
-            log::debug!("Duplicate jump target label: 0x{:x}", pcrel);
-            return Err("found a duplicate jump target label");
-        }
-        self.max_jump_target = core::cmp::max(self.max_jump_target, pcrel);
-
+    fn fallthrough(&mut self) -> Self::ReturnTy {
+        self.start_new_basic_block();
         Ok(())
     }
 
@@ -1270,43 +1257,44 @@ impl<'a> InstructionVisitor for Compiler<'a> {
             todo!();
         }
 
+        let return_address = if ra != Reg::Zero {
+            let index = self.jump_table_index_by_basic_block.get(&self.next_basic_block())
+                .copied()
+                .expect("internal error: couldn't fetch the jump table index for the return basic block");
+
+            Some(index * VM_CODE_ADDRESS_ALIGNMENT)
+        } else {
+            None
+        };
+
         if base == Reg::Zero {
+            // A static jump.
             let label = self.get_or_forward_declare_label(offset);
-            if ra != Reg::Zero {
-                match self.next_instruction_jump_target() {
-                    Some(return_address) => {
-                        self.load_imm(ra, return_address);
-                    }
-                    None => {
-                        // TODO: Make this jump target implicit, and then this won't be necessary.
-                        return Err("found a jump instruction which is not followed by a jump target instruction");
-                    }
-                }
+            if let Some(return_address) = return_address {
+                self.load_imm(ra, return_address);
             }
 
             self.push(jmp_label32(label));
         } else {
+            // A dynamic jump.
             match self.sandbox_kind {
                 SandboxKind::Linux => {
                     // TODO: This could be more efficient. Maybe use fs/gs selector?
                     if offset == 0 {
                         self.push(mov(RegSize::R32, TMP_REG, conv_reg(base)));
                     } else {
-                        let offset = offset.wrapping_mul(4);
                         self.push(lea(RegSize::R32, TMP_REG, reg_indirect(RegSize::R32, conv_reg(base) + offset as i32)));
                     }
 
-                    self.push(ror_imm(RegSize::R32, TMP_REG, 2));
                     self.push(shl_imm(RegSize::R64, TMP_REG, 3));
                     self.push(bts(RegSize::R64, TMP_REG, VM_ADDR_JUMP_TABLE.trailing_zeros() as u8));
                     self.push(load(LoadKind::U64, TMP_REG, reg_indirect(RegSize::R64, TMP_REG)));
                 },
                 SandboxKind::Generic => {
-                    // TODO: This also could be more efficient.
-                    // TODO: FIXME: This is broken if the offset is unaligned!
+                    // // TODO: This also could be more efficient.
                     self.push(lea_rip_label(TMP_REG, self.jump_table_label));
                     self.push(push(conv_reg(base)));
-                    self.push(shl_imm(RegSize::R64, conv_reg(base), 1));
+                    self.push(shl_imm(RegSize::R64, conv_reg(base), 3));
                     if offset > 0 {
                         let offset = offset.wrapping_mul(8);
                         self.push(add((conv_reg(base), imm32(offset))));
@@ -1317,21 +1305,14 @@ impl<'a> InstructionVisitor for Compiler<'a> {
                 }
             }
 
-            if ra != Reg::Zero {
-                match self.next_instruction_jump_target() {
-                    Some(return_address) => {
-                        self.load_imm(ra, return_address);
-                    }
-                    None => {
-                        // TODO: Make this jump target implicit, and then this won't be necessary.
-                        return Err("found a jump instruction which is not followed by a jump target instruction");
-                    }
-                }
+            if let Some(return_address) = return_address {
+                self.load_imm(ra, return_address);
             }
 
             self.push(jmp(TMP_REG));
         }
 
+        self.start_new_basic_block();
         Ok(())
     }
 }

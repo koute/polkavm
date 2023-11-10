@@ -5,7 +5,6 @@ use std::sync::{Arc, Mutex};
 
 use polkavm_common::abi::{
     GuestMemoryConfig, VM_MAXIMUM_EXPORT_COUNT, VM_MAXIMUM_EXTERN_ARG_COUNT, VM_MAXIMUM_IMPORT_COUNT, VM_MAXIMUM_INSTRUCTION_COUNT,
-    VM_MAXIMUM_JUMP_TARGET,
 };
 use polkavm_common::abi::{VM_ADDR_RETURN_TO_HOST, VM_ADDR_USER_STACK_HIGH};
 use polkavm_common::error::Trap;
@@ -122,7 +121,10 @@ struct ModulePrivate {
     imports: BTreeMap<u32, ProgramImport<'static>>,
     export_index_by_name: HashMap<String, usize>,
     instructions: Vec<RawInstruction>,
-    jump_target_to_instruction: HashMap<u32, u32>,
+
+    instruction_by_basic_block: Vec<u32>,
+    jump_table_index_by_basic_block: HashMap<u32, u32>,
+    basic_block_by_jump_table_index: Vec<u32>,
 
     blob: Option<ProgramBlob<'static>>,
     compiled_module: CompiledModuleKind,
@@ -184,8 +186,16 @@ impl Module {
         self.0.exports.get(export_index)
     }
 
-    pub(crate) fn instruction_by_jump_target(&self, target: u32) -> Option<u32> {
-        self.0.jump_target_to_instruction.get(&target).copied()
+    pub(crate) fn instruction_by_basic_block(&self, nth_basic_block: u32) -> Option<u32> {
+        self.0.instruction_by_basic_block.get(nth_basic_block as usize).copied()
+    }
+
+    pub(crate) fn jump_table_index_by_basic_block(&self, nth_basic_block: u32) -> Option<u32> {
+        self.0.jump_table_index_by_basic_block.get(&nth_basic_block).copied()
+    }
+
+    pub(crate) fn basic_block_by_jump_table_index(&self, jump_table_index: u32) -> Option<u32> {
+        self.0.basic_block_by_jump_table_index.get(jump_table_index as usize).copied()
     }
 
     pub(crate) fn memory_config(&self) -> &GuestMemoryConfig {
@@ -222,25 +232,68 @@ impl Module {
             }
         }
 
+        log::trace!("Parsing jump table...");
+        let mut basic_block_by_jump_table_index = Vec::with_capacity(blob.jump_table_upper_bound() + 1);
+
+        // The very first entry is always invalid.
+        basic_block_by_jump_table_index.push(u32::MAX);
+
+        let mut maximum_seen_jump_target = 0;
+        for nth_basic_block in blob.jump_table() {
+            let nth_basic_block = nth_basic_block.map_err(Error::from_display)?;
+            maximum_seen_jump_target = core::cmp::max(maximum_seen_jump_target, nth_basic_block);
+            basic_block_by_jump_table_index.push(nth_basic_block);
+        }
+
+        basic_block_by_jump_table_index.shrink_to_fit();
+
+        let jump_table_index_by_basic_block: HashMap<_, _> = basic_block_by_jump_table_index
+            .iter()
+            .copied()
+            .enumerate()
+            .map(|(jump_table_index, nth_basic_block)| (nth_basic_block, jump_table_index as u32))
+            .collect();
+
         log::trace!("Parsing code...");
-        let (instructions, jump_target_to_instruction) = {
-            let mut jump_target_to_instruction = HashMap::with_capacity(blob.code().len() / 64);
+        let (instructions, instruction_by_basic_block) = {
+            let mut instruction_by_basic_block = Vec::with_capacity(blob.code().len() / 4);
+            instruction_by_basic_block.push(0);
+
             let mut instructions = Vec::with_capacity(blob.code().len() / 4);
             for (nth_instruction, instruction) in blob.instructions().enumerate() {
+                let nth_instruction = nth_instruction as u32;
                 let instruction = instruction.map_err(Error::from_display)?;
                 match instruction.op() {
-                    Opcode::jump_target => {
-                        let target = instruction.raw_imm_or_reg();
-                        if target > VM_MAXIMUM_JUMP_TARGET {
-                            bail!("program has too big jump target");
+                    Opcode::fallthrough => {
+                        instruction_by_basic_block.push(nth_instruction + 1);
+                    }
+                    Opcode::jump_and_link_register => {
+                        let ra = instruction.reg1();
+                        if ra != Reg::Zero {
+                            let return_basic_block = instruction_by_basic_block.len() as u32;
+                            if !jump_table_index_by_basic_block.contains_key(&return_basic_block) {
+                                bail!("found a call instruction where the next basic block is not part of the jump table");
+                            }
                         }
 
-                        if jump_target_to_instruction
-                            .insert(instruction.raw_imm_or_reg(), nth_instruction as u32)
-                            .is_some()
-                        {
-                            bail!("duplicate jump target");
+                        let base = instruction.reg2();
+                        if base == Reg::Zero {
+                            maximum_seen_jump_target = core::cmp::max(maximum_seen_jump_target, instruction.raw_imm_or_reg());
                         }
+
+                        instruction_by_basic_block.push(nth_instruction + 1);
+                    }
+                    Opcode::trap => {
+                        instruction_by_basic_block.push(nth_instruction + 1);
+                    }
+                    Opcode::branch_less_unsigned
+                    | Opcode::branch_less_signed
+                    | Opcode::branch_greater_or_equal_unsigned
+                    | Opcode::branch_greater_or_equal_signed
+                    | Opcode::branch_eq
+                    | Opcode::branch_not_eq => {
+                        instruction_by_basic_block.push(nth_instruction + 1);
+                        maximum_seen_jump_target = core::cmp::max(maximum_seen_jump_target, instruction.raw_imm_or_reg());
                     }
                     Opcode::ecalli => {
                         let nr = instruction.raw_imm_or_reg();
@@ -248,30 +301,36 @@ impl Module {
                             bail!("found an unrecognized ecall number: {nr:}");
                         }
                     }
-                    // TODO: Check jump/branch target validity.
                     _ => {}
                 }
                 instructions.push(instruction);
             }
 
-            if instructions.len() > VM_MAXIMUM_INSTRUCTION_COUNT as usize {
-                bail!(
-                    "too many instructions; the program contains more than {} instructions",
-                    VM_MAXIMUM_INSTRUCTION_COUNT
-                );
-            }
-
-            (instructions, jump_target_to_instruction)
+            instruction_by_basic_block.shrink_to_fit();
+            (instructions, instruction_by_basic_block)
         };
+
+        if instructions.len() > VM_MAXIMUM_INSTRUCTION_COUNT as usize {
+            bail!(
+                "too many instructions; the program contains more than {} instructions",
+                VM_MAXIMUM_INSTRUCTION_COUNT
+            );
+        }
+
+        debug_assert!(!instruction_by_basic_block.is_empty());
+        let maximum_valid_jump_target = (instruction_by_basic_block.len() - 1) as u32;
+        if maximum_seen_jump_target > maximum_valid_jump_target {
+            bail!("out of range jump found; found a jump to @{maximum_seen_jump_target:x}, while the very last valid jump target is @{maximum_valid_jump_target:x}");
+        }
 
         log::trace!("Parsing exports...");
         let exports = {
             let mut exports = Vec::with_capacity(1);
             for export in blob.exports() {
                 let export = export.map_err(Error::from_display)?;
-                if !jump_target_to_instruction.contains_key(&export.address()) {
+                if export.address() > maximum_valid_jump_target {
                     bail!(
-                        "address of export '{}' (0x{:x}) doesn't point to a jump target instruction",
+                        "out of range export found; export '{}' points to @{:x}, while the very last valid jump target is @{maximum_valid_jump_target:x}",
                         export.prototype().name(),
                         export.address()
                     );
@@ -335,7 +394,7 @@ impl Module {
                         SandboxKind::Linux => {
                             #[cfg(target_os = "linux")]
                             {
-                                let module = CompiledModule::new(&instructions, &exports, init, debug_trace_execution)?;
+                                let module = CompiledModule::new(&instructions, &exports, &basic_block_by_jump_table_index, &jump_table_index_by_basic_block, init, debug_trace_execution)?;
                                 CompiledModuleKind::Linux(module)
                             }
 
@@ -346,7 +405,7 @@ impl Module {
                             }
                         },
                         SandboxKind::Generic => {
-                            let module = CompiledModule::new(&instructions, &exports, init, debug_trace_execution)?;
+                            let module = CompiledModule::new(&instructions, &exports, &basic_block_by_jump_table_index, &jump_table_index_by_basic_block, init, debug_trace_execution)?;
                             CompiledModuleKind::Generic(module)
                         }
                     }
@@ -404,7 +463,10 @@ impl Module {
             exports,
             imports,
             export_index_by_name,
-            jump_target_to_instruction,
+
+            instruction_by_basic_block,
+            jump_table_index_by_basic_block,
+            basic_block_by_jump_table_index,
 
             blob: if debug_trace_execution || selected_backend == BackendKind::Interpreter {
                 Some(blob.clone().into_owned())

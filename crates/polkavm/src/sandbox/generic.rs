@@ -12,6 +12,7 @@ use polkavm_common::{
         VM_ADDR_JUMP_TABLE,
         VM_ADDR_JUMP_TABLE_RETURN_TO_HOST,
         VM_SANDBOX_MAXIMUM_NATIVE_CODE_SIZE,
+        VM_SANDBOX_MAXIMUM_JUMP_TABLE_VIRTUAL_SIZE,
     },
 };
 
@@ -891,7 +892,7 @@ impl super::Sandbox for Sandbox {
     type AddressSpace = Mmap;
 
     fn reserve_address_space() -> Result<Self::AddressSpace, Self::Error> {
-        Mmap::reserve_address_space(VM_SANDBOX_MAXIMUM_NATIVE_CODE_SIZE as usize + 0x200000000)
+        Mmap::reserve_address_space(VM_SANDBOX_MAXIMUM_NATIVE_CODE_SIZE as usize + VM_SANDBOX_MAXIMUM_JUMP_TABLE_VIRTUAL_SIZE as usize)
     }
 
     fn prepare_program(init: SandboxProgramInit, mut map: Self::AddressSpace) -> Result<Self::Program, Self::Error> {

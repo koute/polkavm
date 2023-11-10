@@ -4,10 +4,11 @@ use std::collections::HashMap;
 use polkavm_assembler::{Assembler, Label};
 use polkavm_common::error::{ExecutionError, Trap};
 use polkavm_common::init::GuestProgramInit;
-use polkavm_common::program::{InstructionVisitor, Opcode, ProgramExport, RawInstruction};
+use polkavm_common::program::{InstructionVisitor, ProgramExport, RawInstruction};
 use polkavm_common::zygote::{
     VM_COMPILER_MAXIMUM_EPILOGUE_LENGTH, VM_COMPILER_MAXIMUM_INSTRUCTION_LENGTH,
 };
+use polkavm_common::abi::VM_CODE_ADDRESS_ALIGNMENT;
 
 use crate::api::{BackendAccess, ExecutionConfig, Module, OnHostcall, AsCompiledModule};
 use crate::error::{bail, Error};
@@ -22,10 +23,10 @@ struct Compiler<'a> {
     asm: Assembler,
     exports: &'a [ProgramExport<'a>],
     instructions: &'a [RawInstruction],
-    pc_to_label: HashMap<u32, Label>,
-    pc_to_label_pending: HashMap<u32, Label>,
-    next_instruction: Option<RawInstruction>,
-    max_jump_target: u32,
+    basic_block_by_jump_table_index: &'a [u32],
+    jump_table_index_by_basic_block: &'a HashMap<u32, u32>,
+    nth_basic_block_to_label: Vec<Label>,
+    nth_basic_block_to_label_pending: HashMap<u32, Label>,
     jump_table: Vec<u8>,
     export_to_label: HashMap<u32, Label>,
     export_trampolines: Vec<u64>,
@@ -54,6 +55,8 @@ impl<'a> Compiler<'a> {
     fn new(
         instructions: &'a [RawInstruction],
         exports: &'a [ProgramExport<'a>],
+        basic_block_by_jump_table_index: &'a [u32],
+        jump_table_index_by_basic_block: &'a HashMap<u32, u32>,
         sandbox_kind: SandboxKind,
         debug_trace_execution: bool,
         native_code_address: u64,
@@ -68,10 +71,10 @@ impl<'a> Compiler<'a> {
             asm,
             instructions,
             exports,
-            pc_to_label: Default::default(),
-            pc_to_label_pending: Default::default(),
-            next_instruction: None,
-            max_jump_target: 0,
+            basic_block_by_jump_table_index,
+            jump_table_index_by_basic_block,
+            nth_basic_block_to_label: Default::default(),
+            nth_basic_block_to_label_pending: Default::default(),
             jump_table: Default::default(),
             export_to_label: Default::default(),
             export_trampolines: Default::default(),
@@ -93,24 +96,20 @@ impl<'a> Compiler<'a> {
         let mut nth_instruction_to_code_offset_map: Vec<u32> = Vec::with_capacity(self.instructions.len());
         polkavm_common::static_assert!(polkavm_common::zygote::VM_SANDBOX_MAXIMUM_NATIVE_CODE_SIZE < u32::MAX);
 
-        for nth_instruction in 0..self.instructions.len() {
-            self.next_instruction = self.instructions.get(nth_instruction + 1).copied();
+        self.start_new_basic_block();
 
+        for nth_instruction in 0..self.instructions.len() {
             let initial_length = self.asm.len();
             nth_instruction_to_code_offset_map.push(initial_length as u32);
 
             let instruction = self.instructions[nth_instruction];
             log::trace!("Compiling {}/{}: {}", nth_instruction, self.instructions.len() - 1, instruction);
 
-            if self.debug_trace_execution && !matches!(instruction.op(), Opcode::jump_target) {
+            if self.debug_trace_execution {
                 self.trace_execution(nth_instruction);
             }
 
             instruction.visit(self).map_err(Error::from_static_str)?;
-
-            if self.debug_trace_execution && matches!(instruction.op(), Opcode::jump_target) {
-                self.trace_execution(nth_instruction);
-            }
 
             if !self.debug_trace_execution {
                 let instruction_length = self.asm.len() - initial_length;
@@ -142,20 +141,25 @@ impl<'a> Compiler<'a> {
 
         let label_sysreturn = self.emit_sysreturn();
 
-        if !self.pc_to_label_pending.is_empty() {
-            for pc in self.pc_to_label_pending.keys() {
+        if !self.nth_basic_block_to_label_pending.is_empty() {
+            for pc in self.nth_basic_block_to_label_pending.keys() {
                 log::debug!("Missing jump target: @{:x}", pc * 4);
             }
 
-            bail!("program is missing {} jump target(s)", self.pc_to_label_pending.len());
+            bail!("program is missing {} jump target(s)", self.nth_basic_block_to_label_pending.len());
         }
 
         let native_pointer_size = core::mem::size_of::<usize>();
-        self.jump_table.resize((self.max_jump_target as usize + 1) * native_pointer_size, 0);
+        let jump_table_entry_size = native_pointer_size * VM_CODE_ADDRESS_ALIGNMENT as usize;
+        self.jump_table.resize(self.basic_block_by_jump_table_index.len() * jump_table_entry_size, 0);
 
-        for (pc, label) in self.pc_to_label.drain() {
-            let pc = pc as usize;
-            let range = pc * native_pointer_size..(pc + 1) * native_pointer_size;
+        // The very first entry is always invalid.
+        assert_eq!(self.basic_block_by_jump_table_index[0], u32::MAX);
+
+        for (jump_table_index, nth_basic_block) in self.basic_block_by_jump_table_index.iter().copied().enumerate().skip(1) {
+            let label = self.nth_basic_block_to_label[nth_basic_block as usize];
+            let offset = jump_table_index * jump_table_entry_size;
+            let range = offset..offset + native_pointer_size;
             let address = self.native_code_address
                 .checked_add_signed(self.asm.get_label_offset(label) as i64)
                 .expect("overflow");
@@ -209,27 +213,41 @@ impl<'a> Compiler<'a> {
         self.asm.push(inst);
     }
 
-    fn get_or_forward_declare_label(&mut self, pc: u32) -> Label {
-        match self.pc_to_label.get(&pc) {
+    fn get_or_forward_declare_label(&mut self, nth_basic_block: u32) -> Label {
+        match self.nth_basic_block_to_label.get(nth_basic_block as usize) {
             Some(label) => *label,
-            None => match self.pc_to_label_pending.get(&pc) {
+            None => match self.nth_basic_block_to_label_pending.get(&nth_basic_block) {
                 Some(label) => *label,
                 None => {
                     let label = self.asm.forward_declare_label();
-                    self.pc_to_label_pending.insert(pc, label);
+                    self.nth_basic_block_to_label_pending.insert(nth_basic_block, label);
                     label
                 }
             },
         }
     }
 
-    fn next_instruction_jump_target(&self) -> Option<u32> {
-        let inst = self.next_instruction?;
-        if inst.raw_op() == Opcode::jump_target as u8 {
-            Some(inst.raw_imm_or_reg().checked_mul(4)?)
-        } else {
-            None
-        }
+    fn define_label(&mut self, label: Label) {
+        log::trace!("Label: {}", label);
+        self.asm.define_label(label);
+    }
+
+    fn next_basic_block(&self) -> u32 {
+        self.nth_basic_block_to_label.len() as u32
+    }
+
+    fn start_new_basic_block(&mut self) -> Label {
+        let nth_basic_block = self.nth_basic_block_to_label.len() as u32;
+        log::trace!("Starting new basic block: @{nth_basic_block:x}");
+
+        let label = self
+            .nth_basic_block_to_label_pending
+            .remove(&nth_basic_block)
+            .unwrap_or_else(|| self.asm.forward_declare_label());
+
+        self.define_label(label);
+        self.nth_basic_block_to_label.push(label);
+        label
     }
 }
 
@@ -243,6 +261,8 @@ impl<S> CompiledModule<S> where S: Sandbox {
     pub fn new(
         instructions: &[RawInstruction],
         exports: &[ProgramExport],
+        basic_block_by_jump_table_index: &[u32],
+        jump_table_index_by_basic_block: &HashMap<u32, u32>,
         init: GuestProgramInit,
         debug_trace_execution: bool,
     ) -> Result<Self, Error> {
@@ -250,7 +270,7 @@ impl<S> CompiledModule<S> where S: Sandbox {
 
         let address_space = S::reserve_address_space().map_err(Error::from_display)?;
         let native_code_address = crate::sandbox::SandboxAddressSpace::native_code_address(&address_space);
-        let mut program_assembler = Compiler::new(instructions, exports, S::KIND, debug_trace_execution, native_code_address);
+        let mut program_assembler = Compiler::new(instructions, exports, basic_block_by_jump_table_index, jump_table_index_by_basic_block, S::KIND, debug_trace_execution, native_code_address);
         let result = program_assembler.finalize()?;
 
         let init = SandboxProgramInit::new(init)

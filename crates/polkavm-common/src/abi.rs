@@ -45,11 +45,12 @@ pub const VM_MAXIMUM_IMPORT_COUNT: u32 = 1024;
 /// The maximum number of functions the program can export.
 pub const VM_MAXIMUM_EXPORT_COUNT: u32 = 1024;
 
-/// The maximum jump target a program can declare.
-pub const VM_MAXIMUM_JUMP_TARGET: u32 = VM_MAXIMUM_INSTRUCTION_COUNT * 2;
-
 /// The maximum number of arguments that can be used in imported functions.
 pub const VM_MAXIMUM_EXTERN_ARG_COUNT: usize = 6;
+
+/// The minimum required alignment of runtime code pointers.
+// TODO: Support the C extension in the linker and lower this to 2.
+pub const VM_CODE_ADDRESS_ALIGNMENT: u32 = 4;
 
 /// The memory configuration used by a given guest program.
 #[derive(Copy, Clone, PartialEq, Eq)]

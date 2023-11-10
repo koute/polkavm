@@ -13,7 +13,7 @@ use polkavm_common::{
         VmCtx as VmCtxInner, SANDBOX_EMPTY_NATIVE_PROGRAM_COUNTER, SANDBOX_EMPTY_NTH_INSTRUCTION, VMCTX_FUTEX_BUSY, VMCTX_FUTEX_HOSTCALL,
         VMCTX_FUTEX_IDLE, VMCTX_FUTEX_INIT, VMCTX_FUTEX_TRAP, VM_ADDR_JUMP_TABLE, VM_ADDR_JUMP_TABLE_RETURN_TO_HOST, VM_ADDR_NATIVE_CODE,
         VM_ADDR_SIGSTACK, VM_RPC_FLAG_CLEAR_PROGRAM_AFTER_EXECUTION, VM_RPC_FLAG_RECONFIGURE, VM_RPC_FLAG_RESET_MEMORY_AFTER_EXECUTION,
-        VM_SANDBOX_MAXIMUM_JUMP_TABLE_SIZE, VM_SANDBOX_MAXIMUM_NATIVE_CODE_SIZE,
+        VM_SANDBOX_MAXIMUM_JUMP_TABLE_VIRTUAL_SIZE, VM_SANDBOX_MAXIMUM_NATIVE_CODE_SIZE,
     },
 };
 use polkavm_linux_raw as linux_raw;
@@ -411,7 +411,8 @@ unsafe fn initialize(mut stack: *mut usize) -> linux_raw::Fd {
 
     linux_raw::sys_munmap(
         VM_ADDR_JUMP_TABLE as *mut core::ffi::c_void,
-        align_to_next_page_usize(page_size, VM_SANDBOX_MAXIMUM_JUMP_TABLE_SIZE as usize).unwrap_or_else(|| abort_with_message("overflow")),
+        align_to_next_page_usize(page_size, VM_SANDBOX_MAXIMUM_JUMP_TABLE_VIRTUAL_SIZE as usize)
+            .unwrap_or_else(|| abort_with_message("overflow")),
     )
     .unwrap_or_else(|error| abort_with_error("failed to make sure the jump table address space is unmapped", error));
 
