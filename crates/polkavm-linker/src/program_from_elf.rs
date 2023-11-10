@@ -2962,6 +2962,98 @@ fn add_missing_fallthrough_blocks(
     new_used_blocks
 }
 
+fn merge_consecutive_fallthrough_blocks(
+    all_blocks: &mut [BasicBlock<AnyTarget, BlockTarget>],
+    reachability_graph: &mut ReachabilityGraph,
+    section_to_block: &mut HashMap<SectionTarget, BlockTarget>,
+    used_blocks: &mut Vec<BlockTarget>,
+) {
+    if used_blocks.len() < 2 {
+        return;
+    }
+
+    let mut removed = HashSet::new();
+    for nth_block in 0..used_blocks.len() - 1 {
+        let current = used_blocks[nth_block];
+        let next = used_blocks[nth_block + 1];
+        if !all_blocks[current.index()].ops.is_empty() {
+            continue;
+        }
+
+        {
+            let ControlInst::Jump { target } = all_blocks[current.index()].next.instruction else {
+                continue;
+            };
+            if target != next {
+                continue;
+            }
+        }
+
+        let current_reachability = reachability_graph.for_code.get_mut(&current).unwrap();
+        let referenced_by_code: BTreeSet<BlockTarget> = current_reachability
+            .reachable_from
+            .iter()
+            .copied()
+            .chain(current_reachability.address_taken_in.iter().copied())
+            .collect();
+
+        let referenced_by_data: BTreeSet<SectionIndex> = if !current_reachability.referenced_by_data.is_empty() {
+            let section_targets: Vec<SectionTarget> = section_to_block
+                .iter()
+                .filter(|&(_, block_target)| *block_target == current)
+                .map(|(section_target, _)| *section_target)
+                .collect();
+            for section_target in section_targets {
+                section_to_block.insert(section_target, next);
+            }
+
+            let referenced_by_data = core::mem::take(&mut current_reachability.referenced_by_data);
+            reachability_graph
+                .for_code
+                .get_mut(&next)
+                .unwrap()
+                .referenced_by_data
+                .extend(referenced_by_data.iter().copied());
+
+            referenced_by_data
+        } else {
+            Default::default()
+        };
+
+        for dep in referenced_by_code {
+            let references = gather_references(&all_blocks[dep.index()]);
+            for (_, op) in &mut all_blocks[dep.index()].ops {
+                *op = op
+                    .map_target(|target| {
+                        Ok::<_, ()>(if target == AnyTarget::Code(current) {
+                            AnyTarget::Code(next)
+                        } else {
+                            target
+                        })
+                    })
+                    .unwrap();
+            }
+
+            all_blocks[dep.index()].next.instruction = all_blocks[dep.index()]
+                .next
+                .instruction
+                .map_target(|target| Ok::<_, ()>(if target == current { next } else { target }))
+                .unwrap();
+
+            update_references(all_blocks, reachability_graph, None, dep, references);
+        }
+
+        for section_index in referenced_by_data {
+            remove_if_data_is_globally_unreachable(all_blocks, reachability_graph, None, section_index);
+        }
+
+        assert!(!reachability_graph.is_code_reachable(current));
+        removed.insert(current);
+    }
+
+    used_blocks.retain(|current| !removed.contains(current));
+}
+
 fn harvest_all_jump_targets(
     elf: &Elf,
     data_sections_set: &HashSet<SectionIndex>,
@@ -4715,15 +4807,16 @@ pub fn program_from_elf(config: Config, data: &[u8]) -> Result<ProgramBlob, Prog
         }
     }
 
-    let section_to_block = build_section_to_block_map(&all_blocks)?;
+    let mut section_to_block = build_section_to_block_map(&all_blocks)?;
     let mut all_blocks = resolve_basic_block_references(&data_sections_set, &section_to_block, &all_blocks)?;
     let mut reachability_graph;
-    let used_blocks;
+    let mut used_blocks;
 
     if config.optimize {
         reachability_graph = calculate_reachability(&section_to_block, &all_blocks, &data_sections_set, &export_metadata, &relocations)?;
         optimize_program(&config, &elf, &import_metadata, &mut all_blocks, &mut reachability_graph);
         used_blocks = add_missing_fallthrough_blocks(&mut all_blocks, &mut reachability_graph);
+        merge_consecutive_fallthrough_blocks(&mut all_blocks, &mut reachability_graph, &mut section_to_block, &mut used_blocks);
 
         let expected_reachability_graph =
             calculate_reachability(&section_to_block, &all_blocks, &data_sections_set, &export_metadata, &relocations)?;
