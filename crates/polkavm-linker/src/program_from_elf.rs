@@ -2239,6 +2239,7 @@ fn perform_constant_propagation(
                         };
 
                         if let Some(kind) = kind {
+                            modified = true;
                             *op = BasicInst::RegImm {
                                 kind,
                                 dst: *dst,
@@ -2256,6 +2257,7 @@ fn perform_constant_propagation(
                         };
 
                         if let Some(kind) = kind {
+                            modified = true;
                             *op = BasicInst::RegImm {
                                 kind,
                                 dst: *dst,
@@ -2291,6 +2293,7 @@ fn perform_constant_propagation(
                 BasicInst::LoadIndirect { kind, dst, base, offset } => {
                     if *base != Reg::Zero {
                         if let RegValue::Constant(base) = reg_values[*base as usize] {
+                            modified = true;
                             *op = BasicInst::LoadIndirect {
                                 kind: *kind,
                                 dst: *dst,
@@ -2303,6 +2306,7 @@ fn perform_constant_propagation(
                 BasicInst::StoreIndirect { kind, src, base, offset } => {
                     if *base != Reg::Zero {
                         if let RegValue::Constant(base) = reg_values[*base as usize] {
+                            modified = true;
                             *op = BasicInst::StoreIndirect {
                                 kind: *kind,
                                 src: *src,
@@ -2383,6 +2387,8 @@ fn perform_constant_propagation(
                     } else {
                         (target_false, target_true)
                     };
+
+                    modified = true;
                     all_blocks[current.index()].next.instruction = ControlInst::Jump { target: new_target };
 
                     reachability_graph
