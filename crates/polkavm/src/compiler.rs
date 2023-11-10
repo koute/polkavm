@@ -109,7 +109,7 @@ impl<'a> Compiler<'a> {
                 self.trace_execution(nth_instruction);
             }
 
-            instruction.visit(self).map_err(Error::from_static_str)?;
+            instruction.visit(self);
 
             if !self.debug_trace_execution {
                 let instruction_length = self.asm.len() - initial_length;
@@ -129,7 +129,7 @@ impl<'a> Compiler<'a> {
         log::trace!("Emitting trampolines");
 
         // If the code abruptly ends make sure we trap.
-        self.trap().map_err(Error::from_static_str)?;
+        self.trap();
 
         if self.debug_trace_execution {
             self.emit_trace_trampoline();
