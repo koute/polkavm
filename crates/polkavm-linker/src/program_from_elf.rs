@@ -4577,16 +4577,33 @@ pub fn program_from_elf(config: Config, data: &[u8]) -> Result<ProgramBlob, Prog
 
     let section_to_block = build_section_to_block_map(&all_blocks)?;
     let mut all_blocks = resolve_basic_block_references(&data_sections_set, &section_to_block, &all_blocks)?;
-    let mut reachability_graph =
-        calculate_reachability(&section_to_block, &all_blocks, &data_sections_set, &export_metadata, &relocations)?;
+    let mut reachability_graph;
 
     if config.optimize {
+        reachability_graph = calculate_reachability(&section_to_block, &all_blocks, &data_sections_set, &export_metadata, &relocations)?;
         optimize_program(&config, &elf, &import_metadata, &mut all_blocks, &mut reachability_graph);
 
         let expected_reachability_graph =
             calculate_reachability(&section_to_block, &all_blocks, &data_sections_set, &export_metadata, &relocations)?;
         if reachability_graph != expected_reachability_graph {
             panic!("internal error: inconsistent reachability after optimization; this is a bug, please report it!");
+        }
+    } else {
+        reachability_graph = ReachabilityGraph::default();
+        for current in (0..all_blocks.len()).map(BlockTarget::from_raw) {
+            reachability_graph
+                .for_code
+                .entry(current)
+                .or_insert_with(Default::default)
+                .always_reachable = true;
+        }
+
+        for &section_index in sections_ro_data.iter().chain(sections_rw_data.iter()) {
+            reachability_graph
+                .for_data
+                .entry(section_index)
+                .or_insert_with(Default::default)
+                .always_reachable = true;
         }
     }
 
