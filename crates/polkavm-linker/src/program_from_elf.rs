@@ -2472,8 +2472,10 @@ impl BlockRegs {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn perform_constant_propagation(
     imports: &[Import],
+    elf: &Elf,
     all_blocks: &mut [BasicBlock<AnyTarget, BlockTarget>],
     regs_for_block: &mut [BlockRegs],
     unknown_counter: &mut u64,
@@ -2509,6 +2511,44 @@ fn perform_constant_propagation(
 
                 instruction = new_instruction;
                 all_blocks[current.index()].ops[nth_instruction].1 = new_instruction;
+            }
+
+            if let BasicInst::LoadAbsolute { kind, dst, target } = instruction {
+                let section = elf.section_by_index(target.section_index);
+                if section.is_allocated() && !section.is_writable() {
+                    let value = match kind {
+                        LoadKind::U32 => section
+                            .data()
+                            .get(target.offset as usize..target.offset as usize + 4)
+                            .map(|xs| u32::from_le_bytes([xs[0], xs[1], xs[2], xs[3]]) as i32),
+                        LoadKind::U16 => section
+                            .data()
+                            .get(target.offset as usize..target.offset as usize + 2)
+                            .map(|xs| u16::from_le_bytes([xs[0], xs[1]]) as u32 as i32),
+                        LoadKind::I16 => section
+                            .data()
+                            .get(target.offset as usize..target.offset as usize + 2)
+                            .map(|xs| i16::from_le_bytes([xs[0], xs[1]]) as i32),
+                        LoadKind::I8 => section.data().get(target.offset as usize).map(|&x| x as i8 as i32),
+                        LoadKind::U8 => section.data().get(target.offset as usize).map(|&x| x as u32 as i32),
+                    };
+
+                    if let Some(imm) = value {
+                        if !modified_this_block {
+                            references = gather_references(&all_blocks[current.index()]);
+                            modified_this_block = true;
+                            modified = true;
+                        }
+
+                        instruction = BasicInst::RegImm {
+                            kind: RegImmKind::Add,
+                            dst,
+                            src: Reg::Zero,
+                            imm,
+                        };
+                        all_blocks[current.index()].ops[nth_instruction].1 = instruction;
+                    }
+                }
             }
 
             regs.set_reg_from_instruction(imports, unknown_counter, instruction);
@@ -2634,6 +2674,7 @@ fn perform_constant_propagation(
 
 fn optimize_program(
     config: &Config,
+    elf: &Elf,
     imports: &[Import],
     all_blocks: &mut [BasicBlock<AnyTarget, BlockTarget>],
     reachability_graph: &mut ReachabilityGraph,
@@ -2691,6 +2732,7 @@ fn optimize_program(
         );
         perform_constant_propagation(
             imports,
+            elf,
             all_blocks,
             &mut regs_for_block,
             &mut unknown_counter,
@@ -2728,6 +2770,7 @@ fn optimize_program(
             );
             modified |= perform_constant_propagation(
                 imports,
+                elf,
                 all_blocks,
                 &mut regs_for_block,
                 &mut unknown_counter,
@@ -4531,7 +4574,7 @@ pub fn program_from_elf(config: Config, data: &[u8]) -> Result<ProgramBlob, Prog
         calculate_reachability(&section_to_block, &all_blocks, &data_sections_set, &export_metadata, &relocations)?;
 
     if config.optimize {
-        optimize_program(&config, &import_metadata, &mut all_blocks, &mut reachability_graph);
+        optimize_program(&config, &elf, &import_metadata, &mut all_blocks, &mut reachability_graph);
 
         let expected_reachability_graph =
             calculate_reachability(&section_to_block, &all_blocks, &data_sections_set, &export_metadata, &relocations)?;
