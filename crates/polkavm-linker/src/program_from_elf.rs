@@ -3004,7 +3004,7 @@ fn each_reference_for_control_instruction(instruction: &ControlInst<BlockTarget>
             cb(ExtRef::Address(target_return));
         }
         ControlInst::CallIndirect { target_return, .. } => {
-            cb(ExtRef::Jump(target_return));
+            cb(ExtRef::Address(target_return));
         }
         ControlInst::Branch {
             target_true, target_false, ..
