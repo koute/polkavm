@@ -322,8 +322,7 @@ enum BasicInst<T> {
     LoadIndirect { kind: LoadKind, dst: Reg, base: Reg, offset: i32 },
     StoreIndirect { kind: StoreKind, src: Reg, base: Reg, offset: i32 },
     LoadAddress { dst: Reg, target: T },
-    // This is supposed to load the address of a location which contains the `target` address,
-    // not the `target` address directly.
+    // This is supposed to load the address from the GOT, instead of loading it directly as an immediate.
     LoadAddressIndirect { dst: Reg, target: T },
     RegImm { kind: RegImmKind, dst: Reg, src: Reg, imm: i32 },
     Shift { kind: ShiftKind, dst: Reg, src: Reg, amount: u8 },
