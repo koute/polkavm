@@ -1,4 +1,4 @@
-use polkavm_common::abi::{GuestMemoryConfig, VM_ADDR_USER_MEMORY, VM_PAGE_SIZE};
+use polkavm_common::abi::{GuestMemoryConfig, VM_ADDR_USER_MEMORY, VM_CODE_ADDRESS_ALIGNMENT, VM_PAGE_SIZE};
 use polkavm_common::elf::{FnMetadata, ImportMetadata, INSTRUCTION_ECALLI};
 use polkavm_common::program::Reg as PReg;
 use polkavm_common::program::{self, FrameKind, LineProgramOp, Opcode, ProgramBlob, RawInstruction};
@@ -13,8 +13,6 @@ use std::sync::Arc;
 use crate::dwarf::Location;
 use crate::elf::{Elf, Section, SectionIndex};
 use crate::riscv::{BranchKind, Inst, LoadKind, Reg, RegImmKind, RegRegKind, ShiftKind, StoreKind};
-
-const JUMP_TARGET_MULTIPLIER: u32 = 4;
 
 #[derive(Debug)]
 pub enum ProgramFromElfErrorKind {
@@ -3223,6 +3221,10 @@ impl Reachability {
     fn is_unreachable(&self) -> bool {
         self.reachable_from.is_empty() && self.address_taken_in.is_empty() && self.referenced_by_data.is_empty() && !self.always_reachable
     }
+
+    fn is_dynamically_reachable(&self) -> bool {
+        !self.address_taken_in.is_empty() || !self.referenced_by_data.is_empty()
+    }
 }
 
 #[derive(Clone, PartialEq, Eq, Hash, Debug)]
@@ -3592,15 +3594,40 @@ fn cast_reg(reg: Reg) -> PReg {
     }
 }
 
-fn assign_jump_targets(all_blocks: &[BasicBlock<AnyTarget, BlockTarget>], used_blocks: &[BlockTarget]) -> Vec<Option<u32>> {
-    let mut jump_target_for_block: Vec<Option<u32>> = Vec::new();
-    jump_target_for_block.resize(all_blocks.len(), None);
+#[derive(Copy, Clone)]
+struct JumpTarget {
+    static_target: u32,
+    dynamic_target: Option<u32>,
+}
 
-    for (nth, block_target) in used_blocks.iter().enumerate() {
-        jump_target_for_block[block_target.index()] = Some(nth as u32 + 1);
+fn build_jump_table(
+    total_block_count: usize,
+    used_blocks: &[BlockTarget],
+    reachability_graph: &ReachabilityGraph,
+) -> (Vec<u32>, Vec<Option<JumpTarget>>) {
+    let mut jump_target_for_block: Vec<Option<JumpTarget>> = Vec::new();
+    jump_target_for_block.resize(total_block_count, None);
+
+    let mut jump_table = Vec::new();
+    for (static_target, current) in used_blocks.iter().enumerate() {
+        let reachability = reachability_graph.for_code.get(current).unwrap();
+        assert!(!reachability.is_unreachable());
+
+        let dynamic_target = if reachability.is_dynamically_reachable() {
+            let dynamic_target: u32 = (jump_table.len() + 1).try_into().expect("jump table index overflow");
+            jump_table.push(static_target.try_into().expect("jump table index overflow"));
+            Some(dynamic_target)
+        } else {
+            None
+        };
+
+        jump_target_for_block[current.index()] = Some(JumpTarget {
+            static_target: static_target.try_into().expect("jump table index overflow"),
+            dynamic_target,
+        });
     }
 
-    jump_target_for_block
+    (jump_table, jump_target_for_block)
 }
 
 fn calculate_whether_can_fallthrough(
@@ -3633,7 +3660,7 @@ fn emit_code(
     all_blocks: &[BasicBlock<AnyTarget, BlockTarget>],
     used_blocks: &[BlockTarget],
     used_imports: &HashSet<u32>,
-    jump_target_for_block: &[Option<u32>],
+    jump_target_for_block: &[Option<JumpTarget>],
 ) -> Result<Vec<(SourceStack, RawInstruction)>, ProgramFromElfError> {
     let can_fallthrough_to_next_block = calculate_whether_can_fallthrough(all_blocks, used_blocks);
     let get_data_address = |target: SectionTarget| -> Result<u32, ProgramFromElfError> {
@@ -3652,7 +3679,7 @@ fn emit_code(
         }
     };
 
-    let get_jump_target = |target: BlockTarget| -> Result<u32, ProgramFromElfError> {
+    let get_jump_target = |target: BlockTarget| -> Result<JumpTarget, ProgramFromElfError> {
         let Some(jump_target) = jump_target_for_block[target.index()] else {
             return Err(ProgramFromElfError::other("out of range jump target"));
         };
@@ -3660,19 +3687,22 @@ fn emit_code(
         Ok(jump_target)
     };
 
+    let mut basic_block_delimited = true;
     let mut code: Vec<(SourceStack, RawInstruction)> = Vec::new();
     for block_target in used_blocks {
         let block = &all_blocks[block_target.index()];
-        let jump_target = jump_target_for_block[block.target.index()].unwrap();
 
-        code.push((
-            Source {
-                section_index: block.source.section_index,
-                offset_range: (block.source.offset_range.start..block.source.offset_range.start + 4).into(),
-            }
-            .into(),
-            RawInstruction::new_with_imm(Opcode::jump_target, jump_target),
-        ));
+        if !basic_block_delimited {
+            basic_block_delimited = true;
+            code.push((
+                Source {
+                    section_index: block.source.section_index,
+                    offset_range: (block.source.offset_range.start..block.source.offset_range.start + 4).into(),
+                }
+                .into(),
+                RawInstruction::new_argless(Opcode::fallthrough),
+            ));
+        }
 
         fn conv_load_kind(kind: LoadKind) -> Opcode {
             match kind {
@@ -3709,8 +3739,8 @@ fn emit_code(
                 BasicInst::LoadAddress { dst, target } => {
                     let value = match target {
                         AnyTarget::Code(target) => {
-                            let value = get_jump_target(target)?;
-                            let Some(value) = value.checked_mul(JUMP_TARGET_MULTIPLIER) else {
+                            let value = get_jump_target(target)?.dynamic_target.expect("missing jump target for address");
+                            let Some(value) = value.checked_mul(VM_CODE_ADDRESS_ALIGNMENT) else {
                                 return Err(ProgramFromElfError::other("overflow when emitting an address load"));
                             };
                             value
@@ -3786,14 +3816,22 @@ fn emit_code(
             code.push((source.clone(), op));
         }
 
-        fn unconditional_jump(target: u32) -> RawInstruction {
-            RawInstruction::new_with_regs2_imm(Opcode::jump_and_link_register, cast_reg(Reg::Zero), cast_reg(Reg::Zero), target)
+        fn unconditional_jump(target: JumpTarget) -> RawInstruction {
+            RawInstruction::new_with_regs2_imm(
+                Opcode::jump_and_link_register,
+                cast_reg(Reg::Zero),
+                cast_reg(Reg::Zero),
+                target.static_target,
+            )
         }
 
         match block.next.instruction {
             ControlInst::Jump { target } => {
                 let target = get_jump_target(target)?;
-                if !can_fallthrough_to_next_block.contains(block_target) {
+                if can_fallthrough_to_next_block.contains(block_target) {
+                    assert!(basic_block_delimited);
+                    basic_block_delimited = false;
+                } else {
                     code.push((block.next.source.clone(), unconditional_jump(target)));
                 }
             }
@@ -3805,24 +3843,18 @@ fn emit_code(
 
                 code.push((
                     block.next.source.clone(),
-                    RawInstruction::new_with_regs2_imm(Opcode::jump_and_link_register, cast_reg(ra), cast_reg(Reg::Zero), target),
+                    RawInstruction::new_with_regs2_imm(
+                        Opcode::jump_and_link_register,
+                        cast_reg(ra),
+                        cast_reg(Reg::Zero),
+                        target.static_target,
+                    ),
                 ));
             }
             ControlInst::JumpIndirect { base, offset } => {
-                if offset % 4 != 0 {
-                    return Err(ProgramFromElfError::other(
-                        "found an indirect jump with an offset that isn't aligned",
-                    ));
-                }
-
                 code.push((
                     block.next.source.clone(),
-                    RawInstruction::new_with_regs2_imm(
-                        Opcode::jump_and_link_register,
-                        cast_reg(Reg::Zero),
-                        cast_reg(base),
-                        offset as u32 / 4,
-                    ),
+                    RawInstruction::new_with_regs2_imm(Opcode::jump_and_link_register, cast_reg(Reg::Zero), cast_reg(base), offset as u32),
                 ));
             }
             ControlInst::CallIndirect {
@@ -3832,17 +3864,10 @@ fn emit_code(
                 target_return,
             } => {
                 assert!(can_fallthrough_to_next_block.contains(block_target));
-
-                if offset % 4 != 0 {
-                    return Err(ProgramFromElfError::other(
-                        "found an indirect call with a target that isn't aligned",
-                    ));
-                }
-
                 get_jump_target(target_return)?;
                 code.push((
                     block.next.source.clone(),
-                    RawInstruction::new_with_regs2_imm(Opcode::jump_and_link_register, cast_reg(ra), cast_reg(base), offset as u32 / 4),
+                    RawInstruction::new_with_regs2_imm(Opcode::jump_and_link_register, cast_reg(ra), cast_reg(base), offset as u32),
                 ));
             }
             ControlInst::Branch {
@@ -3868,7 +3893,7 @@ fn emit_code(
 
                 code.push((
                     block.next.source.clone(),
-                    RawInstruction::new_with_regs2_imm(kind, cast_reg(src1), cast_reg(src2), target_true),
+                    RawInstruction::new_with_regs2_imm(kind, cast_reg(src1), cast_reg(src2), target_true.static_target),
                 ));
             }
             ControlInst::Unimplemented => {
@@ -4858,7 +4883,7 @@ pub fn program_from_elf(config: Config, data: &[u8]) -> Result<ProgramBlob, Prog
     {
         let mut count_dynamic = 0;
         for reachability in reachability_graph.for_code.values() {
-            if reachability.always_reachable || !reachability.referenced_by_data.is_empty() || !reachability.address_taken_in.is_empty() {
+            if reachability.is_dynamically_reachable() {
                 count_dynamic += 1;
             }
         }
@@ -4947,7 +4972,7 @@ pub fn program_from_elf(config: Config, data: &[u8]) -> Result<ProgramBlob, Prog
         &mut base_address_for_section,
     )?;
 
-    let jump_target_for_block = assign_jump_targets(&all_blocks, &used_blocks);
+    let (jump_table, jump_target_for_block) = build_jump_table(all_blocks.len(), &used_blocks, &reachability_graph);
     let code = emit_code(
         &base_address_for_section,
         section_got,
@@ -5064,7 +5089,8 @@ pub fn program_from_elf(config: Config, data: &[u8]) -> Result<ProgramBlob, Prog
                         )));
                     };
 
-                    let Some(jump_target) = jump_target.checked_mul(JUMP_TARGET_MULTIPLIER) else {
+                    let jump_target = jump_target.dynamic_target.expect("missing jump target for address");
+                    let Some(jump_target) = jump_target.checked_mul(VM_CODE_ADDRESS_ALIGNMENT) else {
                         return Err(ProgramFromElfError::other("overflow when applying a jump target relocation"));
                     };
 
@@ -5112,12 +5138,6 @@ pub fn program_from_elf(config: Config, data: &[u8]) -> Result<ProgramBlob, Prog
                     ));
                 };
 
-                let Some(jump_target) = jump_target.checked_mul(JUMP_TARGET_MULTIPLIER) else {
-                    return Err(ProgramFromElfError::other(
-                        "overflow when applying a jump table relocation: jump target is too big",
-                    ));
-                };
-
                 let Some(section_base) = base_address_for_section.get(&target_base.section_index) else {
                     return Err(ProgramFromElfError::other(
                         "no base address for section when applying a jump table relocation",
@@ -5133,6 +5153,13 @@ pub fn program_from_elf(config: Config, data: &[u8]) -> Result<ProgramBlob, Prog
                 let Ok(base_address) = u32::try_from(base_address) else {
                     return Err(ProgramFromElfError::other(
                         "overflow when applying a jump table relocation: base address doesn't fit in a u32",
+                    ));
+                };
+
+                let jump_target = jump_target.dynamic_target.expect("missing jump target for address");
+                let Some(jump_target) = jump_target.checked_mul(VM_CODE_ADDRESS_ALIGNMENT) else {
+                    return Err(ProgramFromElfError::other(
+                        "overflow when applying a jump table relocation: jump target is too big",
                     ));
                 };
 
@@ -5251,8 +5278,14 @@ pub fn program_from_elf(config: Config, data: &[u8]) -> Result<ProgramBlob, Prog
                 .expect("internal error: export metadata has a non-block target location");
             let jump_target = jump_target_for_block[block_target.index()]
                 .expect("internal error: export metadata points to a block without a jump target assigned");
-            writer.push_varint(jump_target);
+            writer.push_varint(jump_target.static_target);
             writer.push_function_prototype(&meta.prototype);
+        }
+    });
+
+    writer.push_section(program::SECTION_JUMP_TABLE, |writer| {
+        for target in jump_table {
+            writer.push_varint(target);
         }
     });
 

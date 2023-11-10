@@ -51,7 +51,7 @@ impl Tracer {
     pub fn on_before_call(&mut self, export_index: usize, export: &ProgramExport, config: &ExecutionConfig) {
         let target = self
             .module
-            .instruction_by_jump_target(export.address())
+            .instruction_by_basic_block(export.address())
             .expect("internal error: invalid export address");
         log::trace!("Calling export: '{}' (at #{})", export.prototype().name(), target);
 
