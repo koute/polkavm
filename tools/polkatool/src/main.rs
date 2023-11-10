@@ -7,6 +7,7 @@ enum DisassemblyFormat {
     Guest,
     GuestAndNative,
     Native,
+    DiffFriendly,
 }
 
 #[derive(Parser, Debug)]
@@ -322,7 +323,29 @@ fn disassemble_into(
             last_full_name.clear();
         }
 
-        if matches!(format, DisassemblyFormat::Guest | DisassemblyFormat::GuestAndNative) {
+        if matches!(format, DisassemblyFormat::DiffFriendly) {
+            let mut string = instruction.to_string();
+            if instruction.op() == polkavm_common::program::Opcode::add_imm && instruction.reg2() == polkavm_common::program::Reg::Zero {
+                string = format!("{} = _", instruction.reg1());
+            }
+
+            if let Some(index) = string.find('@') {
+                let length = string[index + 1..]
+                    .chars()
+                    .take_while(|character| character.is_ascii_digit() || matches!(character, 'a' | 'b' | 'c' | 'd' | 'e' | 'f'))
+                    .count();
+                string.replace_range(index + 1..index + 1 + length, "_");
+            }
+
+            if let Some(index_1) = string.find("[0x") {
+                let index_2 = string[index_1..].find(']').unwrap() + index_1;
+                string.replace_range(index_1..index_2 + 1, "[_]");
+            }
+
+            if let Err(error) = writeln!(&mut writer, "    {}", string) {
+                bail!("failed to write to output: {error}");
+            }
+        } else if matches!(format, DisassemblyFormat::Guest | DisassemblyFormat::GuestAndNative) {
             if let Err(error) = writeln!(&mut writer, "{nth_instruction:6}: {instruction}") {
                 bail!("failed to write to output: {error}");
             }
