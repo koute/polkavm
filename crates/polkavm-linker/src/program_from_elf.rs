@@ -2445,10 +2445,18 @@ impl BlockRegs {
             BasicInst::LoadAddress {
                 dst,
                 target: AnyTarget::Code(target),
+            }
+            | BasicInst::LoadAddressIndirect {
+                dst,
+                target: AnyTarget::Code(target),
             } => {
                 self.set_reg(dst, RegValue::CodeAddress(target));
             }
             BasicInst::LoadAddress {
+                dst,
+                target: AnyTarget::Data(target),
+            }
+            | BasicInst::LoadAddressIndirect {
                 dst,
                 target: AnyTarget::Data(target),
             } => {
