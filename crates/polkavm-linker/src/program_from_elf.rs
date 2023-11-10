@@ -1519,115 +1519,299 @@ fn resolve_basic_block_references(
     Ok(output)
 }
 
-fn garbage_collect_reachability(
-    all_blocks: &[BasicBlock<AnyTarget, BlockTarget>],
-    reachability_for_block: &mut HashMap<BlockTarget, Reachability>,
-) -> bool {
-    let mut queue = VecSet::new();
-    for (block_target, reachability) in &*reachability_for_block {
-        if reachability.referenced_by_data {
-            queue.push(*block_target);
+fn garbage_collect_reachability(all_blocks: &[BasicBlock<AnyTarget, BlockTarget>], reachability_graph: &mut ReachabilityGraph) -> bool {
+    let mut queue_code = VecSet::new();
+    let mut queue_data = VecSet::new();
+    for (block_target, reachability) in &reachability_graph.for_code {
+        if reachability.always_reachable {
+            queue_code.push(*block_target);
         }
     }
 
-    while let Some(block_target) = queue.pop_unique() {
-        each_reference(&all_blocks[block_target.index()], |ext| match ext {
-            ExtRef::Jump(target) | ExtRef::Address(target) => queue.push(target),
-            ExtRef::DataAddress(..) => {}
-        });
+    for (data_target, reachability) in &reachability_graph.for_data {
+        if reachability.always_reachable {
+            queue_data.push(*data_target);
+        }
     }
 
-    let set = queue.into_set();
-    if set.len() == reachability_for_block.len() {
+    while !queue_code.is_empty() || !queue_data.is_empty() {
+        while let Some(block_target) = queue_code.pop_unique() {
+            each_reference(&all_blocks[block_target.index()], |ext| match ext {
+                ExtRef::Jump(target) | ExtRef::Address(target) => queue_code.push(target),
+                ExtRef::DataAddress(target) => queue_data.push(target),
+            });
+        }
+
+        while let Some(data_target) = queue_data.pop_unique() {
+            if let Some(list) = reachability_graph.code_references_in_data_section.get(&data_target) {
+                for &target in list {
+                    queue_code.push(target);
+                }
+            }
+
+            if let Some(list) = reachability_graph.data_references_in_data_section.get(&data_target) {
+                for &target in list {
+                    queue_data.push(target);
+                }
+            }
+        }
+    }
+
+    let set_code = queue_code.into_set();
+    let set_data = queue_data.into_set();
+    if set_code.len() == reachability_graph.for_code.len() && set_data.len() == reachability_graph.for_data.len() {
         return false;
     }
 
-    log::debug!("Reachability garbage collection: {} -> {}", reachability_for_block.len(), set.len());
-    reachability_for_block.retain(|key, reachability| {
-        reachability.reachable_from.retain(|inner_key| set.contains(inner_key));
-        reachability.address_taken_in.retain(|inner_key| set.contains(inner_key));
-        if !set.contains(key) {
-            log::trace!("  Garbage collected: {key:?}");
+    log::debug!(
+        "Code reachability garbage collection: {} -> {}",
+        reachability_graph.for_code.len(),
+        set_code.len()
+    );
+    reachability_graph.for_code.retain(|block_target, reachability| {
+        reachability.reachable_from.retain(|inner_key| set_code.contains(inner_key));
+        reachability.address_taken_in.retain(|inner_key| set_code.contains(inner_key));
+        reachability.referenced_by_data.retain(|inner_key| set_data.contains(inner_key));
+        if !set_code.contains(block_target) {
+            assert!(!reachability.always_reachable);
+            log::trace!("  Garbage collected: {block_target:?}");
             false
         } else {
             true
         }
     });
+
+    assert_eq!(reachability_graph.for_code.len(), set_code.len());
+
+    log::debug!(
+        "Data reachability garbage collection: {} -> {}",
+        reachability_graph.for_data.len(),
+        set_data.len()
+    );
+    reachability_graph.for_data.retain(|data_target, reachability| {
+        assert!(reachability.reachable_from.is_empty());
+        reachability.address_taken_in.retain(|inner_key| set_code.contains(inner_key));
+        reachability.referenced_by_data.retain(|inner_key| set_data.contains(inner_key));
+        if !set_data.contains(data_target) {
+            assert!(!reachability.always_reachable);
+            log::trace!("  Garbage collected: {data_target:?}");
+            false
+        } else {
+            true
+        }
+    });
+
+    reachability_graph.code_references_in_data_section.retain(|data_target, list| {
+        if !set_data.contains(data_target) {
+            false
+        } else {
+            assert!(list.iter().all(|block_target| set_code.contains(block_target)));
+            true
+        }
+    });
+
+    reachability_graph.data_references_in_data_section.retain(|data_target, list| {
+        if !set_data.contains(data_target) {
+            false
+        } else {
+            assert!(list.iter().all(|next_data_target| set_data.contains(next_data_target)));
+            true
+        }
+    });
+
+    assert_eq!(reachability_graph.for_data.len(), set_data.len());
     true
 }
 
-fn remove_if_globally_unreachable(
+fn remove_unreachable_code_impl(
     all_blocks: &[BasicBlock<AnyTarget, BlockTarget>],
-    reachability_for_block: &mut HashMap<BlockTarget, Reachability>,
+    reachability_graph: &mut ReachabilityGraph,
+    mut optimize_queue: Option<&mut VecSet<BlockTarget>>,
+    queue_code: &mut VecSet<BlockTarget>,
+    queue_data: &mut VecSet<SectionIndex>,
+    current: BlockTarget,
+) {
+    assert!(reachability_graph.for_code.get(&current).unwrap().is_unreachable());
+    log::trace!("Removing {current:?} from the graph...");
+
+    each_reference(&all_blocks[current.index()], |ext| match ext {
+        ExtRef::Jump(target) => {
+            log::trace!("{target:?} is not reachable from {current:?} anymore");
+            let reachability = reachability_graph.for_code.get_mut(&target).unwrap();
+            reachability.reachable_from.remove(&current);
+            if reachability.is_unreachable() {
+                log::trace!("{target:?} is now unreachable!");
+                queue_code.push(target)
+            } else if let Some(ref mut optimize_queue) = optimize_queue {
+                optimize_queue.push(target);
+            }
+        }
+        ExtRef::Address(target) => {
+            log::trace!("{target:?}'s address is not taken in {current:?} anymore");
+            let reachability = reachability_graph.for_code.get_mut(&target).unwrap();
+            reachability.address_taken_in.remove(&current);
+            if reachability.is_unreachable() {
+                log::trace!("{target:?} is now unreachable!");
+                queue_code.push(target)
+            } else if let Some(ref mut optimize_queue) = optimize_queue {
+                optimize_queue.push(target);
+            }
+        }
+        ExtRef::DataAddress(target) => {
+            log::trace!("{target:?}'s address is not taken in {current:?} anymore");
+            let reachability = reachability_graph.for_data.get_mut(&target).unwrap();
+            reachability.address_taken_in.remove(&current);
+            if reachability.is_unreachable() {
+                log::trace!("{target:?} is now unreachable!");
+                queue_data.push(target);
+            }
+        }
+    });
+
+    reachability_graph.for_code.remove(&current);
+}
+
+fn remove_unreachable_data_impl(
+    reachability_graph: &mut ReachabilityGraph,
+    mut optimize_queue: Option<&mut VecSet<BlockTarget>>,
+    queue_code: &mut VecSet<BlockTarget>,
+    queue_data: &mut VecSet<SectionIndex>,
+    current: SectionIndex,
+) {
+    assert!(reachability_graph.for_data.get(&current).unwrap().is_unreachable());
+    log::trace!("Removing {current:?} from the graph...");
+
+    let code_refs = reachability_graph.code_references_in_data_section.remove(&current);
+    let data_refs = reachability_graph.data_references_in_data_section.remove(&current);
+
+    if let Some(list) = code_refs {
+        for target in list {
+            log::trace!("{target:?} is not reachable from {current:?} anymore");
+            let reachability = reachability_graph.for_code.get_mut(&target).unwrap();
+            reachability.referenced_by_data.remove(&current);
+            if reachability.is_unreachable() {
+                log::trace!("{target:?} is now unreachable!");
+                queue_code.push(target)
+            } else if let Some(ref mut optimize_queue) = optimize_queue {
+                optimize_queue.push(target);
+            }
+        }
+    }
+
+    if let Some(list) = data_refs {
+        for target in list {
+            log::trace!("{target:?} is not reachable from {current:?} anymore");
+            let reachability = reachability_graph.for_data.get_mut(&target).unwrap();
+            reachability.referenced_by_data.remove(&current);
+            if reachability.is_unreachable() {
+                log::trace!("{target:?} is now unreachable!");
+                queue_data.push(target)
+            }
+        }
+    }
+
+    reachability_graph.for_data.remove(&current);
+}
+
+fn remove_code_if_globally_unreachable(
+    all_blocks: &[BasicBlock<AnyTarget, BlockTarget>],
+    reachability_graph: &mut ReachabilityGraph,
     mut optimize_queue: Option<&mut VecSet<BlockTarget>>,
     block_target: BlockTarget,
 ) {
-    fn remove_unreachable_impl(
-        all_blocks: &[BasicBlock<AnyTarget, BlockTarget>],
-        reachability_for_block: &mut HashMap<BlockTarget, Reachability>,
-        mut optimize_queue: Option<&mut VecSet<BlockTarget>>,
-        queue: &mut VecSet<BlockTarget>,
-        current: BlockTarget,
-    ) {
-        assert!(reachability_for_block.get(&current).unwrap().is_unreachable());
-        log::trace!("Removing {current:?} from the graph...");
-
-        each_reference(&all_blocks[current.index()], |ext| match ext {
-            ExtRef::Jump(target) => {
-                log::trace!("{target:?} is not reachable from {current:?} anymore");
-                let reachability = reachability_for_block.get_mut(&target).unwrap();
-                reachability.reachable_from.remove(&current);
-                if reachability.is_unreachable() {
-                    log::trace!("{target:?} is now unreachable!");
-                    queue.push(target)
-                } else if let Some(ref mut optimize_queue) = optimize_queue {
-                    optimize_queue.push(target);
-                }
-            }
-            ExtRef::Address(target) => {
-                log::trace!("{target:?}'s address is not taken in {current:?} anymore");
-                let reachability = reachability_for_block.get_mut(&target).unwrap();
-                reachability.address_taken_in.remove(&current);
-                if reachability.is_unreachable() {
-                    log::trace!("{target:?} is now unreachable!");
-                    queue.push(target)
-                } else if let Some(ref mut optimize_queue) = optimize_queue {
-                    optimize_queue.push(target);
-                }
-            }
-            ExtRef::DataAddress(..) => {}
-        });
-
-        reachability_for_block.remove(&current);
-    }
-
-    if !reachability_for_block.get(&block_target).unwrap().is_unreachable() {
+    if !reachability_graph.for_code.get(&block_target).unwrap().is_unreachable() {
         return;
     }
 
     // The inner block is now globally unreachable.
-    let mut queue = VecSet::new();
-    remove_unreachable_impl(
+    let mut queue_code = VecSet::new();
+    let mut queue_data = VecSet::new();
+    remove_unreachable_code_impl(
         all_blocks,
-        reachability_for_block,
+        reachability_graph,
         optimize_queue.as_deref_mut(),
-        &mut queue,
+        &mut queue_code,
+        &mut queue_data,
         block_target,
     );
 
-    // If there are more blocks which are now unreachable then remove them too.
-    while let Some(next) = queue.pop_unique() {
-        remove_unreachable_impl(all_blocks, reachability_for_block, optimize_queue.as_deref_mut(), &mut queue, next);
+    // If there are other dependencies which are now unreachable then remove them too.
+    while !queue_code.is_empty() || !queue_data.is_empty() {
+        while let Some(next) = queue_code.pop_unique() {
+            remove_unreachable_code_impl(
+                all_blocks,
+                reachability_graph,
+                optimize_queue.as_deref_mut(),
+                &mut queue_code,
+                &mut queue_data,
+                next,
+            );
+        }
+
+        while let Some(next) = queue_data.pop_unique() {
+            remove_unreachable_data_impl(
+                reachability_graph,
+                optimize_queue.as_deref_mut(),
+                &mut queue_code,
+                &mut queue_data,
+                next,
+            );
+        }
+    }
+}
+
+fn remove_if_data_is_globally_unreachable(
+    all_blocks: &[BasicBlock<AnyTarget, BlockTarget>],
+    reachability_graph: &mut ReachabilityGraph,
+    mut optimize_queue: Option<&mut VecSet<BlockTarget>>,
+    data_target: SectionIndex,
+) {
+    if !reachability_graph.for_data.get(&data_target).unwrap().is_unreachable() {
+        return;
+    }
+
+    let mut queue_code = VecSet::new();
+    let mut queue_data = VecSet::new();
+    remove_unreachable_data_impl(
+        reachability_graph,
+        optimize_queue.as_deref_mut(),
+        &mut queue_code,
+        &mut queue_data,
+        data_target,
+    );
+
+    // If there are other dependencies which are now unreachable then remove them too.
+    while !queue_code.is_empty() || !queue_data.is_empty() {
+        while let Some(next) = queue_code.pop_unique() {
+            remove_unreachable_code_impl(
+                all_blocks,
+                reachability_graph,
+                optimize_queue.as_deref_mut(),
+                &mut queue_code,
+                &mut queue_data,
+                next,
+            );
+        }
+
+        while let Some(next) = queue_data.pop_unique() {
+            remove_unreachable_data_impl(
+                reachability_graph,
+                optimize_queue.as_deref_mut(),
+                &mut queue_code,
+                &mut queue_data,
+                next,
+            );
+        }
     }
 }
 
 fn add_to_optimize_queue(
     all_blocks: &[BasicBlock<AnyTarget, BlockTarget>],
-    reachability_for_block: &HashMap<BlockTarget, Reachability>,
+    reachability_graph: &ReachabilityGraph,
     optimize_queue: &mut VecSet<BlockTarget>,
     block_target: BlockTarget,
 ) {
-    let Some(reachability) = reachability_for_block.get(&block_target) else {
+    let Some(reachability) = reachability_graph.for_code.get(&block_target) else {
         return;
     };
     if reachability.is_unreachable() {
@@ -1661,7 +1845,7 @@ fn perform_nop_elimination(all_blocks: &mut [BasicBlock<AnyTarget, BlockTarget>]
 
 fn perform_inlining(
     all_blocks: &mut [BasicBlock<AnyTarget, BlockTarget>],
-    reachability_for_block: &mut HashMap<BlockTarget, Reachability>,
+    reachability_graph: &mut ReachabilityGraph,
     optimize_queue: Option<&mut VecSet<BlockTarget>>,
     inline_threshold: usize,
     current: BlockTarget,
@@ -1672,7 +1856,7 @@ fn perform_inlining(
 
     fn inline(
         all_blocks: &mut [BasicBlock<AnyTarget, BlockTarget>],
-        reachability_for_block: &mut HashMap<BlockTarget, Reachability>,
+        reachability_graph: &mut ReachabilityGraph,
         mut optimize_queue: Option<&mut VecSet<BlockTarget>>,
         outer: BlockTarget,
         inner: BlockTarget,
@@ -1680,8 +1864,8 @@ fn perform_inlining(
         log::trace!("Inlining {inner:?} into {outer:?}...");
 
         if let Some(ref mut optimize_queue) = optimize_queue {
-            add_to_optimize_queue(all_blocks, reachability_for_block, optimize_queue, outer);
-            add_to_optimize_queue(all_blocks, reachability_for_block, optimize_queue, inner);
+            add_to_optimize_queue(all_blocks, reachability_graph, optimize_queue, outer);
+            add_to_optimize_queue(all_blocks, reachability_graph, optimize_queue, inner);
         }
 
         // Inlining into ourselves doesn't make sense.
@@ -1696,29 +1880,38 @@ fn perform_inlining(
         // The inner block is not reachable from here anymore.
         // NOTE: This needs to be done *before* adding the references below,
         //       as the inner block might be an infinite loop.
-        reachability_for_block.get_mut(&inner).unwrap().reachable_from.remove(&outer);
+        reachability_graph.for_code.get_mut(&inner).unwrap().reachable_from.remove(&outer);
 
         // Everything which the inner block accesses will be reachable from here, so update reachability.
         each_reference(&all_blocks[inner.index()], |ext| match ext {
             ExtRef::Jump(target) => {
-                reachability_for_block
+                reachability_graph
+                    .for_code
                     .entry(target)
                     .or_insert_with(Default::default)
                     .reachable_from
                     .insert(outer);
             }
             ExtRef::Address(target) => {
-                reachability_for_block
+                reachability_graph
+                    .for_code
                     .entry(target)
                     .or_insert_with(Default::default)
                     .address_taken_in
                     .insert(outer);
             }
-            ExtRef::DataAddress(..) => {}
+            ExtRef::DataAddress(target) => {
+                reachability_graph
+                    .for_data
+                    .entry(target)
+                    .or_insert_with(Default::default)
+                    .address_taken_in
+                    .insert(outer);
+            }
         });
 
         // Remove it from the graph if it's globally unreachable now.
-        remove_if_globally_unreachable(all_blocks, reachability_for_block, optimize_queue, inner);
+        remove_code_if_globally_unreachable(all_blocks, reachability_graph, optimize_queue, inner);
 
         let outer_source = all_blocks[outer.index()].next.source.clone();
         let inner_source = all_blocks[inner.index()].next.source.clone();
@@ -1735,7 +1928,7 @@ fn perform_inlining(
 
     fn should_inline(
         all_blocks: &[BasicBlock<AnyTarget, BlockTarget>],
-        reachability_for_block: &HashMap<BlockTarget, Reachability>,
+        reachability_graph: &ReachabilityGraph,
         current: BlockTarget,
         target: BlockTarget,
         inline_threshold: usize,
@@ -1751,9 +1944,8 @@ fn perform_inlining(
         }
 
         // Inline if the target block is only reachable from here.
-        if let Some(reachability) = reachability_for_block.get(&target) {
-            if !reachability.referenced_by_data && reachability.address_taken_in.is_empty() && reachability.reachable_from.len() == 1 {
-                assert!(reachability.reachable_from.contains(&current));
+        if let Some(reachability) = reachability_graph.for_code.get(&target) {
+            if reachability.is_only_reachable_from(current) {
                 return true;
             }
         }
@@ -1763,13 +1955,13 @@ fn perform_inlining(
 
     match all_blocks[current.index()].next.instruction {
         ControlInst::Jump { target } => {
-            if should_inline(all_blocks, reachability_for_block, current, target, inline_threshold) {
-                inline(all_blocks, reachability_for_block, optimize_queue, current, target);
+            if should_inline(all_blocks, reachability_graph, current, target, inline_threshold) {
+                inline(all_blocks, reachability_graph, optimize_queue, current, target);
                 return true;
             }
         }
         ControlInst::Call { ra, target, target_return } => {
-            if should_inline(all_blocks, reachability_for_block, current, target, inline_threshold) {
+            if should_inline(all_blocks, reachability_graph, current, target, inline_threshold) {
                 all_blocks[current.index()].ops.push((
                     all_blocks[current.index()].next.source.clone(),
                     BasicInst::LoadAddress {
@@ -1778,7 +1970,7 @@ fn perform_inlining(
                     },
                 ));
                 all_blocks[current.index()].next.instruction = ControlInst::Jump { target };
-                inline(all_blocks, reachability_for_block, optimize_queue, current, target);
+                inline(all_blocks, reachability_graph, optimize_queue, current, target);
                 return true;
             }
         }
@@ -1791,14 +1983,14 @@ fn perform_inlining(
 fn perform_dead_code_elimination(
     imports: &[Import],
     all_blocks: &mut [BasicBlock<AnyTarget, BlockTarget>],
-    reachability_for_block: &mut HashMap<BlockTarget, Reachability>,
+    reachability_graph: &mut ReachabilityGraph,
     mut optimize_queue: Option<&mut VecSet<BlockTarget>>,
     block_target: BlockTarget,
 ) -> bool {
     fn perform_dead_code_elimination_on_block(
         imports: &[Import],
         all_blocks: &mut [BasicBlock<AnyTarget, BlockTarget>],
-        reachability_for_block: &mut HashMap<BlockTarget, Reachability>,
+        reachability_graph: &mut ReachabilityGraph,
         mut optimize_queue: Option<&mut VecSet<BlockTarget>>,
         modified: &mut bool,
         mut registers_needed: RegMask,
@@ -1829,7 +2021,7 @@ fn perform_dead_code_elimination(
 
         *modified = true;
         if let Some(ref mut optimize_queue) = optimize_queue {
-            add_to_optimize_queue(all_blocks, reachability_for_block, optimize_queue, block_target);
+            add_to_optimize_queue(all_blocks, reachability_graph, optimize_queue, block_target);
         }
 
         let mut dead_references = HashSet::new();
@@ -1855,27 +2047,49 @@ fn perform_dead_code_elimination(
             dead_references.remove(&ext);
         });
 
-        for ext in dead_references {
+        for ext in &dead_references {
             match ext {
                 ExtRef::Jump(target) => {
                     log::trace!("{target:?} is not reachable from {block_target:?} anymore");
-                    reachability_for_block
-                        .get_mut(&target)
+                    reachability_graph
+                        .for_code
+                        .get_mut(target)
                         .unwrap()
                         .reachable_from
                         .remove(&block_target);
-                    remove_if_globally_unreachable(all_blocks, reachability_for_block, optimize_queue.as_deref_mut(), target);
                 }
                 ExtRef::Address(target) => {
                     log::trace!("{target:?}'s address is not taken in {block_target:?} anymore");
-                    reachability_for_block
-                        .get_mut(&target)
+                    reachability_graph
+                        .for_code
+                        .get_mut(target)
                         .unwrap()
                         .address_taken_in
                         .remove(&block_target);
-                    remove_if_globally_unreachable(all_blocks, reachability_for_block, optimize_queue.as_deref_mut(), target);
                 }
-                ExtRef::DataAddress(..) => {}
+                ExtRef::DataAddress(target) => {
+                    log::trace!("{target:?}'s address is not taken in {block_target:?} anymore");
+                    reachability_graph
+                        .for_data
+                        .get_mut(target)
+                        .unwrap()
+                        .address_taken_in
+                        .remove(&block_target);
+                }
+            }
+        }
+
+        for ext in dead_references {
+            match ext {
+                ExtRef::Jump(target) => {
+                    remove_code_if_globally_unreachable(all_blocks, reachability_graph, optimize_queue.as_deref_mut(), target);
+                }
+                ExtRef::Address(target) => {
+                    remove_code_if_globally_unreachable(all_blocks, reachability_graph, optimize_queue.as_deref_mut(), target);
+                }
+                ExtRef::DataAddress(target) => {
+                    remove_if_data_is_globally_unreachable(all_blocks, reachability_graph, optimize_queue.as_deref_mut(), target);
+                }
             }
         }
 
@@ -1883,7 +2097,7 @@ fn perform_dead_code_elimination(
     }
 
     let mut previous_blocks = Vec::new();
-    for &previous_block in &reachability_for_block.get(&block_target).unwrap().reachable_from {
+    for &previous_block in &reachability_graph.for_code.get(&block_target).unwrap().reachable_from {
         if previous_block == block_target {
             continue;
         }
@@ -1900,7 +2114,7 @@ fn perform_dead_code_elimination(
     let registers_needed = perform_dead_code_elimination_on_block(
         imports,
         all_blocks,
-        reachability_for_block,
+        reachability_graph,
         optimize_queue.as_deref_mut(),
         &mut modified,
         !RegMask::empty(),
@@ -1910,7 +2124,7 @@ fn perform_dead_code_elimination(
         perform_dead_code_elimination_on_block(
             imports,
             all_blocks,
-            reachability_for_block,
+            reachability_graph,
             optimize_queue.as_deref_mut(),
             &mut modified,
             registers_needed,
@@ -1924,7 +2138,7 @@ fn perform_dead_code_elimination(
 fn perform_constant_propagation(
     imports: &[Import],
     all_blocks: &mut [BasicBlock<AnyTarget, BlockTarget>],
-    reachability_for_block: &mut HashMap<BlockTarget, Reachability>,
+    reachability_graph: &mut ReachabilityGraph,
     mut optimize_queue: Option<&mut VecSet<BlockTarget>>,
     mut current: BlockTarget,
 ) -> bool {
@@ -2114,13 +2328,13 @@ fn perform_constant_propagation(
 
         if modified {
             if let Some(ref mut optimize_queue) = optimize_queue {
-                add_to_optimize_queue(all_blocks, reachability_for_block, optimize_queue, current);
+                add_to_optimize_queue(all_blocks, reachability_graph, optimize_queue, current);
             }
         }
 
         match all_blocks[current.index()].next.instruction {
             ControlInst::Jump { target } => {
-                if reachability_for_block.get(&target).unwrap().is_only_reachable_from(current) {
+                if reachability_graph.for_code.get(&target).unwrap().is_only_reachable_from(current) {
                     current = target;
                     continue;
                 }
@@ -2129,7 +2343,7 @@ fn perform_constant_propagation(
                 if offset == 0 && is_constant.contains(base) {
                     if let RegValue::CodeAddress(target) = reg_values[base as usize] {
                         all_blocks[current.index()].next.instruction = ControlInst::Jump { target };
-                        reachability_for_block.get_mut(&target).unwrap().reachable_from.insert(current);
+                        reachability_graph.for_code.get_mut(&target).unwrap().reachable_from.insert(current);
                         modified = true;
 
                         current = target;
@@ -2138,7 +2352,7 @@ fn perform_constant_propagation(
                 }
             }
             ControlInst::Call { ra, target, target_return } => {
-                if current != target && reachability_for_block.get(&target).unwrap().is_only_reachable_from(current) {
+                if current != target && reachability_graph.for_code.get(&target).unwrap().is_only_reachable_from(current) {
                     reg_values[ra as usize] = RegValue::CodeAddress(target_return);
                     is_constant.insert(ra);
                     current = target;
@@ -2178,19 +2392,25 @@ fn perform_constant_propagation(
                         };
                         all_blocks[current.index()].next.instruction = ControlInst::Jump { target: new_target };
 
-                        reachability_for_block
+                        reachability_graph
+                            .for_code
                             .get_mut(&unreachable_target)
                             .unwrap()
                             .reachable_from
                             .remove(&current);
-                        remove_if_globally_unreachable(
+                        remove_code_if_globally_unreachable(
                             all_blocks,
-                            reachability_for_block,
+                            reachability_graph,
                             optimize_queue.as_deref_mut(),
                             unreachable_target,
                         );
 
-                        if reachability_for_block.get(&new_target).unwrap().is_only_reachable_from(current) {
+                        if reachability_graph
+                            .for_code
+                            .get(&new_target)
+                            .unwrap()
+                            .is_only_reachable_from(current)
+                        {
                             current = new_target;
                             continue;
                         }
@@ -2199,10 +2419,22 @@ fn perform_constant_propagation(
                     }
                 }
 
-                if current != target_true && reachability_for_block.get(&target_true).unwrap().is_only_reachable_from(current) {
+                if current != target_true
+                    && reachability_graph
+                        .for_code
+                        .get(&target_true)
+                        .unwrap()
+                        .is_only_reachable_from(current)
+                {
                     current = target_true;
                     continue;
-                } else if current != target_false && reachability_for_block.get(&target_false).unwrap().is_only_reachable_from(current) {
+                } else if current != target_false
+                    && reachability_graph
+                        .for_code
+                        .get(&target_false)
+                        .unwrap()
+                        .is_only_reachable_from(current)
+                {
                     current = target_false;
                     continue;
                 }
@@ -2219,12 +2451,12 @@ fn perform_constant_propagation(
 fn optimize_program(
     imports: &[Import],
     all_blocks: &mut [BasicBlock<AnyTarget, BlockTarget>],
-    reachability_for_block: &mut HashMap<BlockTarget, Reachability>,
+    reachability_graph: &mut ReachabilityGraph,
     inline_threshold: usize,
 ) {
     let mut optimize_queue = VecSet::new();
     for current in (0..all_blocks.len()).map(BlockTarget::from_raw) {
-        if !reachability_for_block.contains_key(&current) {
+        if !reachability_graph.is_code_reachable(current) {
             all_blocks[current.index()].ops.clear();
             all_blocks[current.index()].next.instruction = ControlInst::Unimplemented;
             continue;
@@ -2237,31 +2469,25 @@ fn optimize_program(
     optimize_queue.vec.sort_by_key(|current| all_blocks[current.index()].ops.len());
     optimize_queue.vec.reverse();
 
-    let opt_minimum_iteration_count = reachability_for_block.len();
+    let opt_minimum_iteration_count = reachability_graph.reachable_block_count();
     let mut opt_iteration_count = 0;
     while let Some(current) = optimize_queue.pop_non_unique() {
-        if !reachability_for_block.contains_key(&current) {
+        if !reachability_graph.is_code_reachable(current) {
             continue;
         }
 
         opt_iteration_count += 1;
         perform_nop_elimination(all_blocks, current);
-        perform_inlining(
-            all_blocks,
-            reachability_for_block,
-            Some(&mut optimize_queue),
-            inline_threshold,
-            current,
-        );
-        perform_dead_code_elimination(imports, all_blocks, reachability_for_block, Some(&mut optimize_queue), current);
-        perform_constant_propagation(imports, all_blocks, reachability_for_block, Some(&mut optimize_queue), current);
+        perform_inlining(all_blocks, reachability_graph, Some(&mut optimize_queue), inline_threshold, current);
+        perform_dead_code_elimination(imports, all_blocks, reachability_graph, Some(&mut optimize_queue), current);
+        perform_constant_propagation(imports, all_blocks, reachability_graph, Some(&mut optimize_queue), current);
     }
 
     log::debug!(
         "Optimizing the program took {} iteration(s)",
         opt_iteration_count - opt_minimum_iteration_count
     );
-    garbage_collect_reachability(all_blocks, reachability_for_block);
+    garbage_collect_reachability(all_blocks, reachability_graph);
 
     let mut opt_brute_force_iterations = 0;
     let mut modified = true;
@@ -2269,17 +2495,17 @@ fn optimize_program(
         opt_brute_force_iterations += 1;
         modified = false;
         for current in (0..all_blocks.len()).map(BlockTarget::from_raw) {
-            if !reachability_for_block.contains_key(&current) {
+            if !reachability_graph.is_code_reachable(current) {
                 continue;
             }
 
-            modified |= perform_inlining(all_blocks, reachability_for_block, None, inline_threshold, current);
-            modified |= perform_dead_code_elimination(imports, all_blocks, reachability_for_block, None, current);
-            modified |= perform_constant_propagation(imports, all_blocks, reachability_for_block, None, current);
+            modified |= perform_inlining(all_blocks, reachability_graph, None, inline_threshold, current);
+            modified |= perform_dead_code_elimination(imports, all_blocks, reachability_graph, None, current);
+            modified |= perform_constant_propagation(imports, all_blocks, reachability_graph, None, current);
         }
 
         if modified {
-            garbage_collect_reachability(all_blocks, reachability_for_block);
+            garbage_collect_reachability(all_blocks, reachability_graph);
         }
     }
 
@@ -2402,23 +2628,61 @@ impl<T> VecSet<T> {
     }
 }
 
+#[derive(PartialEq, Eq, Debug, Default)]
+struct ReachabilityGraph {
+    for_code: BTreeMap<BlockTarget, Reachability>,
+    for_data: BTreeMap<SectionIndex, Reachability>,
+    code_references_in_data_section: BTreeMap<SectionIndex, Vec<BlockTarget>>,
+    data_references_in_data_section: BTreeMap<SectionIndex, Vec<SectionIndex>>,
+}
+
+impl ReachabilityGraph {
+    fn reachable_block_count(&self) -> usize {
+        self.for_code.len()
+    }
+
+    fn is_code_reachable(&self, block_target: BlockTarget) -> bool {
+        if let Some(reachability) = self.for_code.get(&block_target) {
+            assert!(!reachability.is_unreachable());
+            true
+        } else {
+            false
+        }
+    }
+
+    fn is_data_section_reachable(&self, section_index: SectionIndex) -> bool {
+        if let Some(reachability) = self.for_data.get(&section_index) {
+            assert!(!reachability.is_unreachable());
+            true
+        } else {
+            false
+        }
+    }
+
+    fn mark_data_section_reachable(&mut self, section_index: SectionIndex) {
+        self.for_data.entry(section_index).or_insert_with(Default::default).always_reachable = true;
+    }
+}
+
 #[derive(Debug, PartialEq, Eq, PartialOrd, Ord, Default)]
 struct Reachability {
     reachable_from: BTreeSet<BlockTarget>,
     address_taken_in: BTreeSet<BlockTarget>,
-    referenced_by_data: bool,
+    referenced_by_data: BTreeSet<SectionIndex>,
+    always_reachable: bool,
 }
 
 impl Reachability {
     fn is_only_reachable_from(&self, block_target: BlockTarget) -> bool {
-        !self.referenced_by_data
+        !self.always_reachable
+            && self.referenced_by_data.is_empty()
             && self.address_taken_in.is_empty()
             && self.reachable_from.len() == 1
             && self.reachable_from.contains(&block_target)
     }
 
     fn is_unreachable(&self) -> bool {
-        self.reachable_from.is_empty() && self.address_taken_in.is_empty() && !self.referenced_by_data
+        self.reachable_from.is_empty() && self.address_taken_in.is_empty() && self.referenced_by_data.is_empty() && !self.always_reachable
     }
 }
 
@@ -2426,29 +2690,29 @@ impl Reachability {
 enum ExtRef {
     Address(BlockTarget),
     Jump(BlockTarget),
-    DataAddress(SectionTarget),
+    DataAddress(SectionIndex),
 }
 
-fn each_reference(block: &BasicBlock<AnyTarget, BlockTarget>, mut cb: impl FnMut(ExtRef)) {
-    for (_, instruction) in &block.ops {
-        let (data_target, code_or_data_target) = instruction.target();
-        if let Some(target) = data_target {
-            cb(ExtRef::DataAddress(target));
-        }
+fn each_reference_for_basic_instruction(instruction: &BasicInst<AnyTarget>, mut cb: impl FnMut(ExtRef)) {
+    let (data_target, code_or_data_target) = instruction.target();
+    if let Some(target) = data_target {
+        cb(ExtRef::DataAddress(target.section_index));
+    }
 
-        if let Some(target) = code_or_data_target {
-            match target {
-                AnyTarget::Code(target) => {
-                    cb(ExtRef::Address(target));
-                }
-                AnyTarget::Data(target) => {
-                    cb(ExtRef::DataAddress(target));
-                }
+    if let Some(target) = code_or_data_target {
+        match target {
+            AnyTarget::Code(target) => {
+                cb(ExtRef::Address(target));
+            }
+            AnyTarget::Data(target) => {
+                cb(ExtRef::DataAddress(target.section_index));
             }
         }
     }
+}
 
-    match block.next.instruction {
+fn each_reference_for_control_instruction(instruction: &ControlInst<BlockTarget>, mut cb: impl FnMut(ExtRef)) {
+    match *instruction {
         ControlInst::Jump { target } => {
             cb(ExtRef::Jump(target));
         }
@@ -2469,26 +2733,39 @@ fn each_reference(block: &BasicBlock<AnyTarget, BlockTarget>, mut cb: impl FnMut
     }
 }
 
+fn each_reference(block: &BasicBlock<AnyTarget, BlockTarget>, mut cb: impl FnMut(ExtRef)) {
+    for (_, instruction) in &block.ops {
+        each_reference_for_basic_instruction(instruction, &mut cb);
+    }
+
+    each_reference_for_control_instruction(&block.next.instruction, cb);
+}
+
 fn calculate_reachability(
     section_to_block: &HashMap<SectionTarget, BlockTarget>,
     all_blocks: &[BasicBlock<AnyTarget, BlockTarget>],
     data_sections_set: &HashSet<SectionIndex>,
     export_metadata: &[ExportMetadata],
     relocations: &BTreeMap<SectionTarget, RelocationKind>,
-) -> Result<(HashMap<BlockTarget, Reachability>, HashSet<SectionIndex>), ProgramFromElfError> {
-    let mut reachable_blocks: HashMap<BlockTarget, Reachability> = HashMap::new();
+) -> Result<ReachabilityGraph, ProgramFromElfError> {
+    let mut graph = ReachabilityGraph::default();
     let mut data_queue: VecSet<SectionTarget> = VecSet::new();
     let mut block_queue: VecSet<BlockTarget> = VecSet::new();
     let mut section_queue: VecSet<SectionIndex> = VecSet::new();
+    let mut relocations_per_section: HashMap<SectionIndex, Vec<&RelocationKind>> = HashMap::new();
+    for (relocation_location, relocation) in relocations.iter() {
+        relocations_per_section
+            .entry(relocation_location.section_index)
+            .or_insert_with(Vec::new)
+            .push(relocation);
+    }
+
     for export in export_metadata {
         let Some(&block_target) = section_to_block.get(&export.location) else {
             return Err(ProgramFromElfError::other("export points to a non-block"));
         };
 
-        reachable_blocks
-            .entry(block_target)
-            .or_insert_with(Default::default)
-            .referenced_by_data = true;
+        graph.for_code.entry(block_target).or_insert_with(Default::default).always_reachable = true;
         block_queue.push(block_target);
     }
 
@@ -2496,7 +2773,8 @@ fn calculate_reachability(
         while let Some(current_block) = block_queue.pop_unique() {
             each_reference(&all_blocks[current_block.index()], |ext| match ext {
                 ExtRef::Jump(target) => {
-                    reachable_blocks
+                    graph
+                        .for_code
                         .entry(target)
                         .or_insert_with(Default::default)
                         .reachable_from
@@ -2504,14 +2782,23 @@ fn calculate_reachability(
                     block_queue.push(target);
                 }
                 ExtRef::Address(target) => {
-                    reachable_blocks
+                    graph
+                        .for_code
                         .entry(target)
                         .or_insert_with(Default::default)
                         .address_taken_in
                         .insert(current_block);
                     block_queue.push(target)
                 }
-                ExtRef::DataAddress(target) => data_queue.push(target),
+                ExtRef::DataAddress(target) => {
+                    graph
+                        .for_data
+                        .entry(target)
+                        .or_insert_with(Default::default)
+                        .address_taken_in
+                        .insert(current_block);
+                    section_queue.push(target)
+                }
             });
         }
 
@@ -2522,21 +2809,40 @@ fn calculate_reachability(
         }
 
         while let Some(section_index) = section_queue.pop_unique() {
-            // TODO: Can we skip some parts of the data sections?
-            // TOOD: Make this more efficient?
-            for (relocation_location, relocation) in relocations.iter() {
-                if relocation_location.section_index != section_index {
-                    continue;
-                }
-
+            let Some(local_relocations) = relocations_per_section.get(&section_index) else {
+                continue;
+            };
+            for relocation in local_relocations {
                 for relocation_target in relocation.targets().into_iter().flatten() {
                     if let Some(&block_target) = section_to_block.get(&relocation_target) {
-                        reachable_blocks
+                        graph
+                            .code_references_in_data_section
+                            .entry(section_index)
+                            .or_insert_with(Default::default)
+                            .push(block_target);
+
+                        graph
+                            .for_code
                             .entry(block_target)
                             .or_insert_with(Default::default)
-                            .referenced_by_data = true;
+                            .referenced_by_data
+                            .insert(section_index);
+
                         block_queue.push(block_target);
                     } else {
+                        graph
+                            .data_references_in_data_section
+                            .entry(section_index)
+                            .or_insert_with(Default::default)
+                            .push(relocation_target.section_index);
+
+                        graph
+                            .for_data
+                            .entry(relocation_target.section_index)
+                            .or_insert_with(Default::default)
+                            .referenced_by_data
+                            .insert(section_index);
+
                         data_queue.push(relocation_target);
                     }
                 }
@@ -2544,8 +2850,26 @@ fn calculate_reachability(
         }
     }
 
-    assert_eq!(block_queue.set.len(), reachable_blocks.len());
-    Ok((reachable_blocks, section_queue.into_set()))
+    for list in graph.code_references_in_data_section.values_mut() {
+        list.sort_unstable();
+        list.dedup();
+    }
+
+    for list in graph.data_references_in_data_section.values_mut() {
+        list.sort_unstable();
+        list.dedup();
+    }
+
+    for reachability in graph.for_code.values() {
+        assert!(!reachability.is_unreachable());
+    }
+
+    for reachability in graph.for_data.values() {
+        assert!(!reachability.is_unreachable());
+    }
+
+    assert_eq!(block_queue.set.len(), graph.for_code.len());
+    Ok(graph)
 }
 
 #[derive(Copy, Clone, PartialEq, Eq, PartialOrd, Ord, Default)]
@@ -3961,26 +4285,21 @@ pub fn program_from_elf(config: Config, data: &[u8]) -> Result<ProgramBlob, Prog
 
     let section_to_block = build_section_to_block_map(&all_blocks)?;
     let mut all_blocks = resolve_basic_block_references(&data_sections_set, &section_to_block, &all_blocks)?;
-    let (mut reachability_for_block, used_data_sections) =
+    let mut reachability_graph =
         calculate_reachability(&section_to_block, &all_blocks, &data_sections_set, &export_metadata, &relocations)?;
 
     if config.optimize {
-        optimize_program(
-            &import_metadata,
-            &mut all_blocks,
-            &mut reachability_for_block,
-            config.inline_threshold,
-        );
+        optimize_program(&import_metadata, &mut all_blocks, &mut reachability_graph, config.inline_threshold);
 
-        if reachability_for_block
-            != calculate_reachability(&section_to_block, &all_blocks, &data_sections_set, &export_metadata, &relocations)?.0
-        {
+        let expected_reachability_graph =
+            calculate_reachability(&section_to_block, &all_blocks, &data_sections_set, &export_metadata, &relocations)?;
+        if reachability_graph != expected_reachability_graph {
             panic!("internal error: inconsistent reachability after optimization; this is a bug, please report it!");
         }
     }
 
     for &section_index in &sections_other {
-        if used_data_sections.contains(&section_index) {
+        if reachability_graph.is_data_section_reachable(section_index) {
             return Err(ProgramFromElfError::other(format!(
                 "unsupported section used in program graph: '{name}'",
                 name = elf.section_by_index(section_index).name(),
@@ -3992,27 +4311,23 @@ pub fn program_from_elf(config: Config, data: &[u8]) -> Result<ProgramBlob, Prog
 
     {
         let mut count_dynamic = 0;
-        for reachability in reachability_for_block.values() {
-            if reachability.referenced_by_data || !reachability.address_taken_in.is_empty() {
+        for reachability in reachability_graph.for_code.values() {
+            if reachability.always_reachable || !reachability.referenced_by_data.is_empty() || !reachability.address_taken_in.is_empty() {
                 count_dynamic += 1;
             }
         }
         log::debug!(
             "Blocks used: {}/{} ({} dynamically reachable, {} statically reachable)",
-            reachability_for_block.len(),
+            reachability_graph.for_code.len(),
             all_blocks.len(),
             count_dynamic,
-            reachability_for_block.len() - count_dynamic
+            reachability_graph.for_code.len() - count_dynamic
         );
     }
 
     let section_got = elf.add_empty_data_section(".got");
     sections_ro_data.push(section_got);
-    let used_data_sections = {
-        let mut set = used_data_sections;
-        set.insert(section_got);
-        set
-    };
+    reachability_graph.mark_data_section_reachable(section_got);
 
     let mut target_to_got_offset: HashMap<AnyTarget, u64> = HashMap::new();
     let mut got_size = 0;
@@ -4020,7 +4335,7 @@ pub fn program_from_elf(config: Config, data: &[u8]) -> Result<ProgramBlob, Prog
     let mut used_blocks = Vec::new();
     let mut used_imports = HashSet::new();
     for block in &all_blocks {
-        if !reachability_for_block.contains_key(&block.target) {
+        if !reachability_graph.is_code_reachable(block.target) {
             continue;
         }
 
@@ -4072,12 +4387,12 @@ pub fn program_from_elf(config: Config, data: &[u8]) -> Result<ProgramBlob, Prog
     let mut base_address_for_section = HashMap::new();
     let sections_ro_data: Vec<_> = sections_ro_data
         .into_iter()
-        .filter(|section_index| used_data_sections.contains(section_index))
+        .filter(|section_index| reachability_graph.is_data_section_reachable(*section_index))
         .collect();
 
     let sections_rw_data: Vec<_> = sections_rw_data
         .into_iter()
-        .filter(|section_index| used_data_sections.contains(section_index))
+        .filter(|section_index| reachability_graph.is_data_section_reachable(*section_index))
         .collect();
 
     let memory_config = extract_memory_config(
@@ -4106,14 +4421,14 @@ pub fn program_from_elf(config: Config, data: &[u8]) -> Result<ProgramBlob, Prog
         // This is mostly used for debug info.
         for &section_index in &sections_other {
             let address = elf.section_by_index(section_index).original_address();
-            assert!(!used_data_sections.contains(&section_index));
+            assert!(!reachability_graph.is_data_section_reachable(section_index));
             assert!(base_address_for_section.insert(section_index, address).is_none());
         }
     }
 
     for (&relocation_target, &relocation) in &relocations {
         let section = elf.section_by_index(relocation_target.section_index);
-        if !used_data_sections.contains(&relocation_target.section_index) {
+        if !reachability_graph.is_data_section_reachable(relocation_target.section_index) {
             continue;
         }
 
@@ -4164,7 +4479,7 @@ pub fn program_from_elf(config: Config, data: &[u8]) -> Result<ProgramBlob, Prog
                 size,
             } => {
                 // These relocations should only be used in debug info sections.
-                if used_data_sections.contains(&section.index()) {
+                if reachability_graph.is_data_section_reachable(section.index()) {
                     return Err(ProgramFromElfError::other(format!(
                         "relocation was not expected in section '{name}': {relocation:?}",
                         name = section.name(),
@@ -4191,7 +4506,7 @@ pub fn program_from_elf(config: Config, data: &[u8]) -> Result<ProgramBlob, Prog
             RelocationKind::Abs { target, size } => {
                 if let Some(&block_target) = section_to_block.get(&target) {
                     let Some(jump_target) = jump_target_for_block[block_target.index()] else {
-                        if !used_data_sections.contains(&relocation_target.section_index) {
+                        if !reachability_graph.is_data_section_reachable(relocation_target.section_index) {
                             // Most likely debug info for something that was stripped out.
                             let data = elf.section_data_mut(relocation_target.section_index);
                             write_generic(size, data, relocation_target.offset, 0)?;
@@ -4219,7 +4534,7 @@ pub fn program_from_elf(config: Config, data: &[u8]) -> Result<ProgramBlob, Prog
                     }
 
                     let Some(section_base) = base_address_for_section.get(&target.section_index) else {
-                        if !used_data_sections.contains(&relocation_target.section_index) {
+                        if !reachability_graph.is_data_section_reachable(relocation_target.section_index) {
                             let data = elf.section_data_mut(relocation_target.section_index);
                             write_generic(size, data, relocation_target.offset, 0)?;
                             continue;
