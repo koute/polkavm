@@ -1979,20 +1979,7 @@ fn perform_inlining(
                 return true;
             }
         }
-        ControlInst::Call { ra, target, target_return } => {
-            if should_inline(all_blocks, reachability_graph, current, target, inline_threshold) {
-                all_blocks[current.index()].ops.push((
-                    all_blocks[current.index()].next.source.clone(),
-                    BasicInst::LoadAddress {
-                        dst: ra,
-                        target: AnyTarget::Code(target_return),
-                    },
-                ));
-                all_blocks[current.index()].next.instruction = ControlInst::Jump { target };
-                inline(all_blocks, reachability_graph, optimize_queue, current, target);
-                return true;
-            }
-        }
+        ControlInst::Call { .. } | ControlInst::CallIndirect { .. } => unreachable!(),
         _ => {}
     }
 
@@ -2185,11 +2172,12 @@ fn perform_dead_code_elimination(
         // If it's going to trap then it's not going to need any of the register values.
         ControlInst::Unimplemented => RegMask::empty(),
         // If it's a jump then we'll need whatever registers the jump target needs.
-        ControlInst::Jump { target } | ControlInst::Call { target, .. } => registers_needed_for_block[target.index()],
+        ControlInst::Jump { target } => registers_needed_for_block[target.index()],
         ControlInst::Branch {
             target_true, target_false, ..
         } => registers_needed_for_block[target_true.index()] | registers_needed_for_block[target_false.index()],
         // ...otherwise assume it'll need all of them.
+        ControlInst::Call { .. } | ControlInst::CallIndirect { .. } => unreachable!(),
         _ => !RegMask::empty() & !RegMask::from(Reg::Zero),
     };
 
@@ -2643,14 +2631,6 @@ fn perform_constant_propagation(
                 regs_for_block[current.index()] = regs.clone();
                 continue;
             }
-            ControlInst::Call { ra, target, target_return }
-                if current != target && reachability_graph.for_code.get(&target).unwrap().is_only_reachable_from(current) =>
-            {
-                regs.set_reg(ra, RegValue::CodeAddress(target_return));
-                current = target;
-                regs_for_block[current.index()] = regs.clone();
-                continue;
-            }
             ControlInst::Branch {
                 target_true, target_false, ..
             } => {
@@ -2686,6 +2666,7 @@ fn perform_constant_propagation(
                     continue;
                 }
             }
+            ControlInst::Call { .. } | ControlInst::CallIndirect { .. } => unreachable!(),
             _ => {}
         }
 
