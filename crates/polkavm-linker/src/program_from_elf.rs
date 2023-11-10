@@ -1968,6 +1968,10 @@ fn perform_inlining(
         false
     }
 
+    if !reachability_graph.is_code_reachable(current) {
+        return false;
+    }
+
     match all_blocks[current.index()].next.instruction {
         ControlInst::Jump { target } => {
             if should_inline(all_blocks, reachability_graph, current, target, inline_threshold) {
@@ -2159,6 +2163,10 @@ fn perform_dead_code_elimination(
         registers_needed
     }
 
+    if !reachability_graph.is_code_reachable(block_target) {
+        return false;
+    }
+
     let mut previous_blocks = Vec::new();
     for &previous_block in &reachability_graph.for_code.get(&block_target).unwrap().reachable_from {
         if previous_block == block_target {
@@ -2200,6 +2208,10 @@ fn perform_dead_code_elimination(
     registers_needed_for_block[block_target.index()] = registers_needed;
 
     for previous_block in previous_blocks {
+        if !reachability_graph.is_code_reachable(previous_block) {
+            continue;
+        }
+
         perform_dead_code_elimination_on_block(
             config,
             imports,
@@ -2496,6 +2508,10 @@ fn perform_constant_propagation(
     loop {
         if !seen.insert(current) {
             // Prevent an infinite loop.
+            break;
+        }
+
+        if !reachability_graph.is_code_reachable(current) {
             break;
         }
 
