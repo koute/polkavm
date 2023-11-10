@@ -2904,6 +2904,64 @@ fn optimize_program(
     );
 }
 
+fn add_missing_fallthrough_blocks(
+    all_blocks: &mut Vec<BasicBlock<AnyTarget, BlockTarget>>,
+    reachability_graph: &mut ReachabilityGraph,
+) -> Vec<BlockTarget> {
+    let mut used_blocks = Vec::new();
+    for block in &*all_blocks {
+        if !reachability_graph.is_code_reachable(block.target) {
+            continue;
+        }
+
+        used_blocks.push(block.target);
+    }
+
+    let mut new_used_blocks = Vec::new();
+    let can_fallthrough_to_next_block = calculate_whether_can_fallthrough(all_blocks, &used_blocks);
+    for current in used_blocks {
+        new_used_blocks.push(current);
+        if can_fallthrough_to_next_block.contains(&current) {
+            continue;
+        }
+
+        let references = gather_references(&all_blocks[current.index()]);
+        let new_fallthrough_target = BlockTarget::from_raw(all_blocks.len());
+        let old_fallthrough_target = match &mut all_blocks[current.index()].next.instruction {
+            ControlInst::Jump { .. } | ControlInst::JumpIndirect { .. } | ControlInst::Unimplemented => continue,
+            ControlInst::Branch { target_false: target, .. }
+            | ControlInst::Call { target_return: target, .. }
+            | ControlInst::CallIndirect { target_return: target, .. } => core::mem::replace(target, new_fallthrough_target),
+        };
+
+        all_blocks.push(BasicBlock {
+            target: new_fallthrough_target,
+            source: all_blocks[current.index()].source,
+            ops: Default::default(),
+            next: EndOfBlock {
+                source: all_blocks[current.index()].next.source.clone(),
+                instruction: ControlInst::Jump {
+                    target: old_fallthrough_target,
+                },
+            },
+        });
+
+        reachability_graph
+            .for_code
+            .get_mut(&old_fallthrough_target)
+            .unwrap()
+            .reachable_from
+            .insert(new_fallthrough_target);
+
+        reachability_graph.for_code.insert(new_fallthrough_target, Reachability::default());
+        update_references(all_blocks, reachability_graph, None, current, references);
+
+        new_used_blocks.push(new_fallthrough_target);
+    }
+
+    new_used_blocks
+}
+
 fn harvest_all_jump_targets(
     elf: &Elf,
     data_sections_set: &HashSet<SectionIndex>,
@@ -3453,15 +3511,10 @@ fn assign_jump_targets(all_blocks: &[BasicBlock<AnyTarget, BlockTarget>], used_b
     jump_target_for_block
 }
 
-fn emit_code(
-    base_address_for_section: &HashMap<SectionIndex, u64>,
-    section_got: SectionIndex,
-    target_to_got_offset: &HashMap<AnyTarget, u64>,
+fn calculate_whether_can_fallthrough(
     all_blocks: &[BasicBlock<AnyTarget, BlockTarget>],
     used_blocks: &[BlockTarget],
-    used_imports: &HashSet<u32>,
-    jump_target_for_block: &[Option<u32>],
-) -> Result<Vec<(SourceStack, RawInstruction)>, ProgramFromElfError> {
+) -> HashSet<BlockTarget> {
     let mut can_fallthrough_to_next_block: HashSet<BlockTarget> = HashSet::new();
     for window in used_blocks.windows(2) {
         match all_blocks[window[0].index()].next.instruction {
@@ -3478,6 +3531,19 @@ fn emit_code(
         }
     }
 
+    can_fallthrough_to_next_block
+}
+
+fn emit_code(
+    base_address_for_section: &HashMap<SectionIndex, u64>,
+    section_got: SectionIndex,
+    target_to_got_offset: &HashMap<AnyTarget, u64>,
+    all_blocks: &[BasicBlock<AnyTarget, BlockTarget>],
+    used_blocks: &[BlockTarget],
+    used_imports: &HashSet<u32>,
+    jump_target_for_block: &[Option<u32>],
+) -> Result<Vec<(SourceStack, RawInstruction)>, ProgramFromElfError> {
+    let can_fallthrough_to_next_block = calculate_whether_can_fallthrough(all_blocks, used_blocks);
     let get_data_address = |target: SectionTarget| -> Result<u32, ProgramFromElfError> {
         if let Some(base_address) = base_address_for_section.get(&target.section_index) {
             let Some(address) = base_address.checked_add(target.offset) else {
@@ -3640,26 +3706,15 @@ fn emit_code(
                 }
             }
             ControlInst::Call { ra, target, target_return } => {
+                assert!(can_fallthrough_to_next_block.contains(block_target));
+
                 let target = get_jump_target(target)?;
-                let target_return = get_jump_target(target_return)?;
+                get_jump_target(target_return)?;
 
-                if can_fallthrough_to_next_block.contains(block_target) {
-                    code.push((
-                        block.next.source.clone(),
-                        RawInstruction::new_with_regs2_imm(Opcode::jump_and_link_register, cast_reg(ra), cast_reg(Reg::Zero), target),
-                    ));
-                } else {
-                    let Some(target_return) = target_return.checked_mul(JUMP_TARGET_MULTIPLIER) else {
-                        return Err(ProgramFromElfError::other("call return address overflow"));
-                    };
-
-                    code.push((
-                        block.next.source.clone(),
-                        RawInstruction::new_with_regs2_imm(Opcode::add_imm, cast_reg(ra), cast_reg(Reg::Zero), target_return),
-                    ));
-
-                    code.push((block.next.source.clone(), unconditional_jump(target)));
-                }
+                code.push((
+                    block.next.source.clone(),
+                    RawInstruction::new_with_regs2_imm(Opcode::jump_and_link_register, cast_reg(ra), cast_reg(Reg::Zero), target),
+                ));
             }
             ControlInst::JumpIndirect { base, offset } => {
                 if offset % 4 != 0 {
@@ -3684,38 +3739,19 @@ fn emit_code(
                 offset,
                 target_return,
             } => {
+                assert!(can_fallthrough_to_next_block.contains(block_target));
+
                 if offset % 4 != 0 {
                     return Err(ProgramFromElfError::other(
                         "found an indirect call with a target that isn't aligned",
                     ));
                 }
 
-                let target_return = get_jump_target(target_return)?;
-                if can_fallthrough_to_next_block.contains(block_target) {
-                    code.push((
-                        block.next.source.clone(),
-                        RawInstruction::new_with_regs2_imm(Opcode::jump_and_link_register, cast_reg(ra), cast_reg(base), offset as u32 / 4),
-                    ));
-                } else {
-                    let Some(target_return) = target_return.checked_mul(JUMP_TARGET_MULTIPLIER) else {
-                        return Err(ProgramFromElfError::other("call return address overflow"));
-                    };
-
-                    code.push((
-                        block.next.source.clone(),
-                        RawInstruction::new_with_regs2_imm(Opcode::add_imm, cast_reg(ra), cast_reg(Reg::Zero), target_return),
-                    ));
-
-                    code.push((
-                        block.next.source.clone(),
-                        RawInstruction::new_with_regs2_imm(
-                            Opcode::jump_and_link_register,
-                            cast_reg(Reg::Zero),
-                            cast_reg(base),
-                            offset as u32 / 4,
-                        ),
-                    ));
-                }
+                get_jump_target(target_return)?;
+                code.push((
+                    block.next.source.clone(),
+                    RawInstruction::new_with_regs2_imm(Opcode::jump_and_link_register, cast_reg(ra), cast_reg(base), offset as u32 / 4),
+                ));
             }
             ControlInst::Branch {
                 kind,
@@ -3724,8 +3760,10 @@ fn emit_code(
                 target_true,
                 target_false,
             } => {
+                assert!(can_fallthrough_to_next_block.contains(block_target));
+
                 let target_true = get_jump_target(target_true)?;
-                let target_false = get_jump_target(target_false)?;
+                get_jump_target(target_false)?;
 
                 let kind = match kind {
                     BranchKind::Eq => Opcode::branch_eq,
@@ -3740,10 +3778,6 @@ fn emit_code(
                     block.next.source.clone(),
                     RawInstruction::new_with_regs2_imm(kind, cast_reg(src1), cast_reg(src2), target_true),
                 ));
-
-                if !can_fallthrough_to_next_block.contains(block_target) {
-                    code.push((block.next.source.clone(), unconditional_jump(target_false)));
-                }
             }
             ControlInst::Unimplemented => {
                 code.push((block.next.source.clone(), RawInstruction::new_argless(Opcode::trap)));
@@ -4684,10 +4718,12 @@ pub fn program_from_elf(config: Config, data: &[u8]) -> Result<ProgramBlob, Prog
     let section_to_block = build_section_to_block_map(&all_blocks)?;
     let mut all_blocks = resolve_basic_block_references(&data_sections_set, &section_to_block, &all_blocks)?;
     let mut reachability_graph;
+    let used_blocks;
 
     if config.optimize {
         reachability_graph = calculate_reachability(&section_to_block, &all_blocks, &data_sections_set, &export_metadata, &relocations)?;
         optimize_program(&config, &elf, &import_metadata, &mut all_blocks, &mut reachability_graph);
+        used_blocks = add_missing_fallthrough_blocks(&mut all_blocks, &mut reachability_graph);
 
         let expected_reachability_graph =
             calculate_reachability(&section_to_block, &all_blocks, &data_sections_set, &export_metadata, &relocations)?;
@@ -4711,6 +4747,8 @@ pub fn program_from_elf(config: Config, data: &[u8]) -> Result<ProgramBlob, Prog
                 .or_insert_with(Default::default)
                 .always_reachable = true;
         }
+
+        used_blocks = (0..all_blocks.len()).map(BlockTarget::from_raw).collect();
     }
 
     for &section_index in &sections_other {
@@ -4747,14 +4785,11 @@ pub fn program_from_elf(config: Config, data: &[u8]) -> Result<ProgramBlob, Prog
     let mut target_to_got_offset: HashMap<AnyTarget, u64> = HashMap::new();
     let mut got_size = 0;
 
-    let mut used_blocks = Vec::new();
     let mut used_imports = HashSet::new();
     for block in &all_blocks {
         if !reachability_graph.is_code_reachable(block.target) {
             continue;
         }
-
-        used_blocks.push(block.target);
 
         for (_, instruction) in &block.ops {
             match instruction {
