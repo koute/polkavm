@@ -2110,6 +2110,13 @@ fn perform_dead_code_elimination(
         }
     }
 
+    let initial_registers_needed = match all_blocks[block_target.index()].next.instruction {
+        // If it's going to trap then it's not going to need any of the register values.
+        ControlInst::Unimplemented => RegMask::empty(),
+        // ...otherwise assume it'll need all of them.
+        _ => !RegMask::empty() & !RegMask::from(Reg::Zero),
+    };
+
     let mut modified = false;
     let registers_needed = perform_dead_code_elimination_on_block(
         imports,
@@ -2117,7 +2124,7 @@ fn perform_dead_code_elimination(
         reachability_graph,
         optimize_queue.as_deref_mut(),
         &mut modified,
-        !RegMask::empty(),
+        initial_registers_needed,
         block_target,
     );
     for previous_block in previous_blocks {
