@@ -2151,14 +2151,16 @@ fn perform_constant_propagation(
 ) -> bool {
     #[derive(Copy, Clone, PartialEq, Eq, Debug)]
     enum RegValue {
-        Unknown,
+        InputReg(Reg),
         CodeAddress(BlockTarget),
         Constant(i32),
+        Unknown(u64),
     }
 
-    let mut reg_values = [RegValue::Unknown; 32];
+    let mut unique_counter = 0;
+    let mut reg_values = ALL_REGS.map(RegValue::InputReg);
     reg_values[0] = RegValue::Constant(0);
-    let mut is_constant = RegMask::from(Reg::Zero);
+
     let mut modified = false;
     let mut seen = HashSet::new();
 
@@ -2183,7 +2185,6 @@ fn perform_constant_propagation(
                     imm,
                 } => {
                     reg_values[*dst as usize] = RegValue::Constant(*imm);
-                    is_constant.insert(*dst);
                     continue;
                 }
                 BasicInst::LoadAddress {
@@ -2191,107 +2192,28 @@ fn perform_constant_propagation(
                     target: AnyTarget::Code(target),
                 } => {
                     reg_values[*dst as usize] = RegValue::CodeAddress(*target);
-                    is_constant.insert(*dst);
                     continue;
                 }
                 BasicInst::RegReg { kind, dst, src1, src2 } => {
-                    let mask_src1 = RegMask::from(*src1);
-                    let mask_src2 = RegMask::from(*src2);
-                    if is_constant.contains(mask_src1 | mask_src2) {
-                        let src1_value = reg_values[*src1 as usize];
-                        let src2_value = reg_values[*src2 as usize];
-                        if let (RegValue::Constant(src1_value), RegValue::Constant(src2_value)) = (src1_value, src2_value) {
-                            #[allow(clippy::unnecessary_cast)]
-                            let value = match kind {
-                                RegRegKind::Add => Some(src1_value.wrapping_add(src2_value)),
-                                RegRegKind::Sub => Some(src1_value.wrapping_sub(src2_value)),
-                                RegRegKind::And => Some(src1_value & src2_value),
-                                RegRegKind::Or => Some(src1_value | src2_value),
-                                RegRegKind::Xor => Some(src1_value ^ src2_value),
-                                RegRegKind::SetLessThanUnsigned => Some(((src1_value as u32) < (src2_value as u32)) as i32),
-                                RegRegKind::SetLessThanSigned => Some(((src1_value as i32) < (src2_value as i32)) as i32),
-                                RegRegKind::ShiftLogicalLeft => Some(((src1_value as u32).wrapping_shl(src2_value as u32)) as i32),
-                                RegRegKind::ShiftLogicalRight => Some(((src1_value as u32).wrapping_shr(src2_value as u32)) as i32),
-                                _ => None,
-                            };
+                    if let (RegValue::Constant(src1_value), RegValue::Constant(src2_value)) =
+                        (reg_values[*src1 as usize], reg_values[*src2 as usize])
+                    {
+                        #[allow(clippy::unnecessary_cast)]
+                        let value = match kind {
+                            RegRegKind::Add => Some(src1_value.wrapping_add(src2_value)),
+                            RegRegKind::Sub => Some(src1_value.wrapping_sub(src2_value)),
+                            RegRegKind::And => Some(src1_value & src2_value),
+                            RegRegKind::Or => Some(src1_value | src2_value),
+                            RegRegKind::Xor => Some(src1_value ^ src2_value),
+                            RegRegKind::SetLessThanUnsigned => Some(((src1_value as u32) < (src2_value as u32)) as i32),
+                            RegRegKind::SetLessThanSigned => Some(((src1_value as i32) < (src2_value as i32)) as i32),
+                            RegRegKind::ShiftLogicalLeft => Some(((src1_value as u32).wrapping_shl(src2_value as u32)) as i32),
+                            RegRegKind::ShiftLogicalRight => Some(((src1_value as u32).wrapping_shr(src2_value as u32)) as i32),
+                            _ => None,
+                        };
 
-                            if let Some(imm) = value {
-                                modified = true;
-                                is_constant.insert(*dst);
-                                reg_values[*dst as usize] = RegValue::Constant(imm);
-                                *op = BasicInst::RegImm {
-                                    kind: RegImmKind::Add,
-                                    dst: *dst,
-                                    src: Reg::Zero,
-                                    imm,
-                                };
-                                continue;
-                            }
-                        }
-                    } else if is_constant.contains(mask_src2) {
-                        let src2_value = reg_values[*src2 as usize];
-                        if let RegValue::Constant(mut imm) = src2_value {
-                            let kind = match kind {
-                                RegRegKind::Add => Some(RegImmKind::Add),
-                                RegRegKind::Sub => {
-                                    imm = -imm;
-                                    Some(RegImmKind::Add)
-                                }
-                                RegRegKind::And => Some(RegImmKind::And),
-                                RegRegKind::Or => Some(RegImmKind::Or),
-                                RegRegKind::Xor => Some(RegImmKind::Xor),
-                                RegRegKind::SetLessThanUnsigned => Some(RegImmKind::SetLessThanUnsigned),
-                                RegRegKind::SetLessThanSigned => Some(RegImmKind::SetLessThanSigned),
-                                _ => None,
-                            };
-
-                            if let Some(kind) = kind {
-                                *op = BasicInst::RegImm {
-                                    kind,
-                                    dst: *dst,
-                                    src: *src1,
-                                    imm,
-                                };
-                            }
-                        }
-                    } else if is_constant.contains(mask_src1) {
-                        let src1_value = reg_values[*src1 as usize];
-                        if let RegValue::Constant(imm) = src1_value {
-                            let kind = match kind {
-                                RegRegKind::Add => Some(RegImmKind::Add),
-                                RegRegKind::And => Some(RegImmKind::And),
-                                RegRegKind::Or => Some(RegImmKind::Or),
-                                RegRegKind::Xor => Some(RegImmKind::Xor),
-                                _ => None,
-                            };
-
-                            if let Some(kind) = kind {
-                                *op = BasicInst::RegImm {
-                                    kind,
-                                    dst: *dst,
-                                    src: *src2,
-                                    imm,
-                                };
-                            }
-                        }
-                    }
-                }
-                BasicInst::RegImm { kind, dst, src, imm } => {
-                    if is_constant.contains(*src) {
-                        let src_value = reg_values[*src as usize];
-                        if let RegValue::Constant(src_value) = src_value {
-                            #[allow(clippy::unnecessary_cast)]
-                            let imm = match kind {
-                                RegImmKind::Add => src_value.wrapping_add(*imm),
-                                RegImmKind::And => src_value & *imm,
-                                RegImmKind::Or => src_value | *imm,
-                                RegImmKind::Xor => src_value ^ *imm,
-                                RegImmKind::SetLessThanUnsigned => ((src_value as u32) < (*imm as u32)) as i32,
-                                RegImmKind::SetLessThanSigned => ((src_value as i32) < (*imm as i32)) as i32,
-                            };
-
+                        if let Some(imm) = value {
                             modified = true;
-                            is_constant.insert(*dst);
                             reg_values[*dst as usize] = RegValue::Constant(imm);
                             *op = BasicInst::RegImm {
                                 kind: RegImmKind::Add,
@@ -2301,10 +2223,73 @@ fn perform_constant_propagation(
                             };
                             continue;
                         }
+                    } else if let RegValue::Constant(mut imm) = reg_values[*src2 as usize] {
+                        let kind = match kind {
+                            RegRegKind::Add => Some(RegImmKind::Add),
+                            RegRegKind::Sub => {
+                                imm = -imm;
+                                Some(RegImmKind::Add)
+                            }
+                            RegRegKind::And => Some(RegImmKind::And),
+                            RegRegKind::Or => Some(RegImmKind::Or),
+                            RegRegKind::Xor => Some(RegImmKind::Xor),
+                            RegRegKind::SetLessThanUnsigned => Some(RegImmKind::SetLessThanUnsigned),
+                            RegRegKind::SetLessThanSigned => Some(RegImmKind::SetLessThanSigned),
+                            _ => None,
+                        };
+
+                        if let Some(kind) = kind {
+                            *op = BasicInst::RegImm {
+                                kind,
+                                dst: *dst,
+                                src: *src1,
+                                imm,
+                            };
+                        }
+                    } else if let RegValue::Constant(imm) = reg_values[*src1 as usize] {
+                        let kind = match kind {
+                            RegRegKind::Add => Some(RegImmKind::Add),
+                            RegRegKind::And => Some(RegImmKind::And),
+                            RegRegKind::Or => Some(RegImmKind::Or),
+                            RegRegKind::Xor => Some(RegImmKind::Xor),
+                            _ => None,
+                        };
+
+                        if let Some(kind) = kind {
+                            *op = BasicInst::RegImm {
+                                kind,
+                                dst: *dst,
+                                src: *src2,
+                                imm,
+                            };
+                        }
+                    }
+                }
+                BasicInst::RegImm { kind, dst, src, imm } => {
+                    if let RegValue::Constant(src_value) = reg_values[*src as usize] {
+                        #[allow(clippy::unnecessary_cast)]
+                        let imm = match kind {
+                            RegImmKind::Add => src_value.wrapping_add(*imm),
+                            RegImmKind::And => src_value & *imm,
+                            RegImmKind::Or => src_value | *imm,
+                            RegImmKind::Xor => src_value ^ *imm,
+                            RegImmKind::SetLessThanUnsigned => ((src_value as u32) < (*imm as u32)) as i32,
+                            RegImmKind::SetLessThanSigned => ((src_value as i32) < (*imm as i32)) as i32,
+                        };
+
+                        modified = true;
+                        reg_values[*dst as usize] = RegValue::Constant(imm);
+                        *op = BasicInst::RegImm {
+                            kind: RegImmKind::Add,
+                            dst: *dst,
+                            src: Reg::Zero,
+                            imm,
+                        };
+                        continue;
                     }
                 }
                 BasicInst::LoadIndirect { kind, dst, base, offset } => {
-                    if is_constant.contains(*base) && *base != Reg::Zero {
+                    if *base != Reg::Zero {
                         if let RegValue::Constant(base) = reg_values[*base as usize] {
                             *op = BasicInst::LoadIndirect {
                                 kind: *kind,
@@ -2316,7 +2301,7 @@ fn perform_constant_propagation(
                     }
                 }
                 BasicInst::StoreIndirect { kind, src, base, offset } => {
-                    if is_constant.contains(*base) && *base != Reg::Zero {
+                    if *base != Reg::Zero {
                         if let RegValue::Constant(base) = reg_values[*base as usize] {
                             *op = BasicInst::StoreIndirect {
                                 kind: *kind,
@@ -2330,7 +2315,10 @@ fn perform_constant_propagation(
                 _ => {}
             }
 
-            is_constant.remove(op.dst_mask(imports));
+            for reg in op.dst_mask(imports) {
+                reg_values[reg as usize] = RegValue::Unknown(unique_counter);
+                unique_counter += 1;
+            }
         }
 
         if modified {
@@ -2347,7 +2335,7 @@ fn perform_constant_propagation(
                 }
             }
             ControlInst::JumpIndirect { base, offset } => {
-                if offset == 0 && is_constant.contains(base) {
+                if offset == 0 {
                     if let RegValue::CodeAddress(target) = reg_values[base as usize] {
                         all_blocks[current.index()].next.instruction = ControlInst::Jump { target };
                         reachability_graph.for_code.get_mut(&target).unwrap().reachable_from.insert(current);
@@ -2361,7 +2349,6 @@ fn perform_constant_propagation(
             ControlInst::Call { ra, target, target_return } => {
                 if current != target && reachability_graph.for_code.get(&target).unwrap().is_only_reachable_from(current) {
                     reg_values[ra as usize] = RegValue::CodeAddress(target_return);
-                    is_constant.insert(ra);
                     current = target;
                     continue;
                 }
@@ -2373,57 +2360,50 @@ fn perform_constant_propagation(
                 target_true,
                 target_false,
             } if target_true != target_false => {
-                if is_constant.contains(src1) && is_constant.contains(src2) {
-                    let values = match (reg_values[src1 as usize], reg_values[src2 as usize]) {
-                        (src1_value, src2_value) if src1_value == src2_value => Some((0, 0)),
-                        (RegValue::Constant(lhs), RegValue::Constant(rhs)) => Some((lhs, rhs)),
-                        _ => None,
+                let values = match (reg_values[src1 as usize], reg_values[src2 as usize]) {
+                    (src1_value, src2_value) if src1_value == src2_value => Some((0, 0)),
+                    (RegValue::Constant(lhs), RegValue::Constant(rhs)) => Some((lhs, rhs)),
+                    _ => None,
+                };
+
+                if let Some((lhs, rhs)) = values {
+                    let is_true = match kind {
+                        BranchKind::Eq => lhs == rhs,
+                        BranchKind::NotEq => lhs != rhs,
+                        #[allow(clippy::unnecessary_cast)]
+                        BranchKind::LessSigned => (lhs as i32) < (rhs as i32),
+                        #[allow(clippy::unnecessary_cast)]
+                        BranchKind::GreaterOrEqualSigned => (lhs as i32) >= (rhs as i32),
+                        BranchKind::LessUnsigned => (lhs as u32) < (rhs as u32),
+                        BranchKind::GreaterOrEqualUnsigned => (lhs as u32) >= (rhs as u32),
                     };
 
-                    if let Some((lhs, rhs)) = values {
-                        let is_true = match kind {
-                            BranchKind::Eq => lhs == rhs,
-                            BranchKind::NotEq => lhs != rhs,
-                            #[allow(clippy::unnecessary_cast)]
-                            BranchKind::LessSigned => (lhs as i32) < (rhs as i32),
-                            #[allow(clippy::unnecessary_cast)]
-                            BranchKind::GreaterOrEqualSigned => (lhs as i32) >= (rhs as i32),
-                            BranchKind::LessUnsigned => (lhs as u32) < (rhs as u32),
-                            BranchKind::GreaterOrEqualUnsigned => (lhs as u32) >= (rhs as u32),
-                        };
+                    let (new_target, unreachable_target) = if is_true {
+                        (target_true, target_false)
+                    } else {
+                        (target_false, target_true)
+                    };
+                    all_blocks[current.index()].next.instruction = ControlInst::Jump { target: new_target };
 
-                        let (new_target, unreachable_target) = if is_true {
-                            (target_true, target_false)
-                        } else {
-                            (target_false, target_true)
-                        };
-                        all_blocks[current.index()].next.instruction = ControlInst::Jump { target: new_target };
+                    reachability_graph
+                        .for_code
+                        .get_mut(&unreachable_target)
+                        .unwrap()
+                        .reachable_from
+                        .remove(&current);
+                    remove_code_if_globally_unreachable(all_blocks, reachability_graph, optimize_queue.as_deref_mut(), unreachable_target);
 
-                        reachability_graph
-                            .for_code
-                            .get_mut(&unreachable_target)
-                            .unwrap()
-                            .reachable_from
-                            .remove(&current);
-                        remove_code_if_globally_unreachable(
-                            all_blocks,
-                            reachability_graph,
-                            optimize_queue.as_deref_mut(),
-                            unreachable_target,
-                        );
-
-                        if reachability_graph
-                            .for_code
-                            .get(&new_target)
-                            .unwrap()
-                            .is_only_reachable_from(current)
-                        {
-                            current = new_target;
-                            continue;
-                        }
-
-                        break;
+                    if reachability_graph
+                        .for_code
+                        .get(&new_target)
+                        .unwrap()
+                        .is_only_reachable_from(current)
+                    {
+                        current = new_target;
+                        continue;
                     }
+
+                    break;
                 }
 
                 if current != target_true
@@ -2939,11 +2919,6 @@ impl RegMask {
         RegMask(0)
     }
 
-    fn contains(&self, mask: impl Into<RegMask>) -> bool {
-        let mask = mask.into();
-        (*self & mask) == mask
-    }
-
     fn remove(&mut self, mask: impl Into<RegMask>) {
         *self &= !mask.into();
     }
@@ -3036,6 +3011,13 @@ const ALL_REGS: [Reg; 16] = [
     Reg::A4,
     Reg::A5,
 ];
+
+#[test]
+fn test_all_regs_indexes() {
+    for (index, reg) in ALL_REGS.iter().enumerate() {
+        assert_eq!(index, *reg as usize);
+    }
+}
 
 fn cast_reg(reg: Reg) -> PReg {
     use Reg::*;
