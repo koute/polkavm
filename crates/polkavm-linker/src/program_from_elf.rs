@@ -385,14 +385,10 @@ impl<T> BasicInst<T> {
         }
     }
 
-    fn has_side_effects(&self) -> bool {
+    fn has_side_effects(&self, config: &Config) -> bool {
         match *self {
-            BasicInst::Ecalli { .. }
-            | BasicInst::StoreAbsolute { .. }
-            | BasicInst::StoreIndirect { .. }
-            | BasicInst::LoadAbsolute { .. }
-            | BasicInst::LoadIndirect { .. } => true,
-
+            BasicInst::Ecalli { .. } | BasicInst::StoreAbsolute { .. } | BasicInst::StoreIndirect { .. } => true,
+            BasicInst::LoadAbsolute { .. } | BasicInst::LoadIndirect { .. } => !config.elide_unnecessary_loads,
             BasicInst::LoadAddress { .. }
             | BasicInst::LoadAddressIndirect { .. }
             | BasicInst::RegImm { .. }
@@ -2090,6 +2086,7 @@ fn update_references(
 }
 
 fn perform_dead_code_elimination(
+    config: &Config,
     imports: &[Import],
     all_blocks: &mut [BasicBlock<AnyTarget, BlockTarget>],
     registers_needed_for_block: &mut [RegMask],
@@ -2097,7 +2094,9 @@ fn perform_dead_code_elimination(
     mut optimize_queue: Option<&mut VecSet<BlockTarget>>,
     block_target: BlockTarget,
 ) -> bool {
+    #[allow(clippy::too_many_arguments)]
     fn perform_dead_code_elimination_on_block(
+        config: &Config,
         imports: &[Import],
         all_blocks: &mut [BasicBlock<AnyTarget, BlockTarget>],
         reachability_graph: &mut ReachabilityGraph,
@@ -2113,7 +2112,7 @@ fn perform_dead_code_elimination(
         let mut dead_code = Vec::new();
         for (nth_instruction, (_, op)) in all_blocks[block_target.index()].ops.iter().enumerate().rev() {
             let dst_mask = op.dst_mask(imports);
-            if !op.has_side_effects() && (dst_mask & registers_needed) == RegMask::empty() {
+            if !op.has_side_effects(config) && (dst_mask & registers_needed) == RegMask::empty() {
                 // This instruction has no side effects and its result is not used; it's dead.
                 dead_code.push(nth_instruction);
                 continue;
@@ -2181,6 +2180,7 @@ fn perform_dead_code_elimination(
 
     let mut modified = false;
     let registers_needed = perform_dead_code_elimination_on_block(
+        config,
         imports,
         all_blocks,
         reachability_graph,
@@ -2194,6 +2194,7 @@ fn perform_dead_code_elimination(
 
     for previous_block in previous_blocks {
         perform_dead_code_elimination_on_block(
+            config,
             imports,
             all_blocks,
             reachability_graph,
@@ -2629,10 +2630,10 @@ fn perform_constant_propagation(
 }
 
 fn optimize_program(
+    config: &Config,
     imports: &[Import],
     all_blocks: &mut [BasicBlock<AnyTarget, BlockTarget>],
     reachability_graph: &mut ReachabilityGraph,
-    inline_threshold: usize,
 ) {
     let mut optimize_queue = VecSet::new();
     for current in (0..all_blocks.len()).map(BlockTarget::from_raw) {
@@ -2669,8 +2670,15 @@ fn optimize_program(
 
         opt_iteration_count += 1;
         perform_nop_elimination(all_blocks, current);
-        perform_inlining(all_blocks, reachability_graph, Some(&mut optimize_queue), inline_threshold, current);
+        perform_inlining(
+            all_blocks,
+            reachability_graph,
+            Some(&mut optimize_queue),
+            config.inline_threshold,
+            current,
+        );
         perform_dead_code_elimination(
+            config,
             imports,
             all_blocks,
             &mut registers_needed_for_block,
@@ -2705,8 +2713,9 @@ fn optimize_program(
                 continue;
             }
 
-            modified |= perform_inlining(all_blocks, reachability_graph, None, inline_threshold, current);
+            modified |= perform_inlining(all_blocks, reachability_graph, None, config.inline_threshold, current);
             modified |= perform_dead_code_elimination(
+                config,
                 imports,
                 all_blocks,
                 &mut registers_needed_for_block,
@@ -4324,6 +4333,7 @@ pub struct Config {
     strip: bool,
     optimize: bool,
     inline_threshold: usize,
+    elide_unnecessary_loads: bool,
 }
 
 impl Default for Config {
@@ -4332,6 +4342,7 @@ impl Default for Config {
             strip: false,
             optimize: true,
             inline_threshold: 2,
+            elide_unnecessary_loads: true,
         }
     }
 }
@@ -4349,6 +4360,11 @@ impl Config {
 
     pub fn set_inline_threshold(&mut self, value: usize) -> &mut Self {
         self.inline_threshold = value;
+        self
+    }
+
+    pub fn set_elide_unnecessary_loads(&mut self, value: bool) -> &mut Self {
+        self.elide_unnecessary_loads = value;
         self
     }
 }
@@ -4512,7 +4528,7 @@ pub fn program_from_elf(config: Config, data: &[u8]) -> Result<ProgramBlob, Prog
         calculate_reachability(&section_to_block, &all_blocks, &data_sections_set, &export_metadata, &relocations)?;
 
     if config.optimize {
-        optimize_program(&import_metadata, &mut all_blocks, &mut reachability_graph, config.inline_threshold);
+        optimize_program(&config, &import_metadata, &mut all_blocks, &mut reachability_graph);
 
         let expected_reachability_graph =
             calculate_reachability(&section_to_block, &all_blocks, &data_sections_set, &export_metadata, &relocations)?;
