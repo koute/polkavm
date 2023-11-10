@@ -1979,6 +1979,38 @@ fn perform_inlining(
                 return true;
             }
         }
+        ControlInst::Branch {
+            kind,
+            src1,
+            src2,
+            target_true,
+            target_false,
+        } => {
+            if let ControlInst::Jump { target } = all_blocks[target_true.index()].next.instruction {
+                if target != target_true && all_blocks[target_true.index()].ops.is_empty() {
+                    // We're branching to another block which immediately jumps somewhere else.
+                    // So skip the middle-man and just jump where we want to go directly.
+                    assert!(reachability_graph
+                        .for_code
+                        .get_mut(&target_true)
+                        .unwrap()
+                        .reachable_from
+                        .remove(&current));
+
+                    reachability_graph.for_code.get_mut(&target).unwrap().reachable_from.insert(current);
+                    all_blocks[current.index()].next.instruction = ControlInst::Branch {
+                        kind,
+                        src1,
+                        src2,
+                        target_true: target,
+                        target_false,
+                    };
+
+                    remove_code_if_globally_unreachable(all_blocks, reachability_graph, optimize_queue, target_true);
+                    return true;
+                }
+            }
+        }
         ControlInst::Call { .. } | ControlInst::CallIndirect { .. } => unreachable!(),
         _ => {}
     }
