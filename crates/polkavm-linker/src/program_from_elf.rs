@@ -283,6 +283,14 @@ impl SectionTarget {
             offset: self.offset + offset,
         }
     }
+
+    fn map_offset_i32(self, cb: impl FnOnce(i32) -> i32) -> Self {
+        let offset: u32 = self.offset.try_into().expect("section offset is too large");
+        SectionTarget {
+            section_index: self.section_index,
+            offset: cb(offset as i32) as u32 as u64,
+        }
+    }
 }
 
 #[derive(Copy, Clone, PartialEq, Eq, PartialOrd, Ord, Debug, Hash)]
@@ -2271,10 +2279,7 @@ impl OperationKind {
         match (lhs, rhs) {
             (RegValue::Constant(lhs), RegValue::Constant(rhs)) => Some(RegValue::Constant(self.apply_const(lhs, rhs))),
             (RegValue::DataAddress(lhs), RegValue::Constant(rhs)) if matches!(self, Self::Add | Self::Sub) => {
-                Some(RegValue::DataAddress(SectionTarget {
-                    section_index: lhs.section_index,
-                    offset: self.apply_const(lhs.offset as u32 as i32, rhs) as u32 as u64,
-                }))
+                Some(RegValue::DataAddress(lhs.map_offset_i32(|lhs| self.apply_const(lhs, rhs))))
             }
             (lhs, RegValue::Constant(0))
                 if matches!(
@@ -2403,23 +2408,21 @@ impl BlockRegs {
                     }
                 }
             }
-            BasicInst::LoadIndirect { kind, dst, base, offset } if base != Reg::Zero => {
-                if let RegValue::Constant(base) = self.get_reg(base) {
-                    return Some(BasicInst::LoadIndirect {
+            BasicInst::LoadIndirect { kind, dst, base, offset } => {
+                if let RegValue::DataAddress(base) = self.get_reg(base) {
+                    return Some(BasicInst::LoadAbsolute {
                         kind,
                         dst,
-                        base: Reg::Zero,
-                        offset: base.wrapping_add(offset),
+                        target: base.map_offset_i32(|base| base.wrapping_add(offset)),
                     });
                 }
             }
-            BasicInst::StoreIndirect { kind, src, base, offset } if base != Reg::Zero => {
-                if let RegValue::Constant(base) = self.get_reg(base) {
-                    return Some(BasicInst::StoreIndirect {
+            BasicInst::StoreIndirect { kind, src, base, offset } => {
+                if let RegValue::DataAddress(base) = self.get_reg(base) {
+                    return Some(BasicInst::StoreAbsolute {
                         kind,
                         src,
-                        base: Reg::Zero,
-                        offset: base.wrapping_add(offset),
+                        target: base.map_offset_i32(|base| base.wrapping_add(offset)),
                     });
                 }
             }
