@@ -715,49 +715,40 @@ impl<'a> Compiler<'a> {
 }
 
 impl<'a> InstructionVisitor for Compiler<'a> {
-    type ReturnTy = Result<(), &'static str>;
+    type ReturnTy = ();
 
     fn trap(&mut self) -> Self::ReturnTy {
         self.push(jmp_label32(self.trap_label));
         self.start_new_basic_block();
-        Ok(())
     }
 
     fn fallthrough(&mut self) -> Self::ReturnTy {
         self.start_new_basic_block();
-        Ok(())
     }
 
     fn ecalli(&mut self, imm: u32) -> Self::ReturnTy {
         self.push(mov_imm(TMP_REG, imm32(imm)));
         self.push(call_label32(self.ecall_label));
-
-        Ok(())
     }
 
     fn set_less_than_unsigned(&mut self, dst: Reg, s1: Reg, s2: Reg) -> Self::ReturnTy {
         self.set_less_than(dst, s1, s2, Signedness::Unsigned);
-        Ok(())
     }
 
     fn set_less_than_signed(&mut self, dst: Reg, s1: Reg, s2: Reg) -> Self::ReturnTy {
         self.set_less_than(dst, s1, s2, Signedness::Signed);
-        Ok(())
     }
 
     fn shift_logical_right(&mut self, d: Reg, s1: Reg, s2: Reg) -> Self::ReturnTy {
         self.shift(d, s1, s2, ShiftKind::LogicalRight);
-        Ok(())
     }
 
     fn shift_arithmetic_right(&mut self, d: Reg, s1: Reg, s2: Reg) -> Self::ReturnTy {
         self.shift(d, s1, s2, ShiftKind::ArithmeticRight);
-        Ok(())
     }
 
     fn shift_logical_left(&mut self, d: Reg, s1: Reg, s2: Reg) -> Self::ReturnTy {
         self.shift(d, s1, s2, ShiftKind::LogicalLeft);
-        Ok(())
     }
 
     fn xor(&mut self, d: Reg, s1: Reg, s2: Reg) -> Self::ReturnTy {
@@ -784,8 +775,6 @@ impl<'a> InstructionVisitor for Compiler<'a> {
                 self.push(xor((self.reg_size(), conv_reg(d), conv_reg(s2))));
             }
         }
-
-        Ok(())
     }
 
     fn and(&mut self, d: Reg, s1: Reg, s2: Reg) -> Self::ReturnTy {
@@ -810,8 +799,6 @@ impl<'a> InstructionVisitor for Compiler<'a> {
                 self.push(and((self.reg_size(), conv_reg(d), conv_reg(s2))));
             }
         }
-
-        Ok(())
     }
 
     fn or(&mut self, d: Reg, s1: Reg, s2: Reg) -> Self::ReturnTy {
@@ -842,8 +829,6 @@ impl<'a> InstructionVisitor for Compiler<'a> {
                 self.push(or((self.reg_size(), conv_reg(d), conv_reg(s2))));
             }
         }
-
-        Ok(())
     }
 
     fn add(&mut self, d: Reg, s1: Reg, s2: Reg) -> Self::ReturnTy {
@@ -872,8 +857,6 @@ impl<'a> InstructionVisitor for Compiler<'a> {
                 self.push(add((self.reg_size(), conv_reg(d), conv_reg(s2))));
             }
         }
-
-        Ok(())
     }
 
     fn sub(&mut self, d: Reg, s1: Reg, s2: Reg) -> Self::ReturnTy {
@@ -908,8 +891,6 @@ impl<'a> InstructionVisitor for Compiler<'a> {
                 self.push(sub((self.reg_size(), conv_reg(d), conv_reg(s2))));
             }
         }
-
-        Ok(())
     }
 
     fn mul(&mut self, d: Reg, s1: Reg, s2: Reg) -> Self::ReturnTy {
@@ -930,8 +911,6 @@ impl<'a> InstructionVisitor for Compiler<'a> {
                 self.push(imul(self.reg_size(), conv_reg(d), conv_reg(s2)));
             }
         }
-
-        Ok(())
     }
 
     fn mul_upper_signed_signed(&mut self, d: Reg, s1: Reg, s2: Reg) -> Self::ReturnTy {
@@ -954,8 +933,6 @@ impl<'a> InstructionVisitor for Compiler<'a> {
                 self.push(shr_imm(RegSize::R64, conv_reg(d), 32));
             }
         }
-
-        Ok(())
     }
 
     fn mul_upper_unsigned_unsigned(&mut self, d: Reg, s1: Reg, s2: Reg) -> Self::ReturnTy {
@@ -987,8 +964,6 @@ impl<'a> InstructionVisitor for Compiler<'a> {
                 self.push(shr_imm(RegSize::R64, conv_reg(d), 32));
             }
         }
-
-        Ok(())
     }
 
     fn mul_upper_signed_unsigned(&mut self, d: Reg, s1: Reg, s2: Reg) -> Self::ReturnTy {
@@ -1029,53 +1004,42 @@ impl<'a> InstructionVisitor for Compiler<'a> {
                 self.push(shr_imm(RegSize::R64, conv_reg(d), 32));
             }
         }
-
-        Ok(())
     }
 
     fn div_unsigned(&mut self, d: Reg, s1: Reg, s2: Reg) -> Self::ReturnTy {
         self.div_rem(d, s1, s2, DivRem::Div, Signedness::Unsigned);
-        Ok(())
     }
 
     fn div_signed(&mut self, d: Reg, s1: Reg, s2: Reg) -> Self::ReturnTy {
         self.div_rem(d, s1, s2, DivRem::Div, Signedness::Signed);
-        Ok(())
     }
 
     fn rem_unsigned(&mut self, d: Reg, s1: Reg, s2: Reg) -> Self::ReturnTy {
         self.div_rem(d, s1, s2, DivRem::Rem, Signedness::Unsigned);
-        Ok(())
     }
 
     fn rem_signed(&mut self, d: Reg, s1: Reg, s2: Reg) -> Self::ReturnTy {
         self.div_rem(d, s1, s2, DivRem::Rem, Signedness::Signed);
-        Ok(())
     }
 
     fn set_less_than_unsigned_imm(&mut self, dst: Reg, src: Reg, imm: u32) -> Self::ReturnTy {
         self.set_less_than_imm(dst, src, imm, Signedness::Unsigned);
-        Ok(())
     }
 
     fn set_less_than_signed_imm(&mut self, dst: Reg, src: Reg, imm: u32) -> Self::ReturnTy {
         self.set_less_than_imm(dst, src, imm, Signedness::Signed);
-        Ok(())
     }
 
     fn shift_logical_right_imm(&mut self, d: Reg, s: Reg, imm: u32) -> Self::ReturnTy {
         self.shift_imm(d, s, imm, ShiftKind::LogicalRight);
-        Ok(())
     }
 
     fn shift_arithmetic_right_imm(&mut self, d: Reg, s: Reg, imm: u32) -> Self::ReturnTy {
         self.shift_imm(d, s, imm, ShiftKind::ArithmeticRight);
-        Ok(())
     }
 
     fn shift_logical_left_imm(&mut self, d: Reg, s: Reg, imm: u32) -> Self::ReturnTy {
         self.shift_imm(d, s, imm, ShiftKind::LogicalLeft);
-        Ok(())
     }
 
     fn or_imm(&mut self, d: Reg, s: Reg, imm: u32) -> Self::ReturnTy {
@@ -1098,8 +1062,6 @@ impl<'a> InstructionVisitor for Compiler<'a> {
                 self.push(or((conv_reg(d), imm32(imm))));
             }
         }
-
-        Ok(())
     }
 
     fn and_imm(&mut self, d: Reg, s: Reg, imm: u32) -> Self::ReturnTy {
@@ -1122,8 +1084,6 @@ impl<'a> InstructionVisitor for Compiler<'a> {
                 self.push(and((conv_reg(d), imm32(imm))));
             }
         }
-
-        Ok(())
     }
 
     fn xor_imm(&mut self, d: Reg, s: Reg, imm: u32) -> Self::ReturnTy {
@@ -1153,8 +1113,6 @@ impl<'a> InstructionVisitor for Compiler<'a> {
                 self.push(xor((conv_reg(d), imm32(imm))));
             }
         }
-
-        Ok(())
     }
 
     fn add_imm(&mut self, d: Reg, s: Reg, imm: u32) -> Self::ReturnTy {
@@ -1178,78 +1136,62 @@ impl<'a> InstructionVisitor for Compiler<'a> {
                 self.push(lea(self.reg_size(), conv_reg(d), reg_indirect(self.reg_size(), conv_reg(s) + imm as i32)));
             }
         }
-
-        Ok(())
     }
 
     fn store_u8(&mut self, src: Reg, base: Reg, offset: u32) -> Self::ReturnTy {
         self.store(src, base, offset, Size::U8);
-        Ok(())
     }
 
     fn store_u16(&mut self, src: Reg, base: Reg, offset: u32) -> Self::ReturnTy {
         self.store(src, base, offset, Size::U16);
-        Ok(())
     }
 
     fn store_u32(&mut self, src: Reg, base: Reg, offset: u32) -> Self::ReturnTy {
         self.store(src, base, offset, Size::U32);
-        Ok(())
     }
 
     fn load_u8(&mut self, dst: Reg, base: Reg, offset: u32) -> Self::ReturnTy {
         self.load(dst, base, offset, LoadKind::U8);
-        Ok(())
     }
 
     fn load_i8(&mut self, dst: Reg, base: Reg, offset: u32) -> Self::ReturnTy {
         self.load(dst, base, offset, LoadKind::I8);
-        Ok(())
     }
 
     fn load_u16(&mut self, dst: Reg, base: Reg, offset: u32) -> Self::ReturnTy {
         self.load(dst, base, offset, LoadKind::U16);
-        Ok(())
     }
 
     fn load_i16(&mut self, dst: Reg, base: Reg, offset: u32) -> Self::ReturnTy {
         self.load(dst, base, offset, LoadKind::I16);
-        Ok(())
     }
 
     fn load_u32(&mut self, dst: Reg, base: Reg, offset: u32) -> Self::ReturnTy {
         self.load(dst, base, offset, LoadKind::U32);
-        Ok(())
     }
 
     fn branch_less_unsigned(&mut self, s1: Reg, s2: Reg, imm: u32) -> Self::ReturnTy {
         self.branch(s1, s2, imm, Condition::Below);
-        Ok(())
     }
 
     fn branch_less_signed(&mut self, s1: Reg, s2: Reg, imm: u32) -> Self::ReturnTy {
         self.branch(s1, s2, imm, Condition::Less);
-        Ok(())
     }
 
     fn branch_greater_or_equal_unsigned(&mut self, s1: Reg, s2: Reg, imm: u32) -> Self::ReturnTy {
         self.branch(s1, s2, imm, Condition::AboveOrEqual);
-        Ok(())
     }
 
     fn branch_greater_or_equal_signed(&mut self, s1: Reg, s2: Reg, imm: u32) -> Self::ReturnTy {
         self.branch(s1, s2, imm, Condition::GreaterOrEqual);
-        Ok(())
     }
 
     fn branch_eq(&mut self, s1: Reg, s2: Reg, imm: u32) -> Self::ReturnTy {
         self.branch(s1, s2, imm, Condition::Equal);
-        Ok(())
     }
 
     fn branch_not_eq(&mut self, s1: Reg, s2: Reg, imm: u32) -> Self::ReturnTy {
         self.branch(s1, s2, imm, Condition::NotEqual);
-        Ok(())
     }
 
     fn jump_and_link_register(&mut self, ra: Reg, base: Reg, offset: u32) -> Self::ReturnTy {
@@ -1313,6 +1255,5 @@ impl<'a> InstructionVisitor for Compiler<'a> {
         }
 
         self.start_new_basic_block();
-        Ok(())
     }
 }
