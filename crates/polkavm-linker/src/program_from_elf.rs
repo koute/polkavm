@@ -2679,6 +2679,50 @@ fn perform_constant_propagation(
     modified
 }
 
+fn perform_load_address_and_jump_fusion(all_blocks: &mut [BasicBlock<AnyTarget, BlockTarget>], reachability_graph: &ReachabilityGraph) {
+    let used_blocks: Vec<_> = (0..all_blocks.len())
+        .map(BlockTarget::from_raw)
+        .filter(|&block_target| reachability_graph.is_code_reachable(block_target))
+        .collect();
+
+    for window in used_blocks.windows(2) {
+        let (current, next) = (window[0], window[1]);
+        let Some(&(
+            _,
+            BasicInst::LoadAddress {
+                dst,
+                target: AnyTarget::Code(target_return),
+            },
+        )) = all_blocks[current.index()].ops.last()
+        else {
+            continue;
+        };
+
+        if target_return != next {
+            continue;
+        }
+
+        all_blocks[current.index()].next.instruction = match all_blocks[current.index()].next.instruction {
+            ControlInst::Jump { target } => ControlInst::Call {
+                target,
+                target_return,
+                ra: dst,
+            },
+            ControlInst::JumpIndirect { base, offset } => ControlInst::CallIndirect {
+                base,
+                offset,
+                target_return,
+                ra: dst,
+            },
+            _ => {
+                continue;
+            }
+        };
+
+        all_blocks[current.index()].ops.pop();
+    }
+}
+
 fn optimize_program(
     config: &Config,
     elf: &Elf,
@@ -2791,6 +2835,8 @@ fn optimize_program(
             garbage_collect_reachability(all_blocks, reachability_graph);
         }
     }
+
+    perform_load_address_and_jump_fusion(all_blocks, reachability_graph);
 
     log::debug!(
         "Optimizing the program took {} brute force iteration(s)",
