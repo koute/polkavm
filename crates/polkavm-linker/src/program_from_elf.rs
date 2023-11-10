@@ -307,7 +307,7 @@ enum AnyTarget {
     Code(BlockTarget),
 }
 
-#[derive(Copy, Clone, Debug)]
+#[derive(Copy, Clone, PartialEq, Eq, Debug)]
 enum BasicInst<T> {
     LoadAbsolute { kind: LoadKind, dst: Reg, target: SectionTarget },
     StoreAbsolute { kind: StoreKind, src: Reg, target: SectionTarget },
@@ -325,6 +325,18 @@ enum BasicInst<T> {
 
 impl<T> BasicInst<T> {
     fn is_nop(&self) -> bool {
+        if let BasicInst::RegImm {
+            kind: RegImmKind::Add,
+            dst,
+            src,
+            imm: 0,
+        } = self
+        {
+            if dst == src {
+                return true;
+            }
+        }
+
         match *self {
             BasicInst::RegImm { dst, .. }
             | BasicInst::Shift { dst, .. }
@@ -1980,9 +1992,107 @@ fn perform_inlining(
     false
 }
 
+fn gather_references(block: &BasicBlock<AnyTarget, BlockTarget>) -> HashSet<ExtRef> {
+    let mut references = HashSet::new();
+    each_reference(block, |ext| {
+        references.insert(ext);
+    });
+    references
+}
+
+fn update_references(
+    all_blocks: &mut [BasicBlock<AnyTarget, BlockTarget>],
+    reachability_graph: &mut ReachabilityGraph,
+    mut optimize_queue: Option<&mut VecSet<BlockTarget>>,
+    block_target: BlockTarget,
+    mut old_references: HashSet<ExtRef>,
+) {
+    let mut new_references = gather_references(&all_blocks[block_target.index()]);
+    new_references.retain(|ext| !old_references.remove(ext));
+
+    for ext in &old_references {
+        match ext {
+            ExtRef::Jump(target) => {
+                log::trace!("{target:?} is not reachable from {block_target:?} anymore");
+                reachability_graph
+                    .for_code
+                    .get_mut(target)
+                    .unwrap()
+                    .reachable_from
+                    .remove(&block_target);
+            }
+            ExtRef::Address(target) => {
+                log::trace!("{target:?}'s address is not taken in {block_target:?} anymore");
+                reachability_graph
+                    .for_code
+                    .get_mut(target)
+                    .unwrap()
+                    .address_taken_in
+                    .remove(&block_target);
+            }
+            ExtRef::DataAddress(target) => {
+                log::trace!("{target:?}'s address is not taken in {block_target:?} anymore");
+                reachability_graph
+                    .for_data
+                    .get_mut(target)
+                    .unwrap()
+                    .address_taken_in
+                    .remove(&block_target);
+            }
+        }
+    }
+
+    for ext in &new_references {
+        match ext {
+            ExtRef::Jump(target) => {
+                log::trace!("{target:?} is reachable from {block_target:?}");
+                reachability_graph
+                    .for_code
+                    .get_mut(target)
+                    .unwrap()
+                    .reachable_from
+                    .insert(block_target);
+            }
+            ExtRef::Address(target) => {
+                log::trace!("{target:?}'s address is taken in {block_target:?}");
+                reachability_graph
+                    .for_code
+                    .get_mut(target)
+                    .unwrap()
+                    .address_taken_in
+                    .insert(block_target);
+            }
+            ExtRef::DataAddress(target) => {
+                log::trace!("{target:?}'s address is taken in {block_target:?}");
+                reachability_graph
+                    .for_data
+                    .get_mut(target)
+                    .unwrap()
+                    .address_taken_in
+                    .insert(block_target);
+            }
+        }
+    }
+
+    for ext in old_references.into_iter().chain(new_references.into_iter()) {
+        match ext {
+            ExtRef::Jump(target) => {
+                remove_code_if_globally_unreachable(all_blocks, reachability_graph, optimize_queue.as_deref_mut(), target);
+            }
+            ExtRef::Address(target) => {
+                remove_code_if_globally_unreachable(all_blocks, reachability_graph, optimize_queue.as_deref_mut(), target);
+            }
+            ExtRef::DataAddress(target) => {
+                remove_if_data_is_globally_unreachable(all_blocks, reachability_graph, optimize_queue.as_deref_mut(), target);
+            }
+        }
+    }
+}
+
 fn perform_dead_code_elimination(
     imports: &[Import],
     all_blocks: &mut [BasicBlock<AnyTarget, BlockTarget>],
+    registers_needed_for_block: &mut [RegMask],
     reachability_graph: &mut ReachabilityGraph,
     mut optimize_queue: Option<&mut VecSet<BlockTarget>>,
     block_target: BlockTarget,
@@ -2024,11 +2134,7 @@ fn perform_dead_code_elimination(
             add_to_optimize_queue(all_blocks, reachability_graph, optimize_queue, block_target);
         }
 
-        let mut dead_references = HashSet::new();
-        each_reference(&all_blocks[block_target.index()], |ext| {
-            dead_references.insert(ext);
-        });
-
+        let references = gather_references(&all_blocks[block_target.index()]);
         for nth_instruction in dead_code {
             // Replace it with a NOP.
             all_blocks[block_target.index()].ops[nth_instruction].1 = BasicInst::RegImm {
@@ -2043,56 +2149,7 @@ fn perform_dead_code_elimination(
             .ops
             .retain(|(_, instruction)| !instruction.is_nop());
 
-        each_reference(&all_blocks[block_target.index()], |ext| {
-            dead_references.remove(&ext);
-        });
-
-        for ext in &dead_references {
-            match ext {
-                ExtRef::Jump(target) => {
-                    log::trace!("{target:?} is not reachable from {block_target:?} anymore");
-                    reachability_graph
-                        .for_code
-                        .get_mut(target)
-                        .unwrap()
-                        .reachable_from
-                        .remove(&block_target);
-                }
-                ExtRef::Address(target) => {
-                    log::trace!("{target:?}'s address is not taken in {block_target:?} anymore");
-                    reachability_graph
-                        .for_code
-                        .get_mut(target)
-                        .unwrap()
-                        .address_taken_in
-                        .remove(&block_target);
-                }
-                ExtRef::DataAddress(target) => {
-                    log::trace!("{target:?}'s address is not taken in {block_target:?} anymore");
-                    reachability_graph
-                        .for_data
-                        .get_mut(target)
-                        .unwrap()
-                        .address_taken_in
-                        .remove(&block_target);
-                }
-            }
-        }
-
-        for ext in dead_references {
-            match ext {
-                ExtRef::Jump(target) => {
-                    remove_code_if_globally_unreachable(all_blocks, reachability_graph, optimize_queue.as_deref_mut(), target);
-                }
-                ExtRef::Address(target) => {
-                    remove_code_if_globally_unreachable(all_blocks, reachability_graph, optimize_queue.as_deref_mut(), target);
-                }
-                ExtRef::DataAddress(target) => {
-                    remove_if_data_is_globally_unreachable(all_blocks, reachability_graph, optimize_queue.as_deref_mut(), target);
-                }
-            }
-        }
-
+        update_references(all_blocks, reachability_graph, optimize_queue, block_target, references);
         registers_needed
     }
 
@@ -2113,6 +2170,11 @@ fn perform_dead_code_elimination(
     let initial_registers_needed = match all_blocks[block_target.index()].next.instruction {
         // If it's going to trap then it's not going to need any of the register values.
         ControlInst::Unimplemented => RegMask::empty(),
+        // If it's a jump then we'll need whatever registers the jump target needs.
+        ControlInst::Jump { target } | ControlInst::Call { target, .. } => registers_needed_for_block[target.index()],
+        ControlInst::Branch {
+            target_true, target_false, ..
+        } => registers_needed_for_block[target_true.index()] | registers_needed_for_block[target_false.index()],
         // ...otherwise assume it'll need all of them.
         _ => !RegMask::empty() & !RegMask::from(Reg::Zero),
     };
@@ -2127,6 +2189,9 @@ fn perform_dead_code_elimination(
         initial_registers_needed,
         block_target,
     );
+
+    registers_needed_for_block[block_target.index()] = registers_needed;
+
     for previous_block in previous_blocks {
         perform_dead_code_elimination_on_block(
             imports,
@@ -2142,219 +2207,319 @@ fn perform_dead_code_elimination(
     modified
 }
 
+enum OperationKind {
+    Add,
+    Sub,
+    And,
+    Or,
+    Xor,
+    SetLessThanUnsigned,
+    SetLessThanSigned,
+    ShiftLogicalLeft,
+    ShiftLogicalRight,
+    ShiftArithmeticRight,
+}
+
+impl From<RegImmKind> for OperationKind {
+    fn from(kind: RegImmKind) -> Self {
+        match kind {
+            RegImmKind::Add => Self::Add,
+            RegImmKind::And => Self::And,
+            RegImmKind::Or => Self::Or,
+            RegImmKind::Xor => Self::Xor,
+            RegImmKind::SetLessThanUnsigned => Self::SetLessThanUnsigned,
+            RegImmKind::SetLessThanSigned => Self::SetLessThanSigned,
+        }
+    }
+}
+
+impl OperationKind {
+    fn from_reg_reg(kind: RegRegKind) -> Option<Self> {
+        Some(match kind {
+            RegRegKind::Add => Self::Add,
+            RegRegKind::Sub => Self::Sub,
+            RegRegKind::And => Self::And,
+            RegRegKind::Or => Self::Or,
+            RegRegKind::Xor => Self::Xor,
+            RegRegKind::SetLessThanUnsigned => Self::SetLessThanUnsigned,
+            RegRegKind::SetLessThanSigned => Self::SetLessThanSigned,
+            RegRegKind::ShiftLogicalLeft => Self::ShiftLogicalLeft,
+            RegRegKind::ShiftLogicalRight => Self::ShiftLogicalRight,
+            RegRegKind::ShiftArithmeticRight => Self::ShiftArithmeticRight,
+            _ => return None,
+        })
+    }
+
+    fn apply_const(self, lhs: i32, rhs: i32) -> i32 {
+        #[allow(clippy::unnecessary_cast)]
+        match self {
+            Self::Add => lhs.wrapping_add(rhs),
+            Self::Sub => lhs.wrapping_sub(rhs),
+            Self::And => lhs & rhs,
+            Self::Or => lhs | rhs,
+            Self::Xor => lhs ^ rhs,
+            Self::SetLessThanUnsigned => ((lhs as u32) < (rhs as u32)) as i32,
+            Self::SetLessThanSigned => ((lhs as i32) < (rhs as i32)) as i32,
+            Self::ShiftLogicalLeft => ((lhs as u32).wrapping_shl(rhs as u32)) as i32,
+            Self::ShiftLogicalRight => ((lhs as u32).wrapping_shr(rhs as u32)) as i32,
+            Self::ShiftArithmeticRight => (lhs as i32).wrapping_shr(rhs as u32),
+        }
+    }
+
+    fn apply(self, lhs: RegValue, rhs: RegValue) -> Option<RegValue> {
+        match (lhs, rhs) {
+            (RegValue::Constant(lhs), RegValue::Constant(rhs)) => Some(RegValue::Constant(self.apply_const(lhs, rhs))),
+            (RegValue::DataAddress(lhs), RegValue::Constant(rhs)) if matches!(self, Self::Add | Self::Sub) => {
+                Some(RegValue::DataAddress(SectionTarget {
+                    section_index: lhs.section_index,
+                    offset: self.apply_const(lhs.offset as u32 as i32, rhs) as u32 as u64,
+                }))
+            }
+            (lhs, RegValue::Constant(0))
+                if matches!(
+                    self,
+                    OperationKind::Add
+                        | OperationKind::Sub
+                        | OperationKind::Or
+                        | OperationKind::ShiftLogicalLeft
+                        | OperationKind::ShiftLogicalRight
+                        | OperationKind::ShiftArithmeticRight
+                ) =>
+            {
+                Some(lhs)
+            }
+            _ => None,
+        }
+    }
+}
+
+#[derive(Copy, Clone, PartialEq, Eq, Debug)]
+enum RegValue {
+    InputReg(Reg),
+    CodeAddress(BlockTarget),
+    DataAddress(SectionTarget),
+    Constant(i32),
+    Unknown(u64),
+}
+
+impl RegValue {
+    fn to_instruction(self, dst: Reg) -> Option<BasicInst<AnyTarget>> {
+        assert_ne!(dst, Reg::Zero);
+        match self {
+            RegValue::CodeAddress(target) => Some(BasicInst::LoadAddress {
+                dst,
+                target: AnyTarget::Code(target),
+            }),
+            RegValue::DataAddress(target) => Some(BasicInst::LoadAddress {
+                dst,
+                target: AnyTarget::Data(target),
+            }),
+            RegValue::Constant(imm) => Some(BasicInst::RegImm {
+                kind: RegImmKind::Add,
+                dst,
+                src: Reg::Zero,
+                imm,
+            }),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Clone)]
+struct BlockRegs {
+    regs: [RegValue; 16],
+}
+
+impl BlockRegs {
+    fn new() -> Self {
+        let mut regs = ALL_REGS.map(RegValue::InputReg);
+        regs[0] = RegValue::Constant(0);
+
+        BlockRegs { regs }
+    }
+
+    fn get_reg(&self, reg: Reg) -> RegValue {
+        self.regs[reg as usize]
+    }
+
+    fn set_reg(&mut self, reg: Reg, value: RegValue) {
+        self.regs[reg as usize] = value;
+    }
+
+    fn simplify_instruction(&self, instruction: BasicInst<AnyTarget>) -> Option<BasicInst<AnyTarget>> {
+        match instruction {
+            BasicInst::RegReg { kind, dst, src1, src2 } => {
+                if let RegValue::Constant(mut imm) = self.get_reg(src2) {
+                    let kind = match kind {
+                        RegRegKind::Add => Some(RegImmKind::Add),
+                        RegRegKind::Sub => {
+                            imm = -imm;
+                            Some(RegImmKind::Add)
+                        }
+                        RegRegKind::And => Some(RegImmKind::And),
+                        RegRegKind::Or => Some(RegImmKind::Or),
+                        RegRegKind::Xor => Some(RegImmKind::Xor),
+                        RegRegKind::SetLessThanUnsigned => Some(RegImmKind::SetLessThanUnsigned),
+                        RegRegKind::SetLessThanSigned => Some(RegImmKind::SetLessThanSigned),
+                        _ => None,
+                    };
+
+                    if let Some(kind) = kind {
+                        return Some(BasicInst::RegImm { kind, dst, src: src1, imm });
+                    }
+                }
+
+                if let RegValue::Constant(imm) = self.get_reg(src1) {
+                    let kind = match kind {
+                        RegRegKind::Add => Some(RegImmKind::Add),
+                        RegRegKind::And => Some(RegImmKind::And),
+                        RegRegKind::Or => Some(RegImmKind::Or),
+                        RegRegKind::Xor => Some(RegImmKind::Xor),
+                        _ => None,
+                    };
+
+                    if let Some(kind) = kind {
+                        return Some(BasicInst::RegImm { kind, dst, src: src2, imm });
+                    }
+                }
+
+                if let Some(kind) = OperationKind::from_reg_reg(kind) {
+                    if let Some(value) = kind.apply(self.get_reg(src1), self.get_reg(src2)) {
+                        if let Some(new_instruction) = value.to_instruction(dst) {
+                            if new_instruction != instruction {
+                                return Some(new_instruction);
+                            }
+                        }
+                    }
+                }
+            }
+            BasicInst::RegImm { kind, dst, src, imm } => {
+                if let Some(value) = OperationKind::from(kind).apply(self.get_reg(src), RegValue::Constant(imm)) {
+                    if let Some(new_instruction) = value.to_instruction(dst) {
+                        if new_instruction != instruction {
+                            return Some(new_instruction);
+                        }
+                    }
+                }
+            }
+            BasicInst::LoadIndirect { kind, dst, base, offset } if base != Reg::Zero => {
+                if let RegValue::Constant(base) = self.get_reg(base) {
+                    return Some(BasicInst::LoadIndirect {
+                        kind,
+                        dst,
+                        base: Reg::Zero,
+                        offset: base.wrapping_add(offset),
+                    });
+                }
+            }
+            BasicInst::StoreIndirect { kind, src, base, offset } if base != Reg::Zero => {
+                if let RegValue::Constant(base) = self.get_reg(base) {
+                    return Some(BasicInst::StoreIndirect {
+                        kind,
+                        src,
+                        base: Reg::Zero,
+                        offset: base.wrapping_add(offset),
+                    });
+                }
+            }
+            _ => {}
+        }
+
+        None
+    }
+
+    fn set_reg_from_instruction(&mut self, imports: &[Import], unknown_counter: &mut u64, instruction: BasicInst<AnyTarget>) {
+        match instruction {
+            BasicInst::RegImm {
+                kind: RegImmKind::Add,
+                dst,
+                src: Reg::Zero,
+                imm,
+            } => {
+                self.set_reg(dst, RegValue::Constant(imm));
+            }
+            BasicInst::LoadAddress {
+                dst,
+                target: AnyTarget::Code(target),
+            } => {
+                self.set_reg(dst, RegValue::CodeAddress(target));
+            }
+            BasicInst::LoadAddress {
+                dst,
+                target: AnyTarget::Data(target),
+            } => {
+                self.set_reg(dst, RegValue::DataAddress(target));
+            }
+            BasicInst::RegImm {
+                kind: RegImmKind::Add,
+                dst,
+                src,
+                imm: 0,
+            } => {
+                self.set_reg(dst, self.get_reg(src));
+            }
+            _ => {
+                for reg in instruction.dst_mask(imports) {
+                    self.set_reg(reg, RegValue::Unknown(*unknown_counter));
+                    *unknown_counter += 1;
+                }
+            }
+        }
+    }
+}
+
 fn perform_constant_propagation(
     imports: &[Import],
     all_blocks: &mut [BasicBlock<AnyTarget, BlockTarget>],
+    regs_for_block: &mut [BlockRegs],
+    unknown_counter: &mut u64,
     reachability_graph: &mut ReachabilityGraph,
     mut optimize_queue: Option<&mut VecSet<BlockTarget>>,
     mut current: BlockTarget,
 ) -> bool {
-    #[derive(Copy, Clone, PartialEq, Eq, Debug)]
-    enum RegValue {
-        InputReg(Reg),
-        CodeAddress(BlockTarget),
-        Constant(i32),
-        Unknown(u64),
-    }
-
-    let mut unique_counter = 0;
-    let mut reg_values = ALL_REGS.map(RegValue::InputReg);
-    reg_values[0] = RegValue::Constant(0);
-
+    let mut regs = regs_for_block[current.index()].clone();
     let mut modified = false;
     let mut seen = HashSet::new();
-
     loop {
         if !seen.insert(current) {
             // Prevent an infinite loop.
             break;
         }
 
-        for (_, op) in all_blocks[current.index()].ops.iter_mut() {
-            assert_eq!(reg_values[0], RegValue::Constant(0));
+        let mut references = HashSet::new();
+        let mut modified_this_block = false;
+        for nth_instruction in 0..all_blocks[current.index()].ops.len() {
+            let mut instruction = all_blocks[current.index()].ops[nth_instruction].1;
+            assert_eq!(regs.get_reg(Reg::Zero), RegValue::Constant(0));
 
-            if op.is_nop() {
+            if instruction.is_nop() {
                 continue;
             }
 
-            match op {
-                BasicInst::RegImm {
-                    kind: RegImmKind::Add,
-                    dst,
-                    src: Reg::Zero,
-                    imm,
-                } => {
-                    reg_values[*dst as usize] = RegValue::Constant(*imm);
-                    continue;
+            while let Some(new_instruction) = regs.simplify_instruction(instruction) {
+                if !modified_this_block {
+                    references = gather_references(&all_blocks[current.index()]);
+                    modified_this_block = true;
+                    modified = true;
                 }
-                BasicInst::LoadAddress {
-                    dst,
-                    target: AnyTarget::Code(target),
-                } => {
-                    reg_values[*dst as usize] = RegValue::CodeAddress(*target);
-                    continue;
-                }
-                BasicInst::RegReg { kind, dst, src1, src2 } => {
-                    if let (RegValue::Constant(src1_value), RegValue::Constant(src2_value)) =
-                        (reg_values[*src1 as usize], reg_values[*src2 as usize])
-                    {
-                        #[allow(clippy::unnecessary_cast)]
-                        let value = match kind {
-                            RegRegKind::Add => Some(src1_value.wrapping_add(src2_value)),
-                            RegRegKind::Sub => Some(src1_value.wrapping_sub(src2_value)),
-                            RegRegKind::And => Some(src1_value & src2_value),
-                            RegRegKind::Or => Some(src1_value | src2_value),
-                            RegRegKind::Xor => Some(src1_value ^ src2_value),
-                            RegRegKind::SetLessThanUnsigned => Some(((src1_value as u32) < (src2_value as u32)) as i32),
-                            RegRegKind::SetLessThanSigned => Some(((src1_value as i32) < (src2_value as i32)) as i32),
-                            RegRegKind::ShiftLogicalLeft => Some(((src1_value as u32).wrapping_shl(src2_value as u32)) as i32),
-                            RegRegKind::ShiftLogicalRight => Some(((src1_value as u32).wrapping_shr(src2_value as u32)) as i32),
-                            _ => None,
-                        };
 
-                        if let Some(imm) = value {
-                            modified = true;
-                            reg_values[*dst as usize] = RegValue::Constant(imm);
-                            *op = BasicInst::RegImm {
-                                kind: RegImmKind::Add,
-                                dst: *dst,
-                                src: Reg::Zero,
-                                imm,
-                            };
-                            continue;
-                        }
-                    } else if let RegValue::Constant(mut imm) = reg_values[*src2 as usize] {
-                        let kind = match kind {
-                            RegRegKind::Add => Some(RegImmKind::Add),
-                            RegRegKind::Sub => {
-                                imm = -imm;
-                                Some(RegImmKind::Add)
-                            }
-                            RegRegKind::And => Some(RegImmKind::And),
-                            RegRegKind::Or => Some(RegImmKind::Or),
-                            RegRegKind::Xor => Some(RegImmKind::Xor),
-                            RegRegKind::SetLessThanUnsigned => Some(RegImmKind::SetLessThanUnsigned),
-                            RegRegKind::SetLessThanSigned => Some(RegImmKind::SetLessThanSigned),
-                            _ => None,
-                        };
-
-                        if let Some(kind) = kind {
-                            modified = true;
-                            *op = BasicInst::RegImm {
-                                kind,
-                                dst: *dst,
-                                src: *src1,
-                                imm,
-                            };
-                        }
-                    } else if let RegValue::Constant(imm) = reg_values[*src1 as usize] {
-                        let kind = match kind {
-                            RegRegKind::Add => Some(RegImmKind::Add),
-                            RegRegKind::And => Some(RegImmKind::And),
-                            RegRegKind::Or => Some(RegImmKind::Or),
-                            RegRegKind::Xor => Some(RegImmKind::Xor),
-                            _ => None,
-                        };
-
-                        if let Some(kind) = kind {
-                            modified = true;
-                            *op = BasicInst::RegImm {
-                                kind,
-                                dst: *dst,
-                                src: *src2,
-                                imm,
-                            };
-                        }
-                    }
-                }
-                BasicInst::RegImm { kind, dst, src, imm } => {
-                    if let RegValue::Constant(src_value) = reg_values[*src as usize] {
-                        #[allow(clippy::unnecessary_cast)]
-                        let imm = match kind {
-                            RegImmKind::Add => src_value.wrapping_add(*imm),
-                            RegImmKind::And => src_value & *imm,
-                            RegImmKind::Or => src_value | *imm,
-                            RegImmKind::Xor => src_value ^ *imm,
-                            RegImmKind::SetLessThanUnsigned => ((src_value as u32) < (*imm as u32)) as i32,
-                            RegImmKind::SetLessThanSigned => ((src_value as i32) < (*imm as i32)) as i32,
-                        };
-
-                        modified = true;
-                        reg_values[*dst as usize] = RegValue::Constant(imm);
-                        *op = BasicInst::RegImm {
-                            kind: RegImmKind::Add,
-                            dst: *dst,
-                            src: Reg::Zero,
-                            imm,
-                        };
-                        continue;
-                    }
-                }
-                BasicInst::LoadIndirect { kind, dst, base, offset } => {
-                    if *base != Reg::Zero {
-                        if let RegValue::Constant(base) = reg_values[*base as usize] {
-                            modified = true;
-                            *op = BasicInst::LoadIndirect {
-                                kind: *kind,
-                                dst: *dst,
-                                base: Reg::Zero,
-                                offset: base.wrapping_add(*offset),
-                            };
-                        }
-                    }
-                }
-                BasicInst::StoreIndirect { kind, src, base, offset } => {
-                    if *base != Reg::Zero {
-                        if let RegValue::Constant(base) = reg_values[*base as usize] {
-                            modified = true;
-                            *op = BasicInst::StoreIndirect {
-                                kind: *kind,
-                                src: *src,
-                                base: Reg::Zero,
-                                offset: base.wrapping_add(*offset),
-                            };
-                        }
-                    }
-                }
-                _ => {}
+                instruction = new_instruction;
+                all_blocks[current.index()].ops[nth_instruction].1 = new_instruction;
             }
 
-            for reg in op.dst_mask(imports) {
-                reg_values[reg as usize] = RegValue::Unknown(unique_counter);
-                unique_counter += 1;
-            }
-        }
-
-        if modified {
-            if let Some(ref mut optimize_queue) = optimize_queue {
-                add_to_optimize_queue(all_blocks, reachability_graph, optimize_queue, current);
-            }
+            regs.set_reg_from_instruction(imports, unknown_counter, instruction);
         }
 
         match all_blocks[current.index()].next.instruction {
-            ControlInst::Jump { target } => {
-                if reachability_graph.for_code.get(&target).unwrap().is_only_reachable_from(current) {
-                    current = target;
-                    continue;
-                }
-            }
-            ControlInst::JumpIndirect { base, offset } => {
-                if offset == 0 {
-                    if let RegValue::CodeAddress(target) = reg_values[base as usize] {
-                        all_blocks[current.index()].next.instruction = ControlInst::Jump { target };
-                        reachability_graph.for_code.get_mut(&target).unwrap().reachable_from.insert(current);
+            ControlInst::JumpIndirect { base, offset } if offset == 0 => {
+                if let RegValue::CodeAddress(target) = regs.get_reg(base) {
+                    if !modified_this_block {
+                        references = gather_references(&all_blocks[current.index()]);
+                        modified_this_block = true;
                         modified = true;
-
-                        current = target;
-                        continue;
                     }
-                }
-            }
-            ControlInst::Call { ra, target, target_return } => {
-                if current != target && reachability_graph.for_code.get(&target).unwrap().is_only_reachable_from(current) {
-                    reg_values[ra as usize] = RegValue::CodeAddress(target_return);
-                    current = target;
-                    continue;
+
+                    all_blocks[current.index()].next.instruction = ControlInst::Jump { target };
                 }
             }
             ControlInst::Branch {
@@ -2364,7 +2529,7 @@ fn perform_constant_propagation(
                 target_true,
                 target_false,
             } if target_true != target_false => {
-                let values = match (reg_values[src1 as usize], reg_values[src2 as usize]) {
+                let values = match (regs.get_reg(src1), regs.get_reg(src2)) {
                     (src1_value, src2_value) if src1_value == src2_value => Some((0, 0)),
                     (RegValue::Constant(lhs), RegValue::Constant(rhs)) => Some((lhs, rhs)),
                     _ => None,
@@ -2382,52 +2547,74 @@ fn perform_constant_propagation(
                         BranchKind::GreaterOrEqualUnsigned => (lhs as u32) >= (rhs as u32),
                     };
 
-                    let (new_target, unreachable_target) = if is_true {
-                        (target_true, target_false)
-                    } else {
-                        (target_false, target_true)
-                    };
-
-                    modified = true;
-                    all_blocks[current.index()].next.instruction = ControlInst::Jump { target: new_target };
-
-                    reachability_graph
-                        .for_code
-                        .get_mut(&unreachable_target)
-                        .unwrap()
-                        .reachable_from
-                        .remove(&current);
-                    remove_code_if_globally_unreachable(all_blocks, reachability_graph, optimize_queue.as_deref_mut(), unreachable_target);
-
-                    if reachability_graph
-                        .for_code
-                        .get(&new_target)
-                        .unwrap()
-                        .is_only_reachable_from(current)
-                    {
-                        current = new_target;
-                        continue;
+                    if !modified_this_block {
+                        references = gather_references(&all_blocks[current.index()]);
+                        modified_this_block = true;
+                        modified = true;
                     }
 
-                    break;
+                    all_blocks[current.index()].next.instruction = ControlInst::Jump {
+                        target: if is_true { target_true } else { target_false },
+                    };
                 }
+            }
+            _ => {}
+        }
 
-                if current != target_true
+        if modified_this_block {
+            update_references(all_blocks, reachability_graph, optimize_queue.as_deref_mut(), current, references);
+            if let Some(ref mut optimize_queue) = optimize_queue {
+                add_to_optimize_queue(all_blocks, reachability_graph, optimize_queue, current);
+            }
+        }
+
+        match all_blocks[current.index()].next.instruction {
+            ControlInst::Jump { target }
+                if current != target && reachability_graph.for_code.get(&target).unwrap().is_only_reachable_from(current) =>
+            {
+                current = target;
+                regs_for_block[current.index()] = regs.clone();
+                continue;
+            }
+            ControlInst::Call { ra, target, target_return }
+                if current != target && reachability_graph.for_code.get(&target).unwrap().is_only_reachable_from(current) =>
+            {
+                regs.set_reg(ra, RegValue::CodeAddress(target_return));
+                current = target;
+                regs_for_block[current.index()] = regs.clone();
+                continue;
+            }
+            ControlInst::Branch {
+                target_true, target_false, ..
+            } => {
+                let true_only_reachable_from_here = current != target_true
                     && reachability_graph
                         .for_code
                         .get(&target_true)
                         .unwrap()
-                        .is_only_reachable_from(current)
-                {
-                    current = target_true;
-                    continue;
-                } else if current != target_false
+                        .is_only_reachable_from(current);
+
+                let false_only_reachable_from_here = current != target_false
                     && reachability_graph
                         .for_code
                         .get(&target_false)
                         .unwrap()
-                        .is_only_reachable_from(current)
-                {
+                        .is_only_reachable_from(current);
+
+                if true_only_reachable_from_here {
+                    regs_for_block[target_true.index()] = regs.clone();
+                }
+
+                if false_only_reachable_from_here {
+                    regs_for_block[target_false.index()] = regs.clone();
+                }
+
+                if true_only_reachable_from_here {
+                    current = target_true;
+                    continue;
+                }
+
+                if false_only_reachable_from_here {
                     current = target_false;
                     continue;
                 }
@@ -2462,6 +2649,17 @@ fn optimize_program(
     optimize_queue.vec.sort_by_key(|current| all_blocks[current.index()].ops.len());
     optimize_queue.vec.reverse();
 
+    let mut unknown_counter = 0;
+    let mut regs_for_block = Vec::with_capacity(all_blocks.len());
+    for _ in 0..all_blocks.len() {
+        regs_for_block.push(BlockRegs::new())
+    }
+
+    let mut registers_needed_for_block = Vec::with_capacity(all_blocks.len());
+    for _ in 0..all_blocks.len() {
+        registers_needed_for_block.push(!RegMask::empty() & !RegMask::from(Reg::Zero))
+    }
+
     let opt_minimum_iteration_count = reachability_graph.reachable_block_count();
     let mut opt_iteration_count = 0;
     while let Some(current) = optimize_queue.pop_non_unique() {
@@ -2472,8 +2670,23 @@ fn optimize_program(
         opt_iteration_count += 1;
         perform_nop_elimination(all_blocks, current);
         perform_inlining(all_blocks, reachability_graph, Some(&mut optimize_queue), inline_threshold, current);
-        perform_dead_code_elimination(imports, all_blocks, reachability_graph, Some(&mut optimize_queue), current);
-        perform_constant_propagation(imports, all_blocks, reachability_graph, Some(&mut optimize_queue), current);
+        perform_dead_code_elimination(
+            imports,
+            all_blocks,
+            &mut registers_needed_for_block,
+            reachability_graph,
+            Some(&mut optimize_queue),
+            current,
+        );
+        perform_constant_propagation(
+            imports,
+            all_blocks,
+            &mut regs_for_block,
+            &mut unknown_counter,
+            reachability_graph,
+            Some(&mut optimize_queue),
+            current,
+        );
     }
 
     log::debug!(
@@ -2493,8 +2706,23 @@ fn optimize_program(
             }
 
             modified |= perform_inlining(all_blocks, reachability_graph, None, inline_threshold, current);
-            modified |= perform_dead_code_elimination(imports, all_blocks, reachability_graph, None, current);
-            modified |= perform_constant_propagation(imports, all_blocks, reachability_graph, None, current);
+            modified |= perform_dead_code_elimination(
+                imports,
+                all_blocks,
+                &mut registers_needed_for_block,
+                reachability_graph,
+                None,
+                current,
+            );
+            modified |= perform_constant_propagation(
+                imports,
+                all_blocks,
+                &mut regs_for_block,
+                &mut unknown_counter,
+                reachability_graph,
+                None,
+                current,
+            );
         }
 
         if modified {
@@ -2679,7 +2907,7 @@ impl Reachability {
     }
 }
 
-#[derive(PartialEq, Eq, Hash, Debug)]
+#[derive(Clone, PartialEq, Eq, Hash, Debug)]
 enum ExtRef {
     Address(BlockTarget),
     Jump(BlockTarget),
