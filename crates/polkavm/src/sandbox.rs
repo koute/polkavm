@@ -230,6 +230,11 @@ macro_rules! sandbox_tests {
 
             use crate::sandbox::$sandbox_kind::{Sandbox, SandboxConfig};
 
+            fn emit_sysreturn(asm: &mut Assembler) {
+                asm.push(mov_imm64(rcx, Sandbox::address_table().syscall_return));
+                asm.push(jmp(rcx));
+            }
+
             #[test]
             fn spawn_stress_test() {
                 let _ = env_logger::try_init();
@@ -237,7 +242,9 @@ macro_rules! sandbox_tests {
                 let init = SandboxProgramInit::new(init);
 
                 let mut asm = Assembler::new();
-                let code = asm.push(ret()).finalize();
+                emit_sysreturn(&mut asm);
+
+                let code = asm.finalize();
                 let address_space = Sandbox::reserve_address_space().unwrap();
                 let native_code_address = address_space.native_code_address();
                 let program = Sandbox::prepare_program(init.with_code(code), address_space).unwrap();
@@ -292,9 +299,9 @@ macro_rules! sandbox_tests {
                 asm
                     .push(load(LoadKind::U32, rax, reg_indirect(RegSize::R64, r15 + mem.ro_data_address().try_into().unwrap())))
                     .push(store(Size::U8, reg_indirect(RegSize::R64, r15 + i32::try_from(mem.rw_data_address()).unwrap()), rax))
-                    .push(store(Size::U16, reg_indirect(RegSize::R64, r15 + (i32::try_from(mem.rw_data_address()).unwrap() + 4)), rax))
-                    .push(ret());
+                    .push(store(Size::U16, reg_indirect(RegSize::R64, r15 + (i32::try_from(mem.rw_data_address()).unwrap() + 4)), rax));
 
+                emit_sysreturn(&mut asm);
                 let code = asm.finalize();
                 let address_space = Sandbox::reserve_address_space().unwrap();
                 let native_code_address = address_space.native_code_address();
@@ -330,9 +337,9 @@ macro_rules! sandbox_tests {
                 asm
                     .push(load(LoadKind::U32, rax, reg_indirect(RegSize::R64, r15 + mem.rw_data_address().try_into().unwrap())))
                     .push(add((rax, imm64(1))))
-                    .push(store(Size::U32, reg_indirect(RegSize::R64, r15 + i32::try_from(mem.rw_data_address()).unwrap()), rax))
-                    .push(ret());
+                    .push(store(Size::U32, reg_indirect(RegSize::R64, r15 + i32::try_from(mem.rw_data_address()).unwrap()), rax));
 
+                emit_sysreturn(&mut asm);
                 let code = asm.finalize();
                 let address_space = Sandbox::reserve_address_space().unwrap();
                 let native_code_address = address_space.native_code_address();
@@ -416,9 +423,9 @@ macro_rules! sandbox_tests {
                     .push(load(LoadKind::U32, rax, reg_indirect(RegSize::R64, r15 + mem.rw_data_address().try_into().unwrap())))
                     .push(add((rax, imm64(1))))
                     .push(store(Size::U32, reg_indirect(RegSize::R64, r15 + i32::try_from(mem.rw_data_address()).unwrap()), rax))
-                    .push(load(LoadKind::U32, rax, reg_indirect(RegSize::R64, r15)))
-                    .push(ret());
+                    .push(load(LoadKind::U32, rax, reg_indirect(RegSize::R64, r15)));
 
+                emit_sysreturn(&mut asm);
                 let code = asm.finalize();
                 let address_space = Sandbox::reserve_address_space().unwrap();
                 let native_code_address = address_space.native_code_address();
@@ -468,7 +475,7 @@ macro_rules! sandbox_tests {
                 let init = SandboxProgramInit::new(init);
                 let mem = init.memory_config(get_native_page_size()).unwrap();
                 let mut asm = Assembler::new();
-                let code = asm
+                asm
                     .push(mov_imm(rdx, imm32(0)))
                     .push(mov_imm(rax, imm32(1)))
                     .push(mov_imm(rcx, imm32(0)))
@@ -476,10 +483,10 @@ macro_rules! sandbox_tests {
                     .push(store(Size::U32, abs(RegSize::R32, i32::try_from(mem.rw_data_address()).unwrap()), r8))
                     .push(idiv(RegSize::R32, rcx))
                     .push(mov_imm(r8, imm32(0x12345678)))
-                    .push(store(Size::U32, abs(RegSize::R32, i32::try_from(mem.rw_data_address()).unwrap()), r8))
-                    .push(ret())
-                    .finalize();
+                    .push(store(Size::U32, abs(RegSize::R32, i32::try_from(mem.rw_data_address()).unwrap()), r8));
 
+                emit_sysreturn(&mut asm);
+                let code = asm.finalize();
                 let address_space = Sandbox::reserve_address_space().unwrap();
                 let native_code_address = address_space.native_code_address();
                 let program = Sandbox::prepare_program(init.with_code(code), address_space).unwrap();
