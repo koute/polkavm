@@ -554,7 +554,7 @@ unsafe fn main_loop(socket: linux_raw::Fd) -> ! {
         trace!("work received...");
 
         let rpc_flags = *VMCTX.rpc_flags.get();
-        let rpc_address = *VMCTX.rpc_address.get().cast::<Option<extern "C" fn()>>();
+        let rpc_address = *VMCTX.rpc_address.get().cast::<Option<extern "C" fn() -> !>>();
 
         if rpc_flags & VM_RPC_FLAG_RECONFIGURE != 0 {
             reconfigure(socket.borrow());
@@ -563,13 +563,9 @@ unsafe fn main_loop(socket: linux_raw::Fd) -> ! {
         if let Some(rpc_address) = rpc_address {
             trace!("jumping to: 0x{:x}", rpc_address as usize);
             rpc_address();
+        } else {
+            longjmp(&mut RESUME_IDLE_LOOP_JMPBUF, 1);
         }
-
-        trace!("returning to idle...");
-        handle_flags_after_jump(rpc_flags);
-
-        VMCTX.futex.store(VMCTX_FUTEX_IDLE, Ordering::Release);
-        linux_raw::sys_futex_wake_one(&VMCTX.futex).unwrap_or_else(|error| abort_with_error("failed to wake up the host process", error));
     }
 }
 
