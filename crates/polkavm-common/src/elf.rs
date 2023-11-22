@@ -19,7 +19,10 @@ impl<'a> Reader<'a> {
     }
 
     pub fn read_byte(&mut self) -> Result<u8, &'static str> {
-        Ok(self.read(1)?[0])
+        let byte = self.buffer.get(0).ok_or("unexpected end of section")?;
+        self.buffer = &self.buffer[1..];
+        self.bytes_consumed += 1;
+        Ok(*byte)
     }
 
     pub fn read_u32(&mut self) -> Result<u32, &'static str> {
