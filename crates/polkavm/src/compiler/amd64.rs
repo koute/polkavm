@@ -9,25 +9,12 @@ use polkavm_assembler::Label;
 use polkavm_common::program::{InstructionVisitor, Reg};
 use polkavm_common::abi::VM_CODE_ADDRESS_ALIGNMENT;
 use polkavm_common::zygote::{
-    VmCtx as LinuxVmCtx,
     VM_ADDR_JUMP_TABLE, VM_ADDR_VMCTX,
 };
 
 use crate::compiler::{Compiler, SandboxKind};
-use crate::sandbox::generic::VmCtx as GenericVmCtx;
 
 use Reg::Zero as Z;
-
-macro_rules! get_field_offset {
-    ($struct:expr, |$struct_ident:ident| $get_field:expr) => {{
-        let $struct_ident = $struct;
-        let struct_ref = &$struct_ident;
-        let field_ref = $get_field;
-        let struct_addr = struct_ref as *const _ as usize;
-        let field_addr = field_ref as *const _ as usize;
-        field_addr - struct_addr
-    }}
-}
 
 const TMP_REG: NativeReg = rcx;
 
@@ -497,25 +484,12 @@ impl<'a> Compiler<'a> {
         }
     }
 
-    fn load_regs_address(&mut self, reg: NativeReg) {
-        let regs_offset: usize = match self.sandbox_kind {
-            SandboxKind::Linux => {
-                get_field_offset!(LinuxVmCtx::new(), |base| base.regs().get())
-            },
-            SandboxKind::Generic => {
-                get_field_offset!(GenericVmCtx::new(), |base| base.regs())
-            }
-        };
-
-        self.load_vmctx_field_address(reg, regs_offset);
-    }
-
     fn save_registers_to_vmctx(&mut self) {
         if self.regs_are_64bit {
             todo!();
         }
 
-        self.load_regs_address(TMP_REG);
+        self.load_vmctx_field_address(TMP_REG, self.vmctx_regs_offset);
         for (nth, reg) in Reg::ALL_NON_ZERO.iter().copied().enumerate() {
             self.push(store(Size::U32, reg_indirect(RegSize::R64, TMP_REG + nth as i32 * 4), conv_reg(reg)));
         }
@@ -526,7 +500,7 @@ impl<'a> Compiler<'a> {
             todo!();
         }
 
-        self.load_regs_address(TMP_REG);
+        self.load_vmctx_field_address(TMP_REG, self.vmctx_regs_offset);
         for (nth, reg) in Reg::ALL_NON_ZERO.iter().copied().enumerate() {
             self.push(load(LoadKind::U32, conv_reg(reg), reg_indirect(RegSize::R64, TMP_REG + nth as i32 * 4)));
         }

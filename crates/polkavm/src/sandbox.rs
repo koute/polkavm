@@ -17,6 +17,17 @@ use polkavm_common::{
 use crate::api::BackendAccess;
 use crate::config::SandboxKind;
 
+macro_rules! get_field_offset {
+    ($struct:expr, |$struct_ident:ident| $get_field:expr) => {{
+        let $struct_ident = $struct;
+        let struct_ref = &$struct_ident;
+        let field_ref = $get_field;
+        let struct_addr = struct_ref as *const _ as usize;
+        let field_addr = field_ref as *const _ as usize;
+        field_addr - struct_addr
+    }}
+}
+
 pub mod generic;
 
 #[cfg(target_os = "linux")]
@@ -79,6 +90,7 @@ pub trait Sandbox: Sized {
     fn access(&'_ mut self) -> Self::Access<'_>;
     fn pid(&self) -> Option<u32>;
     fn address_table() -> AddressTable;
+    fn vmctx_regs_offset() -> usize;
 }
 
 pub type OnHostcall<'a, T> = &'a mut dyn for<'r> FnMut(u32, <T as Sandbox>::Access<'r>) -> Result<(), Trap>;
