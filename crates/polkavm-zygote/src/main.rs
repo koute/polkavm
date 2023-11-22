@@ -533,7 +533,11 @@ unsafe fn main_loop(socket: linux_raw::Fd) -> ! {
         trace!("returning to idle...");
 
         let rpc_flags = *VMCTX.rpc_flags.get();
-        handle_flags_after_jump(rpc_flags);
+        if rpc_flags & VM_RPC_FLAG_CLEAR_PROGRAM_AFTER_EXECUTION != 0 {
+            clear_program();
+        } else if rpc_flags & VM_RPC_FLAG_RESET_MEMORY_AFTER_EXECUTION != 0 {
+            reset_memory();
+        }
 
         VMCTX.futex.store(VMCTX_FUTEX_IDLE, Ordering::Release);
         linux_raw::sys_futex_wake_one(&VMCTX.futex).unwrap_or_else(|error| abort_with_error("failed to wake up the host process", error));
@@ -566,14 +570,6 @@ unsafe fn main_loop(socket: linux_raw::Fd) -> ! {
         } else {
             longjmp(&mut RESUME_IDLE_LOOP_JMPBUF, 1);
         }
-    }
-}
-
-unsafe fn handle_flags_after_jump(rpc_flags: u32) {
-    if rpc_flags & VM_RPC_FLAG_CLEAR_PROGRAM_AFTER_EXECUTION != 0 {
-        clear_program();
-    } else if rpc_flags & VM_RPC_FLAG_RESET_MEMORY_AFTER_EXECUTION != 0 {
-        reset_memory();
     }
 }
 
