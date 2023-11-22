@@ -58,7 +58,9 @@ pub use polkavm_common::{
     utils::{AsUninitSliceMut, Gas},
 };
 
-pub use crate::api::{Engine, Func, FuncType, Instance, InstancePre, IntoExternFn, Linker, Module, TypedFunc, Val, ValType};
+pub use crate::api::{
+    Engine, ExecutionConfig, Func, FuncType, Instance, InstancePre, IntoExternFn, Linker, Module, TypedFunc, Val, ValType,
+};
 pub use crate::caller::{Caller, CallerRef};
 pub use crate::config::{BackendKind, Config, GasMeteringKind, ModuleConfig, SandboxKind};
 pub use crate::error::Error;
