@@ -991,7 +991,17 @@ impl<'a> Reader<'a> {
     }
 
     fn read_byte(&mut self) -> Result<u8, ProgramParseError> {
-        Ok(self.blob[self.read_slice_as_range(1)?][0])
+        let new_pos = self.position + 1;
+        if let Some(byte) = self.blob.get(new_pos) {
+            self.previous_position = core::mem::replace(&mut self.position, new_pos);
+            Ok(*byte)
+        } else {
+            Err(ProgramParseError(ProgramParseErrorKind::UnexpectedEnd {
+                offset: self.position,
+                expected_count: 1,
+                actual_count: self.blob.len() - self.position,
+            }))
+        }
     }
 
     fn read_varint(&mut self) -> Result<u32, ProgramParseError> {
@@ -1047,6 +1057,7 @@ impl<'a> Reader<'a> {
         Ok(())
     }
 
+    #[allow(unsafe_code)]
     fn read_extern_fn_prototype(&mut self) -> Result<ExternFnPrototype<'a>, ProgramParseError> {
         let name = self.read_string_with_length()?;
         let arg_count = self.read_varint()?;
@@ -1061,7 +1072,11 @@ impl<'a> Reader<'a> {
             let ty = ExternTy::try_deserialize(self.read_byte()?).ok_or(ProgramParseError(ProgramParseErrorKind::Other(
                 "found a function prototype with an unrecognized argument type",
             )))?;
-            args[nth_arg as usize] = Some(ty);
+
+            // SAFETY: We have checked the arg count before.
+            unsafe {
+                *args.get_unchecked_mut(nth_arg as usize) = Some(ty);
+            }
         }
 
         let return_ty = match self.read_byte()? {
