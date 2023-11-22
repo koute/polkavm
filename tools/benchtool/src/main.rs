@@ -20,23 +20,25 @@ mod utils;
 
 use crate::backend::Backend;
 
-fn benchmark_execution<T: Backend>(b: &mut Bencher, backend: T, path: &Path) {
-    b.iter_custom(|count| {
-        let mut total_elapsed = core::time::Duration::new(0, 0);
-        let mut engine = backend.create();
-        let blob = backend.load(path);
-        let module = backend.compile(&mut engine, &blob);
-        for _ in 0..count {
-            let mut instance = backend.spawn(&mut engine, &module);
-            backend.initialize(&mut instance);
-            let start = std::time::Instant::now();
-            for _ in 0..32 {
-                backend.run(&mut instance);
-            }
-            total_elapsed += start.elapsed();
+const FAST_INNER_COUNT: u32 = 32;
+const SLOW_INNER_COUNT: u32 = 1;
+
+fn benchmark_execution<T: Backend>(outer_count: u64, inner_count: u32, backend: T, path: &Path) -> core::time::Duration {
+    let mut total_elapsed = core::time::Duration::new(0, 0);
+    let mut engine = backend.create();
+    let blob = backend.load(path);
+    let module = backend.compile(&mut engine, &blob);
+    for _ in 0..outer_count {
+        let mut instance = backend.spawn(&mut engine, &module);
+        backend.initialize(&mut instance);
+        let start = std::time::Instant::now();
+        for _ in 0..inner_count {
+            backend.run(&mut instance);
         }
-        total_elapsed / 32
-    });
+        total_elapsed += start.elapsed();
+    }
+
+    total_elapsed / inner_count
 }
 
 fn criterion_main(c: &mut Criterion, benches: &[Benchmark]) {
@@ -49,8 +51,13 @@ fn criterion_main(c: &mut Criterion, benches: &[Benchmark]) {
         let mut group = c.benchmark_group(format!("runtime/{}", name));
         for bench in variants {
             for backend in bench.kind.matching_backends() {
+                if backend.is_slow() {
+                    // These are too slow for criterion; skip them.
+                    continue;
+                }
+
                 group.bench_function(backend.name(), |b| {
-                    benchmark_execution(b, backend, &bench.path);
+                    b.iter_custom(|count| benchmark_execution(count, FAST_INNER_COUNT, backend, &bench.path));
                 });
             }
         }
@@ -75,6 +82,7 @@ pub struct Benchmark {
 pub enum BenchmarkKind {
     PolkaVM,
     WebAssembly,
+    Ckbvm,
     Native,
 }
 
@@ -92,15 +100,25 @@ fn find_benchmarks_in(root_path: &Path) -> Result<Vec<Benchmark>, std::io::Error
             continue;
         };
 
-        let Some(extension) = path.extension() else { continue };
-        let kind = if extension == "wasm" {
-            BenchmarkKind::WebAssembly
-        } else if extension == "polkavm" {
-            BenchmarkKind::PolkaVM
-        } else if extension == "so" {
-            BenchmarkKind::Native
+        let kind = if let Some(extension) = path.extension() {
+            if extension == "wasm" {
+                BenchmarkKind::WebAssembly
+            } else if extension == "polkavm" {
+                BenchmarkKind::PolkaVM
+            } else if extension == "so" {
+                BenchmarkKind::Native
+            } else {
+                continue;
+            }
         } else {
-            continue;
+            let target = path.parent().and_then(|path| path.parent()).and_then(|path| path.file_name());
+
+            let Some(target) = target else { continue };
+            if target == "riscv64imac-unknown-none-elf" {
+                BenchmarkKind::Ckbvm
+            } else {
+                continue;
+            }
         };
 
         output.push(Benchmark {
@@ -118,6 +136,7 @@ fn find_benchmarks() -> Result<Vec<Benchmark>, std::io::Error> {
     let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../guest-programs");
     let paths = [
         root.join("target/riscv32em-unknown-none-elf/release"),
+        root.join("target/riscv64imac-unknown-none-elf/release"),
         root.join("target/wasm32-unknown-unknown/release"),
         #[cfg(target_arch = "x86_64")]
         root.join("target/x86_64-unknown-linux-gnu/release"),
@@ -278,6 +297,9 @@ enum Args {
     /// Runs the benchmarks with criterion.
     Criterion { filter: Option<String> },
 
+    /// Runs the benchmarks.
+    Benchmark { filter: Option<String> },
+
     /// Runs `perf` for the given benchmark.
     #[cfg(target_os = "linux")]
     Perf {
@@ -302,6 +324,15 @@ enum Args {
 }
 
 fn main() {
+    #[cfg(debug_assertions)]
+    if std::env::var_os("TRUST_ME_BRO_I_KNOW_WHAT_I_AM_DOING").is_none() {
+        // We have interpreters in the benchmark suite, so it's important to compile
+        // with full optimizations and with full fat LTO to keep things fair.
+        eprintln!("Not compiled with `--profile benchmark`; refusing to run! Please recompile and try again!");
+        eprintln!("(...alternatively you can set the `TRUST_ME_BRO_I_KNOW_WHAT_I_AM_DOING` environment variable, if you know what you're doing...)");
+        std::process::exit(1);
+    }
+
     #[cfg(target_os = "linux")]
     crate::utils::restart_with_disabled_aslr().unwrap();
 
@@ -318,6 +349,45 @@ fn main() {
 
             criterion_main(&mut criterion, &benches);
             criterion.final_summary();
+        }
+        Args::Benchmark { filter } => {
+            let mut list = Vec::new();
+            let benches = find_benchmarks().unwrap();
+            for bench in &benches {
+                for backend in bench.kind.matching_backends() {
+                    let name = format!("runtime/{}/{}", bench.name, backend.name());
+                    if let Some(ref filter) = filter {
+                        if !name.contains(filter) {
+                            continue;
+                        }
+                    }
+                    list.push((name, bench, backend));
+                }
+            }
+
+            for (name, bench, backend) in list {
+                let (outer_count, inner_count) = if backend.is_slow() {
+                    (1, SLOW_INNER_COUNT)
+                } else {
+                    (12, FAST_INNER_COUNT)
+                };
+
+                use std::io::Write;
+                let _ = write!(&mut std::io::stdout(), "{name}: ...");
+                let _ = std::io::stdout().flush();
+                let elapsed = benchmark_execution(outer_count, inner_count, backend, &bench.path) / outer_count as u32;
+                let elapsed = if elapsed.as_secs() > 0 {
+                    format!("{:.03}s", elapsed.as_secs_f64())
+                } else if elapsed.as_millis() > 9 {
+                    format!("{}ms", elapsed.as_millis())
+                } else if elapsed.as_micros() > 0 {
+                    format!("{}us", elapsed.as_micros())
+                } else {
+                    format!("{}ns", elapsed.as_nanos())
+                };
+
+                let _ = writeln!(&mut std::io::stdout(), "\r{name}: {elapsed}");
+            }
         }
         #[cfg(target_os = "linux")]
         Args::Perf {

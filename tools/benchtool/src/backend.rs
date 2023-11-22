@@ -1,5 +1,10 @@
 use crate::BenchmarkKind;
-use std::path::{Path, PathBuf};
+use std::path::Path;
+
+mod backend_prelude {
+    pub use super::Backend;
+    pub use std::path::{Path, PathBuf};
+}
 
 pub trait Backend: Copy + Clone {
     type Engine;
@@ -7,6 +12,7 @@ pub trait Backend: Copy + Clone {
     type Module;
     type Instance;
 
+    fn name(&self) -> &'static str;
     fn create(&self) -> Self::Engine;
     fn load(&self, path: &Path) -> Self::Blob;
     fn compile(&self, engine: &mut Self::Engine, blob: &Self::Blob) -> Self::Module;
@@ -16,450 +22,81 @@ pub trait Backend: Copy + Clone {
     fn pid(&self, _instance: &Self::Instance) -> Option<u32> {
         None
     }
-}
 
-#[derive(Copy, Clone, Default)]
-pub struct Unimplemented;
-
-impl Backend for Unimplemented {
-    type Engine = ();
-    type Blob = ();
-    type Module = ();
-    type Instance = ();
-
-    fn create(&self) -> Self::Engine {
-        unimplemented!();
-    }
-
-    fn load(&self, _path: &Path) -> Self::Blob {
-        unimplemented!();
-    }
-
-    fn compile(&self, _engine: &mut Self::Engine, _blob: &Self::Blob) -> Self::Module {
-        unimplemented!();
-    }
-
-    fn spawn(&self, _engine: &mut Self::Engine, _module: &Self::Module) -> Self::Instance {
-        unimplemented!();
-    }
-
-    fn initialize(&self, _instance: &mut Self::Instance) {
-        unimplemented!();
-    }
-
-    fn run(&self, _instance: &mut Self::Instance) {
-        unimplemented!();
+    fn is_slow(&self) -> bool {
+        false
     }
 }
 
-#[derive(Copy, Clone, Default)]
-pub struct PolkaVM;
+#[cfg(target_arch = "x86_64")]
+mod backend_polkavm;
 
-impl Backend for PolkaVM {
-    type Engine = polkavm::Engine;
-    type Blob = Vec<u8>;
-    type Module = polkavm::Module;
-    type Instance = (polkavm::TypedFunc<(), (), ()>, polkavm::TypedFunc<(), (), ()>, Option<u32>);
+#[cfg(target_arch = "x86_64")]
+mod backend_pvfexecutor;
 
-    fn create(&self) -> Self::Engine {
-        let config = polkavm::Config::default();
-        polkavm::Engine::new(&config).unwrap()
-    }
+#[cfg(all(feature = "ckb-vm", target_arch = "x86_64"))]
+mod backend_ckbvm;
 
-    fn load(&self, path: &Path) -> Self::Blob {
-        std::fs::read(path).unwrap()
-    }
+#[cfg(target_arch = "x86_64")]
+mod backend_wasm3;
 
-    fn compile(&self, engine: &mut Self::Engine, blob: &Self::Blob) -> Self::Module {
-        let blob = polkavm::ProgramBlob::parse(&**blob).unwrap();
-        polkavm::Module::from_blob(engine, &Default::default(), &blob).unwrap()
-    }
+#[cfg(all(feature = "wasmtime", any(target_arch = "x86_64", target_arch = "aarch64")))]
+mod backend_wasmtime;
 
-    fn spawn(&self, engine: &mut Self::Engine, module: &Self::Module) -> Self::Instance {
-        let linker = polkavm::Linker::<()>::new(engine);
-        let instance_pre = linker.instantiate_pre(module).unwrap();
-        let instance = instance_pre.instantiate().unwrap();
-        let ext_initialize = instance.get_typed_func::<(), ()>("initialize").unwrap();
-        let ext_run = instance.get_typed_func::<(), ()>("run").unwrap();
-        (ext_initialize, ext_run, instance.pid())
-    }
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+mod backend_wasmer;
 
-    fn initialize(&self, instance: &mut Self::Instance) {
-        instance.0.call(&mut (), ()).unwrap();
-    }
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+mod backend_wazero;
 
-    fn run(&self, instance: &mut Self::Instance) {
-        instance.1.call(&mut (), ()).unwrap();
-    }
-
-    fn pid(&self, instance: &Self::Instance) -> Option<u32> {
-        instance.2
-    }
-}
-
-#[cfg(not(all(feature = "wasmtime", not(target_arch = "x86"))))]
-pub type Wasmtime = Unimplemented;
-
-#[cfg(all(feature = "wasmtime", not(target_arch = "x86")))]
-#[derive(Copy, Clone, Default)]
-pub struct Wasmtime;
-
-#[cfg(all(feature = "wasmtime", not(target_arch = "x86")))]
-pub struct WasmtimeInstance {
-    store: wasmtime::Store<()>,
-    initialize: wasmtime::TypedFunc<(), ()>,
-    run: wasmtime::TypedFunc<(), ()>,
-}
-
-#[cfg(all(feature = "wasmtime", not(target_arch = "x86")))]
-impl Backend for Wasmtime {
-    type Engine = wasmtime::Engine;
-    type Blob = Vec<u8>;
-    type Module = wasmtime::Module;
-    type Instance = WasmtimeInstance;
-
-    fn create(&self) -> Self::Engine {
-        let config = wasmtime::Config::default();
-        wasmtime::Engine::new(&config).unwrap()
-    }
-
-    fn load(&self, path: &Path) -> Self::Blob {
-        std::fs::read(path).unwrap()
-    }
-
-    fn compile(&self, engine: &mut Self::Engine, blob: &Self::Blob) -> Self::Module {
-        wasmtime::Module::new(engine, blob).unwrap()
-    }
-
-    fn spawn(&self, engine: &mut Self::Engine, module: &Self::Module) -> Self::Instance {
-        let mut store = wasmtime::Store::new(engine, ());
-        let instance = wasmtime::Instance::new(&mut store, module, &[]).unwrap();
-        let initialize = instance.get_typed_func::<(), ()>(&mut store, "initialize").unwrap();
-        let run = instance.get_typed_func::<(), ()>(&mut store, "run").unwrap();
-        WasmtimeInstance { store, initialize, run }
-    }
-
-    fn initialize(&self, instance: &mut Self::Instance) {
-        instance.initialize.call(&mut instance.store, ()).unwrap();
-    }
-
-    fn run(&self, instance: &mut Self::Instance) {
-        instance.run.call(&mut instance.store, ()).unwrap();
-    }
-}
-
-#[derive(Copy, Clone, Default)]
-pub struct Wasmer;
-pub struct WasmerInstance {
-    store: wasmer::Store,
-    initialize: wasmer::TypedFunction<(), ()>,
-    run: wasmer::TypedFunction<(), ()>,
-}
-
-impl Backend for Wasmer {
-    type Engine = wasmer::Engine;
-    type Blob = Vec<u8>;
-    type Module = wasmer::Module;
-    type Instance = WasmerInstance;
-
-    fn create(&self) -> Self::Engine {
-        let config = Box::new(wasmer::Singlepass::new());
-        <wasmer::Engine as wasmer::NativeEngineExt>::new(config, wasmer::Target::default(), wasmer::Features::default())
-    }
-
-    fn load(&self, path: &Path) -> Self::Blob {
-        std::fs::read(path).unwrap()
-    }
-
-    fn compile(&self, engine: &mut Self::Engine, blob: &Self::Blob) -> Self::Module {
-        wasmer::Module::new(engine, blob).unwrap()
-    }
-
-    fn spawn(&self, engine: &mut Self::Engine, module: &Self::Module) -> Self::Instance {
-        let mut store = wasmer::Store::new(engine.clone());
-        let import_object = wasmer::imports! {};
-        let instance = wasmer::Instance::new(&mut store, module, &import_object).unwrap();
-        let initialize: wasmer::TypedFunction<(), ()> = instance.exports.get_function("initialize").unwrap().typed(&store).unwrap();
-        let run: wasmer::TypedFunction<(), ()> = instance.exports.get_function("run").unwrap().typed(&store).unwrap();
-        WasmerInstance { store, initialize, run }
-    }
-
-    fn initialize(&self, instance: &mut Self::Instance) {
-        instance.initialize.call(&mut instance.store).unwrap();
-    }
-
-    fn run(&self, instance: &mut Self::Instance) {
-        instance.run.call(&mut instance.store).unwrap();
-    }
-}
-
-#[derive(Copy, Clone, Default)]
-pub struct Native;
-pub struct NativeInstance {
-    initialize: libloading::Symbol<'static, unsafe extern "C" fn()>,
-    run: libloading::Symbol<'static, unsafe extern "C" fn()>,
-    _library: libloading::Library,
-}
-
-impl Backend for Native {
-    type Engine = ();
-    type Blob = PathBuf;
-    type Module = PathBuf;
-    type Instance = NativeInstance;
-
-    fn create(&self) -> Self::Engine {}
-
-    fn load(&self, path: &Path) -> Self::Blob {
-        path.to_owned()
-    }
-
-    fn compile(&self, _engine: &mut Self::Engine, path: &Self::Blob) -> Self::Module {
-        path.clone()
-    }
-
-    fn spawn(&self, _engine: &mut Self::Engine, path: &Self::Module) -> Self::Instance {
-        unsafe {
-            let library = libloading::Library::new(path).unwrap();
-            let initialize: libloading::Symbol<unsafe extern "C" fn()> = library.get(b"initialize").unwrap();
-            let initialize: libloading::Symbol<unsafe extern "C" fn()> = core::mem::transmute(initialize);
-            let run: libloading::Symbol<unsafe extern "C" fn()> = library.get(b"run").unwrap();
-            let run: libloading::Symbol<unsafe extern "C" fn()> = core::mem::transmute(run);
-            NativeInstance {
-                initialize,
-                run,
-                _library: library,
-            }
-        }
-    }
-
-    fn initialize(&self, instance: &mut Self::Instance) {
-        unsafe {
-            (instance.initialize)();
-        }
-    }
-
-    fn run(&self, instance: &mut Self::Instance) {
-        unsafe {
-            (instance.run)();
-        }
-    }
-}
-
-struct WaZeroSo(libloading::Library);
-struct WaZeroInterface<'a> {
-    engine_new: libloading::Symbol<'a, unsafe extern "C" fn() -> u64>,
-    engine_drop: libloading::Symbol<'a, unsafe extern "C" fn(u64)>,
-    module_new: libloading::Symbol<'a, unsafe extern "C" fn(u64, *const u8, core::ffi::c_int) -> u64>,
-    module_drop: libloading::Symbol<'a, unsafe extern "C" fn(u64)>,
-    instance_new: libloading::Symbol<'a, unsafe extern "C" fn(u64, u64) -> u64>,
-    instance_initialize: libloading::Symbol<'a, unsafe extern "C" fn(u64)>,
-    instance_run: libloading::Symbol<'a, unsafe extern "C" fn(u64)>,
-    instance_drop: libloading::Symbol<'a, unsafe extern "C" fn(u64)>,
-}
-
-impl WaZeroSo {
-    fn new() -> Option<Self> {
-        let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("wazero/libwazero.so");
-        unsafe {
-            let library = libloading::Library::new(path).ok()?;
-            Some(WaZeroSo(library))
-        }
-    }
-
-    fn get(&'_ self) -> WaZeroInterface<'_> {
-        unsafe {
-            let engine_new = self.0.get(b"Engine_new").unwrap();
-            let engine_drop = self.0.get(b"Engine_drop").unwrap();
-            let module_new = self.0.get(b"Module_new").unwrap();
-            let module_drop = self.0.get(b"Module_drop").unwrap();
-            let instance_new = self.0.get(b"Instance_new").unwrap();
-            let instance_initialize = self.0.get(b"Instance_initialize").unwrap();
-            let instance_run = self.0.get(b"Instance_run").unwrap();
-            let instance_drop = self.0.get(b"Instance_drop").unwrap();
-            WaZeroInterface {
-                engine_new,
-                engine_drop,
-                module_new,
-                module_drop,
-                instance_new,
-                instance_initialize,
-                instance_run,
-                instance_drop,
-            }
-        }
-    }
-}
-
-struct WaZeroInterfaceStatic {
-    initialized: bool,
-    interface: Option<WaZeroInterface<'static>>,
-}
-
-static mut WA_ZERO_SO: Option<WaZeroSo> = None;
-static mut WA_ZERO_INTERFACE: WaZeroInterfaceStatic = WaZeroInterfaceStatic {
-    initialized: false,
-    interface: None,
-};
-
-static mut WA_ZERO_LOCK: std::sync::RwLock<()> = std::sync::RwLock::new(());
-
-#[cold]
-fn get_wazero_slow() -> Option<&'static WaZeroInterface<'static>> {
-    unsafe {
-        let _lock = WA_ZERO_LOCK.write().unwrap();
-        if WA_ZERO_INTERFACE.initialized {
-            return WA_ZERO_INTERFACE.interface.as_ref();
-        }
-
-        WA_ZERO_INTERFACE.initialized = true;
-        WA_ZERO_SO = Some(WaZeroSo::new()?);
-        WA_ZERO_INTERFACE.interface = Some(WA_ZERO_SO.as_ref().unwrap().get());
-        WA_ZERO_INTERFACE.interface.as_ref()
-    }
-}
-
-fn get_wazero() -> Option<&'static WaZeroInterface<'static>> {
-    unsafe {
-        let _lock = WA_ZERO_LOCK.read().unwrap();
-        if WA_ZERO_INTERFACE.initialized {
-            return WA_ZERO_INTERFACE.interface.as_ref();
-        }
-
-        core::mem::drop(_lock);
-        get_wazero_slow()
-    }
-}
-
-#[derive(Copy, Clone, Default)]
-pub struct WaZero;
-pub struct WaZeroEngine(u64);
-pub struct WaZeroModule(u64);
-pub struct WaZeroInstance(u64);
-
-impl Drop for WaZeroEngine {
-    fn drop(&mut self) {
-        unsafe {
-            (get_wazero().unwrap().engine_drop)(self.0);
-        }
-    }
-}
-
-impl Drop for WaZeroModule {
-    fn drop(&mut self) {
-        unsafe {
-            (get_wazero().unwrap().module_drop)(self.0);
-        }
-    }
-}
-
-impl Drop for WaZeroInstance {
-    fn drop(&mut self) {
-        unsafe {
-            (get_wazero().unwrap().instance_drop)(self.0);
-        }
-    }
-}
-
-impl Backend for WaZero {
-    type Engine = WaZeroEngine;
-    type Blob = Vec<u8>;
-    type Module = WaZeroModule;
-    type Instance = WaZeroInstance;
-
-    fn create(&self) -> Self::Engine {
-        unsafe { WaZeroEngine((get_wazero().unwrap().engine_new)()) }
-    }
-
-    fn load(&self, path: &Path) -> Self::Blob {
-        std::fs::read(path).unwrap()
-    }
-
-    fn compile(&self, engine: &mut Self::Engine, blob: &Self::Blob) -> Self::Module {
-        unsafe { WaZeroModule((get_wazero().unwrap().module_new)(engine.0, blob.as_ptr().cast(), blob.len() as _)) }
-    }
-
-    fn spawn(&self, engine: &mut Self::Engine, module: &Self::Module) -> Self::Instance {
-        unsafe { WaZeroInstance((get_wazero().unwrap().instance_new)(engine.0, module.0)) }
-    }
-
-    fn initialize(&self, instance: &mut Self::Instance) {
-        unsafe { (get_wazero().unwrap().instance_initialize)(instance.0) }
-    }
-
-    fn run(&self, instance: &mut Self::Instance) {
-        unsafe { (get_wazero().unwrap().instance_run)(instance.0) }
-    }
-}
-
-#[derive(Copy, Clone, Default)]
-pub struct PvfExecutor;
-
-impl Backend for PvfExecutor {
-    type Engine = ();
-    type Blob = Vec<u8>;
-    type Module = pvf_executor::PreparedPvf;
-    type Instance = pvf_executor::PvfInstance;
-
-    fn create(&self) -> Self::Engine {}
-
-    fn load(&self, path: &Path) -> Self::Blob {
-        std::fs::read(path).unwrap()
-    }
-
-    fn compile(&self, _engine: &mut Self::Engine, blob: &Self::Blob) -> Self::Module {
-        let blob = pvf_executor::RawPvf::from_bytes(blob);
-        let mut ir = blob.translate().unwrap();
-        ir.optimize();
-
-        let mut codegen = pvf_executor::IntelX64Compiler::new();
-        ir.compile(&mut codegen)
-    }
-
-    fn spawn(&self, _engine: &mut Self::Engine, module: &Self::Module) -> Self::Instance {
-        pvf_executor::PvfInstance::instantiate(module, None)
-    }
-
-    fn initialize(&self, instance: &mut Self::Instance) {
-        unsafe { instance.call::<_, _, ()>("initialize", ()) }.unwrap();
-    }
-
-    fn run(&self, instance: &mut Self::Instance) {
-        unsafe { instance.call::<_, _, ()>("run", ()) }.unwrap();
-    }
-}
+mod backend_native;
+mod backend_wasmi;
 
 macro_rules! define_backends {
-    ($($backend:ident => $name:expr),+) => {
+    ($(
+        #[cfg($($cfg:tt)*)]
+        $backend:ident => $module:ident::$struct:ident($($ctor_args:tt)*)
+    ),+) => {
+        #[allow(non_camel_case_types)]
         #[derive(Copy, Clone)]
         pub enum BackendKind {
-            $($backend),+
+            $(
+                #[cfg($($cfg)*)]
+                $backend
+            ),+
         }
 
+        #[allow(non_camel_case_types)]
         pub enum AnyEngine {
-            $($backend(<$backend as Backend>::Engine)),+
+            $(
+                #[cfg($($cfg)*)]
+                $backend(<self::$module::$struct as Backend>::Engine)
+            ),+
         }
 
+        #[allow(non_camel_case_types)]
         pub enum AnyBlob {
-            $($backend(<$backend as Backend>::Blob)),+
+            $(
+                #[cfg($($cfg)*)]
+                $backend(<self::$module::$struct as Backend>::Blob)
+            ),+
         }
 
+        #[allow(non_camel_case_types)]
         #[allow(clippy::large_enum_variant)]
         pub enum AnyModule {
-            $($backend(<$backend as Backend>::Module)),+
+            $(
+                #[cfg($($cfg)*)]
+                $backend(<self::$module::$struct as Backend>::Module)
+            ),+
         }
 
+        #[allow(non_camel_case_types)]
         pub enum AnyInstance {
-            $($backend(<$backend as Backend>::Instance)),+
-        }
-
-        impl BackendKind {
-            pub fn name(self) -> &'static str {
-                match self {
-                    $(
-                        BackendKind::$backend => $name,
-                    )+
-                }
-            }
+            $(
+                #[cfg($($cfg)*)]
+                $backend(<self::$module::$struct as Backend>::Instance)
+            ),+
         }
 
         impl Backend for BackendKind {
@@ -468,10 +105,20 @@ macro_rules! define_backends {
             type Module = AnyModule;
             type Instance = AnyInstance;
 
+            fn name(&self) -> &'static str {
+                match self {
+                    $(
+                        #[cfg($($cfg)*)]
+                        Self::$backend => self::$module::$struct($($ctor_args)*).name(),
+                    )+
+                }
+            }
+
             fn create(&self) -> Self::Engine {
                 match self {
                     $(
-                        Self::$backend => AnyEngine::$backend($backend::default().create()),
+                        #[cfg($($cfg)*)]
+                        Self::$backend => AnyEngine::$backend(self::$module::$struct($($ctor_args)*).create()),
                     )+
                 }
             }
@@ -479,7 +126,8 @@ macro_rules! define_backends {
             fn load(&self, path: &Path) -> Self::Blob {
                 match self {
                     $(
-                        Self::$backend => AnyBlob::$backend($backend::default().load(path)),
+                        #[cfg($($cfg)*)]
+                        Self::$backend => AnyBlob::$backend(self::$module::$struct($($ctor_args)*).load(path)),
                     )+
                 }
             }
@@ -487,10 +135,11 @@ macro_rules! define_backends {
             fn compile(&self, engine: &mut Self::Engine, blob: &Self::Blob) -> Self::Module {
                 match self {
                     $(
+                        #[cfg($($cfg)*)]
                         Self::$backend => {
                             let AnyEngine::$backend(engine) = engine else { unreachable!() };
                             let AnyBlob::$backend(blob) = blob else { unreachable!() };
-                            AnyModule::$backend($backend::default().compile(engine, blob))
+                            AnyModule::$backend(self::$module::$struct($($ctor_args)*).compile(engine, blob))
                         },
                     )+
                 }
@@ -499,10 +148,11 @@ macro_rules! define_backends {
             fn spawn(&self, engine: &mut Self::Engine, module: &Self::Module) -> Self::Instance {
                 match self {
                     $(
+                        #[cfg($($cfg)*)]
                         Self::$backend => {
                             let AnyEngine::$backend(engine) = engine else { unreachable!() };
                             let AnyModule::$backend(module) = module else { unreachable!() };
-                            AnyInstance::$backend($backend::default().spawn(engine, module))
+                            AnyInstance::$backend(self::$module::$struct($($ctor_args)*).spawn(engine, module))
                         },
                     )+
                 }
@@ -511,9 +161,10 @@ macro_rules! define_backends {
             fn initialize(&self, instance: &mut Self::Instance) {
                 match self {
                     $(
+                        #[cfg($($cfg)*)]
                         Self::$backend => {
                             let AnyInstance::$backend(instance) = instance else { unreachable!() };
-                            $backend::default().initialize(instance)
+                            self::$module::$struct($($ctor_args)*).initialize(instance)
                         },
                     )+
                 }
@@ -522,9 +173,10 @@ macro_rules! define_backends {
             fn run(&self, instance: &mut Self::Instance) {
                 match self {
                     $(
+                        #[cfg($($cfg)*)]
                         Self::$backend => {
                             let AnyInstance::$backend(instance) = instance else { unreachable!() };
-                            $backend::default().run(instance)
+                            self::$module::$struct($($ctor_args)*).run(instance)
                         },
                     )+
                 }
@@ -533,10 +185,20 @@ macro_rules! define_backends {
             fn pid(&self, instance: &Self::Instance) -> Option<u32> {
                 match self {
                     $(
+                        #[cfg($($cfg)*)]
                         Self::$backend => {
                             let AnyInstance::$backend(instance) = instance else { unreachable!() };
-                            $backend::default().pid(instance)
+                            self::$module::$struct($($ctor_args)*).pid(instance)
                         },
+                    )+
+                }
+            }
+
+            fn is_slow(&self) -> bool {
+                match self {
+                    $(
+                        #[cfg($($cfg)*)]
+                        Self::$backend => self::$module::$struct($($ctor_args)*).is_slow(),
                     )+
                 }
             }
@@ -545,35 +207,108 @@ macro_rules! define_backends {
 }
 
 define_backends! {
-    PolkaVM => "polkavm",
-    Wasmtime => "wasmtime",
-    Wasmer => "wasmer",
-    WaZero => "wazero",
-    PvfExecutor => "pvfexecutor",
-    Native => "native"
+    #[cfg(target_arch = "x86_64")]
+    PolkaVM_NoGas => backend_polkavm::PolkaVM(None),
+    #[cfg(target_arch = "x86_64")]
+    PolkaVM_AsyncGas => backend_polkavm::PolkaVM(Some(polkavm::GasMeteringKind::Async)),
+    #[cfg(target_arch = "x86_64")]
+    PolkaVM_SyncGas => backend_polkavm::PolkaVM(Some(polkavm::GasMeteringKind::Sync)),
+
+    #[cfg(all(feature = "wasmtime", any(target_arch = "x86_64", target_arch = "aarch64")))]
+    Wasmtime_Cranelift =>
+        backend_wasmtime::Wasmtime(wasmtime::Strategy::Cranelift, backend_wasmtime::Metering::None),
+
+    #[cfg(all(feature = "wasmtime", any(target_arch = "x86_64", target_arch = "aarch64")))]
+    Wasmtime_CraneliftConsumeFuel =>
+        backend_wasmtime::Wasmtime(wasmtime::Strategy::Cranelift, backend_wasmtime::Metering::ConsumeFuel),
+
+    #[cfg(all(feature = "wasmtime", any(target_arch = "x86_64", target_arch = "aarch64")))]
+    Wasmtime_CraneliftEpochInterruption =>
+        backend_wasmtime::Wasmtime(wasmtime::Strategy::Cranelift, backend_wasmtime::Metering::EpochInterruption),
+
+    #[cfg(all(feature = "wasmtime", any(target_arch = "x86_64", target_arch = "aarch64")))]
+    Wasmtime_Winch =>
+        backend_wasmtime::Wasmtime(wasmtime::Strategy::Winch, backend_wasmtime::Metering::None),
+
+    #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+    Wasmer => backend_wasmer::Wasmer(),
+
+    #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+    WaZero => backend_wazero::WaZero(),
+
+    #[cfg(target_arch = "x86_64")]
+    PvfExecutor => backend_pvfexecutor::PvfExecutor(),
+
+    #[cfg(all(feature = "ckb-vm", target_arch = "x86_64"))]
+    Ckbvm => backend_ckbvm::Ckbvm(),
+
+    #[cfg(target_arch = "x86_64")]
+    Wasm3 => backend_wasm3::Wasm3(),
+
+    #[cfg(not(_dummy))]
+    Wasmi_StackMachine => backend_wasmi::Wasmi(wasmi::EngineBackend::StackMachine),
+    #[cfg(not(_dummy))]
+    Wasmi_RegisterMachine => backend_wasmi::Wasmi(wasmi::EngineBackend::RegisterMachine),
+
+    #[cfg(not(_dummy))]
+    Native => backend_native::Native()
 }
 
 impl BenchmarkKind {
     pub fn matching_backends(self) -> Vec<BackendKind> {
+        let mut output = Vec::new();
         match self {
-            BenchmarkKind::PolkaVM => vec![BackendKind::PolkaVM],
-            BenchmarkKind::WebAssembly => {
-                let mut output = vec![BackendKind::Wasmer];
-
-                if get_wazero().is_some() {
-                    output.push(BackendKind::WaZero);
+            BenchmarkKind::PolkaVM => {
+                #[cfg(target_arch = "x86_64")]
+                {
+                    output.extend([
+                        BackendKind::PolkaVM_NoGas,
+                        BackendKind::PolkaVM_AsyncGas,
+                        BackendKind::PolkaVM_SyncGas,
+                    ]);
                 }
+            }
+            BenchmarkKind::WebAssembly => {
+                output.push(BackendKind::Wasmi_StackMachine);
+                output.push(BackendKind::Wasmi_RegisterMachine);
 
-                #[cfg(not(target_arch = "x86"))]
+                #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
                 {
                     #[cfg(feature = "wasmtime")]
-                    output.push(BackendKind::Wasmtime);
-                    output.push(BackendKind::PvfExecutor);
+                    {
+                        output.extend([
+                            BackendKind::Wasmtime_Cranelift,
+                            BackendKind::Wasmtime_CraneliftConsumeFuel,
+                            BackendKind::Wasmtime_CraneliftEpochInterruption,
+                            // TODO: Enable once it doesn't crash with a 'not yet implemented' error.
+                            // BackendKind::Wasmtime_Winch,
+                        ]);
+                    }
+
+                    output.push(BackendKind::Wasmer);
+
+                    if backend_wazero::is_available() {
+                        output.push(BackendKind::WaZero);
+                    }
                 }
 
-                output
+                #[cfg(target_arch = "x86_64")]
+                {
+                    output.push(BackendKind::PvfExecutor);
+                    output.push(BackendKind::Wasm3);
+                }
             }
-            BenchmarkKind::Native => vec![BackendKind::Native],
+            BenchmarkKind::Ckbvm => {
+                #[cfg(all(feature = "ckb-vm", target_arch = "x86_64"))]
+                {
+                    output.push(BackendKind::Ckbvm);
+                }
+            }
+            BenchmarkKind::Native => {
+                output.push(BackendKind::Native);
+            }
         }
+
+        output
     }
 }

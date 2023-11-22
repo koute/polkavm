@@ -14,15 +14,20 @@ criterion = { version = "0.5.1", default-features = false }
 env_logger = { workspace = true }
 libc = { workspace = true }
 libloading = "0.8.1"
-linux-perf-data = "0.8.2"
 log = { workspace = true }
-polkavm = { workspace = true }
-wasmer = { version = "4.2.2", default-features = false, features = ["std", "singlepass"] }
-pvf-executor = { git = "https://github.com/paritytech/pvf-executor.git", rev = "07194b6f821193c3945c2f66ad496a1f76c01f7a" }
+wasmi = { git = "https://github.com/paritytech/wasmi.git", rev = "ea3a29ce66ca116489b7bbcec520c5415ace17b2" }
 
-[target.'cfg(not(target_arch = "x86"))'.dependencies]
-wasmtime = { version = "13.0.0", default-features = false, features = ["cranelift"], optional = true }
+[target.'cfg(target_arch = "x86_64")'.dependencies]
+ckb-vm = { version = "0.24.6", features = ["asm"], optional = true }
+polkavm = { workspace = true }
+pvf-executor = { git = "https://github.com/paritytech/pvf-executor.git", rev = "d3b2bb77b783bcfaff540c2f9ade99f58a311ac3" }
+wasm3 = { git = "https://github.com/wasm3/wasm3-rs.git", rev = "df74c2a17ed8831595de43db98c406da4633e32a", features = ["build-bindgen"] }
+
+[target.'cfg(any(target_arch = "x86_64", target_arch = "aarch64"))'.dependencies]
+wasmer = { version = "4.2.3", default-features = false, features = ["std", "singlepass"] }
+wasmtime = { version = "15.0.0", default-features = false, features = ["cranelift", "winch"], optional = true }
 
 [features]
 default = ["wasmtime"]
+ckb-vm = ["dep:ckb-vm"]
 wasmtime = ["dep:wasmtime"]
