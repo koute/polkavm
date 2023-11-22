@@ -1,8 +1,9 @@
 use polkavm_assembler::amd64::addr::*;
 use polkavm_assembler::amd64::inst::*;
-use polkavm_assembler::amd64::Reg as NativeReg;
-use polkavm_assembler::amd64::Reg::*;
-use polkavm_assembler::amd64::{Condition, LoadKind, RegSize, Size, ImmKind};
+use polkavm_assembler::amd64::RegIndex as NativeReg;
+use polkavm_assembler::amd64::RegIndex::*;
+use polkavm_assembler::amd64::Reg::rsp;
+use polkavm_assembler::amd64::{Condition, LoadKind, RegSize, Size, ImmKind, MemOp};
 use polkavm_assembler::Label;
 
 use polkavm_common::program::{InstructionVisitor, Reg};
@@ -103,32 +104,44 @@ impl<'a> Compiler<'a> {
         self.push(mov_imm(conv_reg(reg), imm32(imm)));
     }
 
-    fn embedded_load_store(
-        &mut self,
-        src_or_dst: Reg,
-        base: Reg,
-        offset: u32,
-        cb: impl FnOnce(&mut Self, NativeReg, NativeReg)
-    ) {
-        // TODO: This could be more efficient.
-        if base != Reg::Zero {
-            self.push(mov(RegSize::R32, TMP_REG, conv_reg(base)));
-        } else {
-            self.push(xor((RegSize::R32, TMP_REG, TMP_REG)));
-        }
+    fn load_store_operand(&mut self, base: Reg, offset: u32) -> MemOp {
+        match self.sandbox_kind {
+            SandboxKind::Linux => {
+                if base == Reg::Zero {
+                    // [address] = ..
+                    abs(RegSize::R32, offset as i32)
+                } else {
+                    // [address + offset]
+                    reg_indirect(RegSize::R32, conv_reg(base) + offset as i32)
+                }
+            },
+            SandboxKind::Generic => {
+                match (base, offset) {
+                    // [address] = ..
+                    // (address is in the lower 2GB of the address space)
+                    (Z, _) if offset as i32 >= 0 => {
+                        reg_indirect(RegSize::R64, GENERIC_SANDBOX_MEMORY_REG + offset as i32)
+                    },
 
-        if offset != 0 {
-            self.push(add((TMP_REG, imm32(offset))));
-        }
+                    // [address] = ..
+                    (Z, _) => {
+                        self.push(mov_imm(TMP_REG, imm32(offset)));
+                        base_index(RegSize::R64, GENERIC_SANDBOX_MEMORY_REG, TMP_REG)
+                    },
 
-        self.push(add((RegSize::R64, TMP_REG, GENERIC_SANDBOX_MEMORY_REG)));
-        if src_or_dst != Reg::Zero {
-            cb(self, TMP_REG, conv_reg(src_or_dst));
-        } else {
-            self.push(push(GENERIC_SANDBOX_MEMORY_REG));
-            self.push(xor((RegSize::R32, GENERIC_SANDBOX_MEMORY_REG, GENERIC_SANDBOX_MEMORY_REG)));
-            cb(self, TMP_REG, GENERIC_SANDBOX_MEMORY_REG);
-            self.push(pop(GENERIC_SANDBOX_MEMORY_REG));
+                    // [base] = ..
+                    (_, 0) => {
+                        // NOTE: This assumes that `base` has its upper 32-bits clear.
+                        base_index(RegSize::R64, GENERIC_SANDBOX_MEMORY_REG, conv_reg(base))
+                    },
+
+                    // [base + offset] = ..
+                    (_, _) => {
+                        self.push(lea(RegSize::R32, TMP_REG, reg_indirect(RegSize::R32, conv_reg(base) + offset as i32)));
+                        base_index(RegSize::R64, GENERIC_SANDBOX_MEMORY_REG, TMP_REG)
+                    }
+                }
+            }
         }
     }
 
@@ -137,27 +150,11 @@ impl<'a> Compiler<'a> {
             todo!();
         }
 
-        match self.sandbox_kind {
-            SandboxKind::Linux => {
-                match (src, base) {
-                    // [address] = 0
-                    (Z, Z) => self.push(mov_imm(abs(RegSize::R32, offset as i32), zero_imm_from_size(kind))),
-
-                    // [address] = src
-                    (_, Z) => self.push(store(kind, abs(RegSize::R32, offset as i32), conv_reg(src))),
-
-                    // [base + offset] = 0
-                    (Z, _) => self.push(mov_imm(reg_indirect(RegSize::R32, conv_reg(base) + offset as i32), zero_imm_from_size(kind))),
-
-                    // [base + offset] = src
-                    (_, _) => self.push(store(kind, reg_indirect(RegSize::R32, conv_reg(base) + offset as i32), conv_reg(src))),
-                }
-            },
-            SandboxKind::Generic => {
-                self.embedded_load_store(src, base, offset, move |itself, address_reg, value_reg| {
-                    itself.push(store(kind, reg_indirect(RegSize::R64, address_reg), value_reg));
-                });
-            }
+        let dst = self.load_store_operand(base, offset);
+        if src != Reg::Zero {
+            self.push(store(kind, dst, conv_reg(src)));
+        } else {
+            self.push(mov_imm(dst, zero_imm_from_size(kind)));
         }
     }
 
@@ -166,27 +163,15 @@ impl<'a> Compiler<'a> {
             todo!();
         }
 
-        match self.sandbox_kind {
-            SandboxKind::Linux => {
-                let dst_native = if dst == Reg::Zero {
-                    // Do a dummy load. We can't just skip this since an invalid load can trigger a trap.
-                    TMP_REG
-                } else {
-                    conv_reg(dst)
-                };
+        let src = self.load_store_operand(base, offset);
+        let dst = if dst == Reg::Zero {
+            // Do a dummy load. We can't just skip this since an invalid load can trigger a trap.
+            TMP_REG
+        } else {
+            conv_reg(dst)
+        };
 
-                if base == Reg::Zero {
-                    self.push(load(kind, dst_native, abs(RegSize::R32, offset as i32)));
-                } else {
-                    self.push(load(kind, dst_native, reg_indirect(RegSize::R32, conv_reg(base) + offset as i32)));
-                }
-            },
-            SandboxKind::Generic => {
-                self.embedded_load_store(dst, base, offset, move |itself, address_reg, value_reg| {
-                    itself.push(load(kind, value_reg, reg_indirect(RegSize::R64, address_reg)));
-                });
-            }
-        }
+        self.push(load(kind, dst, src));
     }
 
     fn clear_reg(&mut self, reg: Reg) {
@@ -1145,7 +1130,7 @@ impl<'a> InstructionVisitor for Compiler<'a> {
                 },
                 SandboxKind::Generic => {
                     // // TODO: This also could be more efficient.
-                    self.push(lea_rip_label(TMP_REG, self.jump_table_label));
+                    self.push(lea_rip_label(TMP_REG.into(), self.jump_table_label));
                     self.push(push(conv_reg(base)));
                     self.push(shl_imm(RegSize::R64, conv_reg(base), 3));
                     if offset > 0 {
