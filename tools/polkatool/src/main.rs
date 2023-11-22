@@ -115,7 +115,7 @@ fn main_disassemble(input: PathBuf, format: DisassemblyFormat, output: Option<Pa
             Err(error) => bail!("failed to create VM engine: {error}"),
         };
 
-        let module = match polkavm::Module::from_blob(&engine, &blob) {
+        let module = match polkavm::Module::from_blob(&engine, &Default::default(), &blob) {
             Ok(module) => module,
             Err(error) => bail!("failed to compile {input:?}: {error}"),
         };

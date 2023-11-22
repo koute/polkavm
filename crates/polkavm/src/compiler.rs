@@ -14,7 +14,7 @@ use crate::api::{BackendAccess, ExecutionConfig, Module, OnHostcall, AsCompiledM
 use crate::error::{bail, Error};
 
 use crate::sandbox::{Sandbox, SandboxConfig, SandboxProgram, SandboxProgramInit, ExecuteArgs};
-use crate::config::SandboxKind;
+use crate::config::{GasMeteringKind, ModuleConfig, SandboxKind};
 
 #[cfg(target_arch = "x86_64")]
 mod amd64;
@@ -25,6 +25,7 @@ struct Compiler<'a> {
     instructions: &'a [RawInstruction],
     basic_block_by_jump_table_index: &'a [u32],
     jump_table_index_by_basic_block: &'a HashMap<u32, u32>,
+    gas_cost_for_basic_block: &'a [u32],
     nth_basic_block_to_label: Vec<Label>,
     nth_basic_block_to_label_pending: HashMap<u32, Label>,
     jump_table: Vec<u8>,
@@ -36,9 +37,12 @@ struct Compiler<'a> {
     trace_label: Label,
     jump_table_label: Label,
     sandbox_kind: SandboxKind,
+    gas_metering: Option<GasMeteringKind>,
     native_code_address: u64,
     address_table: AddressTable,
     vmctx_regs_offset: usize,
+    vmctx_gas_offset: usize,
+    is_last_instruction: bool,
 
     /// Whether we're compiling a 64-bit program. Currently totally broken and mostly unimplemented.
     // TODO: Fix this.
@@ -56,13 +60,16 @@ struct CompilationResult<'a> {
 impl<'a> Compiler<'a> {
     #[allow(clippy::too_many_arguments)]
     fn new(
+        config: &ModuleConfig,
         instructions: &'a [RawInstruction],
         exports: &'a [ProgramExport<'a>],
         basic_block_by_jump_table_index: &'a [u32],
         jump_table_index_by_basic_block: &'a HashMap<u32, u32>,
+        gas_cost_for_basic_block: &'a [u32],
         sandbox_kind: SandboxKind,
         address_table: AddressTable,
         vmctx_regs_offset: usize,
+        vmctx_gas_offset: usize,
         debug_trace_execution: bool,
         native_code_address: u64,
     ) -> Self {
@@ -78,6 +85,7 @@ impl<'a> Compiler<'a> {
             exports,
             basic_block_by_jump_table_index,
             jump_table_index_by_basic_block,
+            gas_cost_for_basic_block,
             nth_basic_block_to_label: Default::default(),
             nth_basic_block_to_label_pending: Default::default(),
             jump_table: Default::default(),
@@ -88,11 +96,14 @@ impl<'a> Compiler<'a> {
             trace_label,
             jump_table_label,
             sandbox_kind,
+            gas_metering: config.gas_metering,
             native_code_address,
             regs_are_64bit: false,
             debug_trace_execution,
             address_table,
             vmctx_regs_offset,
+            vmctx_gas_offset,
+            is_last_instruction: false,
         }
     }
 
@@ -116,6 +127,7 @@ impl<'a> Compiler<'a> {
                 self.trace_execution(nth_instruction);
             }
 
+            self.is_last_instruction = nth_instruction + 1 == self.instructions.len();
             instruction.visit(self);
 
             if !self.debug_trace_execution {
@@ -243,33 +255,46 @@ impl<'a> Compiler<'a> {
         self.nth_basic_block_to_label.len() as u32
     }
 
-    fn start_new_basic_block(&mut self) -> Label {
-        let nth_basic_block = self.nth_basic_block_to_label.len() as u32;
+    fn start_new_basic_block(&mut self) {
+        if self.is_last_instruction {
+            return;
+        }
+
+        let nth_basic_block = self.nth_basic_block_to_label.len();
         log::trace!("Starting new basic block: @{nth_basic_block:x}");
 
         let label = self
             .nth_basic_block_to_label_pending
-            .remove(&nth_basic_block)
+            .remove(&(nth_basic_block as u32))
             .unwrap_or_else(|| self.asm.forward_declare_label());
 
         self.define_label(label);
         self.nth_basic_block_to_label.push(label);
-        label
+
+        if let Some(gas_metering) = self.gas_metering {
+            let cost = self.gas_cost_for_basic_block[nth_basic_block];
+            if cost > 0 {
+                self.emit_gas_metering(gas_metering, cost);
+            }
+        }
     }
 }
 
-pub struct CompiledModule<S> where S: Sandbox {
+pub(crate) struct CompiledModule<S> where S: Sandbox {
     sandbox_program: S::Program,
     export_trampolines: Vec<u64>,
     nth_instruction_to_code_offset_map: Vec<u32>,
 }
 
 impl<S> CompiledModule<S> where S: Sandbox {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
+        config: &ModuleConfig,
         instructions: &[RawInstruction],
         exports: &[ProgramExport],
         basic_block_by_jump_table_index: &[u32],
         jump_table_index_by_basic_block: &HashMap<u32, u32>,
+        gas_cost_for_basic_block: &[u32],
         init: GuestProgramInit,
         debug_trace_execution: bool,
     ) -> Result<Self, Error> {
@@ -278,13 +303,16 @@ impl<S> CompiledModule<S> where S: Sandbox {
         let address_space = S::reserve_address_space().map_err(Error::from_display)?;
         let native_code_address = crate::sandbox::SandboxAddressSpace::native_code_address(&address_space);
         let mut program_assembler = Compiler::new(
+            config,
             instructions,
             exports,
             basic_block_by_jump_table_index,
             jump_table_index_by_basic_block,
+            gas_cost_for_basic_block,
             S::KIND,
             S::address_table(),
             S::vmctx_regs_offset(),
+            S::vmctx_gas_offset(),
             debug_trace_execution,
             native_code_address
         );
@@ -295,7 +323,7 @@ impl<S> CompiledModule<S> where S: Sandbox {
             .with_jump_table(result.jump_table)
             .with_sysreturn_address(result.sysreturn_address);
 
-        let sandbox_program = S::prepare_program(init, address_space).map_err(Error::from_display)?;
+        let sandbox_program = S::prepare_program(init, address_space, config.gas_metering).map_err(Error::from_display)?;
         let export_trampolines = result.export_trampolines.to_owned();
 
         Ok(CompiledModule {
@@ -362,6 +390,11 @@ impl<S> CompiledInstance<S> where S: Sandbox, Module: AsCompiledModule<S> {
 
         exec_args.set_call(address);
         exec_args.set_initial_regs(&config.initial_regs);
+        if self.module.gas_metering().is_some() {
+            if let Some(gas) = config.gas {
+                exec_args.set_gas(gas);
+            }
+        }
 
         fn wrap_on_hostcall<S>(on_hostcall: OnHostcall<'_>) -> impl for <'r> FnMut(u32, S::Access<'r>) -> Result<(), Trap> + '_ where S: Sandbox {
             move |hostcall, access| {
@@ -370,15 +403,21 @@ impl<S> CompiledInstance<S> where S: Sandbox, Module: AsCompiledModule<S> {
             }
         }
 
-
         let mut on_hostcall = wrap_on_hostcall(on_hostcall);
         exec_args.set_on_hostcall(&mut on_hostcall);
 
-        match self.sandbox.execute(exec_args) {
+        let result = match self.sandbox.execute(exec_args) {
             Ok(()) => Ok(()),
-            Err(ExecutionError::Error(error)) => Err(ExecutionError::Error(Error::from_display(error))),
             Err(ExecutionError::Trap(trap)) => Err(ExecutionError::Trap(trap)),
+            Err(ExecutionError::Error(error)) => return Err(ExecutionError::Error(Error::from_display(error))),
+            Err(ExecutionError::OutOfGas) => return Err(ExecutionError::OutOfGas),
+        };
+
+        if self.module.gas_metering().is_some() && self.sandbox.gas_remaining_impl().is_err() {
+            return Err(ExecutionError::OutOfGas);
         }
+
+        result
     }
 
     pub fn access(&'_ mut self) -> S::Access<'_> {

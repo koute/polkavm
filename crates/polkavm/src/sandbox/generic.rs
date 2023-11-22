@@ -3,14 +3,14 @@
 use polkavm_common::{
     error::{ExecutionError, Trap},
     program::Reg,
-    utils::{byte_slice_init, Access, AsUninitSliceMut},
+    utils::{byte_slice_init, Access, AsUninitSliceMut, Gas},
     zygote::{
         AddressTable,
         AddressTableRaw,
         CacheAligned,
         SandboxMemoryConfig,
         VM_RPC_FLAG_CLEAR_PROGRAM_AFTER_EXECUTION,
-        VM_RPC_FLAG_RECONFIGURE, VM_RPC_FLAG_RESET_MEMORY_AFTER_EXECUTION,
+        VM_RPC_FLAG_RESET_MEMORY_AFTER_EXECUTION,
         VM_ADDR_JUMP_TABLE,
         VM_ADDR_JUMP_TABLE_RETURN_TO_HOST,
         VM_SANDBOX_MAXIMUM_NATIVE_CODE_SIZE,
@@ -29,6 +29,7 @@ use std::sync::Arc;
 
 use super::{OnHostcall, SandboxKind, SandboxProgramInit, get_native_page_size};
 use crate::api::{BackendAccess, MemoryAccessError};
+use crate::config::GasMeteringKind;
 
 // On Linux don't depend on the `libc` crate to lower the number of dependencies.
 #[cfg(target_os = "linux")]
@@ -424,6 +425,8 @@ struct VmCtx {
     return_address: usize,
     return_stack_pointer: usize,
 
+    gas: u64,
+
     program_range: Range<u64>,
     trap_triggered: bool,
 
@@ -443,6 +446,7 @@ impl VmCtx {
             trap_triggered: false,
             program_range: 0..0,
 
+            gas: 0,
             regs: CacheAligned([0; REG_COUNT]),
             on_hostcall: None,
             sandbox: core::ptr::null_mut(),
@@ -550,6 +554,8 @@ struct SandboxProgramInner {
 
     code_memory: Mmap,
     code_length: usize,
+
+    gas_metering: Option<GasMeteringKind>,
 }
 
 impl super::SandboxProgram for SandboxProgram {
@@ -705,11 +711,10 @@ impl Sandbox {
     }
 
     fn execute_impl(&mut self, mut args: ExecuteArgs<Self>) -> Result<(), ExecutionError<Error>> {
-        if args.rpc_flags & VM_RPC_FLAG_RECONFIGURE != 0 {
+        if let Some(SandboxProgram(program)) = args.program {
             log::trace!("Reconfiguring sandbox...");
             self.clear_program()?;
 
-            let program = &args.program.unwrap().0;
             let current = &mut self.memory_config;
             let new = program.memory_config;
             if new.ro_data_size() > 0 {
@@ -805,6 +810,9 @@ impl Sandbox {
         }
 
         self.vmctx_mut().regs.copy_from_slice(args.initial_regs);
+        if let Some(gas) = args.get_gas(self.program.as_ref().and_then(|program| program.0.gas_metering)) {
+            self.vmctx_mut().gas = gas;
+        }
 
         let mut trap_triggered = false;
         if args.rpc_address != 0 {
@@ -833,6 +841,7 @@ impl Sandbox {
                 THREAD_VMCTX.with(|thread_ctx| core::ptr::write(thread_ctx.get(), vmctx));
 
                 let guest_memory = self.memory.as_ptr().cast::<u8>().add(self.guest_memory_offset);
+
                 core::arch::asm!(r#"
                     push rbp
                     push rbx
@@ -875,7 +884,6 @@ impl Sandbox {
                     lateout("r13") _,
                     inlateout("r14") vmctx => _,
                     in("r15") guest_memory,
-
                 );
 
                 THREAD_VMCTX.with(|thread_ctx| core::ptr::write(thread_ctx.get(), core::ptr::null_mut()));
@@ -922,7 +930,7 @@ impl super::Sandbox for Sandbox {
         Mmap::reserve_address_space(VM_SANDBOX_MAXIMUM_NATIVE_CODE_SIZE as usize + VM_SANDBOX_MAXIMUM_JUMP_TABLE_VIRTUAL_SIZE as usize)
     }
 
-    fn prepare_program(init: SandboxProgramInit, mut map: Self::AddressSpace) -> Result<Self::Program, Self::Error> {
+    fn prepare_program(init: SandboxProgramInit, mut map: Self::AddressSpace, gas_metering: Option<GasMeteringKind>) -> Result<Self::Program, Self::Error> {
         let native_page_size = get_native_page_size();
         let cfg = init.memory_config(native_page_size)?;
 
@@ -970,6 +978,7 @@ impl super::Sandbox for Sandbox {
             rw_data: init.rw_data().to_vec(),
             code_memory: map,
             code_length: init.code.len(),
+            gas_metering,
         })))
     }
 
@@ -1008,7 +1017,7 @@ impl super::Sandbox for Sandbox {
                 self.poison = Poison::Poisoned;
                 result
             }
-            result @ (Ok(()) | Err(ExecutionError::Trap(_))) => {
+            result @ (Ok(()) | Err(ExecutionError::Trap(_) | ExecutionError::OutOfGas)) => {
                 self.poison = Poison::None;
                 result
             }
@@ -1035,6 +1044,17 @@ impl super::Sandbox for Sandbox {
 
     fn vmctx_regs_offset() -> usize {
         get_field_offset!(VmCtx::new(), |base| base.regs())
+    }
+
+    fn vmctx_gas_offset() -> usize {
+        get_field_offset!(VmCtx::new(), |base| &base.gas)
+    }
+
+    fn gas_remaining_impl(&self) -> Result<Option<Gas>, super::OutOfGas> {
+        let Some(program) = self.program.as_ref() else { return Ok(None) };
+        if program.0.gas_metering.is_none() { return Ok(None) };
+        let value = self.vmctx().gas;
+        super::get_gas_remaining(value).map(Some)
     }
 }
 
@@ -1134,5 +1154,10 @@ impl<'a> Access<'a> for SandboxAccess<'a> {
 
     fn native_program_counter(&self) -> Option<u64> {
         self.sandbox.vmctx().native_program_counter
+    }
+
+    fn gas_remaining(&self) -> Option<Gas> {
+        use super::Sandbox;
+        self.sandbox.gas_remaining_impl().ok().unwrap_or(Some(Gas::MIN))
     }
 }

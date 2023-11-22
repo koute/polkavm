@@ -11,10 +11,10 @@ use polkavm_common::error::Trap;
 use polkavm_common::init::GuestProgramInit;
 use polkavm_common::program::{ExternFnPrototype, ExternTy, ProgramBlob, ProgramExport, ProgramImport};
 use polkavm_common::program::{FrameKind, Opcode, RawInstruction, Reg};
-use polkavm_common::utils::{Access, AsUninitSliceMut};
+use polkavm_common::utils::{Access, AsUninitSliceMut, Gas};
 
 use crate::caller::{Caller, CallerRaw};
-use crate::config::{BackendKind, Config, SandboxKind};
+use crate::config::{BackendKind, Config, GasMeteringKind, ModuleConfig, SandboxKind};
 use crate::error::{bail, Error, ExecutionError};
 use crate::interpreter::{InterpretedAccess, InterpretedInstance, InterpretedModule};
 use crate::tracer::Tracer;
@@ -130,6 +130,7 @@ struct ModulePrivate {
     compiled_module: CompiledModuleKind,
     interpreted_module: Option<InterpretedModule>,
     memory_config: GuestMemoryConfig,
+    gas_metering: Option<GasMeteringKind>,
 }
 
 if_compiler_is_supported! {
@@ -202,8 +203,12 @@ impl Module {
         &self.0.memory_config
     }
 
+    pub(crate) fn gas_metering(&self) -> Option<GasMeteringKind> {
+        self.0.gas_metering
+    }
+
     /// Creates a new module by deserializing the program from the given `bytes`.
-    pub fn new(engine: &Engine, bytes: impl AsRef<[u8]>) -> Result<Self, Error> {
+    pub fn new(engine: &Engine, config: &ModuleConfig, bytes: impl AsRef<[u8]>) -> Result<Self, Error> {
         let blob = match ProgramBlob::parse(bytes.as_ref()) {
             Ok(blob) => blob,
             Err(error) => {
@@ -211,11 +216,11 @@ impl Module {
             }
         };
 
-        Self::from_blob(engine, &blob)
+        Self::from_blob(engine, config, &blob)
     }
 
     /// Creates a new module from a deserialized program `blob`.
-    pub fn from_blob(engine: &Engine, blob: &ProgramBlob) -> Result<Self, Error> {
+    pub fn from_blob(engine: &Engine, config: &ModuleConfig, blob: &ProgramBlob) -> Result<Self, Error> {
         log::trace!("Parsing imports...");
         let mut imports = BTreeMap::new();
         for import in blob.imports() {
@@ -279,18 +284,32 @@ impl Module {
             .map(|(jump_table_index, nth_basic_block)| (nth_basic_block, jump_table_index as u32))
             .collect();
 
+        let mut gas_cost_for_basic_block: Vec<u32> = Vec::new();
+
         log::trace!("Parsing code...");
         let (instructions, instruction_by_basic_block) = {
             let mut instruction_by_basic_block = Vec::with_capacity(blob.code().len() / 4);
             instruction_by_basic_block.push(0);
+            if config.gas_metering.is_some() {
+                gas_cost_for_basic_block.push(0);
+            }
 
             let mut instructions = Vec::with_capacity(blob.code().len() / 4);
             for (nth_instruction, instruction) in blob.instructions().enumerate() {
                 let nth_instruction = nth_instruction as u32;
                 let instruction = instruction.map_err(Error::from_display)?;
+
+                if config.gas_metering.is_some() {
+                    // TODO: Come up with a better cost model.
+                    *gas_cost_for_basic_block.last_mut().unwrap() += 1;
+                }
+
                 match instruction.op() {
                     Opcode::fallthrough => {
                         instruction_by_basic_block.push(nth_instruction + 1);
+                        if config.gas_metering.is_some() {
+                            gas_cost_for_basic_block.push(0);
+                        }
                     }
                     Opcode::jump_and_link_register => {
                         let ra = instruction.reg1();
@@ -307,9 +326,15 @@ impl Module {
                         }
 
                         instruction_by_basic_block.push(nth_instruction + 1);
+                        if config.gas_metering.is_some() {
+                            gas_cost_for_basic_block.push(0);
+                        }
                     }
                     Opcode::trap => {
                         instruction_by_basic_block.push(nth_instruction + 1);
+                        if config.gas_metering.is_some() {
+                            gas_cost_for_basic_block.push(0);
+                        }
                     }
                     Opcode::branch_less_unsigned
                     | Opcode::branch_less_signed
@@ -319,6 +344,10 @@ impl Module {
                     | Opcode::branch_not_eq => {
                         instruction_by_basic_block.push(nth_instruction + 1);
                         maximum_seen_jump_target = core::cmp::max(maximum_seen_jump_target, instruction.raw_imm_or_reg());
+
+                        if config.gas_metering.is_some() {
+                            gas_cost_for_basic_block.push(0);
+                        }
                     }
                     Opcode::ecalli => {
                         let nr = instruction.raw_imm_or_reg();
@@ -332,6 +361,7 @@ impl Module {
             }
 
             instruction_by_basic_block.shrink_to_fit();
+            gas_cost_for_basic_block.shrink_to_fit();
             (instructions, instruction_by_basic_block)
         };
 
@@ -419,7 +449,16 @@ impl Module {
                         SandboxKind::Linux => {
                             #[cfg(target_os = "linux")]
                             {
-                                let module = CompiledModule::new(&instructions, &exports, &basic_block_by_jump_table_index, &jump_table_index_by_basic_block, init, debug_trace_execution)?;
+                                let module = CompiledModule::new(
+                                    config,
+                                    &instructions,
+                                    &exports,
+                                    &basic_block_by_jump_table_index,
+                                    &jump_table_index_by_basic_block,
+                                    &gas_cost_for_basic_block,
+                                    init,
+                                    debug_trace_execution
+                                )?;
                                 CompiledModuleKind::Linux(module)
                             }
 
@@ -430,7 +469,16 @@ impl Module {
                             }
                         },
                         SandboxKind::Generic => {
-                            let module = CompiledModule::new(&instructions, &exports, &basic_block_by_jump_table_index, &jump_table_index_by_basic_block, init, debug_trace_execution)?;
+                            let module = CompiledModule::new(
+                                config,
+                                &instructions,
+                                &exports,
+                                &basic_block_by_jump_table_index,
+                                &jump_table_index_by_basic_block,
+                                &gas_cost_for_basic_block,
+                                init,
+                                debug_trace_execution
+                            )?;
                             CompiledModuleKind::Generic(module)
                         }
                     }
@@ -443,7 +491,7 @@ impl Module {
         };
 
         let interpreted_module = if interpreter_enabled {
-            Some(InterpretedModule::new(init)?)
+            Some(InterpretedModule::new(init, gas_cost_for_basic_block)?)
         } else {
             None
         };
@@ -501,6 +549,7 @@ impl Module {
             compiled_module,
             interpreted_module,
             memory_config,
+            gas_metering: config.gas_metering,
         })))
     }
 
@@ -1436,14 +1485,14 @@ where
 
 if_compiler_is_supported! {
     {
-        pub enum BackendAccess<'a> {
+        pub(crate) enum BackendAccess<'a> {
             #[cfg(target_os = "linux")]
             CompiledLinux(<SandboxLinux as Sandbox>::Access<'a>),
             CompiledGeneric(<SandboxGeneric as Sandbox>::Access<'a>),
             Interpreted(InterpretedAccess<'a>),
         }
     } else {
-        pub enum BackendAccess<'a> {
+        pub(crate) enum BackendAccess<'a> {
             Interpreted(InterpretedAccess<'a>),
         }
     }
@@ -1502,6 +1551,10 @@ impl<'a> Access<'a> for BackendAccess<'a> {
 
     fn native_program_counter(&self) -> Option<u64> {
         access_backend!(self, |access| access.native_program_counter())
+    }
+
+    fn gas_remaining(&self) -> Option<Gas> {
+        access_backend!(self, |access| access.gas_remaining())
     }
 }
 
@@ -1625,6 +1678,19 @@ impl<T> Instance<T> {
         mutable.backend.access().get_reg(reg)
     }
 
+    /// Gets the amount of gas remaining, or `None` if gas metering is not enabled for this instance.
+    ///
+    /// Note that this being zero doesn't necessarily mean that the execution ran out of gas,
+    /// if the program ended up consuming *exactly* the amount of gas that it was provided with!
+    pub fn gas_remaining(&self) -> Option<Gas> {
+        let mut mutable = match self.0.mutable.lock() {
+            Ok(mutable) => mutable,
+            Err(poison) => poison.into_inner(),
+        };
+
+        mutable.backend.access().gas_remaining()
+    }
+
     /// Returns the PID of the sandbox corresponding to this instance.
     ///
     /// Will be `None` if the instance doesn't run in a separate process.
@@ -1643,6 +1709,7 @@ pub struct ExecutionConfig {
     pub(crate) reset_memory_after_execution: bool,
     pub(crate) clear_program_after_execution: bool,
     pub(crate) initial_regs: [u32; Reg::ALL_NON_ZERO.len()],
+    pub(crate) gas: Option<Gas>,
 }
 
 impl Default for ExecutionConfig {
@@ -1655,6 +1722,7 @@ impl Default for ExecutionConfig {
             reset_memory_after_execution: false,
             clear_program_after_execution: false,
             initial_regs,
+            gas: None,
         }
     }
 }
@@ -1675,6 +1743,11 @@ impl ExecutionConfig {
             self.initial_regs[reg as usize - 1] = value;
         }
 
+        self
+    }
+
+    pub fn set_gas(&mut self, gas: Gas) -> &mut Self {
+        self.gas = Some(gas);
         self
     }
 }
@@ -1837,6 +1910,9 @@ impl<T> Func<T> {
             Err(ExecutionError::Trap(trap)) => {
                 return Err(ExecutionError::Trap(trap));
             }
+            Err(ExecutionError::OutOfGas) => {
+                return Err(ExecutionError::OutOfGas);
+            }
         }
 
         if let Some(return_ty) = prototype.return_ty() {
@@ -1925,6 +2001,9 @@ where
             }
             Err(ExecutionError::Trap(trap)) => {
                 return Err(ExecutionError::Trap(trap));
+            }
+            Err(ExecutionError::OutOfGas) => {
+                return Err(ExecutionError::OutOfGas);
             }
         }
 

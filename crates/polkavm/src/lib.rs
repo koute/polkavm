@@ -55,12 +55,12 @@ if_compiler_is_supported! {
 pub use polkavm_common::{
     error::{ExecutionError, Trap},
     program::{ProgramBlob, Reg},
-    utils::AsUninitSliceMut,
+    utils::{AsUninitSliceMut, Gas},
 };
 
 pub use crate::api::{Engine, Func, FuncType, Instance, InstancePre, IntoExternFn, Linker, Module, TypedFunc, Val, ValType};
 pub use crate::caller::{Caller, CallerRef};
-pub use crate::config::{BackendKind, Config, SandboxKind};
+pub use crate::config::{BackendKind, Config, GasMeteringKind, ModuleConfig, SandboxKind};
 pub use crate::error::Error;
 
 #[cfg(test)]

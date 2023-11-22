@@ -8,7 +8,7 @@ fn main() {
 
     let config = Config::from_env().unwrap();
     let engine = Engine::new(&config).unwrap();
-    let module = Module::from_blob(&engine, &blob).unwrap();
+    let module = Module::from_blob(&engine, &Default::default(), &blob).unwrap();
     let mut linker = Linker::new(&engine);
 
     // Define a host function.

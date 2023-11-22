@@ -85,7 +85,7 @@ fn caller_and_caller_ref_work(config: Config) {
     let _ = env_logger::try_init();
     let blob = ProgramBlob::parse(RAW_BLOB).unwrap();
     let engine = Engine::new(&config).unwrap();
-    let module = Module::from_blob(&engine, &blob).unwrap();
+    let module = Module::from_blob(&engine, &Default::default(), &blob).unwrap();
     let mut linker = Linker::new(&engine);
 
     #[derive(Default)]
@@ -132,7 +132,7 @@ fn caller_split_works(config: Config) {
     let _ = env_logger::try_init();
     let blob = ProgramBlob::parse(RAW_BLOB).unwrap();
     let engine = Engine::new(&config).unwrap();
-    let module = Module::from_blob(&engine, &blob).unwrap();
+    let module = Module::from_blob(&engine, &Default::default(), &blob).unwrap();
     let mut linker = Linker::new(&engine);
 
     #[derive(Default)]
@@ -172,7 +172,7 @@ fn trapping_from_hostcall_handler_works(config: Config) {
     let _ = env_logger::try_init();
     let blob = ProgramBlob::parse(RAW_BLOB).unwrap();
     let engine = Engine::new(&config).unwrap();
-    let module = Module::from_blob(&engine, &blob).unwrap();
+    let module = Module::from_blob(&engine, &Default::default(), &blob).unwrap();
     let mut linker = Linker::new(&engine);
 
     enum Kind {
@@ -263,7 +263,7 @@ fn doom(config: Config, elf: &'static [u8]) {
     let _ = env_logger::try_init();
     let blob = get_blob(elf);
     let engine = Engine::new(&config).unwrap();
-    let module = Module::from_blob(&engine, &blob).unwrap();
+    let module = Module::from_blob(&engine, &Default::default(), &blob).unwrap();
     let mut linker = Linker::new(&engine);
 
     struct State {
@@ -396,7 +396,7 @@ fn pinky(config: Config) {
     let blob = get_blob(include_bytes!("../../../test-data/bench-pinky.elf.zst"));
 
     let engine = Engine::new(&config).unwrap();
-    let module = Module::from_blob(&engine, &blob).unwrap();
+    let module = Module::from_blob(&engine, &Default::default(), &blob).unwrap();
     let linker = Linker::new(&engine);
     let instance_pre = linker.instantiate_pre(&module).unwrap();
     let instance = instance_pre.instantiate().unwrap();

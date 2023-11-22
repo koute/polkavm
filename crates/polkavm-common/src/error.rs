@@ -17,6 +17,7 @@ impl std::error::Error for Trap {}
 pub enum ExecutionError<T> {
     Trap(Trap),
     Error(T),
+    OutOfGas,
 }
 
 impl<T> From<T> for ExecutionError<T> {
@@ -33,6 +34,7 @@ where
         match self {
             ExecutionError::Trap(trap) => trap.fmt(fmt),
             ExecutionError::Error(error) => error.fmt(fmt),
+            ExecutionError::OutOfGas => fmt.write_str("out of gas"),
         }
     }
 }

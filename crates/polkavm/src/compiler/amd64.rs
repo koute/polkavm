@@ -12,6 +12,7 @@ use polkavm_common::zygote::{
     VM_ADDR_JUMP_TABLE, VM_ADDR_VMCTX,
 };
 
+use crate::config::GasMeteringKind;
 use crate::compiler::{Compiler, SandboxKind};
 
 use Reg::Zero as Z;
@@ -20,6 +21,9 @@ const TMP_REG: NativeReg = rcx;
 
 /// The register used for the embedded sandbox to hold the base address of the guest's linear memory.
 const GENERIC_SANDBOX_MEMORY_REG: NativeReg = r15;
+
+/// The register used for the linux sandbox to hold the address of the VM context.
+const LINUX_SANDBOX_VMCTX_REG: NativeReg = r15;
 
 const fn conv_reg(reg: Reg) -> NativeReg {
     match reg {
@@ -471,16 +475,24 @@ impl<'a> Compiler<'a> {
         }
     }
 
-    fn load_vmctx_field_address(&mut self, reg: NativeReg, offset: usize) {
+    fn vmctx_field(&self, offset: usize) -> MemOp {
         match self.sandbox_kind {
             SandboxKind::Linux => {
-                let address = VM_ADDR_VMCTX + offset as u64;
-                self.push(mov_imm64(reg, address));
+                reg_indirect(RegSize::R64, LINUX_SANDBOX_VMCTX_REG + offset as i32)
             },
             SandboxKind::Generic => {
                 let offset = crate::sandbox::generic::GUEST_MEMORY_TO_VMCTX_OFFSET as i32 + offset as i32;
-                self.push(lea(RegSize::R64, reg, reg_indirect(RegSize::R64, GENERIC_SANDBOX_MEMORY_REG + offset)));
+                reg_indirect(RegSize::R64, GENERIC_SANDBOX_MEMORY_REG + offset)
             }
+        }
+    }
+
+    fn load_vmctx_field_address(&mut self, offset: usize) -> NativeReg {
+        if offset == 0 && matches!(self.sandbox_kind, SandboxKind::Linux) {
+            LINUX_SANDBOX_VMCTX_REG
+        } else {
+            self.push(lea(RegSize::R64, TMP_REG, self.vmctx_field(offset)));
+            TMP_REG
         }
     }
 
@@ -489,9 +501,9 @@ impl<'a> Compiler<'a> {
             todo!();
         }
 
-        self.load_vmctx_field_address(TMP_REG, self.vmctx_regs_offset);
+        let regs_base = self.load_vmctx_field_address(self.vmctx_regs_offset);
         for (nth, reg) in Reg::ALL_NON_ZERO.iter().copied().enumerate() {
-            self.push(store(Size::U32, reg_indirect(RegSize::R64, TMP_REG + nth as i32 * 4), conv_reg(reg)));
+            self.push(store(Size::U32, reg_indirect(RegSize::R64, regs_base + nth as i32 * 4), conv_reg(reg)));
         }
     }
 
@@ -500,9 +512,9 @@ impl<'a> Compiler<'a> {
             todo!();
         }
 
-        self.load_vmctx_field_address(TMP_REG, self.vmctx_regs_offset);
+        let regs_base = self.load_vmctx_field_address(self.vmctx_regs_offset);
         for (nth, reg) in Reg::ALL_NON_ZERO.iter().copied().enumerate() {
-            self.push(load(LoadKind::U32, conv_reg(reg), reg_indirect(RegSize::R64, TMP_REG + nth as i32 * 4)));
+            self.push(load(LoadKind::U32, conv_reg(reg), reg_indirect(RegSize::R64, regs_base + nth as i32 * 4)));
         }
     }
 
@@ -516,7 +528,17 @@ impl<'a> Compiler<'a> {
 
             let trampoline_label = self.asm.create_label();
             self.export_to_label.insert(export.address(), trampoline_label);
+
+            if matches!(self.sandbox_kind, SandboxKind::Linux) {
+                self.push(mov_imm64(LINUX_SANDBOX_VMCTX_REG, VM_ADDR_VMCTX));
+            }
             self.restore_registers_from_vmctx();
+
+            if self.gas_metering.is_some() {
+                // Did we enter again after running out of gas? If so don't even bother running anything, just immediately trap.
+                self.push(cmp((self.vmctx_field(self.vmctx_gas_offset), imm64(0))));
+                self.push(jcc_label32(Condition::Sign, self.trap_label));
+            }
 
             let target_label = self.get_or_forward_declare_label(export.address());
             self.push(jmp_label32(target_label));
@@ -578,6 +600,17 @@ impl<'a> Compiler<'a> {
     pub(crate) fn trace_execution(&mut self, nth_instruction: usize) {
         self.push(mov_imm(TMP_REG, imm32(nth_instruction as u32)));
         self.push(call_label32(self.trace_label));
+    }
+
+    pub(crate) fn emit_gas_metering(&mut self, kind: GasMeteringKind, cost: u32) {
+        let cost = cost as i32;
+        assert!(cost >= 0);
+
+        self.push(sub((self.vmctx_field(self.vmctx_gas_offset), imm64(cost))));
+        if matches!(kind, GasMeteringKind::Sync) {
+            self.push(cmp((self.vmctx_field(self.vmctx_gas_offset), imm64(0))));
+            self.push(jcc_label32(Condition::Sign, self.trap_label));
+        }
     }
 }
 
