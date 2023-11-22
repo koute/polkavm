@@ -326,8 +326,8 @@ pub const VMCTX_FUTEX_HOSTCALL: u32 = 3;
 pub const VMCTX_FUTEX_TRAP: u32 = 4;
 
 impl VmCtx {
-    /// Creates a fresh VM context.
-    pub const fn new() -> Self {
+    /// Creates a zeroed VM context.
+    pub const fn zeroed() -> Self {
         VmCtx {
             futex: CacheAligned(AtomicU32::new(VMCTX_FUTEX_BUSY)),
 
@@ -361,6 +361,13 @@ impl VmCtx {
             message_length: UnsafeCell::new(0),
             message_buffer: UnsafeCell::new([0; MESSAGE_BUFFER_SIZE]),
         }
+    }
+
+    /// Creates a fresh VM context.
+    pub const fn new() -> Self {
+        let mut vmctx = Self::zeroed();
+        vmctx.syscall_ffi.0.nth_instruction = UnsafeCell::new(SANDBOX_EMPTY_NTH_INSTRUCTION);
+        vmctx
     }
 
     // Define some accessor methods so that we don't have to update the rest of the codebase

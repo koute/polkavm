@@ -48,7 +48,8 @@ impl core::ops::Deref for VmCtx {
 #[no_mangle]
 #[link_section = ".vmctx"]
 #[used]
-pub static VMCTX: VmCtx = VmCtx(VmCtxInner::new());
+// Use the `zeroed` constructor to make sure this doesn't take up any space in the executable.
+pub static VMCTX: VmCtx = VmCtx(VmCtxInner::zeroed());
 
 #[panic_handler]
 fn panic(_: &core::panic::PanicInfo) -> ! {
@@ -647,7 +648,7 @@ pub unsafe extern "C" fn syscall_trace(nth_instruction: u32, rip: u64) {
     signal_host(VMCTX_FUTEX_HOSTCALL, SignalHostKind::Trace)
         .unwrap_or_else(|error| abort_with_error("failed to wait for the host process (trace)", error));
 
-    *VMCTX.nth_instruction().get() = !SANDBOX_EMPTY_NTH_INSTRUCTION;
+    *VMCTX.nth_instruction().get() = SANDBOX_EMPTY_NTH_INSTRUCTION;
     *VMCTX.rip().get() = SANDBOX_EMPTY_NATIVE_PROGRAM_COUNTER;
 
     if *VMCTX.hostcall().get() == polkavm_common::zygote::HOSTCALL_ABORT_EXECUTION {
