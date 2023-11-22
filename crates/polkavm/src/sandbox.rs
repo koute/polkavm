@@ -79,7 +79,7 @@ pub trait Sandbox: Sized {
     fn pid(&self) -> Option<u32>;
 }
 
-pub type OnHostcall<'a, T> = &'a mut dyn for<'r> FnMut(u64, <T as Sandbox>::Access<'r>) -> Result<(), Trap>;
+pub type OnHostcall<'a, T> = &'a mut dyn for<'r> FnMut(u32, <T as Sandbox>::Access<'r>) -> Result<(), Trap>;
 
 #[derive(Copy, Clone)]
 pub struct SandboxProgramInit<'a> {

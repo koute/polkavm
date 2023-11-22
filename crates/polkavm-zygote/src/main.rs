@@ -609,7 +609,7 @@ unsafe fn reset_memory() {
 #[link_section = ".text_syscall"]
 #[inline(never)]
 #[no_mangle]
-pub unsafe extern "C" fn trigger_syscall(kind: u32, arg_1: u64, arg_2: u64) {
+pub unsafe extern "C" fn trigger_syscall(kind: u32, arg_1: u32, arg_2: u64) {
     match kind {
         polkavm_common::zygote::SYSCALL_HOSTCALL => {
             trace!("syscall: hostcall triggered");
@@ -635,7 +635,7 @@ pub unsafe extern "C" fn trigger_syscall(kind: u32, arg_1: u64, arg_2: u64) {
         // Just for debugging. Normally should never be used.
         polkavm_common::zygote::SYSCALL_TRACE => {
             *VMCTX.hostcall().get() = polkavm_common::zygote::HOSTCALL_TRACE;
-            *VMCTX.nth_instruction().get() = arg_1 as u32;
+            *VMCTX.nth_instruction().get() = arg_1;
             *VMCTX.rip().get() = arg_2;
             signal_host(VMCTX_FUTEX_HOSTCALL, SignalHostKind::Trace)
                 .unwrap_or_else(|error| abort_with_error("failed to wait for the host process (trace)", error));

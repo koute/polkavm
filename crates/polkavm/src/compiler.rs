@@ -346,7 +346,7 @@ impl<S> CompiledInstance<S> where S: Sandbox, Module: AsCompiledModule<S> {
         exec_args.set_call(address);
         exec_args.set_initial_regs(&config.initial_regs);
 
-        fn wrap_on_hostcall<S>(on_hostcall: OnHostcall<'_>) -> impl for <'r> FnMut(u64, S::Access<'r>) -> Result<(), Trap> + '_ where S: Sandbox {
+        fn wrap_on_hostcall<S>(on_hostcall: OnHostcall<'_>) -> impl for <'r> FnMut(u32, S::Access<'r>) -> Result<(), Trap> + '_ where S: Sandbox {
             move |hostcall, access| {
                 let access: BackendAccess = access.into();
                 on_hostcall(hostcall, access)

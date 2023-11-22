@@ -492,7 +492,7 @@ impl<'a, 'b> InstructionVisitor for Visitor<'a, 'b> {
     fn ecalli(&mut self, imm: u32) -> Self::ReturnTy {
         if let Some(on_hostcall) = self.ctx.on_hostcall.as_mut() {
             let access = BackendAccess::Interpreted(self.inner.access());
-            (on_hostcall)(imm as u64, access).map_err(ExecutionError::Trap)?;
+            (on_hostcall)(imm, access).map_err(ExecutionError::Trap)?;
             self.inner.nth_instruction += 1;
             Ok(())
         } else {
