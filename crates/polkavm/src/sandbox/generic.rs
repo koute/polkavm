@@ -844,10 +844,13 @@ impl Sandbox {
                     // Fill in the return stack pointer.
                     mov [r14 + 8], rsp
 
-                    // Call into the guest program.
-                    call {entry_point}
+                    // Align the stack.
+                    sub rsp, 8
 
-                    // We will jump here in case of a trap.
+                    // Call into the guest program.
+                    jmp {entry_point}
+
+                    // We will jump here on exit.
                     1:
 
                     pop rbx
