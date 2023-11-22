@@ -416,6 +416,8 @@ unsafe fn trigger_trap(vmctx: &mut VmCtx) -> ! {
     sysreturn(vmctx);
 }
 
+const REG_COUNT: usize = polkavm_common::program::Reg::ALL_NON_ZERO.len();
+
 #[repr(C)]
 pub struct VmCtx {
     // NOTE: These two fields are accessed from inline assembly so they shouldn't be moved!
@@ -425,7 +427,7 @@ pub struct VmCtx {
     program_range: Range<u64>,
     trap_triggered: bool,
 
-    pub regs: CacheAligned<[u32; 13]>,
+    pub regs: CacheAligned<[u32; REG_COUNT]>,
     on_hostcall: Option<OnHostcall<'static, Sandbox>>,
     sandbox: *mut Sandbox,
     instruction_number: Option<u32>,
@@ -441,7 +443,7 @@ impl VmCtx {
             trap_triggered: false,
             program_range: 0..0,
 
-            regs: CacheAligned([0; 13]),
+            regs: CacheAligned([0; REG_COUNT]),
             on_hostcall: None,
             sandbox: core::ptr::null_mut(),
             instruction_number: None,
@@ -450,7 +452,7 @@ impl VmCtx {
     }
 
     #[inline(always)]
-    pub const fn regs(&self) -> &[u32; 13] {
+    pub const fn regs(&self) -> &[u32; REG_COUNT] {
         &self.regs.0
     }
 }

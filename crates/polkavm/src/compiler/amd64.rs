@@ -515,9 +515,6 @@ impl<'a> Compiler<'a> {
             todo!();
         }
 
-        assert_eq!(Reg::ALL_NON_ZERO.len(), core::mem::size_of_val(LinuxVmCtx::new().regs()) / 4);
-        assert_eq!(Reg::ALL_NON_ZERO.len(), core::mem::size_of_val(GenericVmCtx::new().regs()) / 4);
-
         self.load_regs_address(TMP_REG);
         for (nth, reg) in Reg::ALL_NON_ZERO.iter().copied().enumerate() {
             self.push(store(Size::U32, reg_indirect(RegSize::R64, TMP_REG + nth as i32 * 4), conv_reg(reg)));
