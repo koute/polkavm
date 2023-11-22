@@ -4,6 +4,7 @@ use polkavm_common::program::Reg as PReg;
 use polkavm_common::program::{self, FrameKind, LineProgramOp, Opcode, ProgramBlob, RawInstruction};
 use polkavm_common::utils::align_to_next_page_u64;
 use polkavm_common::varint;
+use polkavm_common::writer::{ProgramBlobBuilder, Writer};
 
 use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
@@ -5205,52 +5206,34 @@ pub fn program_from_elf(config: Config, data: &[u8]) -> Result<ProgramBlob, Prog
 
     log::trace!("Instruction count: {}", code.len());
 
-    let mut writer = Writer::default();
-    writer.push_raw_bytes(&program::BLOB_MAGIC);
-    writer.push_byte(program::BLOB_VERSION_V1);
+    let mut builder = ProgramBlobBuilder::new();
 
-    writer.push_section(program::SECTION_MEMORY_CONFIG, |writer| {
-        writer.push_varint(memory_config.bss_size);
-        writer.push_varint(memory_config.stack_size);
-    });
+    builder.set_bss_size(memory_config.bss_size);
+    builder.set_stack_size(memory_config.stack_size);
 
-    writer.push_section(program::SECTION_RO_DATA, |writer| {
-        for range in memory_config.ro_data {
-            match range {
-                DataRef::Section { section_index, range } => {
-                    let slice = &elf.section_by_index(section_index).data()[range];
-                    writer.push_raw_bytes(slice);
-                }
-                DataRef::Padding(bytes) => {
-                    for _ in 0..bytes {
-                        writer.push_byte(0);
+    let [ro_data, rw_data] = {
+        [memory_config.ro_data, memory_config.rw_data].map(|ranges| {
+            let mut buffer = Vec::new();
+            for range in ranges {
+                match range {
+                    DataRef::Section { section_index, range } => {
+                        let slice = &elf.section_by_index(section_index).data()[range];
+                        buffer.extend_from_slice(slice);
+                    }
+                    DataRef::Padding(bytes) => {
+                        let new_size = buffer.len() + bytes;
+                        buffer.resize(new_size, 0);
                     }
                 }
             }
-        }
-    });
+            buffer
+        })
+    };
 
-    writer.push_section(program::SECTION_RW_DATA, |writer| {
-        for range in memory_config.rw_data {
-            match range {
-                DataRef::Section { section_index, range } => {
-                    let slice = &elf.section_by_index(section_index).data()[range];
-                    writer.push_raw_bytes(slice);
-                }
-                DataRef::Padding(bytes) => {
-                    for _ in 0..bytes {
-                        writer.push_byte(0);
-                    }
-                }
-            }
-        }
-    });
+    builder.set_ro_data(ro_data);
+    builder.set_rw_data(rw_data);
 
-    writer.push_section(program::SECTION_IMPORTS, |writer| {
-        if import_metadata.is_empty() {
-            return;
-        }
-
+    {
         let mut import_metadata = import_metadata;
         import_metadata.sort_by(|a, b| {
             a.metadata
@@ -5259,112 +5242,103 @@ pub fn program_from_elf(config: Config, data: &[u8]) -> Result<ProgramBlob, Prog
                 .then_with(|| a.metadata.name().cmp(b.metadata.name()))
         });
 
-        writer.push_varint(import_metadata.len() as u32);
         for import in import_metadata {
-            writer.push_varint(import.metadata.index.expect("internal error: no index assigned to import"));
-            writer.push_function_prototype(import.metadata.prototype());
+            builder.add_import(
+                import.metadata.index.expect("internal error: no index assigned to import"),
+                import.metadata.prototype(),
+            );
         }
-    });
+    }
 
-    writer.push_section(program::SECTION_EXPORTS, |writer| {
-        if export_metadata.is_empty() {
-            return;
-        }
+    for meta in export_metadata {
+        let &block_target = section_to_block
+            .get(&meta.location)
+            .expect("internal error: export metadata has a non-block target location");
 
-        writer.push_varint(export_metadata.len() as u32);
-        for meta in export_metadata {
-            let &block_target = section_to_block
-                .get(&meta.location)
-                .expect("internal error: export metadata has a non-block target location");
-            let jump_target = jump_target_for_block[block_target.index()]
-                .expect("internal error: export metadata points to a block without a jump target assigned");
-            writer.push_varint(jump_target.static_target);
-            writer.push_function_prototype(&meta.prototype);
-        }
-    });
+        let jump_target = jump_target_for_block[block_target.index()]
+            .expect("internal error: export metadata points to a block without a jump target assigned");
 
-    writer.push_section(program::SECTION_JUMP_TABLE, |writer| {
-        for target in jump_table {
-            writer.push_varint(target);
-        }
-    });
+        builder.add_export(jump_target.static_target, &meta.prototype);
+    }
+
+    builder.set_jump_table(&jump_table);
 
     let mut locations_for_instruction: Vec<Option<Arc<[Location]>>> = Vec::with_capacity(code.len());
-    writer.push_section(program::SECTION_CODE, |writer| {
-        let mut buffer = [0; program::MAX_INSTRUCTION_LENGTH];
-        for (nth_inst, (source_stack, inst)) in code.into_iter().enumerate() {
-            let length = inst.serialize_into(&mut buffer);
-            writer.push_raw_bytes(&buffer[..length]);
+    let mut raw_code = Vec::with_capacity(code.len());
 
-            let mut function_name = None;
-            if !config.strip {
-                // Two or more addresses can point to the same instruction (e.g. in case of macro op fusion).
-                // Two or more instructions can also have the same address (e.g. in case of jump targets).
+    for (nth_inst, (source_stack, inst)) in code.into_iter().enumerate() {
+        raw_code.push(inst);
 
-                // TODO: Use a smallvec.
-                let mut list = Vec::new();
-                for source in source_stack.as_slice() {
-                    for offset in (source.offset_range.start..source.offset_range.end).step_by(4) {
-                        let target = SectionTarget {
-                            section_index: source.section_index,
-                            offset,
-                        };
+        let mut function_name = None;
+        if !config.strip {
+            // Two or more addresses can point to the same instruction (e.g. in case of macro op fusion).
+            // Two or more instructions can also have the same address (e.g. in case of jump targets).
 
-                        if let Some(locations) = location_map.get(&target) {
-                            if let Some(last) = list.last() {
-                                if locations == last {
-                                    // If we inlined a basic block from the same function do not repeat the same location.
-                                    break;
-                                }
-                            } else {
-                                function_name = locations[0].function_name.as_deref();
+            // TODO: Use a smallvec.
+            let mut list = Vec::new();
+            for source in source_stack.as_slice() {
+                for offset in (source.offset_range.start..source.offset_range.end).step_by(4) {
+                    let target = SectionTarget {
+                        section_index: source.section_index,
+                        offset,
+                    };
+
+                    if let Some(locations) = location_map.get(&target) {
+                        if let Some(last) = list.last() {
+                            if locations == last {
+                                // If we inlined a basic block from the same function do not repeat the same location.
+                                break;
                             }
-
-                            list.push(locations.clone());
-                            break;
+                        } else {
+                            function_name = locations[0].function_name.as_deref();
                         }
-                    }
 
-                    if list.is_empty() {
-                        // If the toplevel source doesn't have a location don't try the lower ones.
+                        list.push(locations.clone());
                         break;
                     }
                 }
 
                 if list.is_empty() {
-                    locations_for_instruction.push(None);
-                } else if list.len() == 1 {
-                    locations_for_instruction.push(list.into_iter().next())
-                } else {
-                    let mut new_list = Vec::new();
-                    for sublist in list {
-                        new_list.extend(sublist.iter().cloned());
-                    }
-
-                    locations_for_instruction.push(Some(new_list.into()));
+                    // If the toplevel source doesn't have a location don't try the lower ones.
+                    break;
                 }
             }
 
-            log::trace!(
-                "Code: 0x{source_address:x} [{function_name}] -> {source_stack} -> #{nth_inst}: {inst}",
-                source_address = {
-                    elf.section_by_index(source_stack.top().section_index)
-                        .original_address()
-                        .wrapping_add(source_stack.top().offset_range.start)
-                },
-                function_name = function_name.unwrap_or("")
-            );
-        }
-    });
+            if list.is_empty() {
+                locations_for_instruction.push(None);
+            } else if list.len() == 1 {
+                locations_for_instruction.push(list.into_iter().next())
+            } else {
+                let mut new_list = Vec::new();
+                for sublist in list {
+                    new_list.extend(sublist.iter().cloned());
+                }
 
-    if !config.strip {
-        emit_debug_info(&mut writer, &locations_for_instruction);
+                locations_for_instruction.push(Some(new_list.into()));
+            }
+        }
+
+        log::trace!(
+            "Code: 0x{source_address:x} [{function_name}] -> {source_stack} -> #{nth_inst}: {inst}",
+            source_address = {
+                elf.section_by_index(source_stack.top().section_index)
+                    .original_address()
+                    .wrapping_add(source_stack.top().offset_range.start)
+            },
+            function_name = function_name.unwrap_or("")
+        );
     }
 
-    writer.push_raw_bytes(&[program::SECTION_END_OF_FILE]);
+    builder.set_code(&raw_code);
 
-    log::debug!("Built a program of {} bytes", writer.blob.len());
-    let blob = ProgramBlob::parse(writer.blob)?;
+    if !config.strip {
+        emit_debug_info(&mut builder, &locations_for_instruction);
+    }
+
+    let raw_blob = builder.into_vec();
+
+    log::debug!("Built a program of {} bytes", raw_blob.len());
+    let blob = ProgramBlob::parse(raw_blob)?;
 
     // Sanity check that our debug info was properly emitted and can be parsed.
     if cfg!(debug_assertions) && !config.strip {
@@ -5422,76 +5396,6 @@ pub fn program_from_elf(config: Config, data: &[u8]) -> Result<ProgramBlob, Prog
     Ok(blob)
 }
 
-#[derive(Default)]
-struct Writer {
-    blob: Vec<u8>,
-}
-
-impl Writer {
-    fn push_raw_bytes(&mut self, slice: &[u8]) {
-        self.blob.extend_from_slice(slice);
-    }
-
-    fn push_byte(&mut self, byte: u8) {
-        self.blob.push(byte);
-    }
-
-    fn push_section(&mut self, section: u8, callback: impl FnOnce(&mut Self)) -> Range<usize> {
-        let section_position = self.blob.len();
-        self.blob.push(section);
-
-        // Reserve the space for the length varint.
-        let length_position = self.blob.len();
-        self.push_raw_bytes(&[0xff_u8; varint::MAX_VARINT_LENGTH]);
-
-        let payload_position = self.blob.len();
-        callback(self);
-
-        let payload_length: u32 = (self.blob.len() - payload_position).try_into().expect("section size overflow");
-        if payload_length == 0 {
-            // Nothing was written by the callback. Skip writing the section.
-            self.blob.truncate(section_position);
-            return 0..0;
-        }
-
-        // Write the length varint.
-        let length_length = varint::write_varint(payload_length, &mut self.blob[length_position..]);
-
-        // Drain any excess length varint bytes.
-        self.blob
-            .drain(length_position + length_length..length_position + varint::MAX_VARINT_LENGTH);
-        length_position + length_length..self.blob.len()
-    }
-
-    fn push_varint(&mut self, value: u32) {
-        let mut buffer = [0xff_u8; varint::MAX_VARINT_LENGTH];
-        let length = varint::write_varint(value, &mut buffer);
-        self.push_raw_bytes(&buffer[..length]);
-    }
-
-    fn push_u32(&mut self, value: u32) {
-        self.push_raw_bytes(&value.to_le_bytes());
-    }
-
-    fn push_bytes_with_length(&mut self, slice: &[u8]) {
-        self.push_varint(slice.len().try_into().expect("length overflow"));
-        self.push_raw_bytes(slice);
-    }
-
-    fn push_function_prototype(&mut self, meta: &FnMetadata) {
-        self.push_bytes_with_length(meta.name().as_bytes());
-        self.push_varint(meta.args().count() as u32);
-        for arg_ty in meta.args() {
-            self.push_byte(arg_ty as u8);
-        }
-        self.push_byte(meta.return_ty().map(|ty| ty as u8).unwrap_or(0));
-    }
-
-    fn len(&self) -> usize {
-        self.blob.len()
-    }
-}
-
 fn simplify_path(path: &str) -> Cow<str> {
     // TODO: Sanitize macOS and Windows paths.
     if let Some(p) = path.strip_prefix("/home/") {
@@ -5503,7 +5407,7 @@ fn simplify_path(path: &str) -> Cow<str> {
     path.into()
 }
 
-fn emit_debug_info(writer: &mut Writer, locations_for_instruction: &[Option<Arc<[Location]>>]) {
+fn emit_debug_info(builder: &mut ProgramBlobBuilder, locations_for_instruction: &[Option<Arc<[Location]>>]) {
     #[derive(Default)]
     struct DebugStringsBuilder<'a> {
         map: HashMap<Cow<'a, str>, u32>,
@@ -5602,12 +5506,12 @@ fn emit_debug_info(writer: &mut Writer, locations_for_instruction: &[Option<Arc<
     log::trace!("Location groups: {}", groups.len());
     dbg_strings.write_protected = true;
 
-    writer.push_section(program::SECTION_OPT_DEBUG_STRINGS, |writer| {
-        writer.push_raw_bytes(&dbg_strings.section);
-    });
-
+    let mut section_line_programs = Vec::new();
     let mut info_offsets = Vec::with_capacity(groups.len());
-    writer.push_section(program::SECTION_OPT_DEBUG_LINE_PROGRAMS, |writer| {
+    {
+        let mut writer = Writer::new(&mut section_line_programs);
+        let writer = &mut writer;
+
         let offset_base = writer.len();
         writer.push_byte(program::VERSION_DEBUG_LINE_PROGRAM_V1);
         for group in &groups {
@@ -5836,14 +5740,21 @@ fn emit_debug_info(writer: &mut Writer, locations_for_instruction: &[Option<Arc<
             state.flush_if_any_are_queued(writer);
             writer.push_byte(LineProgramOp::FinishProgram as u8);
         }
-    });
+    }
 
     assert_eq!(info_offsets.len(), groups.len());
-    writer.push_section(program::SECTION_OPT_DEBUG_LINE_PROGRAM_RANGES, |writer| {
+
+    let mut section_line_program_ranges = Vec::new();
+    {
+        let mut writer = Writer::new(&mut section_line_program_ranges);
         for (group, info_offset) in groups.iter().zip(info_offsets.into_iter()) {
             writer.push_u32(group.instruction_position.try_into().expect("overflow"));
             writer.push_u32((group.instruction_position + group.instruction_count).try_into().expect("overflow"));
             writer.push_u32(info_offset);
         }
-    });
+    }
+
+    builder.add_custom_section(program::SECTION_OPT_DEBUG_STRINGS, dbg_strings.section);
+    builder.add_custom_section(program::SECTION_OPT_DEBUG_LINE_PROGRAMS, section_line_programs);
+    builder.add_custom_section(program::SECTION_OPT_DEBUG_LINE_PROGRAM_RANGES, section_line_program_ranges);
 }
