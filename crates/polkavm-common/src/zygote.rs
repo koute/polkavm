@@ -248,13 +248,15 @@ impl<T> core::ops::DerefMut for CacheAligned<T> {
     }
 }
 
+const REG_COUNT: usize = crate::program::Reg::ALL_NON_ZERO.len();
+
 #[repr(C)]
 pub struct VmCtxSyscall {
     // NOTE: The order of fields here can matter for performance!
     /// The hostcall number that was triggered.
     pub hostcall: UnsafeCell<u32>,
     /// A dump of all of the registers of the VM.
-    pub regs: UnsafeCell<[u32; 13]>,
+    pub regs: UnsafeCell<[u32; REG_COUNT]>,
     /// The number of the instruction just about to be executed.
     ///
     /// Should be treated as empty if equal to `SANDBOX_EMPTY_NTH_INSTRUCTION`.
@@ -339,7 +341,7 @@ impl VmCtx {
 
             syscall_ffi: CacheAligned(VmCtxSyscall {
                 hostcall: UnsafeCell::new(0),
-                regs: UnsafeCell::new([0; 13]),
+                regs: UnsafeCell::new([0; REG_COUNT]),
                 rip: UnsafeCell::new(0),
                 nth_instruction: UnsafeCell::new(0),
             }),
@@ -379,7 +381,7 @@ impl VmCtx {
     }
 
     #[inline(always)]
-    pub const fn regs(&self) -> &UnsafeCell<[u32; 13]> {
+    pub const fn regs(&self) -> &UnsafeCell<[u32; REG_COUNT]> {
         &self.syscall_ffi.0.regs
     }
 
