@@ -10,10 +10,10 @@ use polkavm_common::{
     abi::{VM_ADDR_USER_MEMORY, VM_ADDR_USER_STACK_HIGH, VM_MAXIMUM_MEMORY_SIZE},
     utils::align_to_next_page_usize,
     zygote::{
-        VmCtx as VmCtxInner, SANDBOX_EMPTY_NATIVE_PROGRAM_COUNTER, SANDBOX_EMPTY_NTH_INSTRUCTION, VMCTX_FUTEX_BUSY, VMCTX_FUTEX_HOSTCALL,
-        VMCTX_FUTEX_IDLE, VMCTX_FUTEX_INIT, VMCTX_FUTEX_TRAP, VM_ADDR_JUMP_TABLE, VM_ADDR_JUMP_TABLE_RETURN_TO_HOST, VM_ADDR_NATIVE_CODE,
-        VM_ADDR_SIGSTACK, VM_RPC_FLAG_CLEAR_PROGRAM_AFTER_EXECUTION, VM_RPC_FLAG_RECONFIGURE, VM_RPC_FLAG_RESET_MEMORY_AFTER_EXECUTION,
-        VM_SANDBOX_MAXIMUM_JUMP_TABLE_VIRTUAL_SIZE, VM_SANDBOX_MAXIMUM_NATIVE_CODE_SIZE,
+        AddressTableRaw, VmCtx as VmCtxInner, SANDBOX_EMPTY_NATIVE_PROGRAM_COUNTER, SANDBOX_EMPTY_NTH_INSTRUCTION, VMCTX_FUTEX_BUSY,
+        VMCTX_FUTEX_HOSTCALL, VMCTX_FUTEX_IDLE, VMCTX_FUTEX_INIT, VMCTX_FUTEX_TRAP, VM_ADDR_JUMP_TABLE, VM_ADDR_JUMP_TABLE_RETURN_TO_HOST,
+        VM_ADDR_NATIVE_CODE, VM_ADDR_SIGSTACK, VM_RPC_FLAG_CLEAR_PROGRAM_AFTER_EXECUTION, VM_RPC_FLAG_RECONFIGURE,
+        VM_RPC_FLAG_RESET_MEMORY_AFTER_EXECUTION, VM_SANDBOX_MAXIMUM_JUMP_TABLE_VIRTUAL_SIZE, VM_SANDBOX_MAXIMUM_NATIVE_CODE_SIZE,
     },
 };
 use polkavm_linux_raw as linux_raw;
@@ -605,51 +605,64 @@ unsafe fn reset_memory() {
     }
 }
 
-// TODO: Split this into multiple functions.
-#[link_section = ".text_syscall"]
 #[inline(never)]
 #[no_mangle]
-pub unsafe extern "C" fn trigger_syscall(kind: u32, arg_1: u32, arg_2: u64) {
-    match kind {
-        polkavm_common::zygote::SYSCALL_HOSTCALL => {
-            trace!("syscall: hostcall triggered");
-            *VMCTX.hostcall().get() = arg_1;
-            signal_host(VMCTX_FUTEX_HOSTCALL, SignalHostKind::Normal)
-                .unwrap_or_else(|error| abort_with_error("failed to wait for the host process (hostcall)", error));
+pub unsafe extern "C" fn syscall_hostcall(hostcall: u32) {
+    trace!("syscall: hostcall triggered");
 
-            if *VMCTX.hostcall().get() == polkavm_common::zygote::HOSTCALL_ABORT_EXECUTION {
-                longjmp(&mut RESUME_IDLE_LOOP_JMPBUF, 1);
-            }
-        }
-        polkavm_common::zygote::SYSCALL_TRAP => {
-            trace!("syscall: trap triggered");
-            signal_host(VMCTX_FUTEX_TRAP, SignalHostKind::Normal)
-                .unwrap_or_else(|error| abort_with_error("failed to wait for the host process (trap)", error));
+    *VMCTX.hostcall().get() = hostcall;
+    signal_host(VMCTX_FUTEX_HOSTCALL, SignalHostKind::Normal)
+        .unwrap_or_else(|error| abort_with_error("failed to wait for the host process (hostcall)", error));
 
-            longjmp(&mut RESUME_IDLE_LOOP_JMPBUF, 1);
-        }
-        polkavm_common::zygote::SYSCALL_RETURN => {
-            trace!("syscall: return triggered");
-            longjmp(&mut RESUME_IDLE_LOOP_JMPBUF, 1);
-        }
-        // Just for debugging. Normally should never be used.
-        polkavm_common::zygote::SYSCALL_TRACE => {
-            *VMCTX.hostcall().get() = polkavm_common::zygote::HOSTCALL_TRACE;
-            *VMCTX.nth_instruction().get() = arg_1;
-            *VMCTX.rip().get() = arg_2;
-            signal_host(VMCTX_FUTEX_HOSTCALL, SignalHostKind::Trace)
-                .unwrap_or_else(|error| abort_with_error("failed to wait for the host process (trace)", error));
-
-            *VMCTX.nth_instruction().get() = !SANDBOX_EMPTY_NTH_INSTRUCTION;
-            *VMCTX.rip().get() = SANDBOX_EMPTY_NATIVE_PROGRAM_COUNTER;
-
-            if *VMCTX.hostcall().get() == polkavm_common::zygote::HOSTCALL_ABORT_EXECUTION {
-                longjmp(&mut RESUME_IDLE_LOOP_JMPBUF, 1);
-            }
-        }
-        _ => abort_with_message("unknown syscall triggered"),
+    if *VMCTX.hostcall().get() == polkavm_common::zygote::HOSTCALL_ABORT_EXECUTION {
+        longjmp(&mut RESUME_IDLE_LOOP_JMPBUF, 1);
     }
 }
+
+#[inline(never)]
+#[no_mangle]
+pub unsafe extern "C" fn syscall_trap() -> ! {
+    trace!("syscall: trap triggered");
+    signal_host(VMCTX_FUTEX_TRAP, SignalHostKind::Normal)
+        .unwrap_or_else(|error| abort_with_error("failed to wait for the host process (trap)", error));
+
+    longjmp(&mut RESUME_IDLE_LOOP_JMPBUF, 1);
+}
+
+#[inline(never)]
+#[no_mangle]
+pub unsafe extern "C" fn syscall_return() -> ! {
+    trace!("syscall: return triggered");
+    longjmp(&mut RESUME_IDLE_LOOP_JMPBUF, 1);
+}
+
+// Just for debugging. Normally should never be used.
+#[inline(never)]
+#[no_mangle]
+pub unsafe extern "C" fn syscall_trace(nth_instruction: u32, rip: u64) {
+    *VMCTX.hostcall().get() = polkavm_common::HOSTCALL_TRACE;
+    *VMCTX.nth_instruction().get() = nth_instruction;
+    *VMCTX.rip().get() = rip;
+
+    signal_host(VMCTX_FUTEX_HOSTCALL, SignalHostKind::Trace)
+        .unwrap_or_else(|error| abort_with_error("failed to wait for the host process (trace)", error));
+
+    *VMCTX.nth_instruction().get() = !SANDBOX_EMPTY_NTH_INSTRUCTION;
+    *VMCTX.rip().get() = SANDBOX_EMPTY_NATIVE_PROGRAM_COUNTER;
+
+    if *VMCTX.hostcall().get() == polkavm_common::zygote::HOSTCALL_ABORT_EXECUTION {
+        longjmp(&mut RESUME_IDLE_LOOP_JMPBUF, 1);
+    }
+}
+
+#[link_section = ".address_table"]
+#[no_mangle]
+pub static ADDRESS_TABLE: AddressTableRaw = AddressTableRaw {
+    syscall_hostcall,
+    syscall_trap,
+    syscall_return,
+    syscall_trace,
+};
 
 enum SignalHostKind {
     Normal,

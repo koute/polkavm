@@ -25,4 +25,9 @@ pub mod init;
 pub mod program;
 pub mod utils;
 pub mod varint;
+
+#[cfg(target_arch = "x86_64")]
 pub mod zygote;
+
+/// A special hostcall number set by the *guest* to trigger a trace.
+pub const HOSTCALL_TRACE: u32 = 0x80000000;

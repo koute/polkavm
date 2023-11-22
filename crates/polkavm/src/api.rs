@@ -1680,7 +1680,7 @@ fn on_hostcall<'a, T>(
 ) -> impl for<'r> FnMut(u32, BackendAccess<'r>) -> Result<(), Trap> + 'a {
     move |hostcall: u32, mut access: BackendAccess| -> Result<(), Trap> {
         if hostcall & (1 << 31) != 0 {
-            if hostcall == polkavm_common::zygote::HOSTCALL_TRACE {
+            if hostcall == polkavm_common::HOSTCALL_TRACE {
                 if let Some(tracer) = raw.tracer() {
                     return tracer.on_trace(&mut access);
                 }

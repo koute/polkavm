@@ -5,6 +5,8 @@ use polkavm_common::{
     program::Reg,
     utils::{byte_slice_init, Access, AsUninitSliceMut},
     zygote::{
+        AddressTable,
+        AddressTableRaw,
         CacheAligned,
         SandboxMemoryConfig,
         VM_RPC_FLAG_CLEAR_PROGRAM_AFTER_EXECUTION,
@@ -390,11 +392,9 @@ thread_local! {
     static THREAD_VMCTX: UnsafeCell<*mut VmCtx> = const { UnsafeCell::new(core::ptr::null_mut()) };
 }
 
-fn trigger_trap(vmctx: &mut VmCtx) -> ! {
+unsafe fn sysreturn(vmctx: &mut VmCtx) -> ! {
     debug_assert_ne!(vmctx.return_address, 0);
     debug_assert_ne!(vmctx.return_stack_pointer, 0);
-
-    vmctx.trap_triggered = true;
 
     // SAFETY: This function can only be called while we're executing guest code.
     unsafe {
@@ -409,6 +409,11 @@ fn trigger_trap(vmctx: &mut VmCtx) -> ! {
             options(noreturn)
         );
     }
+}
+
+unsafe fn trigger_trap(vmctx: &mut VmCtx) -> ! {
+    vmctx.trap_triggered = true;
+    sysreturn(vmctx);
 }
 
 #[repr(C)]
@@ -470,11 +475,13 @@ unsafe fn vmctx_mut_ptr(memory: &mut Mmap) -> *mut VmCtx {
     memory.as_mut_ptr().cast::<u8>().offset(get_guest_memory_offset() as isize + GUEST_MEMORY_TO_VMCTX_OFFSET).cast()
 }
 
-pub extern "C" fn handle_ecall(guest_memory: *mut c_void, hostcall: u32) {
-    // SAFETY: The pointer to the guest memory is always valid here.
-    let vmctx = unsafe {
-        &mut *guest_memory.cast::<u8>().offset(GUEST_MEMORY_TO_VMCTX_OFFSET).cast::<VmCtx>()
-    };
+unsafe fn conjure_vmctx<'a>() -> &'a mut VmCtx {
+    &mut *THREAD_VMCTX.with(|thread_ctx| *thread_ctx.get())
+}
+
+unsafe extern "C" fn syscall_hostcall(hostcall: u32) {
+    // SAFETY: We were called from the inside of the guest program, so vmctx must be valid.
+    let vmctx = unsafe { conjure_vmctx() };
 
     let Some(on_hostcall) = vmctx.on_hostcall.as_mut().take() else {
         trigger_trap(vmctx);
@@ -492,13 +499,12 @@ pub extern "C" fn handle_ecall(guest_memory: *mut c_void, hostcall: u32) {
     }
 }
 
-pub extern "C" fn handle_trace(guest_memory: *mut c_void, instruction_number: u32) {
-    // SAFETY: The pointer to the guest memory is always valid here.
-    let vmctx = unsafe {
-        &mut *guest_memory.cast::<u8>().offset(GUEST_MEMORY_TO_VMCTX_OFFSET).cast::<VmCtx>()
-    };
+unsafe extern "C" fn syscall_trace(instruction_number: u32, rip: u64) {
+    // SAFETY: We were called from the inside of the guest program, so vmctx must be valid.
+    let vmctx = unsafe { conjure_vmctx() };
 
     vmctx.instruction_number = Some(instruction_number);
+    vmctx.native_program_counter = Some(rip);
 
     let Some(on_hostcall) = vmctx.on_hostcall.as_mut().take() else {
         return;
@@ -510,10 +516,26 @@ pub extern "C" fn handle_trace(guest_memory: *mut c_void, instruction_number: u3
         &mut *vmctx.sandbox
     };
 
-    match on_hostcall(polkavm_common::zygote::HOSTCALL_TRACE, super::Sandbox::access(sandbox)) {
+    match on_hostcall(polkavm_common::HOSTCALL_TRACE, super::Sandbox::access(sandbox)) {
         Ok(()) => {}
         Err(_) => trigger_trap(vmctx)
     }
+}
+
+unsafe extern "C" fn syscall_trap() -> ! {
+    // SAFETY: We were called from the inside of the guest program, so vmctx must be valid.
+    let vmctx = unsafe { conjure_vmctx() };
+
+    // SAFETY: We were called from the inside of the guest program, so it's safe to trap.
+    trigger_trap(vmctx);
+}
+
+unsafe extern "C" fn syscall_return() -> ! {
+    // SAFETY: We were called from the inside of the guest program, so vmctx must be valid.
+    let vmctx = unsafe { conjure_vmctx() };
+
+    // SAFETY: We were called from the inside of the guest program, so it's safe to return.
+    sysreturn(vmctx);
 }
 
 #[derive(Clone)]
@@ -995,6 +1017,15 @@ impl super::Sandbox for Sandbox {
 
     fn pid(&self) -> Option<u32> {
         None
+    }
+
+    fn address_table() -> AddressTable {
+        AddressTable::from_raw(AddressTableRaw {
+            syscall_hostcall,
+            syscall_trap,
+            syscall_return,
+            syscall_trace,
+        })
     }
 }
 

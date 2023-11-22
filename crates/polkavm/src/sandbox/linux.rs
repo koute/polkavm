@@ -8,6 +8,7 @@ use polkavm_common::{
     program::Reg,
     utils::{align_to_next_page_usize, slice_assume_init_mut, Access, AsUninitSliceMut},
     zygote::{
+        AddressTable, AddressTablePacked,
         SandboxMemoryConfig, VmCtx, SANDBOX_EMPTY_NATIVE_PROGRAM_COUNTER, SANDBOX_EMPTY_NTH_INSTRUCTION, VMCTX_FUTEX_BUSY,
         VMCTX_FUTEX_HOSTCALL, VMCTX_FUTEX_IDLE, VMCTX_FUTEX_INIT, VMCTX_FUTEX_TRAP, VM_ADDR_NATIVE_CODE,
     },
@@ -262,10 +263,153 @@ impl Drop for ChildProcess {
 }
 
 #[cfg(polkavm_dev_use_built_zygote)]
-static ZYGOTE_BLOB: &[u8] = include_bytes!("../../polkavm-zygote/target/x86_64-unknown-linux-gnu/release/polkavm-zygote");
+const ZYGOTE_BLOB_CONST: &[u8] = include_bytes!("../../polkavm-zygote/target/x86_64-unknown-linux-gnu/release/polkavm-zygote");
 
 #[cfg(not(polkavm_dev_use_built_zygote))]
-static ZYGOTE_BLOB: &[u8] = include_bytes!("./polkavm-zygote");
+const ZYGOTE_BLOB_CONST: &[u8] = include_bytes!("./polkavm-zygote");
+
+static ZYGOTE_BLOB: &[u8] = ZYGOTE_BLOB_CONST;
+
+// Here we extract the necessary addresses directly from the zygote binary at compile time.
+const ZYGOTE_ADDRESS_TABLE: AddressTable = {
+    const fn starts_with(haystack: &[u8], needle: &[u8]) -> bool {
+        if haystack.len() < needle.len() {
+            return false;
+        }
+
+        let mut index = 0;
+        while index < needle.len() {
+            if haystack[index] != needle[index] {
+                return false;
+            }
+            index += 1;
+        }
+
+        true
+    }
+
+    const fn cast_slice<T>(slice: &[u8]) -> &T where T: Copy {
+        assert!(slice.len() >= core::mem::size_of::<T>());
+        assert!(core::mem::align_of::<T>() == 1);
+
+        // SAFETY: The size and alignment requirements of `T` were `assert`ed,
+        //         and it's `Copy` so it's guaranteed not to drop, so this is always safe.
+        unsafe {
+            &*slice.as_ptr().cast::<T>()
+        }
+    }
+
+    #[repr(C)]
+    #[derive(Copy, Clone)]
+    struct U16([u8; 2]);
+
+    impl U16 {
+        const fn get(self) -> u16 {
+            u16::from_ne_bytes(self.0)
+        }
+    }
+
+    #[repr(C)]
+    #[derive(Copy, Clone)]
+    struct U32([u8; 4]);
+
+    impl U32 {
+        const fn get(self) -> u32 {
+            u32::from_ne_bytes(self.0)
+        }
+    }
+
+    #[repr(C)]
+    #[derive(Copy, Clone)]
+    struct U64([u8; 8]);
+
+    impl U64 {
+        const fn get(self) -> u64 {
+            u64::from_ne_bytes(self.0)
+        }
+    }
+
+    #[repr(C)]
+    #[derive(Copy, Clone)]
+    struct ElfIdent {
+        magic: [u8; 4],
+        class: u8,
+        data: u8,
+        version: u8,
+        os_abi: u8,
+        abi_version: u8,
+        padding: [u8; 7],
+    }
+
+    #[repr(C)]
+    #[derive(Copy, Clone)]
+    struct ElfHeader {
+        e_ident: ElfIdent,
+        e_type: U16,
+        e_machine: U16,
+        e_version: U32,
+        e_entry: U64,
+        e_phoff: U64,
+        e_shoff: U64,
+        e_flags: U32,
+        e_ehsize: U16,
+        e_phentsize: U16,
+        e_phnum: U16,
+        e_shentsize: U16,
+        e_shnum: U16,
+        e_shstrndx: U16,
+    }
+
+    #[repr(C)]
+    #[derive(Copy, Clone)]
+    struct ElfSectionHeader {
+        sh_name: U32,
+        sh_type: U32,
+        sh_flags: U64,
+        sh_addr: U64,
+        sh_offset: U64,
+        sh_size: U64,
+        sh_link: U32,
+        sh_info: U32,
+        sh_addralign: U64,
+        sh_entsize: U64,
+    }
+
+    impl ElfHeader {
+        const fn section_header<'a>(&self, blob: &'a [u8], nth_section: u16) -> &'a ElfSectionHeader {
+            let size = self.e_shentsize.get() as usize;
+            assert!(size == core::mem::size_of::<ElfSectionHeader>());
+
+            let offset = self.e_shoff.get() as usize + nth_section as usize * size;
+            cast_slice(blob.split_at(offset).1)
+        }
+    }
+
+    impl ElfSectionHeader {
+        const fn data<'a>(&self, blob: &'a [u8]) -> &'a [u8] {
+            blob.split_at(self.sh_offset.get() as usize).1.split_at(self.sh_size.get() as usize).0
+        }
+    }
+
+    let header: &ElfHeader = cast_slice(ZYGOTE_BLOB_CONST);
+    let shstr = header.section_header(ZYGOTE_BLOB_CONST, header.e_shstrndx.get()).data(ZYGOTE_BLOB_CONST);
+
+    let mut address_table = None;
+    let mut nth_section = 0;
+    while nth_section < header.e_shnum.get() {
+        let section_header = header.section_header(ZYGOTE_BLOB_CONST, nth_section);
+        if starts_with(shstr.split_at(section_header.sh_name.get() as usize).1, b".address_table") {
+            let data = section_header.data(ZYGOTE_BLOB_CONST);
+            assert!(data.len() == core::mem::size_of::<AddressTablePacked>());
+            address_table = Some(AddressTable::from_packed(cast_slice::<AddressTablePacked>(data)));
+            break;
+        }
+        nth_section += 1;
+    }
+
+    let Some(address_table) = address_table else { panic!("broken zygote binary") };
+    address_table
+};
 
 fn prepare_sealed_memfd(name: &core::ffi::CStr, length: usize, populate: impl FnOnce(&mut [u8])) -> Result<Fd, Error> {
     let native_page_size = get_native_page_size();
@@ -1006,6 +1150,10 @@ impl super::Sandbox for Sandbox {
     fn pid(&self) -> Option<u32> {
         Some(self.child.pid as u32)
     }
+
+    fn address_table() -> AddressTable {
+        ZYGOTE_ADDRESS_TABLE
+    }
 }
 
 impl Sandbox {
@@ -1053,7 +1201,7 @@ impl Sandbox {
                 };
 
                 let hostcall = unsafe { *self.vmctx().hostcall().get() };
-                if hostcall == polkavm_common::zygote::HOSTCALL_TRACE {
+                if hostcall == polkavm_common::HOSTCALL_TRACE {
                     // When tracing aggressively spin to avoid having to call into the kernel.
                     spin_target = 512;
                 }

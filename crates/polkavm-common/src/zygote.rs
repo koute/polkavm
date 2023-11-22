@@ -8,6 +8,58 @@ use crate::utils::align_to_next_page_usize;
 use core::cell::UnsafeCell;
 use core::sync::atomic::{AtomicU32, AtomicU64};
 
+// Due to the limitations of Rust's compile time constant evaluation machinery
+// we need to define this struct multiple times.
+macro_rules! define_address_table {
+    ($($name:ident: $type:ty,)+) => {
+        #[repr(C)]
+        pub struct AddressTableRaw {
+            $(pub $name: $type),+
+        }
+
+        #[derive(Copy, Clone)]
+        #[repr(packed)]
+        pub struct AddressTablePacked {
+            $(pub $name: u64),+
+        }
+
+        #[derive(Copy, Clone)]
+        pub struct AddressTable {
+            $(pub $name: u64),+
+        }
+
+        impl AddressTable {
+            #[inline]
+            pub fn from_raw(table: AddressTableRaw) -> Self {
+                Self {
+                    $(
+                        $name: table.$name as u64
+                    ),+
+                }
+            }
+
+            pub const fn from_packed(table: &AddressTablePacked) -> Self {
+                Self {
+                    $(
+                        $name: table.$name
+                    ),+
+                }
+            }
+        }
+
+        static_assert!(core::mem::size_of::<AddressTableRaw>() == core::mem::size_of::<AddressTablePacked>());
+        static_assert!(core::mem::size_of::<AddressTableRaw>() == core::mem::size_of::<AddressTable>());
+    }
+}
+
+// These are the addresses exported from the zygote.
+define_address_table! {
+    syscall_hostcall: unsafe extern "C" fn(u32),
+    syscall_trap: unsafe extern "C" fn() -> !,
+    syscall_return: unsafe extern "C" fn() -> !,
+    syscall_trace: unsafe extern "C" fn(u32, u64),
+}
+
 /// The address where the native code starts inside of the VM.
 ///
 /// This is not directly accessible by the program running inside of the VM.
@@ -20,21 +72,6 @@ pub const VM_ADDR_JUMP_TABLE: u64 = 0x800000000;
 
 /// The address where the return-to-host jump table vector physically resides.
 pub const VM_ADDR_JUMP_TABLE_RETURN_TO_HOST: u64 = 0xffffe0000;
-
-/// The address of the native entry point used for triggering syscalls.
-pub const VM_ADDR_SYSCALL: u64 = 0x3ffffc000;
-
-// Constants used by the syscall handler in zygote to figure out what exact
-// kind of a syscall should be executed.
-//
-// TODO: Remove these. All of these should be separate functions.
-pub const SYSCALL_HOSTCALL: u32 = 1;
-pub const SYSCALL_TRAP: u32 = 2;
-pub const SYSCALL_RETURN: u32 = 3;
-pub const SYSCALL_TRACE: u32 = 4;
-
-/// A special hostcall number set by the *guest* to trigger a trace.
-pub const HOSTCALL_TRACE: u32 = 0x80000000;
 
 /// A special hostcall number set by the *host* to signal that the guest should stop executing the program.
 pub const HOSTCALL_ABORT_EXECUTION: u32 = !0;
