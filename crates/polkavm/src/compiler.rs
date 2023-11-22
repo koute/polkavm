@@ -6,7 +6,7 @@ use polkavm_common::error::{ExecutionError, Trap};
 use polkavm_common::init::GuestProgramInit;
 use polkavm_common::program::{InstructionVisitor, ProgramExport, RawInstruction};
 use polkavm_common::zygote::{
-    VM_COMPILER_MAXIMUM_EPILOGUE_LENGTH, VM_COMPILER_MAXIMUM_INSTRUCTION_LENGTH,
+    AddressTable, VM_COMPILER_MAXIMUM_EPILOGUE_LENGTH, VM_COMPILER_MAXIMUM_INSTRUCTION_LENGTH,
 };
 use polkavm_common::abi::VM_CODE_ADDRESS_ALIGNMENT;
 
@@ -37,6 +37,7 @@ struct Compiler<'a> {
     jump_table_label: Label,
     sandbox_kind: SandboxKind,
     native_code_address: u64,
+    address_table: AddressTable,
 
     /// Whether we're compiling a 64-bit program. Currently totally broken and mostly unimplemented.
     // TODO: Fix this.
@@ -52,12 +53,14 @@ struct CompilationResult<'a> {
 }
 
 impl<'a> Compiler<'a> {
+    #[allow(clippy::too_many_arguments)]
     fn new(
         instructions: &'a [RawInstruction],
         exports: &'a [ProgramExport<'a>],
         basic_block_by_jump_table_index: &'a [u32],
         jump_table_index_by_basic_block: &'a HashMap<u32, u32>,
         sandbox_kind: SandboxKind,
+        address_table: AddressTable,
         debug_trace_execution: bool,
         native_code_address: u64,
     ) -> Self {
@@ -86,6 +89,7 @@ impl<'a> Compiler<'a> {
             native_code_address,
             regs_are_64bit: false,
             debug_trace_execution,
+            address_table,
         }
     }
 
@@ -270,7 +274,7 @@ impl<S> CompiledModule<S> where S: Sandbox {
 
         let address_space = S::reserve_address_space().map_err(Error::from_display)?;
         let native_code_address = crate::sandbox::SandboxAddressSpace::native_code_address(&address_space);
-        let mut program_assembler = Compiler::new(instructions, exports, basic_block_by_jump_table_index, jump_table_index_by_basic_block, S::KIND, debug_trace_execution, native_code_address);
+        let mut program_assembler = Compiler::new(instructions, exports, basic_block_by_jump_table_index, jump_table_index_by_basic_block, S::KIND, S::address_table(), debug_trace_execution, native_code_address);
         let result = program_assembler.finalize()?;
 
         let init = SandboxProgramInit::new(init)

@@ -18,13 +18,15 @@ fn generate_linker_script() -> String {
             /* Section for zeroed read-write globals. */
             .bss : {{ *(.sbss) *(.sbss.*) *(.bss) *(.bss.*) }}
 
-            . = 0x{text_address:010x};
+            . = ALIGN(0x1000);
             /* Section for code. */
-            .text : {{ KEEP(*(.text_syscall)) *(.text_hot) *(.text .text.*) }}
+            .text : {{ *(.text_hot) *(.text .text.*) }}
 
             /* Global virtual machine context. Must be located at a statically known address. */
             . = 0x{vmctx_address:010x};
             .vmctx : {{ KEEP(*(.vmctx)) }}
+
+            .address_table (INFO) : {{ KEEP(*(.address_table)) }}
 
             /* Strip away junk we don't need. */
             /DISCARD/ : {{ *(.comment) *(.eh_frame) *(.eh_frame_hdr) }}
@@ -32,7 +34,6 @@ fn generate_linker_script() -> String {
 
         ENTRY(_start)
     "#,
-        text_address = polkavm_common::zygote::VM_ADDR_SYSCALL,
         vmctx_address = polkavm_common::zygote::VM_ADDR_VMCTX
     )
 }

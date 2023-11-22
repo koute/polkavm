@@ -6,6 +6,7 @@ use polkavm_common::{
     init::GuestProgramInit,
     program::Reg,
     zygote::{
+        AddressTable,
         SandboxMemoryConfig,
         VM_RPC_FLAG_CLEAR_PROGRAM_AFTER_EXECUTION,
         VM_RPC_FLAG_RECONFIGURE, VM_RPC_FLAG_RESET_MEMORY_AFTER_EXECUTION,
@@ -77,6 +78,7 @@ pub trait Sandbox: Sized {
     fn execute(&mut self, args: ExecuteArgs<Self>) -> Result<(), ExecutionError<Self::Error>>;
     fn access(&'_ mut self) -> Self::Access<'_>;
     fn pid(&self) -> Option<u32>;
+    fn address_table() -> AddressTable;
 }
 
 pub type OnHostcall<'a, T> = &'a mut dyn for<'r> FnMut(u32, <T as Sandbox>::Access<'r>) -> Result<(), Trap>;

@@ -9,7 +9,7 @@ use polkavm_common::program::{InstructionVisitor, Reg};
 use polkavm_common::abi::VM_CODE_ADDRESS_ALIGNMENT;
 use polkavm_common::zygote::{
     VmCtx as LinuxVmCtx,
-    SYSCALL_HOSTCALL, SYSCALL_RETURN, SYSCALL_TRACE, SYSCALL_TRAP, VM_ADDR_JUMP_TABLE, VM_ADDR_SYSCALL, VM_ADDR_VMCTX,
+    VM_ADDR_JUMP_TABLE, VM_ADDR_VMCTX,
 };
 
 use crate::compiler::{Compiler, SandboxKind};
@@ -587,16 +587,8 @@ impl<'a> Compiler<'a> {
         let label = self.asm.create_label();
 
         self.save_registers_to_vmctx();
-        match self.sandbox_kind {
-            SandboxKind::Linux => {
-                self.push(mov_imm64(TMP_REG, VM_ADDR_SYSCALL));
-                self.push(mov_imm(rdi, imm32(SYSCALL_RETURN)));
-                self.push(jmp(TMP_REG));
-            },
-            SandboxKind::Generic => {
-                self.push(ret());
-            }
-        }
+        self.push(mov_imm64(TMP_REG, self.address_table.syscall_return));
+        self.push(jmp(TMP_REG));
 
         label
     }
@@ -605,59 +597,28 @@ impl<'a> Compiler<'a> {
         log::trace!("Emitting trampoline: ecall");
         self.define_label(self.ecall_label);
 
-        match self.sandbox_kind {
-            SandboxKind::Linux => {
-                self.push(push(TMP_REG)); // Save the ecall number.
-                self.save_registers_to_vmctx();
-                self.push(mov_imm64(TMP_REG, VM_ADDR_SYSCALL));
-                self.push(mov_imm(rdi, imm32(SYSCALL_HOSTCALL)));
-                self.push(pop(rsi)); // Pop the ecall number as an argument.
-                self.push(call(TMP_REG));
-                self.restore_registers_from_vmctx();
-                self.push(ret());
-            },
-            SandboxKind::Generic => {
-                let handler_address = crate::sandbox::generic::handle_ecall as usize as u64;
-                self.push(push(TMP_REG)); // Save the ecall number.
-                self.save_registers_to_vmctx();
-                self.push(mov_imm64(TMP_REG, handler_address));
-                self.push(mov(RegSize::R64, rdi, GENERIC_SANDBOX_MEMORY_REG));
-                self.push(pop(rsi)); // Pop the ecall number as an argument.
-                self.push(call(TMP_REG));
-                self.restore_registers_from_vmctx();
-                self.push(ret());
-            }
-        }
+        self.push(push(TMP_REG)); // Save the ecall number.
+        self.save_registers_to_vmctx();
+        self.push(mov_imm64(TMP_REG, self.address_table.syscall_hostcall));
+        self.push(pop(rdi)); // Pop the ecall number as an argument.
+        self.push(call(TMP_REG));
+        self.restore_registers_from_vmctx();
+        self.push(ret());
+
     }
 
     pub(crate) fn emit_trace_trampoline(&mut self) {
         log::trace!("Emitting trampoline: trace");
         self.define_label(self.trace_label);
 
-        match self.sandbox_kind {
-            SandboxKind::Linux => {
-                self.push(push(TMP_REG)); // Save the instruction number.
-                self.save_registers_to_vmctx();
-                self.push(mov_imm64(TMP_REG, VM_ADDR_SYSCALL));
-                self.push(mov_imm(rdi, imm32(SYSCALL_TRACE)));
-                self.push(pop(rsi)); // Pop the instruction number as an argument.
-                self.push(load(LoadKind::U64, rdx, reg_indirect(RegSize::R64, rsp - 8))); // Grab the return address.
-                self.push(call(TMP_REG));
-                self.restore_registers_from_vmctx();
-                self.push(ret());
-            },
-            SandboxKind::Generic => {
-                let handler_address = crate::sandbox::generic::handle_trace as usize as u64;
-                self.push(push(TMP_REG)); // Save the instruction number.
-                self.save_registers_to_vmctx();
-                self.push(mov_imm64(TMP_REG, handler_address));
-                self.push(mov(RegSize::R64, rdi, GENERIC_SANDBOX_MEMORY_REG));
-                self.push(pop(rsi)); // Pop the instruction number as an argument.
-                self.push(call(TMP_REG));
-                self.restore_registers_from_vmctx();
-                self.push(ret());
-            }
-        }
+        self.push(push(TMP_REG)); // Save the instruction number.
+        self.save_registers_to_vmctx();
+        self.push(mov_imm64(TMP_REG, self.address_table.syscall_trace));
+        self.push(pop(rdi)); // Pop the instruction number as an argument.
+        self.push(load(LoadKind::U64, rsi, reg_indirect(RegSize::R64, rsp - 8))); // Grab the return address.
+        self.push(call(TMP_REG));
+        self.restore_registers_from_vmctx();
+        self.push(ret());
     }
 
     pub(crate) fn emit_trap_trampoline(&mut self) {
@@ -665,16 +626,8 @@ impl<'a> Compiler<'a> {
         self.define_label(self.trap_label);
 
         self.save_registers_to_vmctx();
-        match self.sandbox_kind {
-            SandboxKind::Linux => {
-                self.push(mov_imm64(TMP_REG, VM_ADDR_SYSCALL));
-                self.push(mov_imm(rdi, imm32(SYSCALL_TRAP)));
-                self.push(jmp(TMP_REG));
-            },
-            SandboxKind::Generic => {
-                self.push(ud2()); // TODO: FIXME
-            }
-        }
+        self.push(mov_imm64(TMP_REG, self.address_table.syscall_trap));
+        self.push(jmp(TMP_REG));
     }
 
     pub(crate) fn trace_execution(&mut self, nth_instruction: usize) {
