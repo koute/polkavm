@@ -30,8 +30,8 @@ macro_rules! get_field_offset {
 
 const TMP_REG: NativeReg = rcx;
 
-// The register used for the embedded sandbox to hold the base address of the guest's linear memory.
-const GUEST_MEMORY_REG: NativeReg = r15;
+/// The register used for the embedded sandbox to hold the base address of the guest's linear memory.
+const GENERIC_SANDBOX_MEMORY_REG: NativeReg = r15;
 
 const fn conv_reg(reg: Reg) -> NativeReg {
     match reg {
@@ -112,14 +112,14 @@ impl<'a> Compiler<'a> {
             self.push(add((TMP_REG, imm32(offset))));
         }
 
-        self.push(add((RegSize::R64, TMP_REG, GUEST_MEMORY_REG)));
+        self.push(add((RegSize::R64, TMP_REG, GENERIC_SANDBOX_MEMORY_REG)));
         if src_or_dst != Reg::Zero {
             cb(self, TMP_REG, conv_reg(src_or_dst));
         } else {
-            self.push(push(GUEST_MEMORY_REG));
-            self.push(xor((RegSize::R32, GUEST_MEMORY_REG, GUEST_MEMORY_REG)));
-            cb(self, TMP_REG, GUEST_MEMORY_REG);
-            self.push(pop(GUEST_MEMORY_REG));
+            self.push(push(GENERIC_SANDBOX_MEMORY_REG));
+            self.push(xor((RegSize::R32, GENERIC_SANDBOX_MEMORY_REG, GENERIC_SANDBOX_MEMORY_REG)));
+            cb(self, TMP_REG, GENERIC_SANDBOX_MEMORY_REG);
+            self.push(pop(GENERIC_SANDBOX_MEMORY_REG));
         }
     }
 
@@ -549,7 +549,7 @@ impl<'a> Compiler<'a> {
             },
             SandboxKind::Generic => {
                 let offset = crate::sandbox::generic::GUEST_MEMORY_TO_VMCTX_OFFSET as i32 + offset as i32;
-                self.push(lea(RegSize::R64, reg, reg_indirect(RegSize::R64, GUEST_MEMORY_REG + offset)));
+                self.push(lea(RegSize::R64, reg, reg_indirect(RegSize::R64, GENERIC_SANDBOX_MEMORY_REG + offset)));
             }
         }
     }
@@ -652,7 +652,7 @@ impl<'a> Compiler<'a> {
                 self.push(push(TMP_REG)); // Save the ecall number.
                 self.save_registers_to_vmctx();
                 self.push(mov_imm64(TMP_REG, handler_address));
-                self.push(mov(RegSize::R64, rdi, GUEST_MEMORY_REG));
+                self.push(mov(RegSize::R64, rdi, GENERIC_SANDBOX_MEMORY_REG));
                 self.push(pop(rsi)); // Pop the ecall number as an argument.
                 self.push(call(TMP_REG));
                 self.restore_registers_from_vmctx();
@@ -682,7 +682,7 @@ impl<'a> Compiler<'a> {
                 self.push(push(TMP_REG)); // Save the instruction number.
                 self.save_registers_to_vmctx();
                 self.push(mov_imm64(TMP_REG, handler_address));
-                self.push(mov(RegSize::R64, rdi, GUEST_MEMORY_REG));
+                self.push(mov(RegSize::R64, rdi, GENERIC_SANDBOX_MEMORY_REG));
                 self.push(pop(rsi)); // Pop the instruction number as an argument.
                 self.push(call(TMP_REG));
                 self.restore_registers_from_vmctx();
