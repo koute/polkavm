@@ -68,6 +68,15 @@ enum ShiftKind {
     ArithmeticRight,
 }
 
+fn zero_imm_from_size(kind: Size) -> ImmKind {
+    match kind {
+        Size::U8 => imm8(0),
+        Size::U16 => imm16(0),
+        Size::U32 => imm32(0),
+        Size::U64 => imm64(0),
+    }
+}
+
 impl<'a> Compiler<'a> {
     pub const PADDING_BYTE: u8 = 0x90; // NOP
 
@@ -132,36 +141,16 @@ impl<'a> Compiler<'a> {
             SandboxKind::Linux => {
                 match (src, base) {
                     // [address] = 0
-                    (Z, Z) => match kind {
-                        Size::U8 => self.push(mov_imm(abs(RegSize::R32, offset as i32), imm8(0))),
-                        Size::U16 => self.push(mov_imm(abs(RegSize::R32, offset as i32), imm16(0))),
-                        Size::U32 => self.push(mov_imm(abs(RegSize::R32, offset as i32), imm32(0))),
-                        Size::U64 => {
-                            self.push(xor((RegSize::R32, TMP_REG, TMP_REG)));
-                            self.push(store(Size::U64, abs(RegSize::R32, offset as i32), TMP_REG));
-                        }
-                    },
+                    (Z, Z) => self.push(mov_imm(abs(RegSize::R32, offset as i32), zero_imm_from_size(kind))),
 
                     // [address] = src
-                    (_, Z) => {
-                        self.push(store(kind, abs(RegSize::R32, offset as i32), conv_reg(src)));
-                    }
+                    (_, Z) => self.push(store(kind, abs(RegSize::R32, offset as i32), conv_reg(src))),
 
                     // [base + offset] = 0
-                    (Z, _) => match kind {
-                        Size::U8 => self.push(mov_imm(reg_indirect(RegSize::R32, conv_reg(base) + offset as i32), imm8(0))),
-                        Size::U16 => self.push(mov_imm(reg_indirect(RegSize::R32, conv_reg(base) + offset as i32), imm16(0))),
-                        Size::U32 => self.push(mov_imm(reg_indirect(RegSize::R32, conv_reg(base) + offset as i32), imm32(0))),
-                        Size::U64 => {
-                            self.push(xor((RegSize::R32, TMP_REG, TMP_REG)));
-                            self.push(store(kind, reg_indirect(RegSize::R32, conv_reg(base) + offset as i32), TMP_REG));
-                        }
-                    },
+                    (Z, _) => self.push(mov_imm(reg_indirect(RegSize::R32, conv_reg(base) + offset as i32), zero_imm_from_size(kind))),
 
                     // [base + offset] = src
-                    (_, _) => {
-                        self.push(store(kind, reg_indirect(RegSize::R32, conv_reg(base) + offset as i32), conv_reg(src)));
-                    }
+                    (_, _) => self.push(store(kind, reg_indirect(RegSize::R32, conv_reg(base) + offset as i32), conv_reg(src))),
                 }
             },
             SandboxKind::Generic => {
