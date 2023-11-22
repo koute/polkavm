@@ -954,6 +954,18 @@ pub mod addr {
         }
     }
 
+    impl From<(RegSize, Reg, MemOp)> for Operands {
+        fn from((reg_size, dst, src): (RegSize, Reg, MemOp)) -> Self {
+            Self::Reg_RegMem(reg_size.into(), dst, src.into())
+        }
+    }
+
+    impl From<(RegSize, RegIndex, MemOp)> for Operands {
+        fn from((reg_size, dst, src): (RegSize, RegIndex, MemOp)) -> Self {
+            Self::Reg_RegMem(reg_size.into(), dst.into(), src.into())
+        }
+    }
+
     impl From<(Reg, ImmKind)> for Operands {
         fn from((dst, imm): (Reg, ImmKind)) -> Self {
             Self::RegMem_Imm(RegMem::Reg(dst), imm)
@@ -963,6 +975,12 @@ pub mod addr {
     impl From<(RegIndex, ImmKind)> for Operands {
         fn from((dst, imm): (RegIndex, ImmKind)) -> Self {
             Self::RegMem_Imm(RegMem::Reg(dst.into()), imm)
+        }
+    }
+
+    impl From<(MemOp, ImmKind)> for Operands {
+        fn from((dst, imm): (MemOp, ImmKind)) -> Self {
+            Self::RegMem_Imm(RegMem::Mem(dst), imm)
         }
     }
 
