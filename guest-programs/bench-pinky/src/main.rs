@@ -1,26 +1,8 @@
 #![no_std]
 #![no_main]
 
-#[panic_handler]
-fn panic(_info: &core::panic::PanicInfo) -> ! {
-    #[cfg(target_family = "wasm")]
-    {
-        core::arch::wasm32::unreachable();
-    }
-
-    #[cfg(any(target_arch = "riscv32", target_arch = "riscv64"))]
-    unsafe {
-        core::arch::asm!("unimp", options(noreturn));
-    }
-
-    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
-    unsafe {
-        core::arch::asm!("ud2", options(noreturn));
-    }
-}
-
-#[global_allocator]
-static mut GLOBAL_ALLOC: simplealloc::SimpleAlloc<{ 256 * 1024 }> = simplealloc::SimpleAlloc::new();
+include!("../../bench-common.rs");
+global_allocator!(256 * 1024);
 
 use nes::Interface;
 

@@ -20,6 +20,9 @@ function build_benchmark() {
 
     echo "> Building: '$1' (native, i686)"
     RUSTFLAGS="$extra_flags" rustup run 1.72.1 cargo build -q --target=i686-unknown-linux-gnu --release --lib -p $1
+
+    echo "> Building: '$1' (CKB VM)"
+    RUSTFLAGS="$extra_flags -C link-arg=-s --cfg=target_ckb_vm" rustup run 1.72.1 cargo build -q --target=riscv64imac-unknown-none-elf --release --bin $1 -p $1
 }
 
 build_benchmark "bench-pinky"
