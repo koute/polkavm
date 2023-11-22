@@ -1,4 +1,7 @@
-use crate::{Caller, CallerRef, Config, Engine, ExecutionError, Linker, Module, ProgramBlob, Reg, Trap, Val};
+use crate::{
+    Caller, CallerRef, Config, Engine, ExecutionConfig, ExecutionError, Gas, GasMeteringKind, Linker, Module, ModuleConfig, ProgramBlob,
+    Reg, Trap, Val,
+};
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::rc::Rc;
@@ -442,6 +445,67 @@ fn pinky(config: Config) {
     }
 }
 
+fn basic_gas_metering(config: Config, gas_metering_kind: GasMeteringKind) {
+    let _ = env_logger::try_init();
+
+    let mut builder = ProgramBlobBuilder::new();
+    builder.add_export(0, &FnMetadata::new("main", &[], Some(I32)));
+    builder.set_code(&[asm::add_imm(A0, A0, 666), asm::ret()]);
+
+    let blob = ProgramBlob::parse(builder.into_vec()).unwrap();
+    let engine = Engine::new(&config).unwrap();
+    let mut module_config = ModuleConfig::default();
+    module_config.set_gas_metering(Some(gas_metering_kind));
+
+    let module = Module::from_blob(&engine, &module_config, &blob).unwrap();
+    let linker = Linker::new(&engine);
+    let instance_pre = linker.instantiate_pre(&module).unwrap();
+    let instance = instance_pre.instantiate().unwrap();
+
+    {
+        let mut config = ExecutionConfig::default();
+        config.set_gas(Gas::new(2).unwrap());
+
+        let result = instance.get_typed_func::<(), i32>("main").unwrap().call_ex(&mut (), (), config);
+        assert!(matches!(result, Ok(666)), "unexpected result: {result:?}");
+        assert_eq!(instance.gas_remaining().unwrap(), Gas::new(0).unwrap());
+    }
+
+    {
+        let mut config = ExecutionConfig::default();
+        config.set_gas(Gas::new(1).unwrap());
+
+        let result = instance.get_typed_func::<(), i32>("main").unwrap().call_ex(&mut (), (), config);
+        assert!(matches!(result, Err(ExecutionError::OutOfGas)), "unexpected result: {result:?}");
+        assert_eq!(instance.gas_remaining().unwrap(), Gas::new(0).unwrap());
+    }
+
+    {
+        let mut config = ExecutionConfig::default();
+        config.set_gas(Gas::new(4).unwrap());
+
+        let result = instance.get_typed_func::<(), i32>("main").unwrap().call_ex(&mut (), (), config);
+        assert!(matches!(result, Ok(666)), "unexpected result: {result:?}");
+        assert_eq!(instance.gas_remaining().unwrap(), Gas::new(2).unwrap());
+
+        let result = instance.get_typed_func::<(), i32>("main").unwrap().call(&mut (), ());
+        assert!(matches!(result, Ok(666)), "unexpected result: {result:?}");
+        assert_eq!(instance.gas_remaining().unwrap(), Gas::new(0).unwrap());
+
+        let result = instance.get_typed_func::<(), i32>("main").unwrap().call(&mut (), ());
+        assert_eq!(instance.gas_remaining().unwrap(), Gas::new(0).unwrap());
+        assert!(matches!(result, Err(ExecutionError::OutOfGas)), "unexpected result: {result:?}");
+    }
+}
+
+fn basic_gas_metering_sync(config: Config) {
+    basic_gas_metering(config, GasMeteringKind::Sync);
+}
+
+fn basic_gas_metering_async(config: Config) {
+    basic_gas_metering(config, GasMeteringKind::Async);
+}
+
 run_tests! {
     caller_and_caller_ref_work
     caller_split_works
@@ -450,4 +514,7 @@ run_tests! {
     doom_o1_dwarf5
     doom_o3_dwarf2
     pinky
+
+    basic_gas_metering_sync
+    basic_gas_metering_async
 }
