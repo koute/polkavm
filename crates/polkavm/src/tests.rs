@@ -4,6 +4,13 @@ use std::collections::HashMap;
 use std::rc::Rc;
 use std::sync::Mutex;
 
+use polkavm_common::abi::{VM_ADDR_USER_MEMORY, VM_PAGE_SIZE};
+use polkavm_common::elf::FnMetadata;
+use polkavm_common::program::asm;
+use polkavm_common::program::ExternTy::*;
+use polkavm_common::program::Reg::*;
+use polkavm_common::writer::ProgramBlobBuilder;
+
 macro_rules! run_tests {
     ($($test_name:ident)+) => {
         if_compiler_is_supported! {
@@ -78,12 +85,25 @@ macro_rules! run_tests {
     }
 }
 
-// TODO: Add a dedicated test blob.
-const RAW_BLOB: &[u8] = include_bytes!("../../../guest-programs/output/example-hello-world.polkavm");
+fn basic_test_blob() -> ProgramBlob<'static> {
+    let mut builder = ProgramBlobBuilder::new();
+    builder.set_bss_size(VM_PAGE_SIZE);
+    builder.add_export(0, &FnMetadata::new("main", &[I32, I32], Some(I32)));
+    builder.add_import(0, &FnMetadata::new("hostcall", &[], Some(I32)));
+    builder.set_code(&[
+        asm::load_imm(T0, 0x12345678),
+        asm::store_u32(T0, Reg::Zero, VM_ADDR_USER_MEMORY),
+        asm::add(S0, A0, A1),
+        asm::ecalli(0),
+        asm::add(A0, A0, S0),
+        asm::ret(),
+    ]);
+    ProgramBlob::parse(builder.into_vec()).unwrap()
+}
 
 fn caller_and_caller_ref_work(config: Config) {
     let _ = env_logger::try_init();
-    let blob = ProgramBlob::parse(RAW_BLOB).unwrap();
+    let blob = basic_test_blob();
     let engine = Engine::new(&config).unwrap();
     let module = Module::from_blob(&engine, &Default::default(), &blob).unwrap();
     let mut linker = Linker::new(&engine);
@@ -94,15 +114,15 @@ fn caller_and_caller_ref_work(config: Config) {
     }
 
     linker
-        .func_wrap("get_third_number", move |caller: Caller<State>| -> Result<u32, Trap> {
+        .func_wrap("hostcall", move |caller: Caller<State>| -> Result<u32, Trap> {
             {
-                let value = caller.read_u32(polkavm_common::abi::VM_ADDR_USER_STACK_HIGH - 4)?;
-                assert_eq!(value, polkavm_common::abi::VM_ADDR_RETURN_TO_HOST);
+                let value = caller.read_u32(VM_ADDR_USER_MEMORY)?;
+                assert_eq!(value, 0x12345678);
             }
             {
                 let caller = caller.into_ref();
-                let value = caller.read_u32(polkavm_common::abi::VM_ADDR_USER_STACK_HIGH - 4)?;
-                assert_eq!(value, polkavm_common::abi::VM_ADDR_RETURN_TO_HOST);
+                let value = caller.read_u32(VM_ADDR_USER_MEMORY)?;
+                assert_eq!(value, 0x12345678);
 
                 let illegal_contraband = caller.data().illegal_contraband.clone();
                 *illegal_contraband.borrow_mut() = Some(caller);
@@ -116,7 +136,7 @@ fn caller_and_caller_ref_work(config: Config) {
     let instance = instance_pre.instantiate().unwrap();
     let mut state = State::default();
     let result = instance
-        .get_typed_func::<(u32, u32), u32>("add_numbers")
+        .get_typed_func::<(u32, u32), u32>("main")
         .unwrap()
         .call(&mut state, (1, 10))
         .unwrap();
@@ -130,7 +150,7 @@ fn caller_and_caller_ref_work(config: Config) {
 
 fn caller_split_works(config: Config) {
     let _ = env_logger::try_init();
-    let blob = ProgramBlob::parse(RAW_BLOB).unwrap();
+    let blob = basic_test_blob();
     let engine = Engine::new(&config).unwrap();
     let module = Module::from_blob(&engine, &Default::default(), &blob).unwrap();
     let mut linker = Linker::new(&engine);
@@ -141,14 +161,14 @@ fn caller_split_works(config: Config) {
     }
 
     linker
-        .func_wrap("get_third_number", move |caller: Caller<State>| -> Result<u32, Trap> {
+        .func_wrap("hostcall", move |caller: Caller<State>| -> Result<u32, Trap> {
             {
-                let value = caller.read_u32(polkavm_common::abi::VM_ADDR_USER_STACK_HIGH - 4)?;
-                assert_eq!(value, polkavm_common::abi::VM_ADDR_RETURN_TO_HOST);
+                let value = caller.read_u32(VM_ADDR_USER_MEMORY)?;
+                assert_eq!(value, 0x12345678);
             }
             {
                 let (caller, state) = caller.split();
-                state.value = caller.read_u32(polkavm_common::abi::VM_ADDR_USER_STACK_HIGH - 4)?;
+                state.value = caller.read_u32(VM_ADDR_USER_MEMORY)?;
             }
 
             Ok(100)
@@ -159,18 +179,18 @@ fn caller_split_works(config: Config) {
     let instance = instance_pre.instantiate().unwrap();
     let mut state = State::default();
     let result = instance
-        .get_typed_func::<(u32, u32), u32>("add_numbers")
+        .get_typed_func::<(u32, u32), u32>("main")
         .unwrap()
         .call(&mut state, (1, 10))
         .unwrap();
 
     assert_eq!(result, 111);
-    assert_eq!(state.value, polkavm_common::abi::VM_ADDR_RETURN_TO_HOST);
+    assert_eq!(state.value, 0x12345678);
 }
 
 fn trapping_from_hostcall_handler_works(config: Config) {
     let _ = env_logger::try_init();
-    let blob = ProgramBlob::parse(RAW_BLOB).unwrap();
+    let blob = basic_test_blob();
     let engine = Engine::new(&config).unwrap();
     let module = Module::from_blob(&engine, &Default::default(), &blob).unwrap();
     let mut linker = Linker::new(&engine);
@@ -181,7 +201,7 @@ fn trapping_from_hostcall_handler_works(config: Config) {
     }
 
     linker
-        .func_wrap("get_third_number", move |caller: Caller<Kind>| -> Result<u32, Trap> {
+        .func_wrap("hostcall", move |caller: Caller<Kind>| -> Result<u32, Trap> {
             match *caller.data() {
                 Kind::Ok => Ok(100),
                 Kind::Trap => Err(Trap::default()),
@@ -193,25 +213,25 @@ fn trapping_from_hostcall_handler_works(config: Config) {
     let instance = instance_pre.instantiate().unwrap();
 
     let result = instance
-        .get_typed_func::<(u32, u32), u32>("add_numbers")
+        .get_typed_func::<(u32, u32), u32>("main")
         .unwrap()
         .call(&mut Kind::Ok, (1, 10));
     assert!(matches!(result, Ok(111)));
 
     let result = instance
-        .get_typed_func::<(u32, u32), u32>("add_numbers")
+        .get_typed_func::<(u32, u32), u32>("main")
         .unwrap()
         .call(&mut Kind::Trap, (1, 10));
     assert!(matches!(result, Err(ExecutionError::Trap(..))));
 
     let result = instance
-        .get_func("add_numbers")
+        .get_func("main")
         .unwrap()
         .call(&mut Kind::Ok, &[Val::from(1), Val::from(10)]);
     assert!(matches!(result, Ok(Some(Val::I32(111)))));
 
     let result = instance
-        .get_func("add_numbers")
+        .get_func("main")
         .unwrap()
         .call(&mut Kind::Trap, &[Val::from(1), Val::from(10)]);
     assert!(matches!(result, Err(ExecutionError::Trap(..))));
