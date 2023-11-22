@@ -1358,7 +1358,13 @@ pub mod inst {
             (fmt.write_fmt(core::format_args!("sar {}, cl", self.1.display(Size::from(self.0))))),
 
         sar_imm(RegSize, RegMem, u8) =>
-            Inst::new(0xc1).rex_64b_if(matches!(self.0, RegSize::R64)).regmem(self.1).modrm_opext(0b111).imm8(self.2).encode(),
+            {
+                if self.2 == 1 {
+                    Inst::new(0xd1)
+                } else {
+                    Inst::new(0xc1).imm8(self.2)
+                }.rex_64b_if(matches!(self.0, RegSize::R64)).regmem(self.1).modrm_opext(0b111).encode()
+            },
             (fmt.write_fmt(core::format_args!("sar {}, 0x{:x}", self.1.display(Size::from(self.0)), self.2))),
 
         shl_cl(RegSize, RegMem) =>
@@ -1366,7 +1372,13 @@ pub mod inst {
             (fmt.write_fmt(core::format_args!("shl {}, cl", self.1.display(Size::from(self.0))))),
 
         shl_imm(RegSize, RegMem, u8) =>
-            Inst::new(0xc1).rex_64b_if(matches!(self.0, RegSize::R64)).regmem(self.1).modrm_opext(0b100).imm8(self.2).encode(),
+            {
+                if self.2 == 1 {
+                    Inst::new(0xd1)
+                } else {
+                    Inst::new(0xc1).imm8(self.2)
+                }.rex_64b_if(matches!(self.0, RegSize::R64)).regmem(self.1).modrm_opext(0b100).encode()
+            },
             (fmt.write_fmt(core::format_args!("shl {}, 0x{:x}", self.1.display(Size::from(self.0)), self.2))),
 
         shr_cl(RegSize, RegMem) =>
@@ -1374,12 +1386,24 @@ pub mod inst {
             (fmt.write_fmt(core::format_args!("shr {}, cl", self.1.display(Size::from(self.0))))),
 
         shr_imm(RegSize, RegMem, u8) =>
-            Inst::new(0xc1).rex_64b_if(matches!(self.0, RegSize::R64)).regmem(self.1).modrm_opext(0b101).imm8(self.2).encode(),
+            {
+                if self.2 == 1 {
+                    Inst::new(0xd1)
+                } else {
+                    Inst::new(0xc1).imm8(self.2)
+                }.rex_64b_if(matches!(self.0, RegSize::R64)).regmem(self.1).modrm_opext(0b101).encode()
+            },
             (fmt.write_fmt(core::format_args!("shr {}, 0x{:x}", self.1.display(Size::from(self.0)), self.2))),
 
         // https://www.felixcloutier.com/x86/rcl:rcr:rol:ror
         ror_imm(RegSize, RegMem, u8) =>
-            Inst::new(0xc1).rex_64b_if(matches!(self.0, RegSize::R64)).regmem(self.1).modrm_opext(0b001).imm8(self.2).encode(),
+            {
+                if self.2 == 1 {
+                    Inst::new(0xd1)
+                } else {
+                    Inst::new(0xc1).imm8(self.2)
+                }.rex_64b_if(matches!(self.0, RegSize::R64)).regmem(self.1).modrm_opext(0b001).encode()
+            },
             (fmt.write_fmt(core::format_args!("ror {}, 0x{:x}", self.1.display(Size::from(self.0)), self.2))),
 
         // https://www.felixcloutier.com/x86/test
@@ -1941,7 +1965,7 @@ mod tests {
     #[cfg(test)]
     impl GenerateTestValues for u8 {
         fn generate_test_values(cb: impl FnMut(Self)) {
-            [0, 0x7f, 0x80, 0x81, 0xfe, 0xff].into_iter().for_each(cb);
+            [0, 1, 31, 0x7f, 0x80, 0x81, 0xfe, 0xff].into_iter().for_each(cb);
         }
     }
 
