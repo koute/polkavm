@@ -26,6 +26,9 @@ pub mod program;
 pub mod utils;
 pub mod varint;
 
+#[cfg(feature = "alloc")]
+pub mod writer;
+
 #[cfg(target_arch = "x86_64")]
 pub mod zygote;
 
