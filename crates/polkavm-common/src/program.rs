@@ -174,6 +174,42 @@ macro_rules! define_opcodes {
             }
         }
 
+        pub mod asm {
+            use super::{RawInstruction, Opcode, Reg};
+
+            $(
+                pub fn $name_argless() -> RawInstruction {
+                    RawInstruction::new_argless(Opcode::$name_argless)
+                }
+            )+
+
+            $(
+                pub fn $name_with_imm(imm: u32) -> RawInstruction {
+                    RawInstruction::new_with_imm(Opcode::$name_with_imm, imm)
+                }
+            )+
+
+            $(
+                pub fn $name_with_regs3(reg1: Reg, reg2: Reg, reg3: Reg) -> RawInstruction {
+                    RawInstruction::new_with_regs3(Opcode::$name_with_regs3, reg1, reg2, reg3)
+                }
+            )+
+
+            $(
+                pub fn $name_with_regs2_imm(reg1: Reg, reg2: Reg, imm: u32) -> RawInstruction {
+                    RawInstruction::new_with_regs2_imm(Opcode::$name_with_regs2_imm, reg1, reg2, imm)
+                }
+            )+
+
+            pub fn ret() -> RawInstruction {
+                jump_and_link_register(Reg::Zero, Reg::RA, 0)
+            }
+
+            pub fn load_imm(dst: Reg, value: u32) -> RawInstruction {
+                add_imm(dst, Reg::Zero, value)
+            }
+        }
+
         define_opcodes!(
             @impl_shared
             $($name_argless = $value_argless,)+
