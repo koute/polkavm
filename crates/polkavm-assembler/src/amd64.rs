@@ -441,6 +441,12 @@ impl From<Reg> for RegMem {
     }
 }
 
+impl From<RegIndex> for RegMem {
+    fn from(reg: RegIndex) -> Self {
+        RegMem::Reg(reg.into())
+    }
+}
+
 impl From<MemOp> for RegMem {
     fn from(mem: MemOp) -> Self {
         RegMem::Mem(mem)
@@ -870,8 +876,22 @@ pub mod addr {
         }
     }
 
+    impl core::ops::Add<i32> for RegIndex {
+        type Output = (RegIndex, i32);
+        fn add(self, offset: i32) -> Self::Output {
+            (self, offset)
+        }
+    }
+
     impl core::ops::Sub<i32> for Reg {
         type Output = (Reg, i32);
+        fn sub(self, offset: i32) -> Self::Output {
+            (self, -offset)
+        }
+    }
+
+    impl core::ops::Sub<i32> for RegIndex {
+        type Output = (RegIndex, i32);
         fn sub(self, offset: i32) -> Self::Output {
             (self, -offset)
         }
@@ -889,10 +909,24 @@ pub mod addr {
         }
     }
 
+    impl IntoMemOp for RegIndex {
+        #[doc(hidden)]
+        fn into_mem_op(self, segment: Option<SegReg>, reg_size: RegSize) -> MemOp {
+            MemOp::BaseOffset(segment, reg_size, self.into(), 0)
+        }
+    }
+
     impl IntoMemOp for (Reg, i32) {
         #[doc(hidden)]
         fn into_mem_op(self, segment: Option<SegReg>, reg_size: RegSize) -> MemOp {
             MemOp::BaseOffset(segment, reg_size, self.0, self.1)
+        }
+    }
+
+    impl IntoMemOp for (RegIndex, i32) {
+        #[doc(hidden)]
+        fn into_mem_op(self, segment: Option<SegReg>, reg_size: RegSize) -> MemOp {
+            MemOp::BaseOffset(segment, reg_size, self.0.into(), self.1)
         }
     }
 
@@ -904,15 +938,31 @@ pub mod addr {
         MemOp::Offset(None, reg_size, offset)
     }
 
+    pub fn base_index(reg_size: RegSize, base: impl Into<Reg>, index: RegIndex) -> MemOp {
+        MemOp::BaseIndexScaleOffset(None, reg_size, base.into(), index, Scale::x1, 0)
+    }
+
     impl From<(RegSize, Reg, Reg)> for Operands {
         fn from((reg_size, dst, src): (RegSize, Reg, Reg)) -> Self {
             Self::RegMem_Reg(reg_size.into(), RegMem::Reg(dst), src)
         }
     }
 
+    impl From<(RegSize, RegIndex, RegIndex)> for Operands {
+        fn from((reg_size, dst, src): (RegSize, RegIndex, RegIndex)) -> Self {
+            Self::RegMem_Reg(reg_size.into(), RegMem::Reg(dst.into()), src.into())
+        }
+    }
+
     impl From<(Reg, ImmKind)> for Operands {
         fn from((dst, imm): (Reg, ImmKind)) -> Self {
             Self::RegMem_Imm(RegMem::Reg(dst), imm)
+        }
+    }
+
+    impl From<(RegIndex, ImmKind)> for Operands {
+        fn from((dst, imm): (RegIndex, ImmKind)) -> Self {
+            Self::RegMem_Imm(RegMem::Reg(dst.into()), imm)
         }
     }
 
