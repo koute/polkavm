@@ -285,7 +285,7 @@ pub enum MemOp {
     /// [segment:base * scale + offset]
     IndexScaleOffset(Option<SegReg>, RegSize, RegIndex, Scale, i32),
     /// [segment:offset]
-    Offset(Option<SegReg>, i32),
+    Offset(Option<SegReg>, RegSize, i32),
     /// [segment:rip + offset]
     RipRelative(Option<SegReg>, i32),
 }
@@ -327,13 +327,15 @@ impl MemOp {
 
 impl core::fmt::Display for MemOp {
     fn fmt(&self, fmt: &mut core::fmt::Formatter) -> core::fmt::Result {
-        let (segment, base, index, offset) = match self.simplify() {
-            MemOp::BaseOffset(segment, reg_size, base, offset) => (segment, Some((reg_size, base)), None, offset),
+        let (segment, base, index, offset_reg_size, offset) = match self.simplify() {
+            MemOp::BaseOffset(segment, reg_size, base, offset) => (segment, Some((reg_size, base)), None, reg_size, offset),
             MemOp::BaseIndexScaleOffset(segment, reg_size, base, index, scale, offset) => {
-                (segment, Some((reg_size, base)), Some((reg_size, index, scale)), offset)
+                (segment, Some((reg_size, base)), Some((reg_size, index, scale)), reg_size, offset)
             }
-            MemOp::IndexScaleOffset(segment, reg_size, index, scale, offset) => (segment, None, Some((reg_size, index, scale)), offset),
-            MemOp::Offset(segment, offset) => (segment, None, None, offset),
+            MemOp::IndexScaleOffset(segment, reg_size, index, scale, offset) => {
+                (segment, None, Some((reg_size, index, scale)), reg_size, offset)
+            }
+            MemOp::Offset(segment, reg_size, offset) => (segment, None, None, reg_size, offset),
             MemOp::RipRelative(segment, offset) => {
                 fmt.write_str("[")?;
                 if let Some(segment) = segment {
@@ -381,9 +383,17 @@ impl core::fmt::Display for MemOp {
             if base.is_some() || index.is_some() {
                 if offset > 0 {
                     fmt.write_fmt(core::format_args!("+0x{:x}", offset))?;
+                } else if offset_reg_size == RegSize::R32 {
+                    if let Some(offset) = offset.checked_neg() {
+                        fmt.write_fmt(core::format_args!("-0x{:x}", offset))?;
+                    } else {
+                        fmt.write_fmt(core::format_args!("-0x{:x}", offset as u32))?;
+                    }
                 } else {
                     fmt.write_fmt(core::format_args!("-0x{:x}", -(offset as i64)))?;
                 }
+            } else if offset_reg_size == RegSize::R32 {
+                fmt.write_fmt(core::format_args!("0x{:x}", offset))?;
             } else {
                 fmt.write_fmt(core::format_args!("0x{:x}", offset as i64))?;
             }
@@ -604,12 +614,12 @@ impl Inst {
                 self.override_segment = segment;
                 self.override_addr_size_if(matches!(reg_size, RegSize::R32))
             }
-            MemOp::Offset(segment, offset) => {
+            MemOp::Offset(segment, reg_size, offset) => {
                 self.modrm |= 0b00000100;
                 self.sib |= 0b00100101;
                 self.displacement = Some(RawImm::Imm32(offset as u32));
                 self.override_segment = segment;
-                self
+                self.override_addr_size_if(matches!(reg_size, RegSize::R32) && offset < 0)
             }
             MemOp::RipRelative(segment, offset) => {
                 self.modrm |= 0b00000101;
@@ -890,8 +900,8 @@ pub mod addr {
         op.into_mem_op(None, reg_size)
     }
 
-    pub fn abs(offset: i32) -> MemOp {
-        MemOp::Offset(None, offset)
+    pub fn abs(reg_size: RegSize, offset: i32) -> MemOp {
+        MemOp::Offset(None, reg_size, offset)
     }
 
     impl From<(RegSize, Reg, Reg)> for Operands {
@@ -1808,7 +1818,9 @@ mod tests {
             });
 
             Option::<super::SegReg>::generate_test_values(|seg_reg| {
-                i32::generate_test_values(|offset| cb(super::MemOp::Offset(seg_reg, offset)))
+                super::RegSize::generate_test_values(|reg_size| {
+                    i32::generate_test_values(|offset| cb(super::MemOp::Offset(seg_reg, reg_size, offset)))
+                })
             });
 
             Option::<super::SegReg>::generate_test_values(|seg_reg| {

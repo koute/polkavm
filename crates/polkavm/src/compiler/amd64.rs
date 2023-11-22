@@ -130,51 +130,25 @@ impl<'a> Compiler<'a> {
 
         match self.sandbox_kind {
             SandboxKind::Linux => {
-                match (src, base, (offset as i32 >= 0)) {
+                match (src, base) {
                     // [address] = 0
-                    // (address is in the lower 2GB of the address space)
-                    (Z, Z, true) => match kind {
-                        Size::U8 => self.push(mov_imm(abs(offset as i32), imm8(0))),
-                        Size::U16 => self.push(mov_imm(abs(offset as i32), imm16(0))),
-                        Size::U32 => self.push(mov_imm(abs(offset as i32), imm32(0))),
+                    (Z, Z) => match kind {
+                        Size::U8 => self.push(mov_imm(abs(RegSize::R32, offset as i32), imm8(0))),
+                        Size::U16 => self.push(mov_imm(abs(RegSize::R32, offset as i32), imm16(0))),
+                        Size::U32 => self.push(mov_imm(abs(RegSize::R32, offset as i32), imm32(0))),
                         Size::U64 => {
                             self.push(xor((RegSize::R32, TMP_REG, TMP_REG)));
-                            self.push(store(Size::U64, abs(offset as i32), TMP_REG));
+                            self.push(store(Size::U64, abs(RegSize::R32, offset as i32), TMP_REG));
                         }
                     },
 
                     // [address] = src
-                    // (address is in the lower 2GB of the address space)
-                    (_, Z, true) => {
-                        self.push(store(kind, abs(offset as i32), conv_reg(src)));
-                    }
-
-                    // [address] = 0
-                    // (address is in the upper 2GB of the address space)
-                    (Z, Z, false) => {
-                        // The offset would get sign extended to full 64-bits if we'd use it
-                        // in a displacement, so we need to do an indirect store here.
-                        self.push(mov_imm(TMP_REG, imm32(offset)));
-                        match kind {
-                            Size::U8 => self.push(mov_imm(reg_indirect(RegSize::R32, TMP_REG), imm8(0))),
-                            Size::U16 => self.push(mov_imm(reg_indirect(RegSize::R32, TMP_REG), imm16(0))),
-                            Size::U32 => self.push(mov_imm(reg_indirect(RegSize::R32, TMP_REG), imm32(0))),
-                            Size::U64 => {
-                                self.push(mov_imm(reg_indirect(RegSize::R32, TMP_REG), imm32(0)));
-                                self.push(mov_imm(reg_indirect(RegSize::R32, TMP_REG + 4), imm32(0)));
-                            }
-                        }
-                    }
-
-                    // [address] = src
-                    // (address is in the upper 2GB of the address space)
-                    (_, Z, false) => {
-                        self.push(mov_imm(TMP_REG, imm32(offset)));
-                        self.push(store(kind, reg_indirect(RegSize::R32, TMP_REG), conv_reg(src)));
+                    (_, Z) => {
+                        self.push(store(kind, abs(RegSize::R32, offset as i32), conv_reg(src)));
                     }
 
                     // [base + offset] = 0
-                    (Z, _, _) => match kind {
+                    (Z, _) => match kind {
                         Size::U8 => self.push(mov_imm(reg_indirect(RegSize::R32, conv_reg(base) + offset as i32), imm8(0))),
                         Size::U16 => self.push(mov_imm(reg_indirect(RegSize::R32, conv_reg(base) + offset as i32), imm16(0))),
                         Size::U32 => self.push(mov_imm(reg_indirect(RegSize::R32, conv_reg(base) + offset as i32), imm32(0))),
@@ -185,7 +159,7 @@ impl<'a> Compiler<'a> {
                     },
 
                     // [base + offset] = src
-                    (_, _, _) => {
+                    (_, _) => {
                         self.push(store(kind, reg_indirect(RegSize::R32, conv_reg(base) + offset as i32), conv_reg(src)));
                     }
                 }
@@ -213,12 +187,7 @@ impl<'a> Compiler<'a> {
                 };
 
                 if base == Reg::Zero {
-                    if (offset as i32) < 0 {
-                        self.push(mov_imm(TMP_REG, imm32(offset)));
-                        self.push(load(kind, dst_native, reg_indirect(RegSize::R32, TMP_REG)));
-                    } else {
-                        self.push(load(kind, dst_native, abs(offset as i32)));
-                    }
+                    self.push(load(kind, dst_native, abs(RegSize::R32, offset as i32)));
                 } else {
                     self.push(load(kind, dst_native, reg_indirect(RegSize::R32, conv_reg(base) + offset as i32)));
                 }

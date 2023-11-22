@@ -459,10 +459,10 @@ macro_rules! sandbox_tests {
                     .push(mov_imm(rax, imm32(1)))
                     .push(mov_imm(rcx, imm32(0)))
                     .push(mov_imm(r8, imm32(0x11223344)))
-                    .push(store(Size::U32, abs(i32::try_from(mem.rw_data_address()).unwrap()), r8))
+                    .push(store(Size::U32, abs(RegSize::R32, i32::try_from(mem.rw_data_address()).unwrap()), r8))
                     .push(idiv(RegSize::R32, rcx))
                     .push(mov_imm(r8, imm32(0x12345678)))
-                    .push(store(Size::U32, abs(i32::try_from(mem.rw_data_address()).unwrap()), r8))
+                    .push(store(Size::U32, abs(RegSize::R32, i32::try_from(mem.rw_data_address()).unwrap()), r8))
                     .push(ret())
                     .finalize();
 
