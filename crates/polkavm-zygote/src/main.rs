@@ -248,7 +248,7 @@ static mut RESUME_IDLE_LOOP_JMPBUF: JmpBuf = JmpBuf {
 };
 
 #[naked]
-unsafe extern "C" fn longjmp(_jmpbuf: *mut JmpBuf, _return_value: u64) {
+unsafe extern "C" fn longjmp(_jmpbuf: *mut JmpBuf, _return_value: u64) -> ! {
     core::arch::asm!(
         // Restore registers.
         "mov rbx, [rdi + 8]",
