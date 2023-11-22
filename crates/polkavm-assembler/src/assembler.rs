@@ -106,6 +106,11 @@ impl Assembler {
         self
     }
 
+    pub fn push_raw(&mut self, bytes: &[u8]) -> &mut Self {
+        self.code.extend_from_slice(bytes);
+        self
+    }
+
     pub fn finalize(&mut self) -> &[u8] {
         for fixup in self.fixups.drain(..) {
             let origin = fixup.instruction_offset + fixup.instruction_length as usize;
