@@ -38,6 +38,7 @@ struct Compiler<'a> {
     sandbox_kind: SandboxKind,
     native_code_address: u64,
     address_table: AddressTable,
+    vmctx_regs_offset: usize,
 
     /// Whether we're compiling a 64-bit program. Currently totally broken and mostly unimplemented.
     // TODO: Fix this.
@@ -61,6 +62,7 @@ impl<'a> Compiler<'a> {
         jump_table_index_by_basic_block: &'a HashMap<u32, u32>,
         sandbox_kind: SandboxKind,
         address_table: AddressTable,
+        vmctx_regs_offset: usize,
         debug_trace_execution: bool,
         native_code_address: u64,
     ) -> Self {
@@ -90,6 +92,7 @@ impl<'a> Compiler<'a> {
             regs_are_64bit: false,
             debug_trace_execution,
             address_table,
+            vmctx_regs_offset,
         }
     }
 
@@ -274,9 +277,19 @@ impl<S> CompiledModule<S> where S: Sandbox {
 
         let address_space = S::reserve_address_space().map_err(Error::from_display)?;
         let native_code_address = crate::sandbox::SandboxAddressSpace::native_code_address(&address_space);
-        let mut program_assembler = Compiler::new(instructions, exports, basic_block_by_jump_table_index, jump_table_index_by_basic_block, S::KIND, S::address_table(), debug_trace_execution, native_code_address);
-        let result = program_assembler.finalize()?;
+        let mut program_assembler = Compiler::new(
+            instructions,
+            exports,
+            basic_block_by_jump_table_index,
+            jump_table_index_by_basic_block,
+            S::KIND,
+            S::address_table(),
+            S::vmctx_regs_offset(),
+            debug_trace_execution,
+            native_code_address
+        );
 
+        let result = program_assembler.finalize()?;
         let init = SandboxProgramInit::new(init)
             .with_code(result.code)
             .with_jump_table(result.jump_table)

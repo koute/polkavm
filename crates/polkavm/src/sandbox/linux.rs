@@ -1154,6 +1154,10 @@ impl super::Sandbox for Sandbox {
     fn address_table() -> AddressTable {
         ZYGOTE_ADDRESS_TABLE
     }
+
+    fn vmctx_regs_offset() -> usize {
+        get_field_offset!(VmCtx::new(), |base| base.regs().get())
+    }
 }
 
 impl Sandbox {

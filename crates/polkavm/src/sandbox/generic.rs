@@ -419,7 +419,7 @@ unsafe fn trigger_trap(vmctx: &mut VmCtx) -> ! {
 const REG_COUNT: usize = polkavm_common::program::Reg::ALL_NON_ZERO.len();
 
 #[repr(C)]
-pub struct VmCtx {
+struct VmCtx {
     // NOTE: These two fields are accessed from inline assembly so they shouldn't be moved!
     return_address: usize,
     return_stack_pointer: usize,
@@ -427,7 +427,7 @@ pub struct VmCtx {
     program_range: Range<u64>,
     trap_triggered: bool,
 
-    pub regs: CacheAligned<[u32; REG_COUNT]>,
+    regs: CacheAligned<[u32; REG_COUNT]>,
     on_hostcall: Option<OnHostcall<'static, Sandbox>>,
     sandbox: *mut Sandbox,
     instruction_number: Option<u32>,
@@ -1028,6 +1028,10 @@ impl super::Sandbox for Sandbox {
             syscall_return,
             syscall_trace,
         })
+    }
+
+    fn vmctx_regs_offset() -> usize {
+        get_field_offset!(VmCtx::new(), |base| base.regs())
     }
 }
 
