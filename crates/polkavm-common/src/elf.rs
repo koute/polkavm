@@ -51,6 +51,21 @@ pub struct FnMetadata {
 }
 
 impl FnMetadata {
+    pub fn new(name: impl Into<alloc::string::String>, args: &[ExternTy], return_ty: Option<ExternTy>) -> Self {
+        assert!(args.len() <= crate::abi::VM_MAXIMUM_EXTERN_ARG_COUNT);
+
+        let mut args_array = [None; crate::abi::VM_MAXIMUM_EXTERN_ARG_COUNT];
+        for (slot, arg) in args_array.iter_mut().zip(args.iter()) {
+            *slot = Some(*arg);
+        }
+
+        FnMetadata {
+            name: name.into(),
+            return_ty,
+            args: args_array,
+        }
+    }
+
     pub fn args(&self) -> impl Iterator<Item = ExternTy> + '_ {
         self.args.iter().take_while(|arg| arg.is_some()).flatten().copied()
     }
