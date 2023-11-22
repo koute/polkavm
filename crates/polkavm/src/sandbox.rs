@@ -11,11 +11,11 @@ use polkavm_common::{
         VM_RPC_FLAG_CLEAR_PROGRAM_AFTER_EXECUTION,
         VM_RPC_FLAG_RECONFIGURE, VM_RPC_FLAG_RESET_MEMORY_AFTER_EXECUTION,
     },
-    utils::Access
+    utils::{Access, Gas}
 };
 
 use crate::api::BackendAccess;
-use crate::config::SandboxKind;
+use crate::config::{GasMeteringKind, SandboxKind};
 
 macro_rules! get_field_offset {
     ($struct:expr, |$struct_ident:ident| $get_field:expr) => {{
@@ -62,6 +62,25 @@ pub(crate) fn assert_native_page_size() {
     );
 }
 
+#[derive(Copy, Clone, PartialEq, Eq, Debug)]
+pub(crate) struct OutOfGas;
+
+fn get_gas_remaining(raw_gas: u64) -> Result<Gas, OutOfGas> {
+    Gas::new(raw_gas).ok_or(OutOfGas)
+}
+
+#[test]
+fn test_get_gas_remaining() {
+    assert_eq!(get_gas_remaining(0), Ok(Gas::new(0).unwrap()));
+    assert_eq!(get_gas_remaining(1), Ok(Gas::new(1).unwrap()));
+    assert_eq!(get_gas_remaining((-1_i64) as u64), Err(OutOfGas));
+    assert_eq!(get_gas_remaining(Gas::MIN.get()), Ok(Gas::MIN));
+    assert_eq!(get_gas_remaining(Gas::MAX.get()), Ok(Gas::MAX));
+
+    // We should never have such gas values, but test it anyway.
+    assert_eq!(get_gas_remaining(Gas::MAX.get() + 1), Err(OutOfGas));
+}
+
 pub trait SandboxConfig: Default {
     fn enable_logger(&mut self, value: bool);
 }
@@ -74,7 +93,7 @@ pub trait SandboxProgram: Clone {
     fn machine_code(&self) -> Cow<[u8]>;
 }
 
-pub trait Sandbox: Sized {
+pub(crate) trait Sandbox: Sized {
     const KIND: SandboxKind;
 
     type Access<'r>: Access<'r> + Into<BackendAccess<'r>> where Self: 'r;
@@ -84,16 +103,18 @@ pub trait Sandbox: Sized {
     type AddressSpace: SandboxAddressSpace;
 
     fn reserve_address_space() -> Result<Self::AddressSpace, Self::Error>;
-    fn prepare_program(init: SandboxProgramInit, address_space: Self::AddressSpace) -> Result<Self::Program, Self::Error>;
+    fn prepare_program(init: SandboxProgramInit, address_space: Self::AddressSpace, gas_metering: Option<GasMeteringKind>) -> Result<Self::Program, Self::Error>;
     fn spawn(config: &Self::Config) -> Result<Self, Self::Error>;
     fn execute(&mut self, args: ExecuteArgs<Self>) -> Result<(), ExecutionError<Self::Error>>;
     fn access(&'_ mut self) -> Self::Access<'_>;
     fn pid(&self) -> Option<u32>;
     fn address_table() -> AddressTable;
     fn vmctx_regs_offset() -> usize;
+    fn vmctx_gas_offset() -> usize;
+    fn gas_remaining_impl(&self) -> Result<Option<Gas>, OutOfGas>;
 }
 
-pub type OnHostcall<'a, T> = &'a mut dyn for<'r> FnMut(u32, <T as Sandbox>::Access<'r>) -> Result<(), Trap>;
+pub(crate) type OnHostcall<'a, T> = &'a mut dyn for<'r> FnMut(u32, <T as Sandbox>::Access<'r>) -> Result<(), Trap>;
 
 #[derive(Copy, Clone)]
 pub struct SandboxProgramInit<'a> {
@@ -151,12 +172,13 @@ impl<'a> SandboxProgramInit<'a> {
     }
 }
 
-pub struct ExecuteArgs<'a, T> where T: Sandbox + 'a {
+pub(crate) struct ExecuteArgs<'a, T> where T: Sandbox + 'a {
     rpc_address: u64,
     rpc_flags: u32,
     program: Option<&'a T::Program>,
     on_hostcall: Option<OnHostcall<'a, T>>,
     initial_regs: &'a [u32],
+    gas: Option<Gas>,
 }
 
 impl<'a, T> Default for ExecuteArgs<'a, T> where T: Sandbox {
@@ -175,6 +197,7 @@ impl<'a, T> ExecuteArgs<'a, T> where T: Sandbox {
             program: None,
             on_hostcall: None,
             initial_regs: EMPTY_REGS,
+            gas: None,
         }
     }
 
@@ -208,6 +231,25 @@ impl<'a, T> ExecuteArgs<'a, T> where T: Sandbox {
     pub fn set_initial_regs(&mut self, regs: &'a [u32]) {
         assert_eq!(regs.len(), Reg::ALL_NON_ZERO.len());
         self.initial_regs = regs;
+    }
+
+    #[inline]
+    pub fn set_gas(&mut self, gas: Gas) {
+        self.gas = Some(gas);
+    }
+
+    fn get_gas(&self, gas_metering: Option<GasMeteringKind>) -> Option<u64> {
+        if self.program.is_none() && self.gas.is_none() && gas_metering.is_some() {
+            // Keep whatever value was set there previously.
+            return None;
+        }
+
+        let gas = self.gas.unwrap_or(Gas::MIN);
+        if gas_metering.is_some() {
+            Some(gas.get())
+        } else {
+            Some(0)
+        }
     }
 }
 
@@ -247,7 +289,7 @@ macro_rules! sandbox_tests {
                 let code = asm.finalize();
                 let address_space = Sandbox::reserve_address_space().unwrap();
                 let native_code_address = address_space.native_code_address();
-                let program = Sandbox::prepare_program(init.with_code(code), address_space).unwrap();
+                let program = Sandbox::prepare_program(init.with_code(code), address_space, None).unwrap();
 
                 const THREAD_COUNT: usize = 32;
                 let barrier = std::sync::Arc::new(std::sync::Barrier::new(THREAD_COUNT));
@@ -305,7 +347,7 @@ macro_rules! sandbox_tests {
                 let code = asm.finalize();
                 let address_space = Sandbox::reserve_address_space().unwrap();
                 let native_code_address = address_space.native_code_address();
-                let program = Sandbox::prepare_program(init.with_code(code), address_space).unwrap();
+                let program = Sandbox::prepare_program(init.with_code(code), address_space, None).unwrap();
                 let mut args = ExecuteArgs::new();
                 args.set_program(&program);
                 args.set_call(native_code_address);
@@ -343,7 +385,7 @@ macro_rules! sandbox_tests {
                 let code = asm.finalize();
                 let address_space = Sandbox::reserve_address_space().unwrap();
                 let native_code_address = address_space.native_code_address();
-                let program = Sandbox::prepare_program(init.with_code(code), address_space).unwrap();
+                let program = Sandbox::prepare_program(init.with_code(code), address_space, None).unwrap();
 
                 let mut sandbox = Sandbox::spawn(&Default::default()).unwrap();
                 assert!(sandbox.access().read_memory_into_new_vec(mem.rw_data_address(), 4).is_err());
@@ -429,7 +471,7 @@ macro_rules! sandbox_tests {
                 let code = asm.finalize();
                 let address_space = Sandbox::reserve_address_space().unwrap();
                 let native_code_address = address_space.native_code_address();
-                let program = Sandbox::prepare_program(init.with_code(code), address_space).unwrap();
+                let program = Sandbox::prepare_program(init.with_code(code), address_space, None).unwrap();
 
                 let mut sandbox = Sandbox::spawn(&Default::default()).unwrap();
                 {
@@ -489,7 +531,7 @@ macro_rules! sandbox_tests {
                 let code = asm.finalize();
                 let address_space = Sandbox::reserve_address_space().unwrap();
                 let native_code_address = address_space.native_code_address();
-                let program = Sandbox::prepare_program(init.with_code(code), address_space).unwrap();
+                let program = Sandbox::prepare_program(init.with_code(code), address_space, None).unwrap();
                 let mut sandbox = Sandbox::spawn(&Default::default()).unwrap();
 
                 {

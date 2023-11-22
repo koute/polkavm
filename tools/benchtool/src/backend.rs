@@ -72,7 +72,7 @@ impl Backend for PolkaVM {
 
     fn compile(&self, engine: &mut Self::Engine, blob: &Self::Blob) -> Self::Module {
         let blob = polkavm::ProgramBlob::parse(&**blob).unwrap();
-        polkavm::Module::from_blob(engine, &blob).unwrap()
+        polkavm::Module::from_blob(engine, &Default::default(), &blob).unwrap()
     }
 
     fn spawn(&self, engine: &mut Self::Engine, module: &Self::Module) -> Self::Instance {

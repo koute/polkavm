@@ -6,7 +6,7 @@ extern crate polkavm_linux_raw as linux_raw;
 use polkavm_common::{
     error::{ExecutionError, Trap},
     program::Reg,
-    utils::{align_to_next_page_usize, slice_assume_init_mut, Access, AsUninitSliceMut},
+    utils::{align_to_next_page_usize, slice_assume_init_mut, Access, AsUninitSliceMut, Gas},
     zygote::{
         AddressTable, AddressTablePacked,
         SandboxMemoryConfig, VmCtx, SANDBOX_EMPTY_NATIVE_PROGRAM_COUNTER, SANDBOX_EMPTY_NTH_INSTRUCTION, VMCTX_FUTEX_BUSY,
@@ -28,6 +28,7 @@ use std::sync::Arc;
 
 use super::{OnHostcall, SandboxKind, SandboxProgramInit, get_native_page_size};
 use crate::api::{BackendAccess, MemoryAccessError};
+use crate::config::GasMeteringKind;
 
 pub struct SandboxConfig {
     enable_logger: bool,
@@ -638,6 +639,7 @@ struct SandboxProgramInner {
     memory_config: SandboxMemoryConfig,
     sysreturn_address: u64,
     code_range: Range<usize>,
+    gas_metering: Option<GasMeteringKind>,
 }
 
 impl super::SandboxProgram for SandboxProgram {
@@ -799,6 +801,8 @@ pub struct Sandbox {
 
     count_wait_loop_start: u64,
     count_futex_wait: u64,
+
+    gas_metering: Option<GasMeteringKind>,
 }
 
 impl Drop for Sandbox {
@@ -840,7 +844,7 @@ impl super::Sandbox for Sandbox {
         Ok(())
     }
 
-    fn prepare_program(init: SandboxProgramInit, _: Self::AddressSpace) -> Result<Self::Program, Self::Error> {
+    fn prepare_program(init: SandboxProgramInit, _: Self::AddressSpace, gas_metering: Option<GasMeteringKind>) -> Result<Self::Program, Self::Error> {
         let native_page_size = get_native_page_size();
         let cfg = init.memory_config(native_page_size)?;
         let mut code_range = 0..0;
@@ -874,6 +878,7 @@ impl super::Sandbox for Sandbox {
             memory_config: cfg,
             sysreturn_address: init.sysreturn_address,
             code_range,
+            gas_metering,
         })))
     }
 
@@ -1111,6 +1116,8 @@ impl super::Sandbox for Sandbox {
 
             count_wait_loop_start: 0,
             count_futex_wait: 0,
+
+            gas_metering: None,
         })
     }
 
@@ -1121,12 +1128,18 @@ impl super::Sandbox for Sandbox {
         })?;
 
         unsafe {
-            *self.vmctx().rpc_address.get() = args.rpc_address;
-            *self.vmctx().rpc_flags.get() = args.rpc_flags;
             if let Some(program) = args.program {
                 *self.vmctx().new_memory_config.get() = program.0.memory_config;
                 *self.vmctx().new_sysreturn_address.get() = program.0.sysreturn_address;
+                self.gas_metering = program.0.gas_metering;
             }
+
+            if let Some(gas) = args.get_gas(self.gas_metering) {
+                *self.vmctx().gas().get() = gas;
+            }
+
+            *self.vmctx().rpc_address.get() = args.rpc_address;
+            *self.vmctx().rpc_flags.get() = args.rpc_flags;
 
             (*self.vmctx().regs().get()).copy_from_slice(args.initial_regs);
             self.vmctx().futex.store(VMCTX_FUTEX_BUSY, Ordering::Release);
@@ -1157,6 +1170,16 @@ impl super::Sandbox for Sandbox {
 
     fn vmctx_regs_offset() -> usize {
         get_field_offset!(VmCtx::new(), |base| base.regs().get())
+    }
+
+    fn vmctx_gas_offset() -> usize {
+        get_field_offset!(VmCtx::new(), |base| base.gas().get())
+    }
+
+    fn gas_remaining_impl(&self) -> Result<Option<Gas>, super::OutOfGas> {
+        if self.gas_metering.is_none() { return Ok(None) };
+        let value = unsafe { *self.vmctx().gas().get() };
+        super::get_gas_remaining(value).map(Some)
     }
 }
 
@@ -1402,5 +1425,10 @@ impl<'a> Access<'a> for SandboxAccess<'a> {
         } else {
             Some(value)
         }
+    }
+
+    fn gas_remaining(&self) -> Option<Gas> {
+        use super::Sandbox;
+        self.sandbox.gas_remaining_impl().ok().unwrap_or(Some(Gas::MIN))
     }
 }

@@ -181,6 +181,58 @@ impl<const N: usize> AsUninitSliceMut for [u8; N] {
     }
 }
 
+/// A gas value used for gas metering.
+#[derive(Copy, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Debug, Default)]
+#[repr(transparent)]
+pub struct Gas(u64);
+
+impl core::fmt::Display for Gas {
+    fn fmt(&self, fmt: &mut core::fmt::Formatter) -> core::fmt::Result {
+        self.0.fmt(fmt)
+    }
+}
+
+impl Gas {
+    /// The maximum possible available gas.
+    pub const MAX: Self = Gas(i64::MAX as u64);
+
+    /// The minimum possible available gas.
+    pub const MIN: Self = Gas(0);
+
+    /// Constructs a new gas value, checking whether it's not greater than [`Gas::MAX`].
+    pub const fn new(gas: u64) -> Option<Self> {
+        let gas = Self(gas);
+        if gas.0 > Self::MAX.0 {
+            None
+        } else {
+            Some(gas)
+        }
+    }
+
+    /// Gets the raw gas value.
+    pub const fn get(self) -> u64 {
+        self.0
+    }
+
+    /// Checks whether there is no gas remaining.
+    pub const fn is_empty(self) -> bool {
+        self.0 == 0
+    }
+}
+
+impl From<u32> for Gas {
+    fn from(gas: u32) -> Self {
+        Gas(gas as u64)
+    }
+}
+
+impl TryFrom<u64> for Gas {
+    type Error = &'static str;
+    fn try_from(gas: u64) -> Result<Self, Self::Error> {
+        Self::new(gas).ok_or("out of range gas")
+    }
+}
+
 pub trait Access<'a> {
     type Error: core::fmt::Display;
 
@@ -192,6 +244,12 @@ pub trait Access<'a> {
     fn write_memory(&mut self, address: u32, data: &[u8]) -> Result<(), Self::Error>;
     fn program_counter(&self) -> Option<u32>;
     fn native_program_counter(&self) -> Option<u64>;
+
+    /// Gets the amount of gas remaining, or `None` if gas metering is not enabled for this instance.
+    ///
+    /// Note that this being zero doesn't necessarily mean that the execution ran out of gas,
+    /// if the program ended up consuming *exactly* the amount of gas that it was provided with!
+    fn gas_remaining(&self) -> Option<Gas>;
 
     #[cfg(feature = "alloc")]
     fn read_memory_into_new_vec(&self, address: u32, length: u32) -> Result<Vec<u8>, Self::Error> {

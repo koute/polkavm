@@ -213,3 +213,48 @@ impl Config {
         self
     }
 }
+
+/// The type of gas metering.
+#[derive(Copy, Clone, PartialEq, Eq, Debug)]
+pub enum GasMeteringKind {
+    /// Synchronous gas metering. This will immediately abort the execution if we run out of gas.
+    Sync,
+    /// Asynchronous gas metering. Has a lower performance overhead compared to synchronous gas metering,
+    /// but will only periodically and asynchronously check whether we still have gas remaining while
+    /// the program is running.
+    ///
+    /// With asynchronous gas metering the program can run slightly longer than it would otherwise,
+    /// and the exact point *when* it is interrupted is not deterministic, but whether the computation
+    /// as a whole finishes under a given gas limit will still be strictly enforced and deterministic.
+    ///
+    /// This is only a hint, and the VM might still fall back to using synchronous gas metering
+    /// if asynchronous metering is not available.
+    Async,
+}
+
+/// The configuration for a module.
+#[derive(Clone)]
+pub struct ModuleConfig {
+    pub(crate) gas_metering: Option<GasMeteringKind>,
+}
+
+impl Default for ModuleConfig {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl ModuleConfig {
+    /// Creates a new default module configuration.
+    pub fn new() -> Self {
+        ModuleConfig { gas_metering: None }
+    }
+
+    /// Sets the type of gas metering to enable for this module.
+    ///
+    /// Default: `None`
+    pub fn set_gas_metering(&mut self, kind: Option<GasMeteringKind>) -> &mut Self {
+        self.gas_metering = kind;
+        self
+    }
+}

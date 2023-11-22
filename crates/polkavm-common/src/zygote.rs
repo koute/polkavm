@@ -253,6 +253,8 @@ const REG_COUNT: usize = crate::program::Reg::ALL_NON_ZERO.len();
 #[repr(C)]
 pub struct VmCtxSyscall {
     // NOTE: The order of fields here can matter for performance!
+    /// The current gas counter.
+    pub gas: UnsafeCell<u64>,
     /// The hostcall number that was triggered.
     pub hostcall: UnsafeCell<u32>,
     /// A dump of all of the registers of the VM.
@@ -280,6 +282,9 @@ pub struct VmCtxCounters {
 /// as well as by the host to communicate with the sandbox.
 #[repr(C)]
 pub struct VmCtx {
+    /// Fields used when making syscalls from the VM into the host.
+    syscall_ffi: CacheAligned<VmCtxSyscall>,
+
     /// The futex used to synchronize the sandbox with the host process.
     pub futex: CacheAligned<AtomicU32>,
 
@@ -293,9 +298,6 @@ pub struct VmCtx {
     pub new_memory_config: UnsafeCell<SandboxMemoryConfig>,
     /// The new sysreturn trampoline address. Will be applied if the appropriate flag is set.
     pub new_sysreturn_address: UnsafeCell<u64>,
-
-    /// Fields used when making syscalls from the VM into the host.
-    syscall_ffi: CacheAligned<VmCtxSyscall>,
 
     /// Performance counters. Only for debugging.
     pub counters: CacheAligned<VmCtxCounters>,
@@ -340,6 +342,7 @@ impl VmCtx {
             new_sysreturn_address: UnsafeCell::new(0),
 
             syscall_ffi: CacheAligned(VmCtxSyscall {
+                gas: UnsafeCell::new(0),
                 hostcall: UnsafeCell::new(0),
                 regs: UnsafeCell::new([0; REG_COUNT]),
                 rip: UnsafeCell::new(0),
@@ -374,6 +377,11 @@ impl VmCtx {
 
     // Define some accessor methods so that we don't have to update the rest of the codebase
     // when we shuffle things around in the structure.
+
+    #[inline(always)]
+    pub const fn gas(&self) -> &UnsafeCell<u64> {
+        &self.syscall_ffi.0.gas
+    }
 
     #[inline(always)]
     pub const fn hostcall(&self) -> &UnsafeCell<u32> {

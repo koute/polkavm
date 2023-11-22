@@ -22,7 +22,7 @@ impl Vm {
     pub fn from_blob(blob: ProgramBlob) -> Result<Self, polkavm::Error> {
         let config = Config::from_env()?;
         let engine = Engine::new(&config)?;
-        let module = Module::from_blob(&engine, &blob)?;
+        let module = Module::from_blob(&engine, &Default::default(), &blob)?;
         let mut linker = Linker::new(&engine);
 
         linker.func_wrap(

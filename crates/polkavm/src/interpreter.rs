@@ -5,17 +5,18 @@ use polkavm_common::abi::{VM_ADDR_RETURN_TO_HOST, VM_CODE_ADDRESS_ALIGNMENT};
 use polkavm_common::error::Trap;
 use polkavm_common::init::GuestProgramInit;
 use polkavm_common::program::{InstructionVisitor, Reg};
-use polkavm_common::utils::{byte_slice_init, Access, AsUninitSliceMut};
+use polkavm_common::utils::{byte_slice_init, Access, AsUninitSliceMut, Gas};
 
 type ExecutionError<E = core::convert::Infallible> = polkavm_common::error::ExecutionError<E>;
 
 pub(crate) struct InterpretedModule {
     ro_data: Vec<u8>,
     rw_data: Vec<u8>,
+    gas_cost_for_basic_block: Vec<u32>,
 }
 
 impl InterpretedModule {
-    pub fn new(init: GuestProgramInit) -> Result<Self, Error> {
+    pub fn new(init: GuestProgramInit, gas_cost_for_basic_block: Vec<u32>) -> Result<Self, Error> {
         let memory_config = init.memory_config().map_err(Error::from_static_str)?;
         let mut ro_data: Vec<_> = init.ro_data().into();
         ro_data.resize(memory_config.ro_data_size() as usize, 0);
@@ -23,6 +24,7 @@ impl InterpretedModule {
         Ok(InterpretedModule {
             ro_data,
             rw_data: init.rw_data().into(),
+            gas_cost_for_basic_block,
         })
     }
 }
@@ -60,6 +62,8 @@ pub(crate) struct InterpretedInstance {
     nth_basic_block: u32,
     return_to_host: bool,
     cycle_counter: u64,
+    gas_remaining: Option<i64>,
+    in_new_execution: bool,
 }
 
 impl InterpretedInstance {
@@ -83,6 +87,8 @@ impl InterpretedInstance {
             nth_basic_block: 0,
             return_to_host: true,
             cycle_counter: 0,
+            gas_remaining: None,
+            in_new_execution: false,
         };
 
         interpreter.reset_memory();
@@ -103,6 +109,19 @@ impl InterpretedInstance {
     }
 
     pub fn run(&mut self, ctx: InterpreterContext) -> Result<(), ExecutionError<Error>> {
+        fn translate_error(error: Result<(), ExecutionError>) -> Result<(), ExecutionError<Error>> {
+            error.map_err(|error| match error {
+                ExecutionError::Trap(trap) => ExecutionError::Trap(trap),
+                ExecutionError::OutOfGas => ExecutionError::OutOfGas,
+                ExecutionError::Error(_) => unreachable!(),
+            })
+        }
+
+        if self.in_new_execution {
+            self.in_new_execution = false;
+            translate_error(self.on_start_new_basic_block())?;
+        }
+
         let mut visitor = Visitor { inner: self, ctx };
         loop {
             visitor.inner.cycle_counter += 1;
@@ -116,14 +135,7 @@ impl InterpretedInstance {
                 return Err(ExecutionError::Trap(Default::default()));
             };
 
-            let result: Result<(), ExecutionError<core::convert::Infallible>> = instruction.visit(&mut visitor);
-            if let Err(error) = result {
-                match error {
-                    ExecutionError::Trap(trap) => return Err(ExecutionError::Trap(trap)),
-                    ExecutionError::Error(_) => unreachable!(),
-                }
-            }
-
+            translate_error(instruction.visit(&mut visitor))?;
             if visitor.inner.return_to_host {
                 break;
             }
@@ -157,10 +169,24 @@ impl InterpretedInstance {
         self.return_to_host = false;
         self.regs[1..].copy_from_slice(&config.initial_regs);
         self.nth_instruction = nth_instruction;
-        self.nth_basic_block = nth_basic_block
+        self.nth_basic_block = nth_basic_block;
+        if self.module.gas_metering().is_some() {
+            if let Some(gas) = config.gas {
+                self.gas_remaining = Some(gas.get() as i64);
+            }
+        } else {
+            self.gas_remaining = None;
+        }
+
+        self.in_new_execution = true;
     }
 
     pub fn step_once(&mut self, ctx: InterpreterContext) -> Result<(), ExecutionError> {
+        if self.in_new_execution {
+            self.in_new_execution = false;
+            self.on_start_new_basic_block()?;
+        }
+
         self.cycle_counter += 1;
         let Some(instruction) = self.module.instructions().get(self.nth_instruction as usize).copied() else {
             return Err(ExecutionError::Trap(Default::default()));
@@ -204,6 +230,19 @@ impl InterpretedInstance {
 
         let offset = (address - range.start) as usize;
         memory_slice.get_mut(offset..offset + length as usize)
+    }
+
+    fn on_start_new_basic_block(&mut self) -> Result<(), ExecutionError> {
+        if let Some(ref mut gas_remaining) = self.gas_remaining {
+            let module = self.module.interpreted_module().unwrap();
+            let gas_cost = module.gas_cost_for_basic_block[self.nth_basic_block as usize] as i64;
+            *gas_remaining -= gas_cost;
+            if *gas_remaining < 0 {
+                return Err(ExecutionError::OutOfGas);
+            }
+        }
+
+        Ok(())
     }
 }
 
@@ -266,6 +305,11 @@ impl<'a> Access<'a> for InterpretedAccess<'a> {
     fn native_program_counter(&self) -> Option<u64> {
         None
     }
+
+    fn gas_remaining(&self) -> Option<Gas> {
+        let gas = self.instance.gas_remaining?;
+        Some(Gas::new(gas as u64).unwrap_or(Gas::MIN))
+    }
 }
 
 struct Visitor<'a, 'b> {
@@ -320,7 +364,7 @@ impl<'a, 'b> Visitor<'a, 'b> {
             self.inner.nth_basic_block += 1;
         }
 
-        Ok(())
+        self.inner.on_start_new_basic_block()
     }
 
     fn load<T: LoadTy>(&mut self, dst: Reg, base: Reg, offset: u32) -> Result<(), ExecutionError> {
@@ -486,7 +530,7 @@ impl<'a, 'b> InstructionVisitor for Visitor<'a, 'b> {
     fn fallthrough(&mut self) -> Self::ReturnTy {
         self.inner.nth_instruction += 1;
         self.inner.nth_basic_block += 1;
-        Ok(())
+        self.inner.on_start_new_basic_block()
     }
 
     fn ecalli(&mut self, imm: u32) -> Self::ReturnTy {
@@ -760,7 +804,7 @@ impl<'a, 'b> InstructionVisitor for Visitor<'a, 'b> {
             self.inner.nth_instruction = nth_instruction;
         }
 
-        Ok(())
+        self.inner.on_start_new_basic_block()
     }
 }
 
