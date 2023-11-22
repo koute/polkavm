@@ -34,10 +34,10 @@ pub const SYSCALL_RETURN: u32 = 3;
 pub const SYSCALL_TRACE: u32 = 4;
 
 /// A special hostcall number set by the *guest* to trigger a trace.
-pub const HOSTCALL_TRACE: u64 = 0x100000000;
+pub const HOSTCALL_TRACE: u32 = 0x80000000;
 
 /// A special hostcall number set by the *host* to signal that the guest should stop executing the program.
-pub const HOSTCALL_ABORT_EXECUTION: u64 = !0;
+pub const HOSTCALL_ABORT_EXECUTION: u32 = !0;
 
 /// A sentinel value to indicate that the instruction counter is not available.
 pub const SANDBOX_EMPTY_NTH_INSTRUCTION: u32 = !0;
@@ -215,7 +215,7 @@ impl<T> core::ops::DerefMut for CacheAligned<T> {
 pub struct VmCtxSyscall {
     // NOTE: The order of fields here can matter for performance!
     /// The hostcall number that was triggered.
-    pub hostcall: UnsafeCell<u64>,
+    pub hostcall: UnsafeCell<u32>,
     /// A dump of all of the registers of the VM.
     pub regs: UnsafeCell<[u32; 13]>,
     /// The number of the instruction just about to be executed.
@@ -330,7 +330,7 @@ impl VmCtx {
     // when we shuffle things around in the structure.
 
     #[inline(always)]
-    pub const fn hostcall(&self) -> &UnsafeCell<u64> {
+    pub const fn hostcall(&self) -> &UnsafeCell<u32> {
         &self.syscall_ffi.0.hostcall
     }
 

@@ -470,7 +470,7 @@ unsafe fn vmctx_mut_ptr(memory: &mut Mmap) -> *mut VmCtx {
     memory.as_mut_ptr().cast::<u8>().offset(get_guest_memory_offset() as isize + GUEST_MEMORY_TO_VMCTX_OFFSET).cast()
 }
 
-pub extern "C" fn handle_ecall(guest_memory: *mut c_void, hostcall: u64) {
+pub extern "C" fn handle_ecall(guest_memory: *mut c_void, hostcall: u32) {
     // SAFETY: The pointer to the guest memory is always valid here.
     let vmctx = unsafe {
         &mut *guest_memory.cast::<u8>().offset(GUEST_MEMORY_TO_VMCTX_OFFSET).cast::<VmCtx>()

@@ -298,7 +298,7 @@ impl Tracer {
             return Ok(());
         }
 
-        let mut on_hostcall = |_hostcall: u64, _access: BackendAccess<'_>| -> Result<(), Trap> { Ok(()) };
+        let mut on_hostcall = |_hostcall: u32, _access: BackendAccess<'_>| -> Result<(), Trap> { Ok(()) };
         let mut on_set_reg = |reg: Reg, value: u32| -> Result<(), Trap> {
             assert!(self.crosscheck_reg.is_none());
             self.crosscheck_reg = Some((reg, value));

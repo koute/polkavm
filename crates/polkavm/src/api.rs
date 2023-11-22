@@ -57,7 +57,7 @@ where
     }
 }
 
-pub(crate) type OnHostcall<'a> = &'a mut dyn for<'r> FnMut(u64, BackendAccess<'r>) -> Result<(), Trap>;
+pub(crate) type OnHostcall<'a> = &'a mut dyn for<'r> FnMut(u32, BackendAccess<'r>) -> Result<(), Trap>;
 
 pub struct Engine {
     config: Config,
@@ -220,6 +220,10 @@ impl Module {
         let mut imports = BTreeMap::new();
         for import in blob.imports() {
             let import = import.map_err(Error::from_display)?;
+            if import.index() & (1 << 31) != 0 {
+                bail!("out of range import index");
+            }
+
             if imports.insert(import.index(), import).is_some() {
                 bail!("duplicate import index");
             }
@@ -1673,9 +1677,9 @@ fn on_hostcall<'a, T>(
     host_functions: &'a HashMap<u32, ExternFnArc<T>>,
     fallback_handler: Option<&'a FallbackHandlerArc<T>>,
     raw: &'a mut CallerRaw,
-) -> impl for<'r> FnMut(u64, BackendAccess<'r>) -> Result<(), Trap> + 'a {
-    move |hostcall: u64, mut access: BackendAccess| -> Result<(), Trap> {
-        if hostcall > u32::MAX as u64 {
+) -> impl for<'r> FnMut(u32, BackendAccess<'r>) -> Result<(), Trap> + 'a {
+    move |hostcall: u32, mut access: BackendAccess| -> Result<(), Trap> {
+        if hostcall & (1 << 31) != 0 {
             if hostcall == polkavm_common::zygote::HOSTCALL_TRACE {
                 if let Some(tracer) = raw.tracer() {
                     return tracer.on_trace(&mut access);
@@ -1689,11 +1693,11 @@ fn on_hostcall<'a, T>(
             return Err(Trap::default());
         }
 
-        let host_fn = match host_functions.get(&(hostcall as u32)) {
+        let host_fn = match host_functions.get(&hostcall) {
             Some(host_fn) => host_fn,
             None => {
                 if let Some(fallback_handler) = fallback_handler {
-                    return Caller::wrap(user_data, &mut access, raw, move |caller| fallback_handler(caller, hostcall as u32));
+                    return Caller::wrap(user_data, &mut access, raw, move |caller| fallback_handler(caller, hostcall));
                 }
 
                 // This should never happen.
