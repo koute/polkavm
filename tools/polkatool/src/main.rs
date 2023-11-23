@@ -22,6 +22,10 @@ enum Args {
         #[clap(short = 's', long)]
         strip: bool,
 
+        /// Will only run if the output file doesn't exist, or the input is newer.
+        #[clap(long)]
+        run_only_if_newer: bool,
+
         /// The input file.
         input: PathBuf,
     },
@@ -51,7 +55,12 @@ fn main() {
 
     let args = Args::parse();
     let result = match args {
-        Args::Link { output, input, strip } => main_link(input, output, strip),
+        Args::Link {
+            output,
+            input,
+            strip,
+            run_only_if_newer,
+        } => main_link(input, output, strip, run_only_if_newer),
         Args::Disassemble { output, format, input } => main_disassemble(input, format, output),
     };
 
@@ -61,7 +70,17 @@ fn main() {
     }
 }
 
-fn main_link(input: PathBuf, output: PathBuf, strip: bool) -> Result<(), String> {
+fn main_link(input: PathBuf, output: PathBuf, strip: bool, run_only_if_newer: bool) -> Result<(), String> {
+    if run_only_if_newer {
+        if let Ok(output_mtime) = std::fs::metadata(&output).and_then(|m| m.modified()) {
+            if let Ok(input_mtime) = std::fs::metadata(&input).and_then(|m| m.modified()) {
+                if output_mtime >= input_mtime {
+                    return Ok(());
+                }
+            }
+        }
+    }
+
     let mut config = polkavm_linker::Config::default();
     config.set_strip(strip);
 
