@@ -1,21 +1,45 @@
 use super::backend_prelude::*;
 
 #[derive(Copy, Clone)]
-pub struct Ckbvm();
+pub enum CkbvmBackend {
+    Asm,
+    NonAsm,
+}
+
+#[derive(Copy, Clone)]
+pub struct Ckbvm(pub CkbvmBackend);
+
+enum CkbvmInstanceKind {
+    Asm(ckb_vm::machine::asm::AsmMachine),
+    NonAsm(ckb_vm::DefaultMachine<ckb_vm::DefaultCoreMachine<u64, ckb_vm::SparseMemory<u64>>>),
+}
+
 pub struct CkbvmInstance {
     pc: u64,
     sp: u64,
-    machine: ckb_vm::machine::asm::AsmMachine,
+    kind: CkbvmInstanceKind,
 }
 
 impl CkbvmInstance {
     fn run(&mut self, a0: u64) {
         use ckb_vm::CoreMachine;
-        self.machine.machine.set_register(ckb_vm::registers::SP, self.sp);
-        self.machine.machine.set_register(ckb_vm::registers::A0, a0);
-        self.machine.machine.update_pc(self.pc);
-        self.machine.machine.commit_pc();
-        self.machine.machine.run().unwrap();
+
+        match self.kind {
+            CkbvmInstanceKind::Asm(ref mut machine) => {
+                machine.machine.set_register(ckb_vm::registers::SP, self.sp);
+                machine.machine.set_register(ckb_vm::registers::A0, a0);
+                machine.machine.update_pc(self.pc);
+                machine.machine.commit_pc();
+                machine.machine.run().unwrap();
+            }
+            CkbvmInstanceKind::NonAsm(ref mut machine) => {
+                machine.set_register(ckb_vm::registers::SP, self.sp);
+                machine.set_register(ckb_vm::registers::A0, a0);
+                machine.update_pc(self.pc);
+                machine.commit_pc();
+                machine.run().unwrap();
+            }
+        }
     }
 }
 
@@ -26,7 +50,10 @@ impl Backend for Ckbvm {
     type Instance = CkbvmInstance;
 
     fn name(&self) -> &'static str {
-        "ckbvm"
+        match self.0 {
+            CkbvmBackend::Asm => "ckbvm_asm",
+            CkbvmBackend::NonAsm => "ckbvm_non_asm",
+        }
     }
 
     fn create(&self) -> Self::Engine {}
@@ -40,14 +67,6 @@ impl Backend for Ckbvm {
     }
 
     fn spawn(&self, _engine: &mut Self::Engine, module: &Self::Module) -> Self::Instance {
-        use ckb_vm::CoreMachine;
-
-        let core_machine = ckb_vm::machine::asm::AsmCoreMachine::new(
-            ckb_vm::ISA_IMC | ckb_vm::ISA_A | ckb_vm::ISA_B | ckb_vm::ISA_MOP,
-            ckb_vm::machine::VERSION2,
-            u64::max_value(),
-        );
-
         struct SyscallHandler;
 
         impl<Mac: ckb_vm::SupportMachine> ckb_vm::Syscalls<Mac> for SyscallHandler {
@@ -61,18 +80,50 @@ impl Backend for Ckbvm {
             }
         }
 
-        let core = ckb_vm::DefaultMachineBuilder::new(core_machine)
-            .instruction_cycle_func(Box::new(ckb_vm::cost_model::estimate_cycles))
-            .syscall(Box::new(SyscallHandler))
-            .build();
+        use ckb_vm::CoreMachine;
 
-        let mut machine = ckb_vm::machine::asm::AsmMachine::new(core);
-        machine.load_program(&module.clone().into(), &[]).unwrap();
+        match self.0 {
+            CkbvmBackend::Asm => {
+                let core_machine = ckb_vm::machine::asm::AsmCoreMachine::new(
+                    ckb_vm::ISA_IMC | ckb_vm::ISA_A | ckb_vm::ISA_B | ckb_vm::ISA_MOP,
+                    ckb_vm::machine::VERSION2,
+                    u64::max_value(),
+                );
 
-        CkbvmInstance {
-            pc: *machine.machine.pc(),
-            sp: machine.machine.registers()[ckb_vm::registers::SP],
-            machine,
+                let core = ckb_vm::DefaultMachineBuilder::new(core_machine)
+                    .instruction_cycle_func(Box::new(ckb_vm::cost_model::estimate_cycles))
+                    .syscall(Box::new(SyscallHandler))
+                    .build();
+
+                let mut machine = ckb_vm::machine::asm::AsmMachine::new(core);
+                machine.load_program(&module.clone().into(), &[]).unwrap();
+
+                CkbvmInstance {
+                    pc: *machine.machine.pc(),
+                    sp: machine.machine.registers()[ckb_vm::registers::SP],
+                    kind: CkbvmInstanceKind::Asm(machine),
+                }
+            }
+            CkbvmBackend::NonAsm => {
+                let core_machine = ckb_vm::DefaultCoreMachine::<u64, ckb_vm::SparseMemory<u64>>::new(
+                    ckb_vm::ISA_IMC | ckb_vm::ISA_A | ckb_vm::ISA_B | ckb_vm::ISA_MOP,
+                    ckb_vm::machine::VERSION2,
+                    u64::MAX,
+                );
+
+                let mut machine = ckb_vm::DefaultMachineBuilder::new(core_machine)
+                    .instruction_cycle_func(Box::new(ckb_vm::cost_model::estimate_cycles))
+                    .syscall(Box::new(SyscallHandler))
+                    .build();
+
+                machine.load_program(&module.clone().into(), &[]).unwrap();
+
+                CkbvmInstance {
+                    pc: *machine.pc(),
+                    sp: machine.registers()[ckb_vm::registers::SP],
+                    kind: CkbvmInstanceKind::NonAsm(machine),
+                }
+            }
         }
     }
 

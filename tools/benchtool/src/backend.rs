@@ -240,7 +240,10 @@ define_backends! {
     PvfExecutor => backend_pvfexecutor::PvfExecutor(),
 
     #[cfg(all(feature = "ckb-vm", target_arch = "x86_64"))]
-    Ckbvm => backend_ckbvm::Ckbvm(),
+    Ckbvm_Asm => backend_ckbvm::Ckbvm(backend_ckbvm::CkbvmBackend::Asm),
+
+    #[cfg(all(feature = "ckb-vm", target_arch = "x86_64"))]
+    Ckbvm_NonAsm => backend_ckbvm::Ckbvm(backend_ckbvm::CkbvmBackend::NonAsm),
 
     #[cfg(target_arch = "x86_64")]
     Wasm3 => backend_wasm3::Wasm3(),
@@ -301,7 +304,8 @@ impl BenchmarkKind {
             BenchmarkKind::Ckbvm => {
                 #[cfg(all(feature = "ckb-vm", target_arch = "x86_64"))]
                 {
-                    output.push(BackendKind::Ckbvm);
+                    output.push(BackendKind::Ckbvm_Asm);
+                    output.push(BackendKind::Ckbvm_NonAsm);
                 }
             }
             BenchmarkKind::Native => {
