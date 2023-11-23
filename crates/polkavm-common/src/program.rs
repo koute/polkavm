@@ -991,8 +991,8 @@ impl<'a> Reader<'a> {
     }
 
     fn read_byte(&mut self) -> Result<u8, ProgramParseError> {
-        let new_pos = self.position + 1;
-        if let Some(byte) = self.blob.get(new_pos) {
+        if let Some(byte) = self.blob.get(self.position) {
+            let new_pos = self.position + 1;
             self.previous_position = core::mem::replace(&mut self.position, new_pos);
             Ok(*byte)
         } else {
