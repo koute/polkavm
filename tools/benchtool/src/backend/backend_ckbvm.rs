@@ -30,7 +30,7 @@ impl CkbvmInstance {
                 machine.machine.set_register(ckb_vm::registers::A0, a0);
                 machine.machine.update_pc(self.pc);
                 machine.machine.commit_pc();
-                machine.machine.run().unwrap();
+                machine.run().unwrap();
             }
             CkbvmInstanceKind::NonAsm(ref mut machine) => {
                 machine.set_register(ckb_vm::registers::SP, self.sp);
