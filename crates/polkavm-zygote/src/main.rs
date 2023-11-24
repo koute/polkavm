@@ -470,6 +470,13 @@ unsafe fn initialize(mut stack: *mut usize) -> linux_raw::Fd {
     )
     .unwrap_or_else(|error| abort_with_error("failed to map the sysreturn jump table", error));
 
+    unsafe {
+        core::arch::asm!(
+            "wrgsbase {addr}",
+            addr = in(reg) VM_ADDR_JUMP_TABLE
+        );
+    }
+
     // Change the name of the process.
     linux_raw::sys_prctl_set_name(b"polkavm-sandbox\0").unwrap_or_else(|error| abort_with_error("failed to set the process name", error));
 

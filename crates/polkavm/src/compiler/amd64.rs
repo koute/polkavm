@@ -8,9 +8,7 @@ use polkavm_assembler::Label;
 
 use polkavm_common::program::{InstructionVisitor, Reg};
 use polkavm_common::abi::VM_CODE_ADDRESS_ALIGNMENT;
-use polkavm_common::zygote::{
-    VM_ADDR_JUMP_TABLE, VM_ADDR_VMCTX,
-};
+use polkavm_common::zygote::VM_ADDR_VMCTX;
 
 use crate::config::GasMeteringKind;
 use crate::compiler::{Compiler, SandboxKind};
@@ -1177,16 +1175,20 @@ impl<'a> InstructionVisitor for Compiler<'a> {
             // A dynamic jump.
             match self.sandbox_kind {
                 SandboxKind::Linux => {
-                    // TODO: This could be more efficient. Maybe use fs/gs selector?
-                    if offset == 0 {
-                        self.push(mov(RegSize::R32, TMP_REG, conv_reg(base)));
-                    } else {
+                    use polkavm_assembler::amd64::{SegReg, Scale};
+
+                    let target = if offset != 0 || ra == base {
                         self.push(lea(RegSize::R32, TMP_REG, reg_indirect(RegSize::R32, conv_reg(base) + offset as i32)));
+                        TMP_REG
+                    } else {
+                        conv_reg(base)
+                    };
+
+                    if let Some(return_address) = return_address {
+                        self.load_imm(ra, return_address);
                     }
 
-                    self.push(shl_imm(RegSize::R64, TMP_REG, 3));
-                    self.push(bts(RegSize::R64, TMP_REG, VM_ADDR_JUMP_TABLE.trailing_zeros() as u8));
-                    self.push(load(LoadKind::U64, TMP_REG, reg_indirect(RegSize::R64, TMP_REG)));
+                    self.asm.push(jmp(MemOp::IndexScaleOffset(Some(SegReg::gs), RegSize::R64, target, Scale::x8, 0)));
                 },
                 SandboxKind::Generic => {
                     // // TODO: This also could be more efficient.
@@ -1200,14 +1202,14 @@ impl<'a> InstructionVisitor for Compiler<'a> {
                     self.push(add((RegSize::R64, TMP_REG, conv_reg(base))));
                     self.push(pop(conv_reg(base)));
                     self.push(load(LoadKind::U64, TMP_REG, reg_indirect(RegSize::R64, TMP_REG)));
+
+                    if let Some(return_address) = return_address {
+                        self.load_imm(ra, return_address);
+                    }
+
+                    self.push(jmp(TMP_REG));
                 }
             }
-
-            if let Some(return_address) = return_address {
-                self.load_imm(ra, return_address);
-            }
-
-            self.push(jmp(TMP_REG));
         }
 
         self.start_new_basic_block();
