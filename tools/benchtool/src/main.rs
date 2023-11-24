@@ -185,13 +185,11 @@ fn find_benchmarks() -> Result<Vec<Benchmark>, std::io::Error> {
     Ok(output)
 }
 
-#[cfg(target_os = "linux")]
 enum BenchVariant {
     Runtime,
     Compilation,
 }
 
-#[cfg(target_os = "linux")]
 impl BenchVariant {
     fn name(&self) -> &'static str {
         match self {
@@ -353,7 +351,13 @@ enum Args {
     Criterion { filter: Option<String> },
 
     /// Runs the benchmarks.
-    Benchmark { filter: Option<String> },
+    Benchmark {
+        /// The iteration limit of the benchmark.
+        #[clap(long, short = 'i')]
+        iteration_limit: Option<u64>,
+
+        filter: Option<String>,
+    },
 
     /// Runs `perf` for the given benchmark.
     #[cfg(target_os = "linux")]
@@ -379,7 +383,7 @@ enum Args {
 }
 
 fn main() {
-    #[cfg(debug_assertions)]
+    #[cfg(all(debug_assertions, not(miri)))]
     if std::env::var_os("TRUST_ME_BRO_I_KNOW_WHAT_I_AM_DOING").is_none() {
         // We have interpreters in the benchmark suite, so it's important to compile
         // with full optimizations and with full fat LTO to keep things fair.
@@ -388,7 +392,7 @@ fn main() {
         std::process::exit(1);
     }
 
-    #[cfg(target_os = "linux")]
+    #[cfg(all(target_os = "linux", not(miri)))]
     crate::utils::restart_with_disabled_aslr().unwrap();
 
     #[cfg(feature = "env_logger")]
@@ -407,32 +411,47 @@ fn main() {
             criterion_main(&mut criterion, &benches);
             criterion.final_summary();
         }
-        Args::Benchmark { filter } => {
+        Args::Benchmark { iteration_limit, filter } => {
             let mut list = Vec::new();
             let benches = find_benchmarks().unwrap();
             for bench in &benches {
                 for backend in bench.kind.matching_backends() {
-                    let name = format!("runtime/{}/{}", bench.name, backend.name());
-                    if let Some(ref filter) = filter {
-                        if !name.contains(filter) {
+                    for variant in [BenchVariant::Runtime, BenchVariant::Compilation] {
+                        if matches!(variant, BenchVariant::Compilation) && !backend.is_compiled() {
                             continue;
                         }
+
+                        let name = format!("{}/{}/{}", variant.name(), bench.name, backend.name());
+                        if let Some(ref filter) = filter {
+                            if !name.contains(filter) {
+                                continue;
+                            }
+                        }
+                        list.push((name, variant, bench, backend));
                     }
-                    list.push((name, bench, backend));
                 }
             }
 
-            for (name, bench, backend) in list {
-                let (outer_count, inner_count) = if backend.is_slow() {
-                    (1, SLOW_INNER_COUNT)
-                } else {
-                    (12, FAST_INNER_COUNT)
-                };
-
+            for (name, variant, bench, backend) in list {
                 use std::io::Write;
                 let _ = write!(&mut std::io::stdout(), "{name}: ...");
                 let _ = std::io::stdout().flush();
-                let elapsed = benchmark_execution(outer_count, inner_count, backend, &bench.path) / outer_count as u32;
+
+                let elapsed = match variant {
+                    BenchVariant::Runtime => {
+                        let (outer_count, inner_count) = if backend.is_slow() {
+                            (iteration_limit.unwrap_or(1), SLOW_INNER_COUNT)
+                        } else {
+                            (iteration_limit.unwrap_or(12), FAST_INNER_COUNT)
+                        };
+                        benchmark_execution(outer_count, inner_count, backend, &bench.path) / outer_count as u32
+                    }
+                    BenchVariant::Compilation => {
+                        let count = if cfg!(miri) { 1 } else { iteration_limit.unwrap_or(128) };
+                        benchmark_compilation(count, backend, &bench.path) / count as u32
+                    }
+                };
+
                 let elapsed = if elapsed.as_secs() > 0 {
                     format!("{:.03}s", elapsed.as_secs_f64())
                 } else if elapsed.as_millis() > 9 {
