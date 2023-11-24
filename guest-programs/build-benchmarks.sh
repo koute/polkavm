@@ -73,7 +73,7 @@ function build_benchmark() {
 
     if [ "${BUILD_CKBVM}" == "1" ]; then
         echo "> Building: '$1' (CKB VM)"
-        RUSTFLAGS="$extra_flags -C link-arg=-s --cfg=target_ckb_vm" rustup run $TOOLCHAIN_VERSION cargo build -q --target=riscv64imac-unknown-none-elf --release --bin $1 -p $1
+        RUSTFLAGS="$extra_flags -C target-feature=+zba,+zbb,+zbc,+zbs -C link-arg=-s --cfg=target_ckb_vm" rustup run $TOOLCHAIN_VERSION cargo build -q --target=riscv64imac-unknown-none-elf --release --bin $1 -p $1
     fi
 }
 
