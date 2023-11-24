@@ -50,4 +50,8 @@ impl Backend for Wasmer {
     fn run(&self, instance: &mut Self::Instance) {
         instance.run.call(&mut instance.store).unwrap();
     }
+
+    fn is_compiled(&self) -> bool {
+        true
+    }
 }

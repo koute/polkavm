@@ -41,13 +41,23 @@ fn benchmark_execution<T: Backend>(outer_count: u64, inner_count: u32, backend: 
     total_elapsed / inner_count
 }
 
+fn benchmark_compilation<T: Backend>(count: u64, backend: T, path: &Path) -> core::time::Duration {
+    let mut engine = backend.create();
+    let blob = backend.load(path);
+    let start = std::time::Instant::now();
+    for _ in 0..count {
+        backend.compile(&mut engine, &blob);
+    }
+    start.elapsed()
+}
+
 fn criterion_main(c: &mut Criterion, benches: &[Benchmark]) {
     let mut by_name = BTreeMap::new();
     for bench in benches {
         by_name.entry(bench.name.clone()).or_insert_with(Vec::new).push(bench);
     }
 
-    for (name, variants) in by_name {
+    for (name, variants) in &by_name {
         let mut group = c.benchmark_group(format!("runtime/{}", name));
         for bench in variants {
             for backend in bench.kind.matching_backends() {
@@ -58,6 +68,22 @@ fn criterion_main(c: &mut Criterion, benches: &[Benchmark]) {
 
                 group.bench_function(backend.name(), |b| {
                     b.iter_custom(|count| benchmark_execution(count, FAST_INNER_COUNT, backend, &bench.path));
+                });
+            }
+        }
+        group.finish();
+    }
+
+    for (name, variants) in &by_name {
+        let mut group = c.benchmark_group(format!("compilation/{}", name));
+        for bench in variants {
+            for backend in bench.kind.matching_backends() {
+                if !backend.is_compiled() {
+                    continue;
+                }
+
+                group.bench_function(backend.name(), |b| {
+                    b.iter_custom(|count| benchmark_compilation(count, backend, &bench.path));
                 });
             }
         }
@@ -159,19 +185,42 @@ fn find_benchmarks() -> Result<Vec<Benchmark>, std::io::Error> {
 }
 
 #[cfg(target_os = "linux")]
-fn pick_benchmark(benchmark: Option<String>) -> (Benchmark, BackendKind) {
+enum BenchVariant {
+    Runtime,
+    Compilation,
+}
+
+#[cfg(target_os = "linux")]
+impl BenchVariant {
+    fn name(&self) -> &'static str {
+        match self {
+            BenchVariant::Runtime => "runtime",
+            BenchVariant::Compilation => "compilation",
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn pick_benchmark(benchmark: Option<String>) -> (BenchVariant, Benchmark, BackendKind) {
     let benches = find_benchmarks().unwrap();
     let mut all = Vec::new();
     let mut found = Vec::new();
     for bench in &benches {
         for backend in bench.kind.matching_backends() {
-            let name = format!("{}/{}", bench.name, backend.name());
-            if let Some(ref benchmark) = benchmark {
-                if *benchmark == name {
-                    found.push((bench.clone(), backend));
+            for variant in [BenchVariant::Runtime, BenchVariant::Compilation] {
+                if matches!(variant, BenchVariant::Compilation) && !backend.is_compiled() {
+                    continue;
                 }
+
+                let name = format!("{}/{}/{}", variant.name(), bench.name, backend.name());
+                if let Some(ref benchmark) = benchmark {
+                    if *benchmark == name {
+                        println!("{} {}", benchmark, name);
+                        found.push((variant, bench.clone(), backend));
+                    }
+                }
+                all.push(name);
             }
-            all.push(name);
         }
     }
 
@@ -181,6 +230,8 @@ fn pick_benchmark(benchmark: Option<String>) -> (Benchmark, BackendKind) {
         }
 
         eprintln!("Available benchmarks:");
+
+        all.sort();
         for name in all {
             eprintln!("  {name}");
         }
@@ -207,7 +258,14 @@ struct Process {
 }
 
 #[cfg(target_os = "linux")]
-fn prepare_for_profiling(bench: Benchmark, backend: BackendKind, iteration_limit: Option<usize>) -> Process {
+fn prepare_for_profiling<T>(
+    iteration_limit: Option<usize>,
+    initialize: impl FnOnce() -> (T, Option<u32>) + Send + 'static,
+    mut run: impl FnMut(&mut T) + Send + 'static,
+) -> Process
+where
+    T: 'static,
+{
     let init_barrier = Arc::new(Barrier::new(2));
     let run_barrier = Arc::new(Barrier::new(2));
     let running = Arc::new(AtomicBool::new(false));
@@ -225,13 +283,8 @@ fn prepare_for_profiling(bench: Benchmark, backend: BackendKind, iteration_limit
         let run_barrier = run_barrier.clone();
         let running = running.clone();
         std::thread::spawn(move || {
-            let mut engine = backend.create();
-            let blob = backend.load(&bench.path);
-            let module = backend.compile(&mut engine, &blob);
-            let mut instance = backend.spawn(&mut engine, &module);
-            backend.initialize(&mut instance);
-
-            let (pid, tid) = if let Some(pid) = backend.pid(&instance) {
+            let (mut benchmark_state, pid) = initialize();
+            let (pid, tid) = if let Some(pid) = pid {
                 log::info!("Child PID (external process): pid={pid}");
                 (pid, pid)
             } else {
@@ -253,7 +306,7 @@ fn prepare_for_profiling(bench: Benchmark, backend: BackendKind, iteration_limit
                     break;
                 }
 
-                backend.run(&mut instance);
+                run(&mut benchmark_state);
             }
 
             let _ = done_tx.send(());
@@ -397,13 +450,41 @@ fn main() {
             command,
             perf_args,
         } => {
-            let (bench, backend) = pick_benchmark(benchmark);
+            let (variant, bench, backend) = pick_benchmark(benchmark);
 
             if time_limit.is_none() && iteration_limit.is_none() {
                 time_limit = Some(5.0);
             }
 
-            let process = prepare_for_profiling(bench, backend, iteration_limit);
+            let process = match variant {
+                BenchVariant::Runtime => prepare_for_profiling(
+                    iteration_limit,
+                    move || {
+                        let mut engine = backend.create();
+                        let blob = backend.load(&bench.path);
+                        let module = backend.compile(&mut engine, &blob);
+                        let mut instance = backend.spawn(&mut engine, &module);
+                        backend.initialize(&mut instance);
+                        let pid = backend.pid(&instance);
+                        (instance, pid)
+                    },
+                    move |instance| {
+                        backend.run(instance);
+                    },
+                ),
+                BenchVariant::Compilation => prepare_for_profiling(
+                    iteration_limit,
+                    move || {
+                        let engine = backend.create();
+                        let blob = backend.load(&bench.path);
+                        ((engine, blob), None)
+                    },
+                    move |(engine, blob)| {
+                        backend.compile(engine, blob);
+                    },
+                ),
+            };
+
             let mut cmd = Command::new("perf");
             let mut cmd = cmd
                 .arg(&command)

@@ -26,6 +26,10 @@ pub trait Backend: Copy + Clone {
     fn is_slow(&self) -> bool {
         false
     }
+
+    fn is_compiled(&self) -> bool {
+        false
+    }
 }
 
 #[cfg(target_arch = "x86_64")]
@@ -199,6 +203,15 @@ macro_rules! define_backends {
                     $(
                         #[cfg($($cfg)*)]
                         Self::$backend => self::$module::$struct($($ctor_args)*).is_slow(),
+                    )+
+                }
+            }
+
+            fn is_compiled(&self) -> bool {
+                match self {
+                    $(
+                        #[cfg($($cfg)*)]
+                        Self::$backend => self::$module::$struct($($ctor_args)*).is_compiled(),
                     )+
                 }
             }

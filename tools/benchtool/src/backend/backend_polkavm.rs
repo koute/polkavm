@@ -59,4 +59,8 @@ impl Backend for PolkaVM {
     fn pid(&self, instance: &Self::Instance) -> Option<u32> {
         instance.2
     }
+
+    fn is_compiled(&self) -> bool {
+        true
+    }
 }
