@@ -39,4 +39,8 @@ impl Backend for PvfExecutor {
     fn run(&self, instance: &mut Self::Instance) {
         unsafe { instance.call::<_, _, ()>("run", ()) }.unwrap();
     }
+
+    fn is_compiled(&self) -> bool {
+        true
+    }
 }

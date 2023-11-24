@@ -152,4 +152,8 @@ impl Backend for WaZero {
     fn run(&self, instance: &mut Self::Instance) {
         unsafe { (get_wazero().unwrap().instance_run)(instance.0) }
     }
+
+    fn is_compiled(&self) -> bool {
+        true
+    }
 }
