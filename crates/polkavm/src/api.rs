@@ -265,16 +265,17 @@ impl Module {
 
         let mut gas_cost_for_basic_block: Vec<u32> = Vec::new();
         let mut last_instruction = None;
+        let mut jump_count = 0;
 
         log::trace!("Parsing code...");
         let (instructions, instruction_by_basic_block) = {
-            let mut instruction_by_basic_block = Vec::with_capacity(blob.code().len() / 4);
+            let mut instruction_by_basic_block = Vec::with_capacity(blob.code().len() / 3);
             instruction_by_basic_block.push(0);
             if config.gas_metering.is_some() {
                 gas_cost_for_basic_block.push(0);
             }
 
-            let mut instructions = Vec::with_capacity(blob.code().len() / 4);
+            let mut instructions = Vec::with_capacity(blob.code().len() / 3);
             for (nth_instruction, instruction) in blob.instructions().enumerate() {
                 let nth_instruction = nth_instruction as u32;
                 let instruction = instruction.map_err(Error::from_display)?;
@@ -303,13 +304,15 @@ impl Module {
 
                         let base = instruction.reg2();
                         if base == Reg::Zero {
-                            maximum_seen_jump_target = core::cmp::max(maximum_seen_jump_target, instruction.raw_imm_or_reg());
+                            maximum_seen_jump_target = core::cmp::max(maximum_seen_jump_target, instruction.raw_imm_or_reg3());
                         }
 
                         instruction_by_basic_block.push(nth_instruction + 1);
                         if config.gas_metering.is_some() {
                             gas_cost_for_basic_block.push(0);
                         }
+
+                        jump_count += 1;
                     }
                     Opcode::trap => {
                         instruction_by_basic_block.push(nth_instruction + 1);
@@ -324,14 +327,16 @@ impl Module {
                     | Opcode::branch_eq
                     | Opcode::branch_not_eq => {
                         instruction_by_basic_block.push(nth_instruction + 1);
-                        maximum_seen_jump_target = core::cmp::max(maximum_seen_jump_target, instruction.raw_imm_or_reg());
+                        maximum_seen_jump_target = core::cmp::max(maximum_seen_jump_target, instruction.raw_imm_or_reg3());
 
                         if config.gas_metering.is_some() {
                             gas_cost_for_basic_block.push(0);
                         }
+
+                        jump_count += 1;
                     }
                     Opcode::ecalli => {
-                        let nr = instruction.raw_imm_or_reg();
+                        let nr = instruction.raw_imm_or_reg3();
                         if imports.get(&nr).is_none() {
                             bail!("found an unrecognized ecall number: {nr:}");
                         }
@@ -345,6 +350,8 @@ impl Module {
             gas_cost_for_basic_block.shrink_to_fit();
             (instructions, instruction_by_basic_block)
         };
+
+        let basic_block_count = instruction_by_basic_block.len();
 
         {
             let Some(last_instruction) = last_instruction else {
@@ -459,7 +466,9 @@ impl Module {
                                     &jump_table_index_by_basic_block,
                                     &gas_cost_for_basic_block,
                                     init,
-                                    debug_trace_execution
+                                    debug_trace_execution,
+                                    jump_count,
+                                    basic_block_count,
                                 )?;
                                 CompiledModuleKind::Linux(module)
                             }
@@ -479,7 +488,9 @@ impl Module {
                                 &jump_table_index_by_basic_block,
                                 &gas_cost_for_basic_block,
                                 init,
-                                debug_trace_execution
+                                debug_trace_execution,
+                                jump_count,
+                                basic_block_count,
                             )?;
                             CompiledModuleKind::Generic(module)
                         }

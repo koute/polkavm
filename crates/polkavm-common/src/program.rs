@@ -119,11 +119,31 @@ macro_rules! define_opcodes {
         }
 
         impl Opcode {
+            #[cfg_attr(feature = "alloc", inline)]
             pub fn from_u8(byte: u8) -> Option<Opcode> {
+                if !IS_INSTRUCTION_VALID[byte as usize] {
+                    return None;
+                }
+
+                #[allow(unsafe_code)]
+                // SAFETY: We already checked that this opcode is valid, so this is safe.
+                unsafe {
+                    Some(core::mem::transmute(byte))
+                }
+            }
+        }
+
+        #[test]
+        fn test_opcode_from_u8() {
+            fn from_u8_naive(byte: u8) -> Option<Opcode> {
                 match byte {
                     $($value => Some(Opcode::$name),)+
                     _ => None
                 }
+            }
+
+            for byte in 0..=255 {
+                assert_eq!(from_u8_naive(byte), Opcode::from_u8(byte));
             }
         }
 
@@ -158,12 +178,17 @@ macro_rules! define_opcodes {
 
         impl RawInstruction {
             pub fn visit<T>(self, visitor: &mut T) -> T::ReturnTy where T: InstructionVisitor {
-                match self.op {
-                    $($value_argless => visitor.$name_argless(),)+
-                    $($value_with_imm => visitor.$name_with_imm(self.imm_or_reg),)+
-                    $($value_with_regs3 => visitor.$name_with_regs3(self.reg1(), self.reg2(), self.reg3()),)+
-                    $($value_with_regs2_imm => visitor.$name_with_regs2_imm(self.reg1(), self.reg2(), self.imm_or_reg),)+
-                    _ => unreachable!()
+                // SAFETY: If a given opcode is set then we have a guarantee the arguments are also
+                // properly set, in which case calling the `*_unchecked` methods is safe.
+                #[allow(unsafe_code)]
+                unsafe {
+                    match self.op as usize {
+                        $($value_argless => visitor.$name_argless(),)+
+                        $($value_with_imm => visitor.$name_with_imm(self.imm_or_reg),)+
+                        $($value_with_regs3 => visitor.$name_with_regs3(self.reg1_unchecked(), self.reg2_unchecked(), self.reg3_unchecked()),)+
+                        $($value_with_regs2_imm => visitor.$name_with_regs2_imm(self.reg1_unchecked(), self.reg2_unchecked(), self.imm_or_reg),)+
+                        _ => unreachable!()
+                    }
                 }
             }
         }
@@ -296,14 +321,14 @@ pub const MAX_INSTRUCTION_LENGTH: usize = MAX_VARINT_LENGTH + 2;
 
 #[derive(Copy, Clone, PartialEq, Eq)]
 pub struct RawInstruction {
-    op: u8,
+    op: Opcode,
     regs: u8,
     imm_or_reg: u32,
 }
 
 impl core::fmt::Debug for RawInstruction {
     fn fmt(&self, fmt: &mut core::fmt::Formatter) -> core::fmt::Result {
-        write!(fmt, "({:02x} {:02x} {:08x}) {}", self.op, self.regs, self.imm_or_reg, self)
+        write!(fmt, "({:02x} {:02x} {:08x}) {}", self.op as u8, self.regs, self.imm_or_reg, self)
     }
 }
 
@@ -587,7 +612,7 @@ impl RawInstruction {
     pub fn new_argless(op: Opcode) -> Self {
         assert_eq!(op as u8 & 0b11_000000, 0b00_000000);
         RawInstruction {
-            op: op as u8,
+            op,
             regs: 0,
             imm_or_reg: 0,
         }
@@ -597,7 +622,7 @@ impl RawInstruction {
     pub fn new_with_imm(op: Opcode, imm: u32) -> Self {
         assert_eq!(op as u8 & 0b11_000000, 0b01_000000);
         RawInstruction {
-            op: op as u8,
+            op,
             regs: 0,
             imm_or_reg: imm,
         }
@@ -607,7 +632,7 @@ impl RawInstruction {
     pub fn new_with_regs3(op: Opcode, reg1: Reg, reg2: Reg, reg3: Reg) -> Self {
         assert_eq!(op as u8 & 0b11_000000, 0b10_000000);
         RawInstruction {
-            op: op as u8,
+            op,
             regs: reg1 as u8 | (reg2 as u8) << 4,
             imm_or_reg: reg3 as u32,
         }
@@ -617,7 +642,7 @@ impl RawInstruction {
     pub fn new_with_regs2_imm(op: Opcode, reg1: Reg, reg2: Reg, imm: u32) -> Self {
         assert_eq!(op as u8 & 0b11_000000, 0b11_000000);
         RawInstruction {
-            op: op as u8,
+            op,
             regs: reg1 as u8 | (reg2 as u8) << 4,
             imm_or_reg: imm,
         }
@@ -625,11 +650,7 @@ impl RawInstruction {
 
     #[inline]
     pub fn op(self) -> Opcode {
-        if let Some(op) = Opcode::from_u8(self.op) {
-            op
-        } else {
-            unreachable!()
-        }
+        self.op
     }
 
     #[inline]
@@ -648,20 +669,45 @@ impl RawInstruction {
     }
 
     #[inline]
-    pub fn raw_op(self) -> u8 {
-        self.op
+    #[allow(unsafe_code)]
+    unsafe fn reg1_unchecked(self) -> Reg {
+        core::mem::transmute(self.raw_reg1())
     }
 
     #[inline]
-    pub fn raw_imm_or_reg(self) -> u32 {
+    #[allow(unsafe_code)]
+    unsafe fn reg2_unchecked(self) -> Reg {
+        core::mem::transmute(self.raw_reg2())
+    }
+
+    #[inline]
+    #[allow(unsafe_code)]
+    unsafe fn reg3_unchecked(self) -> Reg {
+        core::mem::transmute(self.raw_reg3())
+    }
+
+    #[inline]
+    pub fn raw_reg1(self) -> u8 {
+        self.regs & 0b00001111
+    }
+
+    #[inline]
+    pub fn raw_reg2(self) -> u8 {
+        self.regs >> 4
+    }
+
+    #[inline]
+    pub fn raw_reg3(self) -> u8 {
+        self.imm_or_reg as u8
+    }
+
+    #[inline]
+    pub fn raw_imm_or_reg3(self) -> u32 {
         self.imm_or_reg
     }
 
     pub fn deserialize(input: &[u8]) -> Option<(usize, Self)> {
-        let op = *input.get(0)?;
-        if !IS_INSTRUCTION_VALID[op as usize] {
-            return None;
-        }
+        let op = Opcode::from_u8(*input.get(0)?)?;
 
         let mut position = 1;
         let mut output = RawInstruction {
@@ -671,7 +717,7 @@ impl RawInstruction {
         };
 
         // Should we load the registers mask?
-        if op & 0b10000000 != 0 {
+        if op as u8 & 0b10000000 != 0 {
             output.regs = *input.get(position)?;
             if matches!(output.regs & 0b1111, 14 | 15) || matches!(output.regs >> 4, 14 | 15) {
                 // Invalid register.
@@ -681,11 +727,11 @@ impl RawInstruction {
         }
 
         // Is there at least another byte to load?
-        if op & 0b11000000 != 0 {
+        if op as u8 & 0b11000000 != 0 {
             let first_byte = *input.get(position)?;
             position += 1;
 
-            if op & 0b11_000000 == 0b10_000000 {
+            if op as u8 & 0b11_000000 == 0b10_000000 {
                 // It's the third register.
                 if first_byte > 13 {
                     // Invalid register.
@@ -707,15 +753,15 @@ impl RawInstruction {
     #[inline]
     pub fn serialize_into(self, buffer: &mut [u8]) -> usize {
         assert!(buffer.len() >= MAX_INSTRUCTION_LENGTH);
-        buffer[0] = self.op;
+        buffer[0] = self.op as u8;
 
         let mut length = 1;
-        if self.op & 0b10000000 != 0 {
+        if self.op as u8 & 0b10000000 != 0 {
             buffer[1] = self.regs;
             length += 1;
         }
 
-        if self.op & 0b11000000 != 0 {
+        if self.op as u8 & 0b11000000 != 0 {
             length += write_varint(self.imm_or_reg, &mut buffer[length..]);
         }
 
@@ -752,18 +798,18 @@ macro_rules! test_serde {
 }
 
 test_serde! {
-    [0b01_111111, 0b01111111] => RawInstruction { op: 0b01_111111, regs: 0, imm_or_reg: 0b01111111 },
-    [0b01_111111, 0b10111111, 0b00000000] => RawInstruction { op: 0b01_111111, regs: 0, imm_or_reg: 0b00111111_00000000 },
-    [0b01_111111, 0b10111111, 0b10101010] => RawInstruction { op: 0b01_111111, regs: 0, imm_or_reg: 0b00111111_10101010 },
-    [0b01_111111, 0b10111111, 0b01010101] => RawInstruction { op: 0b01_111111, regs: 0, imm_or_reg: 0b00111111_01010101 },
-    [0b01_111111, 0b10000001, 0b11111111] => RawInstruction { op: 0b01_111111, regs: 0, imm_or_reg: 0b00000001_11111111 },
-    [0b01_111111, 0b11000001, 0b10101010, 0b01010101] => RawInstruction { op: 0b01_111111, regs: 0, imm_or_reg: 0b00000001_01010101_10101010 },
+    [0b01_111111, 0b01111111] => RawInstruction { op: Opcode::ecalli, regs: 0, imm_or_reg: 0b01111111 },
+    [0b01_111111, 0b10111111, 0b00000000] => RawInstruction { op: Opcode::ecalli, regs: 0, imm_or_reg: 0b00111111_00000000 },
+    [0b01_111111, 0b10111111, 0b10101010] => RawInstruction { op: Opcode::ecalli, regs: 0, imm_or_reg: 0b00111111_10101010 },
+    [0b01_111111, 0b10111111, 0b01010101] => RawInstruction { op: Opcode::ecalli, regs: 0, imm_or_reg: 0b00111111_01010101 },
+    [0b01_111111, 0b10000001, 0b11111111] => RawInstruction { op: Opcode::ecalli, regs: 0, imm_or_reg: 0b00000001_11111111 },
+    [0b01_111111, 0b11000001, 0b10101010, 0b01010101] => RawInstruction { op: Opcode::ecalli, regs: 0, imm_or_reg: 0b00000001_01010101_10101010 },
 
-    [0b00_000000] => RawInstruction { op: 0b00_000000, regs: 0, imm_or_reg: 0 },
+    [0b00_000000] => RawInstruction { op: Opcode::trap, regs: 0, imm_or_reg: 0 },
 
-    [0b10_000000, 0b00100001, 0b00000100] => RawInstruction { op: 0b10_000000, regs: 0b00100001, imm_or_reg: 0b00000100 },
+    [0b10_000000, 0b00100001, 0b00000100] => RawInstruction { op: Opcode::set_less_than_unsigned, regs: 0b00100001, imm_or_reg: 0b00000100 },
 
-    [0b11_000000, 0b00100001, 0b10111111, 0b00000000] => RawInstruction { op: 0b11_000000, regs: 0b00100001, imm_or_reg: 0b00111111_00000000 },
+    [0b11_000000, 0b00100001, 0b10111111, 0b00000000] => RawInstruction { op: Opcode::set_less_than_unsigned_imm, regs: 0b00100001, imm_or_reg: 0b00111111_00000000 },
 }
 
 #[derive(Debug)]

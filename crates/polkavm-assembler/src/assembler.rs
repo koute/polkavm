@@ -1,3 +1,5 @@
+use alloc::vec::Vec;
+
 #[derive(Copy, Clone)]
 struct Fixup {
     target_label: Label,
@@ -40,69 +42,83 @@ impl Assembler {
     }
 
     pub fn forward_declare_label(&mut self) -> Label {
-        let label = self.labels.len();
+        let label = self.labels.len() as u32;
         self.labels.push(isize::MAX);
         Label(label)
     }
 
     pub fn create_label(&mut self) -> Label {
-        let label = self.labels.len();
+        let label = self.labels.len() as u32;
         self.labels.push(self.code.len() as isize);
         Label(label)
     }
 
     pub fn define_label(&mut self, label: Label) -> &mut Self {
-        assert_eq!(self.labels[label.0], isize::MAX, "tried to redefine an already defined label");
-        self.labels[label.0] = self.code.len() as isize;
+        assert_eq!(
+            self.labels[label.0 as usize],
+            isize::MAX,
+            "tried to redefine an already defined label"
+        );
+        self.labels[label.0 as usize] = self.code.len() as isize;
         self
     }
 
-    pub fn push_with_label(&mut self, label: Label, inst: impl Instruction) -> &mut Self {
+    pub fn push_with_label<T>(&mut self, label: Label, instruction: Instruction<T>) -> &mut Self
+    where
+        T: core::fmt::Display,
+    {
         self.define_label(label);
-        self.push(inst)
+        self.push(instruction)
     }
 
     pub fn get_label_offset(&self, label: Label) -> isize {
-        let offset = self.labels[label.0];
+        let offset = self.labels[label.0 as usize];
         assert_ne!(offset, isize::MAX, "tried to fetch a label offset for a label that was not defined");
         offset
     }
 
     pub fn set_label_offset(&mut self, label: Label, offset: isize) {
-        self.labels[label.0] = offset;
+        self.labels[label.0 as usize] = offset;
     }
 
-    fn add_fixup_if_necessary(&mut self, bytes: &[u8], inst: impl Instruction) {
-        let (target_label, fixup_offset, fixup_length) = match inst.target_fixup() {
-            Some(fixup) => fixup,
-            None => return,
-        };
-
-        assert!(target_label.0 < self.labels.len());
+    fn add_fixup(
+        &mut self,
+        bytes_len: usize,
+        InstFixup {
+            target_label,
+            fixup_offset,
+            fixup_length,
+        }: InstFixup,
+    ) {
+        assert!((target_label.0 as usize) < self.labels.len());
         assert!(
-            (fixup_offset as usize) < bytes.len(),
+            (fixup_offset as usize) < bytes_len,
             "instruction is {} bytes long and yet its target fixup starts at {}",
-            bytes.len(),
+            bytes_len,
             fixup_offset
         );
-        assert!((fixup_length as usize) < bytes.len());
-        assert!((fixup_offset as usize + fixup_length as usize) <= bytes.len());
+        assert!((fixup_length as usize) < bytes_len);
+        assert!((fixup_offset as usize + fixup_length as usize) <= bytes_len);
         self.fixups.push(Fixup {
             target_label,
             instruction_offset: self.code.len(),
-            instruction_length: bytes.len() as u8,
+            instruction_length: bytes_len as u8,
             fixup_offset,
             fixup_length,
         });
     }
 
-    pub fn push(&mut self, inst: impl Instruction) -> &mut Self {
-        let enc = inst.encode();
-        let bytes = enc.as_bytes();
-        self.add_fixup_if_necessary(bytes, inst);
-        log::trace!("{:08x}: {}", self.origin + self.code.len() as u64, inst);
+    #[inline(always)]
+    pub fn push<T>(&mut self, instruction: Instruction<T>) -> &mut Self
+    where
+        T: core::fmt::Display,
+    {
+        log::trace!("{:08x}: {}", self.origin + self.code.len() as u64, instruction);
+        if let Some(fixup) = instruction.fixup {
+            self.add_fixup(instruction.bytes.len(), fixup);
+        }
 
-        self.code.extend_from_slice(bytes);
+        instruction.bytes.encode_into(&mut self.code);
         self
     }
 
@@ -114,7 +130,7 @@ impl Assembler {
     pub fn finalize(&mut self) -> &[u8] {
         for fixup in self.fixups.drain(..) {
             let origin = fixup.instruction_offset + fixup.instruction_length as usize;
-            let target_absolute = self.labels[fixup.target_label.0];
+            let target_absolute = self.labels[fixup.target_label.0 as usize];
             assert_ne!(target_absolute, isize::MAX);
             let offset = target_absolute - origin as isize;
             let p = fixup.instruction_offset + fixup.fixup_offset as usize;
@@ -143,8 +159,24 @@ impl Assembler {
         self.code.len()
     }
 
+    pub fn spare_capacity(&self) -> usize {
+        self.code.capacity() - self.code.len()
+    }
+
     pub fn resize(&mut self, size: usize, fill_with: u8) {
         self.code.resize(size, fill_with)
+    }
+
+    pub fn reserve_code(&mut self, length: usize) {
+        self.code.reserve(length);
+    }
+
+    pub fn reserve_labels(&mut self, length: usize) {
+        self.labels.reserve(length);
+    }
+
+    pub fn reserve_fixups(&mut self, length: usize) {
+        self.fixups.reserve(length);
     }
 
     pub fn clear(&mut self) {
@@ -157,7 +189,7 @@ impl Assembler {
 
 #[derive(Copy, Clone, PartialEq, Eq, Debug)]
 #[repr(transparent)]
-pub struct Label(usize);
+pub struct Label(u32);
 
 impl core::fmt::Display for Label {
     fn fmt(&self, fmt: &mut core::fmt::Formatter) -> core::fmt::Result {
@@ -165,77 +197,146 @@ impl core::fmt::Display for Label {
     }
 }
 
-#[derive(Copy, Clone, PartialEq, Eq, Debug)]
-#[repr(align(8))]
-pub struct EncInst {
-    bytes: [u8; 15],
-    length: u8,
+#[derive(Copy, Clone)]
+pub struct Instruction<T> {
+    pub(crate) instruction: T,
+    pub(crate) bytes: InstBuf,
+    pub(crate) fixup: Option<InstFixup>,
 }
 
-impl EncInst {
-    pub const fn new() -> Self {
-        Self::from_array([])
+impl<T> core::fmt::Debug for Instruction<T>
+where
+    T: core::fmt::Debug,
+{
+    fn fmt(&self, fmt: &mut core::fmt::Formatter) -> core::fmt::Result {
+        self.instruction.fmt(fmt)
+    }
+}
+
+impl<T> core::fmt::Display for Instruction<T>
+where
+    T: core::fmt::Display,
+{
+    fn fmt(&self, fmt: &mut core::fmt::Formatter) -> core::fmt::Result {
+        self.instruction.fmt(fmt)
+    }
+}
+
+#[derive(Copy, Clone)]
+pub struct InstFixup {
+    pub(crate) target_label: Label,
+    pub(crate) fixup_offset: u8,
+    pub(crate) fixup_length: u8,
+}
+
+#[derive(Copy, Clone)]
+pub struct InstBuf {
+    out_1: u64,
+    out_2: u64,
+    length: usize,
+}
+
+#[allow(clippy::new_without_default)]
+impl InstBuf {
+    #[inline]
+    pub fn new() -> Self {
+        Self {
+            out_1: 0,
+            out_2: 0,
+            length: 0,
+        }
     }
 
-    pub const fn from_array<const N: usize>(array: [u8; N]) -> Self {
-        let mut out = EncInst { bytes: [0; 15], length: 0 };
+    #[inline]
+    pub fn len(&self) -> usize {
+        self.length
+    }
 
-        let mut n = 0;
-        while n < N {
-            out.bytes[n] = array[n];
-            n += 1;
+    #[inline]
+    pub fn append(&mut self, byte: u8) {
+        if self.length < 8 {
+            self.out_1 |= (byte as u64) << (self.length * 8);
+        } else {
+            self.out_2 |= (byte as u64) << ((self.length - 8) * 8);
         }
-        out.length = N as u8;
+
+        self.length += 1;
+    }
+
+    #[inline]
+    pub fn append2(&mut self, bytes: [u8; 2]) {
+        self.append(bytes[0]);
+        self.append(bytes[1]);
+    }
+
+    #[inline]
+    pub fn append4(&mut self, bytes: [u8; 4]) {
+        self.append(bytes[0]);
+        self.append(bytes[1]);
+        self.append(bytes[2]);
+        self.append(bytes[3]);
+    }
+
+    #[inline]
+    unsafe fn encode_into_raw(self, output: *mut u8) {
+        core::ptr::write_unaligned(output.cast::<u64>(), u64::from_le(self.out_1));
+        core::ptr::write_unaligned(output.add(8).cast::<u64>(), u64::from_le(self.out_2));
+    }
+
+    #[inline]
+    pub fn encode_into(self, output: &mut Vec<u8>) {
+        // NOTE: This `if` actually matters and should not be removed, even though `reserve` would be a no-op anyway in such case.
+        if output.spare_capacity_mut().len() < 16 {
+            output.reserve(16);
+            assert!(output.spare_capacity_mut().len() >= 16);
+        }
+
+        // SAFETY: We've made sure that there is at least 16 bytes of spare capacity,
+        //         and `encode_into_raw` can only write up to 16 bytes, so this is safe.
+        unsafe {
+            self.encode_into_raw(output.spare_capacity_mut().as_mut_ptr().cast());
+            let new_length = output.len() + self.length;
+            output.set_len(new_length);
+        }
+    }
+
+    #[inline]
+    pub fn from_array<const N: usize>(array: [u8; N]) -> Self {
+        if N > 16 {
+            panic!();
+        }
+
+        let mut out = Self::new();
+        for value in array {
+            out.append(value);
+        }
         out
     }
 
-    pub const fn len(self) -> usize {
-        self.length as usize
-    }
-
-    pub const fn is_empty(self) -> bool {
-        self.len() == 0
-    }
-
-    pub const fn append(self, byte: u8) -> Self {
-        self.append_array([byte])
-    }
-
-    pub const fn append_array_if<const N: usize>(self, condition: bool, array: [u8; N]) -> Self {
-        if condition {
-            self.append_array::<N>(array)
-        } else {
-            self
-        }
-    }
-
-    pub const fn append_array<const N: usize>(mut self, array: [u8; N]) -> Self {
-        let mut p = self.length as usize;
-        assert!(p + N < 16);
-
-        let mut n = 0;
-        while n < N {
-            self.bytes[p] = array[n];
-            p += 1;
-            n += 1;
-        }
-
-        self.length += N as u8;
-        self
-    }
-
-    pub fn as_bytes(&self) -> &[u8] {
-        &self.bytes[..self.length as usize]
+    #[inline]
+    pub fn to_vec(self) -> Vec<u8> {
+        let mut vec = Vec::new();
+        self.encode_into(&mut vec);
+        vec
     }
 }
 
-impl AsRef<[u8]> for EncInst {
-    fn as_ref(&self) -> &[u8] {
-        self.as_bytes()
-    }
-}
-
-pub trait Instruction: Copy + core::fmt::Display {
-    fn encode(self) -> EncInst;
-    fn target_fixup(self) -> Option<(Label, u8, u8)>;
+#[test]
+fn test_inst_buf() {
+    assert_eq!(InstBuf::from_array([0x01]).to_vec(), [0x01]);
+    assert_eq!(InstBuf::from_array([0x01, 0x02]).to_vec(), [0x01, 0x02]);
+    assert_eq!(InstBuf::from_array([0x01, 0x02, 0x03]).to_vec(), [0x01, 0x02, 0x03]);
+    assert_eq!(InstBuf::from_array([0x01, 0x02, 0x03, 0x04]).to_vec(), [0x01, 0x02, 0x03, 0x04]);
+    assert_eq!(
+        InstBuf::from_array([0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08]).to_vec(),
+        [0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08]
+    );
+    assert_eq!(
+        InstBuf::from_array([0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09]).to_vec(),
+        [0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09]
+    );
+    assert_eq!(
+        InstBuf::from_array([0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0A]).to_vec(),
+        [0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0A]
+    );
 }

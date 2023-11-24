@@ -27,7 +27,8 @@ struct Compiler<'a> {
     jump_table_index_by_basic_block: &'a HashMap<u32, u32>,
     gas_cost_for_basic_block: &'a [u32],
     nth_basic_block_to_label: Vec<Label>,
-    nth_basic_block_to_label_pending: HashMap<u32, Label>,
+    nth_basic_block_to_label_pending: Vec<Option<Label>>,
+    pending_label_count: usize,
     jump_table: Vec<u8>,
     export_to_label: HashMap<u32, Label>,
     export_trampolines: Vec<u64>,
@@ -72,12 +73,24 @@ impl<'a> Compiler<'a> {
         vmctx_gas_offset: usize,
         debug_trace_execution: bool,
         native_code_address: u64,
+        jump_count: usize,
+        basic_block_count: usize,
     ) -> Self {
         let mut asm = Assembler::new();
         let ecall_label = asm.forward_declare_label();
         let trap_label = asm.forward_declare_label();
         let trace_label = asm.forward_declare_label();
         let jump_table_label = asm.forward_declare_label();
+
+        let mut nth_basic_block_to_label = Vec::new();
+        nth_basic_block_to_label.reserve(basic_block_count);
+
+        let mut nth_basic_block_to_label_pending = Vec::new();
+        nth_basic_block_to_label_pending.resize(basic_block_count, None);
+
+        asm.reserve_code(instructions.len() * 16);
+        asm.reserve_labels(basic_block_count * 2);
+        asm.reserve_fixups(jump_count * 2);
 
         Compiler {
             asm,
@@ -86,8 +99,9 @@ impl<'a> Compiler<'a> {
             basic_block_by_jump_table_index,
             jump_table_index_by_basic_block,
             gas_cost_for_basic_block,
-            nth_basic_block_to_label: Default::default(),
-            nth_basic_block_to_label_pending: Default::default(),
+            nth_basic_block_to_label,
+            nth_basic_block_to_label_pending,
+            pending_label_count: 0,
             jump_table: Default::default(),
             export_to_label: Default::default(),
             export_trampolines: Default::default(),
@@ -111,7 +125,7 @@ impl<'a> Compiler<'a> {
         assert_eq!(self.asm.len(), 0);
         self.asm.set_origin(self.native_code_address);
 
-        let mut nth_instruction_to_code_offset_map: Vec<u32> = Vec::with_capacity(self.instructions.len());
+        let mut nth_instruction_to_code_offset_map: Vec<u32> = Vec::with_capacity(self.instructions.len() + 1);
         polkavm_common::static_assert!(polkavm_common::zygote::VM_SANDBOX_MAXIMUM_NATIVE_CODE_SIZE < u32::MAX);
 
         self.start_new_basic_block();
@@ -160,12 +174,8 @@ impl<'a> Compiler<'a> {
 
         let label_sysreturn = self.emit_sysreturn();
 
-        if !self.nth_basic_block_to_label_pending.is_empty() {
-            for pc in self.nth_basic_block_to_label_pending.keys() {
-                log::debug!("Missing jump target: @{:x}", pc * 4);
-            }
-
-            bail!("program is missing {} jump target(s)", self.nth_basic_block_to_label_pending.len());
+        if self.pending_label_count > 0 {
+            bail!("program is missing {} jump target(s)", self.pending_label_count);
         }
 
         let native_pointer_size = core::mem::size_of::<usize>();
@@ -228,18 +238,20 @@ impl<'a> Compiler<'a> {
         })
     }
 
-    fn push(&mut self, inst: impl polkavm_assembler::Instruction) {
+    #[inline(always)]
+    fn push<T>(&mut self, inst: polkavm_assembler::Instruction<T>) where T: core::fmt::Display {
         self.asm.push(inst);
     }
 
     fn get_or_forward_declare_label(&mut self, nth_basic_block: u32) -> Label {
         match self.nth_basic_block_to_label.get(nth_basic_block as usize) {
             Some(label) => *label,
-            None => match self.nth_basic_block_to_label_pending.get(&nth_basic_block) {
-                Some(label) => *label,
+            None => match self.nth_basic_block_to_label_pending[nth_basic_block as usize] {
+                Some(label) => label,
                 None => {
                     let label = self.asm.forward_declare_label();
-                    self.nth_basic_block_to_label_pending.insert(nth_basic_block, label);
+                    self.nth_basic_block_to_label_pending[nth_basic_block as usize] = Some(label);
+                    self.pending_label_count += 1;
                     label
                 }
             },
@@ -263,10 +275,12 @@ impl<'a> Compiler<'a> {
         let nth_basic_block = self.nth_basic_block_to_label.len();
         log::trace!("Starting new basic block: @{nth_basic_block:x}");
 
-        let label = self
-            .nth_basic_block_to_label_pending
-            .remove(&(nth_basic_block as u32))
-            .unwrap_or_else(|| self.asm.forward_declare_label());
+        let label = if let Some(label) = self.nth_basic_block_to_label_pending[nth_basic_block].take() {
+            self.pending_label_count -= 1;
+            label
+        } else {
+            self.asm.forward_declare_label()
+        };
 
         self.define_label(label);
         self.nth_basic_block_to_label.push(label);
@@ -297,6 +311,8 @@ impl<S> CompiledModule<S> where S: Sandbox {
         gas_cost_for_basic_block: &[u32],
         init: GuestProgramInit,
         debug_trace_execution: bool,
+        jump_count: usize,
+        basic_block_count: usize,
     ) -> Result<Self, Error> {
         crate::sandbox::assert_native_page_size();
 
@@ -314,7 +330,9 @@ impl<S> CompiledModule<S> where S: Sandbox {
             S::vmctx_regs_offset(),
             S::vmctx_gas_offset(),
             debug_trace_execution,
-            native_code_address
+            native_code_address,
+            jump_count,
+            basic_block_count,
         );
 
         let result = program_assembler.finalize()?;

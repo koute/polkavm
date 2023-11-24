@@ -1,6 +1,6 @@
 #![allow(non_camel_case_types)]
 
-use crate::assembler::{EncInst, Label};
+use crate::assembler::{InstBuf, InstFixup, Instruction, Label};
 
 /// The REX prefix.
 const REX: u8 = 0x40;
@@ -44,18 +44,22 @@ impl Reg {
         }
     }
 
+    #[inline]
     pub const fn needs_rex(self) -> bool {
         self as usize >= Reg::r8 as usize
     }
 
+    #[inline]
     pub const fn modrm_rm_bits(self) -> u8 {
         (self as usize & 0b111) as u8
     }
 
+    #[inline]
     pub const fn modrm_reg_bits(self) -> u8 {
         (((self as usize) << 3) & 0b111000) as u8
     }
 
+    #[inline]
     pub const fn rex_bit(self) -> u8 {
         if self as usize >= Reg::r8 as usize {
             REX_EXT_MODRM_RM
@@ -64,6 +68,7 @@ impl Reg {
         }
     }
 
+    #[inline]
     pub const fn rex_modrm_reg(self) -> u8 {
         if self as usize >= Reg::r8 as usize {
             REX_EXT_MODRM_REG
@@ -173,12 +178,14 @@ pub enum RegIndex {
 }
 
 impl From<RegIndex> for Reg {
+    #[inline]
     fn from(reg: RegIndex) -> Reg {
         reg.into_reg()
     }
 }
 
 impl RegIndex {
+    #[inline]
     pub const fn into_reg(self) -> Reg {
         match self {
             RegIndex::rax => Reg::rax,
@@ -261,17 +268,12 @@ enum RawImm {
 }
 
 impl RawImm {
-    const fn append_into(self, enc: EncInst) -> EncInst {
+    #[inline(always)]
+    fn append_into(self, buf: &mut InstBuf) {
         match self {
-            RawImm::Imm8(value) => enc.append(value),
-            RawImm::Imm16(value) => {
-                let xs = value.to_le_bytes();
-                enc.append_array([xs[0], xs[1]])
-            }
-            RawImm::Imm32(value) => {
-                let xs = value.to_le_bytes();
-                enc.append_array([xs[0], xs[1], xs[2], xs[3]])
-            }
+            RawImm::Imm8(value) => buf.append(value),
+            RawImm::Imm16(value) => buf.append2(value.to_le_bytes()),
+            RawImm::Imm32(value) => buf.append4(value.to_le_bytes()),
         }
     }
 }
@@ -304,6 +306,7 @@ pub enum Operands {
 }
 
 impl MemOp {
+    #[inline]
     const fn needs_rex(self) -> bool {
         match self {
             MemOp::BaseOffset(_, _, base, _) => base.needs_rex(),
@@ -314,6 +317,7 @@ impl MemOp {
         }
     }
 
+    #[inline]
     const fn simplify(self) -> Self {
         match self {
             // Use a more compact encoding if possible.
@@ -436,18 +440,21 @@ impl RegMem {
 }
 
 impl From<Reg> for RegMem {
+    #[inline]
     fn from(reg: Reg) -> Self {
         RegMem::Reg(reg)
     }
 }
 
 impl From<RegIndex> for RegMem {
+    #[inline]
     fn from(reg: RegIndex) -> Self {
         RegMem::Reg(reg.into())
     }
 }
 
 impl From<MemOp> for RegMem {
+    #[inline]
     fn from(mem: MemOp) -> Self {
         RegMem::Mem(mem)
     }
@@ -469,6 +476,7 @@ struct Inst {
 
 // See: https://www-user.tu-chemnitz.de/~heha/hsn/chm/x86.chm/x64.htm
 impl Inst {
+    #[inline]
     const fn new(opcode: u8) -> Self {
         Inst {
             override_op_size: false,
@@ -485,15 +493,18 @@ impl Inst {
         }
     }
 
+    #[inline]
     const fn with_reg_in_op(opcode: u8, reg: Reg) -> Self {
         Inst::new(opcode | reg.modrm_rm_bits()).rex_from_reg(reg)
     }
 
+    #[inline]
     const fn override_op_size(mut self) -> Self {
         self.override_op_size = true;
         self
     }
 
+    #[inline]
     const fn override_addr_size_if(mut self, cond: bool) -> Self {
         if cond {
             self.override_addr_size = true;
@@ -501,16 +512,19 @@ impl Inst {
         self
     }
 
+    #[inline]
     const fn op_alt(mut self) -> Self {
         self.op_alt = true;
         self
     }
 
+    #[inline]
     const fn rex(mut self) -> Self {
         self.rex |= REX;
         self
     }
 
+    #[inline]
     const fn rex_if(mut self, cond: bool) -> Self {
         if cond {
             self = self.rex();
@@ -518,6 +532,7 @@ impl Inst {
         self
     }
 
+    #[inline]
     const fn rex_from_reg(mut self, reg: Reg) -> Self {
         if reg.needs_rex() {
             self.rex |= REX_EXT_MODRM_RM;
@@ -525,11 +540,13 @@ impl Inst {
         self
     }
 
+    #[inline]
     const fn rex_64b(mut self) -> Self {
         self.rex |= REX_64B_OP;
         self
     }
 
+    #[inline]
     const fn rex_64b_if(mut self, cond: bool) -> Self {
         if cond {
             self.rex |= REX_64B_OP;
@@ -537,6 +554,7 @@ impl Inst {
         self
     }
 
+    #[inline]
     const fn modrm_rm_direct(mut self, value: Reg) -> Self {
         if value.needs_rex() {
             self.rex |= REX_EXT_MODRM_RM;
@@ -545,6 +563,7 @@ impl Inst {
         self
     }
 
+    #[inline(always)]
     const fn regmem(self, operand: RegMem) -> Self {
         match operand {
             RegMem::Reg(reg) => self.modrm_rm_direct(reg),
@@ -552,6 +571,7 @@ impl Inst {
         }
     }
 
+    #[inline(always)]
     const fn mem(mut self, operand: MemOp) -> Self {
         match operand.simplify() {
             MemOp::BaseOffset(segment, reg_size, base, offset) => {
@@ -636,6 +656,7 @@ impl Inst {
         }
     }
 
+    #[inline]
     const fn modrm_reg(mut self, value: Reg) -> Self {
         if value.needs_rex() {
             self.rex |= REX_EXT_MODRM_REG;
@@ -645,69 +666,78 @@ impl Inst {
         self
     }
 
+    #[inline]
     const fn modrm_opext(mut self, ext: u8) -> Self {
         self.modrm |= ext << 3;
         self.force_enable_modrm = true;
         self
     }
 
+    #[inline]
     const fn imm8(mut self, value: u8) -> Self {
         self.immediate = Some(RawImm::Imm8(value));
         self
     }
 
+    #[inline]
     const fn imm16(mut self, value: u16) -> Self {
         self.immediate = Some(RawImm::Imm16(value));
         self
     }
 
+    #[inline]
     const fn imm32(mut self, value: u32) -> Self {
         self.immediate = Some(RawImm::Imm32(value));
         self
     }
 
-    const fn encode(self) -> EncInst {
-        let mut enc = EncInst::new();
+    #[inline]
+    fn encode(self) -> InstBuf {
+        let mut enc = InstBuf::new();
+        self.encode_into(&mut enc);
+        enc
+    }
+
+    #[inline(always)]
+    fn encode_into(self, buf: &mut InstBuf) {
         match self.override_segment {
-            Some(SegReg::fs) => enc = enc.append(PREFIX_OVERRIDE_SEGMENT_FS),
-            Some(SegReg::gs) => enc = enc.append(PREFIX_OVERRIDE_SEGMENT_GS),
+            Some(SegReg::fs) => buf.append(PREFIX_OVERRIDE_SEGMENT_FS),
+            Some(SegReg::gs) => buf.append(PREFIX_OVERRIDE_SEGMENT_GS),
             None => {}
         }
 
         if self.override_op_size {
-            enc = enc.append(PREFIX_OVERRIDE_OP_SIZE);
+            buf.append(PREFIX_OVERRIDE_OP_SIZE);
         }
 
         if self.override_addr_size {
-            enc = enc.append(PREFIX_OVERRIDE_ADDR_SIZE);
+            buf.append(PREFIX_OVERRIDE_ADDR_SIZE);
         }
 
         if self.rex != 0 {
-            enc = enc.append(self.rex);
+            buf.append(self.rex);
         }
 
         if self.op_alt {
-            enc = enc.append(0x0f);
+            buf.append(0x0f);
         }
 
-        enc = enc.append(self.opcode);
+        buf.append(self.opcode);
 
         if self.modrm != 0 || self.force_enable_modrm {
-            enc = enc.append(self.modrm);
+            buf.append(self.modrm);
             if self.modrm & 0b11000000 != 0b11000000 && self.modrm & 0b111 == 0b100 {
-                enc = enc.append(self.sib);
+                buf.append(self.sib);
             }
         }
 
         if let Some(displacement) = self.displacement {
-            enc = displacement.append_into(enc);
+            displacement.append_into(buf);
         }
 
         if let Some(immediate) = self.immediate {
-            enc = immediate.append_into(enc);
+            immediate.append_into(buf);
         }
-
-        enc
     }
 }
 
@@ -782,17 +812,12 @@ macro_rules! impl_inst {
         $cb($name())
     };
 
-    (@impl |$self:ident, $fmt:ident| $($name:ident($($arg:ty),*) => $body:expr, ($fmt_body:expr),)+) => {
+    (@impl |$self:ident, $fmt:ident| $($name:ident($($arg:ty),*) => $body:expr, $fixup:expr, ($fmt_body:expr),)+) => {
         pub(crate) mod types {
             use super::*;
             $(
                 #[derive(Copy, Clone, PartialEq, Eq, Debug)]
                 pub struct $name($(pub $arg),*);
-                impl $name {
-                    pub(crate) const fn encode_const($self) -> EncInst {
-                        $body
-                    }
-                }
 
                 impl core::fmt::Display for $name {
                     fn fmt(&$self, $fmt: &mut core::fmt::Formatter) -> core::fmt::Result {
@@ -800,13 +825,16 @@ macro_rules! impl_inst {
                     }
                 }
 
-                impl crate::Instruction for $name {
-                    fn encode(self) -> EncInst {
-                        self.encode_const()
+                impl $name {
+                    #[inline(always)]
+                    pub fn encode($self) -> InstBuf {
+                        $body
                     }
 
-                    fn target_fixup(self) -> Option<(Label, u8, u8)> {
-                        None
+                    #[inline(always)]
+                    pub fn fixup($self) -> Option<InstFixup> {
+                        let value: Option<(Label, u8, u8)> = $fixup;
+                        value.map(|(target_label, fixup_offset, fixup_length)| InstFixup { target_label, fixup_offset, fixup_length})
                     }
                 }
 
@@ -828,13 +856,23 @@ macro_rules! impl_inst {
         i32
     };
 
+    (@conv_ty Label) => {
+        Label
+    };
+
     (@conv_ty $type:ty) => {
         impl Into<$type>
     };
 
     (@ctor_impl $name:ident, $(($arg_name:ident: $arg_ty:tt)),*) => {
-        pub fn $name($($arg_name: impl_inst!(@conv_ty $arg_ty)),*) -> types::$name {
-            self::types::$name($($arg_name.into()),*)
+        #[inline(always)]
+        pub fn $name($($arg_name: impl_inst!(@conv_ty $arg_ty)),*) -> Instruction<types::$name> {
+            let instruction = self::types::$name($($arg_name.into()),*);
+            Instruction {
+                instruction,
+                bytes: instruction.encode(),
+                fixup: instruction.fixup(),
+            }
         }
     };
 
@@ -858,8 +896,8 @@ macro_rules! impl_inst {
         impl_inst!(@ctor_impl $name, (a0: $a0), (a1: $a1), (a2: $a2), (a3: $a3));
     };
 
-    (|$self:ident, $fmt:ident| $($name:ident($($arg:tt),*) => $body:expr, ($fmt_body:expr),)+) => {
-        impl_inst!(@impl |$self, $fmt| $($name($($arg),*) => $body, ($fmt_body),)+);
+    (|$self:ident, $fmt:ident| $($name:ident($($arg:tt),*) => $body:expr, $fixup:expr, ($fmt_body:expr),)+) => {
+        impl_inst!(@impl |$self, $fmt| $($name($($arg),*) => $body, $fixup, ($fmt_body),)+);
         $(
             impl_inst!(@ctor $name, $($arg),*);
         )+
@@ -871,6 +909,8 @@ pub mod addr {
 
     impl core::ops::Add<i32> for Reg {
         type Output = (Reg, i32);
+
+        #[inline]
         fn add(self, offset: i32) -> Self::Output {
             (self, offset)
         }
@@ -878,6 +918,8 @@ pub mod addr {
 
     impl core::ops::Add<i32> for RegIndex {
         type Output = (RegIndex, i32);
+
+        #[inline]
         fn add(self, offset: i32) -> Self::Output {
             (self, offset)
         }
@@ -885,6 +927,8 @@ pub mod addr {
 
     impl core::ops::Sub<i32> for Reg {
         type Output = (Reg, i32);
+
+        #[inline]
         fn sub(self, offset: i32) -> Self::Output {
             (self, -offset)
         }
@@ -892,6 +936,8 @@ pub mod addr {
 
     impl core::ops::Sub<i32> for RegIndex {
         type Output = (RegIndex, i32);
+
+        #[inline]
         fn sub(self, offset: i32) -> Self::Output {
             (self, -offset)
         }
@@ -904,6 +950,7 @@ pub mod addr {
 
     impl IntoMemOp for Reg {
         #[doc(hidden)]
+        #[inline]
         fn into_mem_op(self, segment: Option<SegReg>, reg_size: RegSize) -> MemOp {
             MemOp::BaseOffset(segment, reg_size, self, 0)
         }
@@ -911,6 +958,7 @@ pub mod addr {
 
     impl IntoMemOp for RegIndex {
         #[doc(hidden)]
+        #[inline]
         fn into_mem_op(self, segment: Option<SegReg>, reg_size: RegSize) -> MemOp {
             MemOp::BaseOffset(segment, reg_size, self.into(), 0)
         }
@@ -918,6 +966,7 @@ pub mod addr {
 
     impl IntoMemOp for (Reg, i32) {
         #[doc(hidden)]
+        #[inline]
         fn into_mem_op(self, segment: Option<SegReg>, reg_size: RegSize) -> MemOp {
             MemOp::BaseOffset(segment, reg_size, self.0, self.1)
         }
@@ -925,77 +974,92 @@ pub mod addr {
 
     impl IntoMemOp for (RegIndex, i32) {
         #[doc(hidden)]
+        #[inline]
         fn into_mem_op(self, segment: Option<SegReg>, reg_size: RegSize) -> MemOp {
             MemOp::BaseOffset(segment, reg_size, self.0.into(), self.1)
         }
     }
 
+    #[inline]
     pub fn reg_indirect(reg_size: RegSize, op: impl IntoMemOp) -> MemOp {
         op.into_mem_op(None, reg_size)
     }
 
+    #[inline]
     pub fn abs(reg_size: RegSize, offset: i32) -> MemOp {
         MemOp::Offset(None, reg_size, offset)
     }
 
+    #[inline]
     pub fn base_index(reg_size: RegSize, base: impl Into<Reg>, index: RegIndex) -> MemOp {
         MemOp::BaseIndexScaleOffset(None, reg_size, base.into(), index, Scale::x1, 0)
     }
 
     impl From<(RegSize, Reg, Reg)> for Operands {
+        #[inline]
         fn from((reg_size, dst, src): (RegSize, Reg, Reg)) -> Self {
             Self::RegMem_Reg(reg_size.into(), RegMem::Reg(dst), src)
         }
     }
 
     impl From<(RegSize, RegIndex, RegIndex)> for Operands {
+        #[inline]
         fn from((reg_size, dst, src): (RegSize, RegIndex, RegIndex)) -> Self {
             Self::RegMem_Reg(reg_size.into(), RegMem::Reg(dst.into()), src.into())
         }
     }
 
     impl From<(RegSize, Reg, MemOp)> for Operands {
+        #[inline]
         fn from((reg_size, dst, src): (RegSize, Reg, MemOp)) -> Self {
             Self::Reg_RegMem(reg_size.into(), dst, src.into())
         }
     }
 
     impl From<(RegSize, RegIndex, MemOp)> for Operands {
+        #[inline]
         fn from((reg_size, dst, src): (RegSize, RegIndex, MemOp)) -> Self {
             Self::Reg_RegMem(reg_size.into(), dst.into(), src.into())
         }
     }
 
     impl From<(Reg, ImmKind)> for Operands {
+        #[inline]
         fn from((dst, imm): (Reg, ImmKind)) -> Self {
             Self::RegMem_Imm(RegMem::Reg(dst), imm)
         }
     }
 
     impl From<(RegIndex, ImmKind)> for Operands {
+        #[inline]
         fn from((dst, imm): (RegIndex, ImmKind)) -> Self {
             Self::RegMem_Imm(RegMem::Reg(dst.into()), imm)
         }
     }
 
     impl From<(MemOp, ImmKind)> for Operands {
+        #[inline]
         fn from((dst, imm): (MemOp, ImmKind)) -> Self {
             Self::RegMem_Imm(RegMem::Mem(dst), imm)
         }
     }
 
+    #[inline]
     pub fn imm8(value: u8) -> ImmKind {
         ImmKind::I8(value)
     }
 
+    #[inline]
     pub fn imm16(value: u16) -> ImmKind {
         ImmKind::I16(value)
     }
 
+    #[inline]
     pub fn imm32(value: u32) -> ImmKind {
         ImmKind::I32(value)
     }
 
+    #[inline]
     pub fn imm64(value: i32) -> ImmKind {
         ImmKind::I64(value)
     }
@@ -1003,8 +1067,9 @@ pub mod addr {
 
 pub mod inst {
     use super::*;
-    use crate::assembler::EncInst;
+    use crate::assembler::InstBuf;
 
+    #[inline(always)]
     const fn new_rm(op: u8, size: Size, regmem: RegMem, reg: Option<Reg>) -> Inst {
         let inst = match size {
             Size::U8 => {
@@ -1031,6 +1096,7 @@ pub mod inst {
         }
     }
 
+    #[inline(always)]
     const fn new_rm_imm(op: u8, regmem: RegMem, imm: ImmKind) -> Inst {
         let inst = new_rm(op, imm.size(), regmem, None);
         match imm {
@@ -1041,7 +1107,8 @@ pub mod inst {
         }
     }
 
-    const fn alu_impl(op_reg2rm: u8, op_rm2reg: u8, opext: u8, operands: Operands) -> EncInst {
+    #[inline(always)]
+    fn alu_impl(op_reg2rm: u8, op_rm2reg: u8, opext: u8, operands: Operands) -> InstBuf {
         match operands {
             Operands::RegMem_Reg(size, dst, src) => new_rm(op_reg2rm, size, dst, Some(src)).encode(),
             Operands::Reg_RegMem(size, dst, src) => new_rm(op_rm2reg, size, src, Some(dst)).encode(),
@@ -1114,77 +1181,94 @@ pub mod inst {
 
     impl_inst! { |self, fmt|
         ud2() =>
-            EncInst::from_array([0x0f, 0x0b]),
+            InstBuf::from_array([0x0f, 0x0b]),
+            None,
             (fmt.write_str("ud2")),
 
         // https://www.felixcloutier.com/x86/endbr64
         endbr64() =>
-            EncInst::from_array([0xf3, 0x0f, 0x1e, 0xfa]),
+            InstBuf::from_array([0xf3, 0x0f, 0x1e, 0xfa]),
+            None,
             (fmt.write_str("endbr64")),
 
         // https://www.felixcloutier.com/x86/syscall
         syscall() =>
-            EncInst::from_array([0x0f, 0x05]),
+            InstBuf::from_array([0x0f, 0x05]),
+            None,
             (fmt.write_str("syscall")),
 
         // https://www.felixcloutier.com/x86/push
         push(Reg) =>
             Inst::with_reg_in_op(0x50, self.0).encode(),
+            None,
             (fmt.write_fmt(core::format_args!("push {}", self.0))),
 
         // https://www.felixcloutier.com/x86/pop
         pop(Reg) =>
             Inst::with_reg_in_op(0x58, self.0).encode(),
+            None,
             (fmt.write_fmt(core::format_args!("pop {}", self.0))),
 
         // https://www.felixcloutier.com/x86/nop
         nop() =>
-            EncInst::from_array([0x90]),
+            InstBuf::from_array([0x90]),
+            None,
             (fmt.write_str("nop")),
 
         nop2() =>
-            EncInst::from_array([0x66, 0x90]),
+            InstBuf::from_array([0x66, 0x90]),
+            None,
             (fmt.write_str("xchg ax, ax")),
 
         nop3() =>
-            EncInst::from_array([0x0f, 0x1f, 0x00]),
+            InstBuf::from_array([0x0f, 0x1f, 0x00]),
+            None,
             (fmt.write_str("nop dword [rax]")),
 
         nop4() =>
-            EncInst::from_array([0x0f, 0x1f, 0x40, 0x00]),
+            InstBuf::from_array([0x0f, 0x1f, 0x40, 0x00]),
+            None,
             (fmt.write_str("nop dword [rax]")),
 
         nop5() =>
-            EncInst::from_array([0x0f, 0x1f, 0x44, 0x00, 0x00]),
+            InstBuf::from_array([0x0f, 0x1f, 0x44, 0x00, 0x00]),
+            None,
             (fmt.write_str("nop dword [rax+rax]")),
 
         nop6() =>
-            EncInst::from_array([0x66, 0x0f, 0x1f, 0x44, 0x00, 0x00]),
+            InstBuf::from_array([0x66, 0x0f, 0x1f, 0x44, 0x00, 0x00]),
+            None,
             (fmt.write_str("nop word [rax+rax]")),
 
         nop7() =>
-            EncInst::from_array([0x0f, 0x1f, 0x80, 0x00, 0x00, 0x00, 0x00]),
+            InstBuf::from_array([0x0f, 0x1f, 0x80, 0x00, 0x00, 0x00, 0x00]),
+            None,
             (fmt.write_str("nop dword [rax]")), //
 
         nop8() =>
-            EncInst::from_array([0x0f, 0x1f, 0x84, 0x00, 0x00, 0x00, 0x00, 0x00]),
+            InstBuf::from_array([0x0f, 0x1f, 0x84, 0x00, 0x00, 0x00, 0x00, 0x00]),
+            None,
             (fmt.write_str("nop dword [rax+rax]")),
 
         nop9() =>
-            EncInst::from_array([0x66, 0x0f, 0x1f, 0x84, 0x00, 0x00, 0x00, 0x00, 0x00]),
+            InstBuf::from_array([0x66, 0x0f, 0x1f, 0x84, 0x00, 0x00, 0x00, 0x00, 0x00]),
+            None,
             (fmt.write_str("nop word [rax+rax]")), //
 
         nop10() =>
-            EncInst::from_array([0x66, 0x2e, 0x0f, 0x1f, 0x84, 0x00, 0x00, 0x00, 0x00, 0x00]),
+            InstBuf::from_array([0x66, 0x2e, 0x0f, 0x1f, 0x84, 0x00, 0x00, 0x00, 0x00, 0x00]),
+            None,
             (fmt.write_str("nop word [cs:rax+rax]")),
 
         nop11() =>
-            EncInst::from_array([0x66, 0x66, 0x2e, 0x0f, 0x1f, 0x84, 0x00, 0x00, 0x00, 0x00, 0x00]),
+            InstBuf::from_array([0x66, 0x66, 0x2e, 0x0f, 0x1f, 0x84, 0x00, 0x00, 0x00, 0x00, 0x00]),
+            None,
             (fmt.write_str("nop word [cs:rax+rax]")),
 
         // https://www.felixcloutier.com/x86/ret
         ret() =>
-            EncInst::from_array([0xc3]),
+            InstBuf::from_array([0xc3]),
+            None,
             (fmt.write_str("ret")),
 
         // https://www.felixcloutier.com/x86/mov
@@ -1192,25 +1276,28 @@ pub mod inst {
         // https://www.felixcloutier.com/x86/movsx:movsxd
         mov(RegSize, Reg, Reg) =>
             Inst::new(0x89).rex_64b_if(matches!(self.0, RegSize::R64)).modrm_rm_direct(self.1).modrm_reg(self.2).encode(),
+            None,
             (fmt.write_fmt(core::format_args!("mov {}, {}", self.1.name_from(self.0), self.2.name_from(self.0)))),
 
         movsxd_32_to_64(Reg, Reg) =>
             Inst::new(0x63).rex_64b().modrm_rm_direct(self.1).modrm_reg(self.0).encode(),
+            None,
             (fmt.write_fmt(core::format_args!("movsxd {}, {}", self.0.name(), self.1.name32()))),
 
         mov_imm64(Reg, u64) =>
             {
                 if self.1 <= 0x7fffffff {
-                    mov_imm(RegMem::Reg(self.0), ImmKind::I32(self.1 as u32)).encode_const()
+                    mov_imm(RegMem::Reg(self.0), ImmKind::I32(self.1 as u32)).encode()
                 } else {
                     let xs = self.1.to_le_bytes();
-                    EncInst::from_array([
+                    InstBuf::from_array([
                         REX_64B_OP | self.0.rex_bit(),
                         0xb8 | self.0.modrm_rm_bits(),
                         xs[0], xs[1], xs[2], xs[3], xs[4], xs[5], xs[6], xs[7]
                     ])
                 }
             },
+            None,
             ({
                 if self.1 <= 0x7fffffff {
                     mov_imm(RegMem::Reg(self.0), ImmKind::I32(self.1 as u32)).fmt(fmt)
@@ -1233,10 +1320,12 @@ pub mod inst {
                     }
                 }
             },
+            None,
             (display_with_operands(fmt, "mov", Operands::RegMem_Imm(self.0, self.1))),
 
         store(Size, MemOp, Reg) =>
             new_rm(0x88, self.0, RegMem::Mem(self.1), Some(self.2)).encode(),
+            None,
             (fmt.write_fmt(core::format_args!("mov {}, {}", self.1, self.2.name_from_size(self.0)))),
 
         load(LoadKind, Reg, MemOp) =>
@@ -1269,6 +1358,7 @@ pub mod inst {
                     .mem(self.2)
                     .encode()
             },
+            None,
             ({
                 let (name, kind, size) = match self.0 {
                     LoadKind::U8 if !self.1.needs_rex() && !self.2.needs_rex() => (self.1.name32(), "zx", "byte "),
@@ -1295,41 +1385,49 @@ pub mod inst {
                     .regmem(self.3)
                     .encode()
             },
+            None,
             (fmt.write_fmt(core::format_args!("cmov{} {}, {}", self.0.suffix(), self.2.name_from(self.1), self.3.display_without_prefix(Size::from(self.1))))),
 
         // https://www.felixcloutier.com/x86/add
         add(Operands) =>
             alu_impl(0x00, 0x02, 0b000, self.0),
+            None,
             (display_with_operands(fmt, "add", self.0)),
 
         // https://www.felixcloutier.com/x86/inc
         inc(Size, RegMem) =>
             new_rm(0xfe, self.0, self.1, None).encode(),
+            None,
             (fmt.write_fmt(core::format_args!("inc {}", self.1.display(self.0)))),
 
         // https://www.felixcloutier.com/x86/sub
         sub(Operands) =>
             alu_impl(0x28, 0x2a, 0b101, self.0),
+            None,
             (display_with_operands(fmt, "sub", self.0)),
 
         // https://www.felixcloutier.com/x86/or
         or(Operands) =>
             alu_impl(0x08, 0x0a, 0b001, self.0),
+            None,
             (display_with_operands(fmt, "or", self.0)),
 
         // https://www.felixcloutier.com/x86/and
         and(Operands) =>
             alu_impl(0x20, 0x22, 0b100, self.0),
+            None,
             (display_with_operands(fmt, "and", self.0)),
 
         // https://www.felixcloutier.com/x86/xor
         xor(Operands) =>
             alu_impl(0x30, 0x32, 0b110, self.0),
+            None,
             (display_with_operands(fmt, "xor", self.0)),
 
         // https://www.felixcloutier.com/x86/bts
         bts(RegSize, RegMem, u8) =>
             Inst::new(0xba).op_alt().modrm_opext(0b101).rex_64b_if(matches!(self.0, RegSize::R64)).regmem(self.1).imm8(self.2).encode(),
+            None,
             ({
                 match self.0 {
                     RegSize::R64 => fmt.write_fmt(core::format_args!("bts {}, 0x{:x}", self.1.display(Size::from(self.0)), self.2 as i64)),
@@ -1340,21 +1438,25 @@ pub mod inst {
         // https://www.felixcloutier.com/x86/neg
         neg(Size, RegMem) =>
             new_rm(0xf6, self.0, self.1, None).modrm_opext(0b011).encode(),
+            None,
             (fmt.write_fmt(core::format_args!("neg {}", self.1.display(self.0)))),
 
         // https://www.felixcloutier.com/x86/not
         not(Size, RegMem) =>
             new_rm(0xf6, self.0, self.1, None).modrm_opext(0b010).encode(),
+            None,
             (fmt.write_fmt(core::format_args!("not {}", self.1.display(self.0)))),
 
         // https://www.felixcloutier.com/x86/cmp
         cmp(Operands) =>
             alu_impl(0x38, 0x3a, 0b111, self.0),
+            None,
             (display_with_operands(fmt, "cmp", self.0)),
 
         // https://www.felixcloutier.com/x86/sal:sar:shl:shr
         sar_cl(RegSize, RegMem) =>
             Inst::new(0xd3).rex_64b_if(matches!(self.0, RegSize::R64)).regmem(self.1).modrm_opext(0b111).encode(),
+            None,
             (fmt.write_fmt(core::format_args!("sar {}, cl", self.1.display(Size::from(self.0))))),
 
         sar_imm(RegSize, RegMem, u8) =>
@@ -1365,10 +1467,12 @@ pub mod inst {
                     Inst::new(0xc1).imm8(self.2)
                 }.rex_64b_if(matches!(self.0, RegSize::R64)).regmem(self.1).modrm_opext(0b111).encode()
             },
+            None,
             (fmt.write_fmt(core::format_args!("sar {}, 0x{:x}", self.1.display(Size::from(self.0)), self.2))),
 
         shl_cl(RegSize, RegMem) =>
             Inst::new(0xd3).rex_64b_if(matches!(self.0, RegSize::R64)).regmem(self.1).modrm_opext(0b100).encode(),
+            None,
             (fmt.write_fmt(core::format_args!("shl {}, cl", self.1.display(Size::from(self.0))))),
 
         shl_imm(RegSize, RegMem, u8) =>
@@ -1379,10 +1483,12 @@ pub mod inst {
                     Inst::new(0xc1).imm8(self.2)
                 }.rex_64b_if(matches!(self.0, RegSize::R64)).regmem(self.1).modrm_opext(0b100).encode()
             },
+            None,
             (fmt.write_fmt(core::format_args!("shl {}, 0x{:x}", self.1.display(Size::from(self.0)), self.2))),
 
         shr_cl(RegSize, RegMem) =>
             Inst::new(0xd3).rex_64b_if(matches!(self.0, RegSize::R64)).regmem(self.1).modrm_opext(0b101).encode(),
+            None,
             (fmt.write_fmt(core::format_args!("shr {}, cl", self.1.display(Size::from(self.0))))),
 
         shr_imm(RegSize, RegMem, u8) =>
@@ -1393,6 +1499,7 @@ pub mod inst {
                     Inst::new(0xc1).imm8(self.2)
                 }.rex_64b_if(matches!(self.0, RegSize::R64)).regmem(self.1).modrm_opext(0b101).encode()
             },
+            None,
             (fmt.write_fmt(core::format_args!("shr {}, 0x{:x}", self.1.display(Size::from(self.0)), self.2))),
 
         // https://www.felixcloutier.com/x86/rcl:rcr:rol:ror
@@ -1404,6 +1511,7 @@ pub mod inst {
                     Inst::new(0xc1).imm8(self.2)
                 }.rex_64b_if(matches!(self.0, RegSize::R64)).regmem(self.1).modrm_opext(0b001).encode()
             },
+            None,
             (fmt.write_fmt(core::format_args!("ror {}, 0x{:x}", self.1.display(Size::from(self.0)), self.2))),
 
         // https://www.felixcloutier.com/x86/test
@@ -1415,6 +1523,7 @@ pub mod inst {
                     Operands::RegMem_Imm(regmem, imm) => new_rm_imm(0xf6, regmem, imm).encode(),
                 }
             },
+            None,
             ({
                 let operands = match self.0 {
                     Operands::Reg_RegMem(size, reg, regmem) => Operands::RegMem_Reg(size, regmem, reg),
@@ -1427,21 +1536,25 @@ pub mod inst {
         // https://www.felixcloutier.com/x86/imul
         imul(RegSize, Reg, RegMem) =>
             Inst::new(0xaf).op_alt().rex_64b_if(matches!(self.0, RegSize::R64)).modrm_reg(self.1).regmem(self.2).encode(),
+            None,
             (fmt.write_fmt(core::format_args!("imul {}, {}", self.1.name_from(self.0), self.2.display_without_prefix(Size::from(self.0))))),
 
         // https://www.felixcloutier.com/x86/div
         div(RegSize, RegMem) =>
             Inst::new(0xf7).modrm_opext(0b110).rex_64b_if(matches!(self.0, RegSize::R64)).regmem(self.1).encode(),
+            None,
             (fmt.write_fmt(core::format_args!("div {}", self.1.display(Size::from(self.0))))),
 
         // https://www.felixcloutier.com/x86/idiv
         idiv(RegSize, RegMem) =>
             Inst::new(0xf7).modrm_opext(0b111).rex_64b_if(matches!(self.0, RegSize::R64)).regmem(self.1).encode(),
+            None,
             (fmt.write_fmt(core::format_args!("idiv {}", self.1.display(Size::from(self.0))))),
 
         // https://www.felixcloutier.com/x86/cwd:cdq:cqo
         cdq() =>
             Inst::new(0x99).encode(),
+            None,
             (fmt.write_str("cdq")),
 
         // https://www.felixcloutier.com/x86/setcc
@@ -1453,6 +1566,7 @@ pub mod inst {
                     .regmem(self.1)
                     .encode()
             },
+            None,
             (fmt.write_fmt(core::format_args!("set{} {}", self.0.suffix(), self.1.display_without_prefix(Size::U8)))),
 
         // https://www.felixcloutier.com/x86/lea
@@ -1461,12 +1575,14 @@ pub mod inst {
                 .rex_64b_if(matches!(self.0, RegSize::R64))
                 .modrm_reg(self.1)
                 .mem(self.2).encode(),
+            None,
             (fmt.write_fmt(core::format_args!("lea {}, {}", self.1.name_from(self.0), self.2))),
 
         // https://www.felixcloutier.com/x86/call
         call(RegMem) => {
             Inst::new(0xff).modrm_opext(0b010).regmem(self.0).encode()
         },
+        None,
         ({
             match self.0 {
                 RegMem::Reg(reg) => fmt.write_fmt(core::format_args!("call {}", reg)),
@@ -1476,12 +1592,14 @@ pub mod inst {
 
         call_rel32(i32) =>
             Inst::new(0xe8).imm32(self.0 as u32).encode(),
+            None,
             (fmt.write_fmt(core::format_args!("call 0x{:x}", (self.0 as i64).wrapping_add(5)))),
 
         // https://www.felixcloutier.com/x86/jmp
         jmp(RegMem) => {
             Inst::new(0xff).modrm_opext(0b100).regmem(self.0).encode()
         },
+        None,
         ({
             match self.0 {
                 RegMem::Reg(reg) => fmt.write_fmt(core::format_args!("jmp {}", reg)),
@@ -1491,164 +1609,55 @@ pub mod inst {
 
         jmp_rel8(i8) =>
             Inst::new(0xeb).imm8(self.0 as u8).encode(),
+            None,
             (fmt.write_fmt(core::format_args!("jmp short 0x{:x}", (self.0 as i64).wrapping_add(2)))),
 
         jmp_rel32(i32) =>
             Inst::new(0xe9).imm32(self.0 as u32).encode(),
+            None,
             (fmt.write_fmt(core::format_args!("jmp 0x{:x}", (self.0 as i64).wrapping_add(5)))),
 
         // https://www.felixcloutier.com/x86/jcc
         jcc_rel8(Condition, i8) =>
             Inst::new(0x70 | self.0 as u8).imm8(self.1 as u8).encode(),
+            None,
             (fmt.write_fmt(core::format_args!("j{} short 0x{:x}", self.0.suffix(), (self.1 as i64).wrapping_add(2)))),
 
         jcc_rel32(Condition, i32) =>
             Inst::new(0x80 | self.0 as u8).op_alt().imm32(self.1 as u32).encode(),
+            None,
             (fmt.write_fmt(core::format_args!("j{} near 0x{:x}", self.0.suffix(), (self.1 as i64).wrapping_add(6)))),
-    }
 
-    #[derive(Copy, Clone, PartialEq, Eq, Debug)]
-    pub struct jmp_label8(pub Label);
-    impl jmp_label8 {
-        const fn encode_const(self) -> EncInst {
-            types::jmp_rel8(0).encode_const()
-        }
-    }
+        // (label instructions)
+        jmp_label8(Label) =>
+            jmp_rel8(0).encode(),
+            Some((self.0, 1, 1)),
+            (fmt.write_fmt(core::format_args!("jmp {}", self.0))),
 
-    impl core::fmt::Display for jmp_label8 {
-        fn fmt(&self, fmt: &mut core::fmt::Formatter) -> core::fmt::Result {
-            fmt.write_fmt(core::format_args!("jmp {}", self.0))
-        }
-    }
+        jmp_label32(Label) =>
+            jmp_rel32(0).encode(),
+            Some((self.0, 1, 4)),
+            (fmt.write_fmt(core::format_args!("jmp {}", self.0))),
 
-    impl crate::Instruction for jmp_label8 {
-        fn encode(self) -> EncInst {
-            self.encode_const()
-        }
+        call_label32(Label) =>
+            call_rel32(0).encode(),
+            Some((self.0, 1, 4)),
+            (fmt.write_fmt(core::format_args!("call {}", self.0))),
 
-        fn target_fixup(self) -> Option<(Label, u8, u8)> {
-            Some((self.0, 1, 1))
-        }
-    }
+        jcc_label8(Condition, Label) =>
+            jcc_rel8(self.0, 0).encode(),
+            Some((self.1, 1, 1)),
+            (fmt.write_fmt(core::format_args!("j{} {}", self.0.suffix(), self.1))),
 
-    #[derive(Copy, Clone, PartialEq, Eq, Debug)]
-    pub struct jmp_label32(pub Label);
-    impl jmp_label32 {
-        const fn encode_const(self) -> EncInst {
-            types::jmp_rel32(0).encode_const()
-        }
-    }
+        jcc_label32(Condition, Label) =>
+            jcc_rel32(self.0, 0).encode(),
+            Some((self.1, 2, 4)),
+            (fmt.write_fmt(core::format_args!("j{} {}", self.0.suffix(), self.1))),
 
-    impl core::fmt::Display for jmp_label32 {
-        fn fmt(&self, fmt: &mut core::fmt::Formatter) -> core::fmt::Result {
-            fmt.write_fmt(core::format_args!("jmp {}", self.0))
-        }
-    }
-
-    impl crate::Instruction for jmp_label32 {
-        fn encode(self) -> EncInst {
-            self.encode_const()
-        }
-
-        fn target_fixup(self) -> Option<(Label, u8, u8)> {
-            Some((self.0, 1, 4))
-        }
-    }
-
-    #[derive(Copy, Clone, PartialEq, Eq, Debug)]
-    pub struct call_label32(pub Label);
-    impl call_label32 {
-        const fn encode_const(self) -> EncInst {
-            types::call_rel32(0).encode_const()
-        }
-    }
-
-    impl core::fmt::Display for call_label32 {
-        fn fmt(&self, fmt: &mut core::fmt::Formatter) -> core::fmt::Result {
-            fmt.write_fmt(core::format_args!("call {}", self.0))
-        }
-    }
-
-    impl crate::Instruction for call_label32 {
-        fn encode(self) -> EncInst {
-            self.encode_const()
-        }
-
-        fn target_fixup(self) -> Option<(Label, u8, u8)> {
-            Some((self.0, 1, 4))
-        }
-    }
-
-    #[derive(Copy, Clone, PartialEq, Eq, Debug)]
-    pub struct jcc_label8(pub Condition, pub Label);
-    impl jcc_label8 {
-        const fn encode_const(self) -> EncInst {
-            types::jcc_rel8(self.0, 0).encode_const()
-        }
-    }
-
-    impl core::fmt::Display for jcc_label8 {
-        fn fmt(&self, fmt: &mut core::fmt::Formatter) -> core::fmt::Result {
-            fmt.write_fmt(core::format_args!("j{} {}", self.0.suffix(), self.1))
-        }
-    }
-
-    impl crate::Instruction for jcc_label8 {
-        fn encode(self) -> EncInst {
-            self.encode_const()
-        }
-
-        fn target_fixup(self) -> Option<(Label, u8, u8)> {
-            Some((self.1, 1, 1))
-        }
-    }
-
-    #[derive(Copy, Clone, PartialEq, Eq, Debug)]
-    pub struct jcc_label32(pub Condition, pub Label);
-    impl jcc_label32 {
-        const fn encode_const(self) -> EncInst {
-            types::jcc_rel32(self.0, 0).encode_const()
-        }
-    }
-
-    impl core::fmt::Display for jcc_label32 {
-        fn fmt(&self, fmt: &mut core::fmt::Formatter) -> core::fmt::Result {
-            fmt.write_fmt(core::format_args!("j{} {}", self.0.suffix(), self.1))
-        }
-    }
-
-    impl crate::Instruction for jcc_label32 {
-        fn encode(self) -> EncInst {
-            self.encode_const()
-        }
-
-        fn target_fixup(self) -> Option<(Label, u8, u8)> {
-            Some((self.1, 2, 4))
-        }
-    }
-
-    #[derive(Copy, Clone, PartialEq, Eq, Debug)]
-    pub struct lea_rip_label(pub Reg, pub Label);
-    impl lea_rip_label {
-        const fn encode_const(self) -> EncInst {
-            types::lea(RegSize::R64, self.0, MemOp::RipRelative(None, 0)).encode_const()
-        }
-    }
-
-    impl core::fmt::Display for lea_rip_label {
-        fn fmt(&self, fmt: &mut core::fmt::Formatter) -> core::fmt::Result {
-            fmt.write_fmt(core::format_args!("lea {}, [{}]", self.0, self.1))
-        }
-    }
-
-    impl crate::Instruction for lea_rip_label {
-        fn encode(self) -> EncInst {
-            self.encode_const()
-        }
-
-        fn target_fixup(self) -> Option<(Label, u8, u8)> {
-            Some((self.1, 3, 4))
-        }
+        lea_rip_label(Reg, Label) =>
+            lea(RegSize::R64, self.0, MemOp::RipRelative(None, 0)).encode(),
+            Some((self.1, 3, 4)),
+            (fmt.write_fmt(core::format_args!("lea {}, [{}]", self.0, self.1))),
     }
 }
 
@@ -1778,6 +1787,7 @@ impl Size {
 }
 
 impl From<RegSize> for Size {
+    #[inline]
     fn from(reg_size: RegSize) -> Size {
         match reg_size {
             RegSize::R32 => Size::U32,
@@ -1814,6 +1824,7 @@ impl core::fmt::Display for ImmKind {
 }
 
 impl ImmKind {
+    #[inline]
     const fn size(self) -> Size {
         match self {
             ImmKind::I8(..) => Size::U8,
@@ -1837,6 +1848,9 @@ impl tests::GenerateTestValues for ImmKind {
 
 #[cfg(test)]
 mod tests {
+    use alloc::format;
+    use alloc::string::String;
+
     #[cfg(test)]
     pub trait GenerateTestValues: Copy {
         fn generate_test_values(cb: impl FnMut(Self));
@@ -1942,6 +1956,12 @@ mod tests {
                     cb(super::Operands::RegMem_Imm(regmem, imm));
                 });
             });
+        }
+    }
+
+    impl GenerateTestValues for crate::Label {
+        fn generate_test_values(_: impl FnMut(Self)) {
+            unimplemented!();
         }
     }
 
@@ -2057,8 +2077,8 @@ mod tests {
     }
 
     fn disassemble_into(mut code: &[u8], output: &mut String) {
+        use core::fmt::Write;
         use iced_x86::Formatter;
-        use std::fmt::Write;
 
         let mut formatter = iced_x86::NasmFormatter::new();
         formatter.options_mut().set_space_after_operand_separator(true);
@@ -2111,7 +2131,10 @@ mod tests {
             }
         }
 
-        fn run(&mut self, inst: impl crate::Instruction + core::fmt::Debug) {
+        fn run<T>(&mut self, inst: crate::Instruction<T>)
+        where
+            T: Copy + core::fmt::Display + core::fmt::Debug,
+        {
             use core::fmt::Write;
 
             self.asm.clear();
@@ -2145,7 +2168,13 @@ mod tests {
                 #[test]
                 fn $inst_name() {
                     let mut test = TestAsm::new();
-                    <super::inst::types::$inst_name as GenerateTestValues>::generate_test_values(|inst| test.run(inst));
+                    <super::inst::types::$inst_name as GenerateTestValues>::generate_test_values(|instruction| {
+                        test.run(crate::Instruction {
+                            bytes: instruction.encode(),
+                            fixup: None,
+                            instruction
+                        })
+                    });
                 }
             )+
         }
