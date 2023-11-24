@@ -10,24 +10,45 @@ publish = false
 
 [dependencies]
 clap = { workspace = true, features = ["derive"] }
-criterion = { version = "0.5.1", default-features = false }
-env_logger = { workspace = true }
+criterion = { version = "0.5.1", default-features = false, optional = true }
+env_logger = { workspace = true, optional = true }
 libc = { workspace = true }
-libloading = "0.8.1"
+libloading = { version = "0.8.1", optional = true }
 log = { workspace = true }
-wasmi = { git = "https://github.com/paritytech/wasmi.git", rev = "ea3a29ce66ca116489b7bbcec520c5415ace17b2" }
+wasmi = { git = "https://github.com/paritytech/wasmi.git", rev = "ea3a29ce66ca116489b7bbcec520c5415ace17b2", optional = true }
 
 [target.'cfg(target_arch = "x86_64")'.dependencies]
 ckb-vm = { version = "0.24.6", features = ["asm"], optional = true }
 polkavm = { workspace = true }
-pvf-executor = { git = "https://github.com/paritytech/pvf-executor.git", rev = "d3b2bb77b783bcfaff540c2f9ade99f58a311ac3" }
-wasm3 = { git = "https://github.com/wasm3/wasm3-rs.git", rev = "df74c2a17ed8831595de43db98c406da4633e32a", features = ["build-bindgen"] }
+pvf-executor = { git = "https://github.com/paritytech/pvf-executor.git", rev = "d3b2bb77b783bcfaff540c2f9ade99f58a311ac3", optional = true }
+wasm3 = { git = "https://github.com/wasm3/wasm3-rs.git", rev = "df74c2a17ed8831595de43db98c406da4633e32a", features = ["build-bindgen"], optional = true }
 
 [target.'cfg(any(target_arch = "x86_64", target_arch = "aarch64"))'.dependencies]
-wasmer = { version = "4.2.3", default-features = false, features = ["std", "singlepass"] }
+wasmer = { version = "4.2.3", default-features = false, features = ["std", "singlepass"], optional = true }
 wasmtime = { version = "15.0.0", default-features = false, features = ["cranelift", "winch"], optional = true }
 
 [features]
-default = ["wasmtime"]
+default = [
+    "native",
+    "pvf-executor",
+    "wasm3",
+    "wasmer",
+    "wasmi",
+    "wasmtime",
+    "wazero",
+
+    "criterion",
+    "env_logger",
+]
+
+criterion = ["dep:criterion"]
+env_logger = ["dep:env_logger"]
+
 ckb-vm = ["dep:ckb-vm"]
+native = ["dep:libloading"]
+pvf-executor = ["dep:pvf-executor"]
+wasm3 = ["dep:wasm3"]
+wasmer = ["dep:wasmer"]
+wasmi = ["dep:wasmi"]
 wasmtime = ["dep:wasmtime"]
+wazero = ["dep:libloading"]

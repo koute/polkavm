@@ -1,6 +1,6 @@
 use clap::Parser;
+#[cfg(feature = "criterion")]
 use criterion::*;
-use std::collections::BTreeMap;
 use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
 
@@ -51,8 +51,9 @@ fn benchmark_compilation<T: Backend>(count: u64, backend: T, path: &Path) -> cor
     start.elapsed()
 }
 
+#[cfg(feature = "criterion")]
 fn criterion_main(c: &mut Criterion, benches: &[Benchmark]) {
-    let mut by_name = BTreeMap::new();
+    let mut by_name = std::collections::BTreeMap::new();
     for bench in benches {
         by_name.entry(bench.name.clone()).or_insert_with(Vec::new).push(bench);
     }
@@ -348,6 +349,7 @@ impl Process {
 #[clap(version)]
 enum Args {
     /// Runs the benchmarks with criterion.
+    #[cfg(feature = "criterion")]
     Criterion { filter: Option<String> },
 
     /// Runs the benchmarks.
@@ -389,10 +391,12 @@ fn main() {
     #[cfg(target_os = "linux")]
     crate::utils::restart_with_disabled_aslr().unwrap();
 
+    #[cfg(feature = "env_logger")]
     env_logger::init();
     let args = Args::parse();
 
     match args {
+        #[cfg(feature = "criterion")]
         Args::Criterion { filter } => {
             let benches = find_benchmarks().unwrap();
             let mut criterion = Criterion::default().sample_size(10).with_output_color(true);
