@@ -35,25 +35,28 @@ pub trait Backend: Copy + Clone {
 #[cfg(target_arch = "x86_64")]
 mod backend_polkavm;
 
-#[cfg(target_arch = "x86_64")]
+#[cfg(all(feature = "pvf-executor", target_arch = "x86_64"))]
 mod backend_pvfexecutor;
 
 #[cfg(all(feature = "ckb-vm", target_arch = "x86_64"))]
 mod backend_ckbvm;
 
-#[cfg(target_arch = "x86_64")]
+#[cfg(all(feature = "wasm3", target_arch = "x86_64"))]
 mod backend_wasm3;
 
 #[cfg(all(feature = "wasmtime", any(target_arch = "x86_64", target_arch = "aarch64")))]
 mod backend_wasmtime;
 
-#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+#[cfg(all(feature = "wasmer", any(target_arch = "x86_64", target_arch = "aarch64")))]
 mod backend_wasmer;
 
-#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+#[cfg(all(feature = "wazero", any(target_arch = "x86_64", target_arch = "aarch64")))]
 mod backend_wazero;
 
+#[cfg(feature = "native")]
 mod backend_native;
+
+#[cfg(feature = "wasmi")]
 mod backend_wasmi;
 
 macro_rules! define_backends {
@@ -243,13 +246,13 @@ define_backends! {
     Wasmtime_Winch =>
         backend_wasmtime::Wasmtime(wasmtime::Strategy::Winch, backend_wasmtime::Metering::None),
 
-    #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+    #[cfg(all(feature = "wasmer", any(target_arch = "x86_64", target_arch = "aarch64")))]
     Wasmer => backend_wasmer::Wasmer(),
 
-    #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+    #[cfg(all(feature = "wazero", any(target_arch = "x86_64", target_arch = "aarch64")))]
     WaZero => backend_wazero::WaZero(),
 
-    #[cfg(target_arch = "x86_64")]
+    #[cfg(all(feature = "pvf-executor", target_arch = "x86_64"))]
     PvfExecutor => backend_pvfexecutor::PvfExecutor(),
 
     #[cfg(all(feature = "ckb-vm", target_arch = "x86_64"))]
@@ -258,15 +261,15 @@ define_backends! {
     #[cfg(all(feature = "ckb-vm", target_arch = "x86_64"))]
     Ckbvm_NonAsm => backend_ckbvm::Ckbvm(backend_ckbvm::CkbvmBackend::NonAsm),
 
-    #[cfg(target_arch = "x86_64")]
+    #[cfg(all(feature = "wasm3", target_arch = "x86_64"))]
     Wasm3 => backend_wasm3::Wasm3(),
 
-    #[cfg(not(_dummy))]
+    #[cfg(feature = "wasmi")]
     Wasmi_StackMachine => backend_wasmi::Wasmi(wasmi::EngineBackend::StackMachine),
-    #[cfg(not(_dummy))]
+    #[cfg(feature = "wasmi")]
     Wasmi_RegisterMachine => backend_wasmi::Wasmi(wasmi::EngineBackend::RegisterMachine),
 
-    #[cfg(not(_dummy))]
+    #[cfg(feature = "native")]
     Native => backend_native::Native()
 }
 
@@ -285,8 +288,11 @@ impl BenchmarkKind {
                 }
             }
             BenchmarkKind::WebAssembly => {
-                output.push(BackendKind::Wasmi_StackMachine);
-                output.push(BackendKind::Wasmi_RegisterMachine);
+                #[cfg(feature = "wasmi")]
+                {
+                    output.push(BackendKind::Wasmi_StackMachine);
+                    output.push(BackendKind::Wasmi_RegisterMachine);
+                }
 
                 #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
                 {
@@ -301,8 +307,10 @@ impl BenchmarkKind {
                         ]);
                     }
 
+                    #[cfg(feature = "wasmer")]
                     output.push(BackendKind::Wasmer);
 
+                    #[cfg(feature = "wazero")]
                     if backend_wazero::is_available() {
                         output.push(BackendKind::WaZero);
                     }
@@ -310,7 +318,9 @@ impl BenchmarkKind {
 
                 #[cfg(target_arch = "x86_64")]
                 {
+                    #[cfg(feature = "pvf-executor")]
                     output.push(BackendKind::PvfExecutor);
+                    #[cfg(feature = "wasm3")]
                     output.push(BackendKind::Wasm3);
                 }
             }
@@ -322,6 +332,7 @@ impl BenchmarkKind {
                 }
             }
             BenchmarkKind::Native => {
+                #[cfg(feature = "native")]
                 output.push(BackendKind::Native);
             }
         }
