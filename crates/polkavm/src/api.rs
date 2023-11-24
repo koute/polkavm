@@ -241,27 +241,6 @@ impl Module {
             }
         }
 
-        {
-            let Some(last_instruction) = blob.instructions().last() else {
-                bail!("the module contains no code");
-            };
-
-            match last_instruction.map_err(Error::from_display)?.op() {
-                Opcode::fallthrough
-                | Opcode::jump_and_link_register
-                | Opcode::trap
-                | Opcode::branch_less_unsigned
-                | Opcode::branch_less_signed
-                | Opcode::branch_greater_or_equal_unsigned
-                | Opcode::branch_greater_or_equal_signed
-                | Opcode::branch_eq
-                | Opcode::branch_not_eq => {}
-                _ => {
-                    bail!("code doesn't end with a control flow instruction")
-                }
-            }
-        }
-
         log::trace!("Parsing jump table...");
         let mut basic_block_by_jump_table_index = Vec::with_capacity(blob.jump_table_upper_bound() + 1);
 
@@ -285,6 +264,7 @@ impl Module {
             .collect();
 
         let mut gas_cost_for_basic_block: Vec<u32> = Vec::new();
+        let mut last_instruction = None;
 
         log::trace!("Parsing code...");
         let (instructions, instruction_by_basic_block) = {
@@ -298,6 +278,7 @@ impl Module {
             for (nth_instruction, instruction) in blob.instructions().enumerate() {
                 let nth_instruction = nth_instruction as u32;
                 let instruction = instruction.map_err(Error::from_display)?;
+                last_instruction = Some(instruction);
 
                 if config.gas_metering.is_some() {
                     // TODO: Come up with a better cost model.
@@ -364,6 +345,27 @@ impl Module {
             gas_cost_for_basic_block.shrink_to_fit();
             (instructions, instruction_by_basic_block)
         };
+
+        {
+            let Some(last_instruction) = last_instruction else {
+                bail!("the module contains no code");
+            };
+
+            match last_instruction.op() {
+                Opcode::fallthrough
+                | Opcode::jump_and_link_register
+                | Opcode::trap
+                | Opcode::branch_less_unsigned
+                | Opcode::branch_less_signed
+                | Opcode::branch_greater_or_equal_unsigned
+                | Opcode::branch_greater_or_equal_signed
+                | Opcode::branch_eq
+                | Opcode::branch_not_eq => {}
+                _ => {
+                    bail!("code doesn't end with a control flow instruction")
+                }
+            }
+        }
 
         if instructions.len() > VM_MAXIMUM_INSTRUCTION_COUNT as usize {
             bail!(
