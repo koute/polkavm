@@ -24,21 +24,23 @@ const GENERIC_SANDBOX_MEMORY_REG: NativeReg = r15;
 const LINUX_SANDBOX_VMCTX_REG: NativeReg = r15;
 
 const fn conv_reg_const(reg: Reg) -> NativeReg {
+    // NOTE: This is sorted roughly in the order of which registers are more commonly used.
+    // We try to assign registers which result in more compact code to the more common RISC-V registers.
     match reg {
         Reg::Zero => unreachable!(),
-        Reg::A0 => rsi,
-        Reg::A1 => rdi,
-        Reg::A2 => r8,
-        Reg::SP => r9,
-        Reg::S1 => r10,
-        Reg::A3 => r11,
-        Reg::S0 => r12,
-        Reg::A4 => r13,
-        Reg::RA => r14,
-        Reg::A5 => rbp,
-        Reg::T0 => rax,
-        Reg::T1 => rbx,
-        Reg::T2 => rdx,
+        Reg::A0 => rdi,
+        Reg::A1 => rsi,
+        Reg::SP => rax,
+        Reg::RA => rbx,
+        Reg::A2 => rdx,
+        Reg::A3 => rbp,
+        Reg::S0 => r8,
+        Reg::S1 => r9,
+        Reg::A4 => r10,
+        Reg::A5 => r11,
+        Reg::T0 => r13,
+        Reg::T1 => r14,
+        Reg::T2 => r12,
     }
 }
 
