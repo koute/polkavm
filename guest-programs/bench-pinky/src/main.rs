@@ -2,7 +2,6 @@
 #![no_main]
 
 include!("../../bench-common.rs");
-global_allocator!(256 * 1024);
 
 use nes::Interface;
 
@@ -23,15 +22,28 @@ impl nes::Context for Emulator {
 // Source of the ROM: https://github.com/christopherpow/nes-test-roms/tree/97720008e51db15dd281a2a1e64d4c65cf1bca4c/nes15-1.0.0
 // Licensed under a BSD-style license.
 const ROM: &[u8] = core::include_bytes!("nes15-NTSC.nes");
-static mut EMULATOR: Emulator = Emulator { state: nes::State::new() };
-static mut FRAMEBUFFER: [u32; 256 * 240] = [0; 256 * 240];
 
-#[polkavm_derive::polkavm_export]
-#[no_mangle]
-pub extern "C" fn initialize() {
-    let nes = unsafe { &mut EMULATOR };
+struct State {
+    nes: Emulator,
+    framebuffer: Option<Box<[u32; 256 * 240]>>,
+}
 
-    nes.load_rom(ROM).unwrap();
+define_benchmark! {
+    heap_size = 512 * 1024,
+    state = State {
+        nes: Emulator { state: nes::State::new() },
+        framebuffer: None,
+    },
+}
+
+#[inline]
+unsafe fn alloc_zeroed_box<T>() -> Box<T> {
+    Box::from_raw(alloc::alloc::alloc_zeroed(alloc::alloc::Layout::new::<T>()) as *mut T)
+}
+
+fn benchmark_initialize(state: &mut State) {
+    state.framebuffer = Some(unsafe { alloc_zeroed_box() });
+    state.nes.load_rom(ROM).unwrap();
 
     // By default the game which we're emulating stays on the main menu
     // screen without anything happening on screen; it doesn't even try
@@ -48,37 +60,38 @@ pub extern "C" fn initialize() {
     // I don't know why; I just started to empirically increase the number
     // of frames until it worked.
     for _ in 0..4 {
-        nes.execute_until_vblank().unwrap();
+        state.nes.execute_until_vblank().unwrap();
     }
 
     // Now we can press a button to start the game.
-    nes.press(nes::ControllerPort::First, nes::Button::Select);
-    nes.execute_until_vblank().unwrap();
-    nes.release(nes::ControllerPort::First, nes::Button::Select);
+    state.nes.press(nes::ControllerPort::First, nes::Button::Select);
+    state.nes.execute_until_vblank().unwrap();
+    state.nes.release(nes::ControllerPort::First, nes::Button::Select);
 
     // We need to wait for at least three frames until we can trigger
     // the autosolve mechanism.
     for _ in 0..3 {
-        nes.execute_until_vblank().unwrap();
+        state.nes.execute_until_vblank().unwrap();
     }
 
     // Now we can press select to make the game start playing itself.
-    nes.press(nes::ControllerPort::First, nes::Button::Select);
-    nes.execute_until_vblank().unwrap();
-    nes.release(nes::ControllerPort::First, nes::Button::Select);
+    state.nes.press(nes::ControllerPort::First, nes::Button::Select);
+    state.nes.execute_until_vblank().unwrap();
+    state.nes.release(nes::ControllerPort::First, nes::Button::Select);
 }
 
-#[polkavm_derive::polkavm_export]
-#[no_mangle]
-pub extern "C" fn run() {
-    unsafe {
-        EMULATOR.execute_until_vblank().unwrap();
-        EMULATOR.framebuffer().convert_to_abgr(&nes::Palette::default(), &mut FRAMEBUFFER);
-    }
+fn benchmark_run(state: &mut State) {
+    state.nes.execute_until_vblank().unwrap();
+    state
+        .nes
+        .framebuffer()
+        .convert_to_abgr(&nes::Palette::default(), &mut state.framebuffer.as_mut().unwrap()[..]);
 }
 
+// Used by unit tests.
+#[cfg(any(target_arch = "riscv32", target_arch = "riscv64"))]
 #[polkavm_derive::polkavm_export]
 #[no_mangle]
-pub extern "C" fn get_framebuffer() -> usize {
-    unsafe { FRAMEBUFFER.as_mut_ptr() as usize }
+extern "C" fn get_framebuffer() -> usize {
+    unsafe { STATE.framebuffer.as_mut().unwrap().as_mut_ptr() as usize }
 }

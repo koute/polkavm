@@ -44,6 +44,20 @@ else
     echo "      You can add it with: rustup toolchain install $TOOLCHAIN_VERSION"
 fi
 
+if [ "${SOLANA_PLATFORM_TOOLS_DIR:-}" == "" ]; then
+    echo "WARN: 'SOLANA_PLATFORM_TOOLS_DIR' is not set; Solana eBPF binaries won't be built!"
+    case "$OSTYPE" in
+        linux*)
+            echo "      You can set it up like this:"
+            echo "        $ curl -Lo platform-tools-linux-x86_64.tar.bz2 'https://github.com/solana-labs/platform-tools/releases/download/v1.39/platform-tools-linux-x86_64.tar.bz2'"
+            echo "        $ mkdir -p /tmp/solana-platform-tools"
+            echo "        $ tar -C /tmp/solana-platform-tools -xf platform-tools-linux-x86_64.tar.bz2"
+            echo "        $ export SOLANA_PLATFORM_TOOLS_DIR='/tmp/solana-platform-tools'"
+            echo ""
+        ;;
+    esac
+fi
+
 function build_benchmark() {
     current_dir=$(pwd)
     extra_flags="${extra_flags:-}"
@@ -74,6 +88,16 @@ function build_benchmark() {
     if [ "${BUILD_CKBVM}" == "1" ]; then
         echo "> Building: '$1' (CKB VM)"
         RUSTFLAGS="$extra_flags -C target-feature=+zba,+zbb,+zbc,+zbs -C link-arg=-s --cfg=target_ckb_vm" rustup run $TOOLCHAIN_VERSION cargo build -q --target=riscv64imac-unknown-none-elf --release --bin $1 -p $1
+    fi
+
+    if [ "${SOLANA_PLATFORM_TOOLS_DIR:-}" != "" ]; then
+        echo "> Building: '$1' (Solana eBPF)"
+        CARGO_TARGET_SBF_SOLANA_SOLANA_LINKER=$SOLANA_PLATFORM_TOOLS_DIR/llvm/bin/lld \
+        PATH=$PATH:$SOLANA_PLATFORM_TOOLS_DIR/rust/bin:$SOLANA_PLATFORM_TOOLS_DIR/llvm/bin \
+        LD_LIBRARY_PATH=$SOLANA_PLATFORM_TOOLS_DIR/rust/lib:$SOLANA_PLATFORM_TOOLS_DIR/llvm/lib \
+        RUSTC=$SOLANA_PLATFORM_TOOLS_DIR/rust/bin/rustc \
+        RUSTFLAGS="-C link-arg=-e -C link-arg=__solana_entry_point -C link-arg=-T.cargo/solana.ld" \
+        $SOLANA_PLATFORM_TOOLS_DIR/rust/bin/cargo build --target=sbf-solana-solana --release -Zbuild-std=std,panic_abort --lib -p $1
     fi
 }
 

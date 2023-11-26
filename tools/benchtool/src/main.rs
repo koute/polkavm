@@ -110,6 +110,7 @@ pub enum BenchmarkKind {
     PolkaVM,
     WebAssembly,
     Ckbvm,
+    Solana,
     Native,
 }
 
@@ -123,9 +124,15 @@ fn find_benchmarks_in(root_path: &Path) -> Result<Vec<Benchmark>, std::io::Error
             continue;
         };
 
-        let Some(name) = stem.strip_prefix("bench-").or_else(|| stem.strip_prefix("libbench_")) else {
+        let Some(name) = stem
+            .strip_prefix("bench-")
+            .or_else(|| stem.strip_prefix("libbench_"))
+            .or_else(|| stem.strip_prefix("bench_"))
+        else {
             continue;
         };
+
+        let target = path.parent().and_then(|path| path.parent()).and_then(|path| path.file_name());
 
         let kind = if let Some(extension) = path.extension() {
             if extension == "wasm" {
@@ -133,13 +140,15 @@ fn find_benchmarks_in(root_path: &Path) -> Result<Vec<Benchmark>, std::io::Error
             } else if extension == "polkavm" {
                 BenchmarkKind::PolkaVM
             } else if extension == "so" {
-                BenchmarkKind::Native
+                if target.as_ref().map(|target| *target == "sbf-solana-solana").unwrap_or(false) {
+                    BenchmarkKind::Solana
+                } else {
+                    BenchmarkKind::Native
+                }
             } else {
                 continue;
             }
         } else {
-            let target = path.parent().and_then(|path| path.parent()).and_then(|path| path.file_name());
-
             let Some(target) = target else { continue };
             if target == "riscv64imac-unknown-none-elf" {
                 BenchmarkKind::Ckbvm
@@ -165,6 +174,7 @@ fn find_benchmarks() -> Result<Vec<Benchmark>, std::io::Error> {
         root.join("target/riscv32em-unknown-none-elf/release"),
         root.join("target/riscv64imac-unknown-none-elf/release"),
         root.join("target/wasm32-unknown-unknown/release"),
+        root.join("target/sbf-solana-solana/release"),
         #[cfg(target_arch = "x86_64")]
         root.join("target/x86_64-unknown-linux-gnu/release"),
         #[cfg(target_arch = "x86")]

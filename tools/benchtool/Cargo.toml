@@ -15,6 +15,7 @@ env_logger = { workspace = true, optional = true }
 libc = { workspace = true }
 libloading = { version = "0.8.1", optional = true }
 log = { workspace = true }
+object = { version = "0.32.1", default-features = false, features = ["std", "elf"], optional = true }
 wasmi = { git = "https://github.com/paritytech/wasmi.git", rev = "ea3a29ce66ca116489b7bbcec520c5415ace17b2", optional = true }
 
 [target.'cfg(target_arch = "x86_64")'.dependencies]
@@ -22,6 +23,9 @@ ckb-vm = { version = "0.24.6", features = ["asm"], optional = true }
 polkavm = { workspace = true }
 pvf-executor = { git = "https://github.com/paritytech/pvf-executor.git", rev = "d3b2bb77b783bcfaff540c2f9ade99f58a311ac3", optional = true }
 wasm3 = { git = "https://github.com/wasm3/wasm3-rs.git", rev = "df74c2a17ed8831595de43db98c406da4633e32a", features = ["build-bindgen"], optional = true }
+
+[target.'cfg(all(target_arch = "x86_64", not(target_os = "windows")))'.dependencies]
+solana_rbpf = { version = "0.8.0", optional = true }
 
 [target.'cfg(any(target_arch = "x86_64", target_arch = "aarch64"))'.dependencies]
 wasmer = { version = "4.2.3", default-features = false, features = ["std", "singlepass"], optional = true }
@@ -31,6 +35,7 @@ wasmtime = { version = "15.0.0", default-features = false, features = ["cranelif
 default = [
     "native",
     "pvf-executor",
+    "solana_rbpf",
     "wasm3",
     "wasmer",
     "wasmi",
@@ -47,6 +52,7 @@ env_logger = ["dep:env_logger"]
 ckb-vm = ["dep:ckb-vm"]
 native = ["dep:libloading"]
 pvf-executor = ["dep:pvf-executor"]
+solana_rbpf = ["dep:solana_rbpf", "dep:object"]
 wasm3 = ["dep:wasm3"]
 wasmer = ["dep:wasmer"]
 wasmi = ["dep:wasmi"]
