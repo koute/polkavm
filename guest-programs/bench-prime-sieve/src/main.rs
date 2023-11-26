@@ -2,11 +2,14 @@
 #![no_main]
 
 include!("../../bench-common.rs");
-global_allocator!(1024 * 1024);
+
+struct State;
+define_benchmark! {
+    heap_size = 1024 * 1024,
+    state = State,
+}
 
 use primes::PrimeSieve;
-
-extern crate alloc;
 
 use crate::unrolled_extreme::FlagStorageExtremeHybrid;
 
@@ -620,9 +623,7 @@ fn run_sieve(limit: usize) -> PrimeSieve<FlagStorageExtremeHybrid> {
     sieve
 }
 
-#[polkavm_derive::polkavm_export]
-#[no_mangle]
-pub extern "C" fn initialize() {
+fn benchmark_initialize(_state: &mut State) {
     for limit in [100, 1000, 10000, 100000, 1000000, 10000000] {
         let prime_sieve = run_sieve(limit);
         assert_eq!(
@@ -632,8 +633,6 @@ pub extern "C" fn initialize() {
     }
 }
 
-#[polkavm_derive::polkavm_export]
-#[no_mangle]
-pub extern "C" fn run() {
+fn benchmark_run(_state: &mut State) {
     core::hint::black_box(run_sieve(10000000));
 }

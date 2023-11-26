@@ -30,7 +30,7 @@ checksum = "327762f6e5a765692301e5bb513e0d9fef63be86bbc14528052b1cd3e6f03e07"
 [[package]]
 name = "emumisc"
 version = "0.1.0"
-source = "git+https://github.com/koute/pinky.git?rev=1a557db8867c253cc50a38655e764abcc737fa9b#1a557db8867c253cc50a38655e764abcc737fa9b"
+source = "git+https://github.com/koute/pinky.git?rev=5a9d4ff5f22731191cffd7d6202a1d144aacd740#5a9d4ff5f22731191cffd7d6202a1d144aacd740"
 dependencies = [
  "unreachable",
 ]
@@ -54,7 +54,7 @@ dependencies = [
 [[package]]
 name = "mos6502"
 version = "0.1.0"
-source = "git+https://github.com/koute/pinky.git?rev=1a557db8867c253cc50a38655e764abcc737fa9b#1a557db8867c253cc50a38655e764abcc737fa9b"
+source = "git+https://github.com/koute/pinky.git?rev=5a9d4ff5f22731191cffd7d6202a1d144aacd740#5a9d4ff5f22731191cffd7d6202a1d144aacd740"
 dependencies = [
  "bitflags",
  "emumisc",
@@ -63,7 +63,7 @@ dependencies = [
 [[package]]
 name = "nes"
 version = "0.1.0"
-source = "git+https://github.com/koute/pinky.git?rev=1a557db8867c253cc50a38655e764abcc737fa9b#1a557db8867c253cc50a38655e764abcc737fa9b"
+source = "git+https://github.com/koute/pinky.git?rev=5a9d4ff5f22731191cffd7d6202a1d144aacd740#5a9d4ff5f22731191cffd7d6202a1d144aacd740"
 dependencies = [
  "bitflags",
  "emumisc",

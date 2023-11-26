@@ -53,6 +53,9 @@ mod backend_wasmer;
 #[cfg(all(feature = "wazero", any(target_arch = "x86_64", target_arch = "aarch64")))]
 mod backend_wazero;
 
+#[cfg(all(feature = "solana_rbpf", target_arch = "x86_64", not(target_os = "windows")))]
+mod backend_solana_rbpf;
+
 #[cfg(feature = "native")]
 mod backend_native;
 
@@ -99,6 +102,7 @@ macro_rules! define_backends {
         }
 
         #[allow(non_camel_case_types)]
+        #[allow(clippy::large_enum_variant)]
         pub enum AnyInstance {
             $(
                 #[cfg($($cfg)*)]
@@ -261,6 +265,9 @@ define_backends! {
     #[cfg(all(feature = "ckb-vm", target_arch = "x86_64"))]
     Ckbvm_NonAsm => backend_ckbvm::Ckbvm(backend_ckbvm::CkbvmBackend::NonAsm),
 
+    #[cfg(all(feature = "solana_rbpf", target_arch = "x86_64", not(target_os = "windows")))]
+    SolanaRbpf => backend_solana_rbpf::SolanaRbpf(),
+
     #[cfg(all(feature = "wasm3", target_arch = "x86_64"))]
     Wasm3 => backend_wasm3::Wasm3(),
 
@@ -329,6 +336,12 @@ impl BenchmarkKind {
                 {
                     output.push(BackendKind::Ckbvm_Asm);
                     output.push(BackendKind::Ckbvm_NonAsm);
+                }
+            }
+            BenchmarkKind::Solana => {
+                #[cfg(all(feature = "solana_rbpf", target_arch = "x86_64", not(target_os = "windows")))]
+                {
+                    output.push(BackendKind::SolanaRbpf);
                 }
             }
             BenchmarkKind::Native => {
