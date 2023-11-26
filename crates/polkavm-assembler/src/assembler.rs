@@ -71,13 +71,22 @@ impl Assembler {
         self.push(instruction)
     }
 
-    pub fn get_label_offset(&self, label: Label) -> isize {
+    #[inline]
+    pub fn get_label_origin_offset(&self, label: Label) -> Option<isize> {
         let offset = self.labels[label.0 as usize];
-        assert_ne!(offset, isize::MAX, "tried to fetch a label offset for a label that was not defined");
-        offset
+        if offset == isize::MAX {
+            None
+        } else {
+            Some(offset)
+        }
     }
 
-    pub fn set_label_offset(&mut self, label: Label, offset: isize) {
+    pub fn get_label_origin_offset_or_panic(&self, label: Label) -> isize {
+        self.get_label_origin_offset(label)
+            .expect("tried to fetch a label offset for a label that was not defined")
+    }
+
+    pub fn set_label_origin_offset(&mut self, label: Label, offset: isize) {
         self.labels[label.0 as usize] = offset;
     }
 
@@ -219,6 +228,14 @@ where
 {
     fn fmt(&self, fmt: &mut core::fmt::Formatter) -> core::fmt::Result {
         self.instruction.fmt(fmt)
+    }
+}
+
+impl<T> Instruction<T> {
+    #[allow(clippy::len_without_is_empty)]
+    #[inline]
+    pub fn len(&self) -> usize {
+        self.bytes.len()
     }
 }
 

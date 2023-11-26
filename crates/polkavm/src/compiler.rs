@@ -190,7 +190,7 @@ impl<'a> Compiler<'a> {
             let offset = jump_table_index * jump_table_entry_size;
             let range = offset..offset + native_pointer_size;
             let address = self.native_code_address
-                .checked_add_signed(self.asm.get_label_offset(label) as i64)
+                .checked_add_signed(self.asm.get_label_origin_offset_or_panic(label) as i64)
                 .expect("overflow");
 
             log::trace!("Jump table: [0x{:x}] = 0x{:x}", self.native_code_address + range.start as u64, address);
@@ -201,7 +201,7 @@ impl<'a> Compiler<'a> {
         for export in self.exports {
             let label = self.export_to_label.get(&export.address()).unwrap();
             let native_address = self.native_code_address
-                .checked_add_signed(self.asm.get_label_offset(*label) as i64)
+                .checked_add_signed(self.asm.get_label_origin_offset_or_panic(*label) as i64)
                 .expect("overflow");
             self.export_trampolines.push(native_address);
         }
@@ -215,7 +215,7 @@ impl<'a> Compiler<'a> {
         );
 
         let sysreturn_address = self.native_code_address
-            .checked_add_signed(self.asm.get_label_offset(label_sysreturn) as i64)
+            .checked_add_signed(self.asm.get_label_origin_offset_or_panic(label_sysreturn) as i64)
             .expect("overflow");
 
         match self.sandbox_kind {

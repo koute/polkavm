@@ -372,6 +372,34 @@ impl<'a> Compiler<'a> {
         self.push(mov(self.reg_size(), conv_reg(dst), conv_reg(src)))
     }
 
+    #[inline(always)]
+    fn calculate_label_offset(&self, rel8_len: usize, rel32_len: usize, offset: isize) -> Result<i8, i32> {
+        let offset_near = offset - (self.asm.len() as isize + rel8_len as isize);
+        if offset_near <= i8::MAX as isize && offset_near >= i8::MIN as isize {
+            Ok(offset_near as i8)
+        } else {
+            let offset = offset - (self.asm.len() as isize + rel32_len as isize);
+            Err(offset as i32)
+        }
+    }
+
+    fn jump_to_label(&mut self, label: Label) {
+        if let Some(offset) = self.asm.get_label_origin_offset(label) {
+            let offset = self.calculate_label_offset(
+                jmp_rel8(i8::MAX).len(),
+                jmp_rel32(i32::MAX).len(),
+                offset
+            );
+
+            match offset {
+                Ok(offset) => self.push(jmp_rel8(offset)),
+                Err(offset) => self.push(jmp_rel32(offset))
+            }
+        } else {
+            self.push(jmp_label32(label));
+        }
+    }
+
     fn branch(&mut self, s1: Reg, s2: Reg, imm: u32, mut condition: Condition) {
         match (s1, s2) {
             (Z, Z) => {
@@ -387,7 +415,7 @@ impl<'a> Compiler<'a> {
 
                 if should_jump {
                     let label = self.get_or_forward_declare_label(imm);
-                    self.push(jmp_label32(label));
+                    self.jump_to_label(label);
                 } else {
                     self.nop();
                 }
@@ -416,7 +444,22 @@ impl<'a> Compiler<'a> {
         }
 
         let label = self.get_or_forward_declare_label(imm);
-        self.push(jcc_label32(condition, label));
+        if let Some(offset) = self.asm.get_label_origin_offset(label) {
+            let offset = self.calculate_label_offset(
+                jcc_rel8(condition, i8::MAX).len(),
+                jcc_rel32(condition, i32::MAX).len(),
+                offset
+            );
+
+            match offset {
+                Ok(offset) => self.push(jcc_rel8(condition, offset)),
+                Err(offset) => self.push(jcc_rel32(condition, offset))
+            }
+
+        } else {
+            self.push(jcc_label32(condition, label));
+        }
+
         self.start_new_basic_block();
     }
 
@@ -1170,7 +1213,7 @@ impl<'a> InstructionVisitor for Compiler<'a> {
                 self.load_imm(ra, return_address);
             }
 
-            self.push(jmp_label32(label));
+            self.jump_to_label(label);
         } else {
             // A dynamic jump.
             match self.sandbox_kind {
