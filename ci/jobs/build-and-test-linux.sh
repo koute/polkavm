@@ -20,3 +20,6 @@ POLKAVM_TRACE_EXECUTION=1 POLKAVM_ALLOW_INSECURE=1 POLKAVM_BACKEND=compiler POLK
 
 echo ">> cargo run (examples, compiler, generic, x86_64-unknown-linux-gnu)"
 POLKAVM_TRACE_EXECUTION=1 POLKAVM_ALLOW_INSECURE=1 POLKAVM_BACKEND=compiler POLKAVM_SANDBOX=generic cargo run --target=x86_64-unknown-linux-gnu -p hello-world-host
+
+echo ">> cargo check (polkatool, i686-unknown-linux-musl)"
+cargo check --target=i686-unknown-linux-musl -p polkatool
