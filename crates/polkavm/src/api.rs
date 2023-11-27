@@ -500,6 +500,8 @@ impl Module {
                 }
             }
         } else {
+            let _ = jump_count;
+            let _ = basic_block_count;
             CompiledModuleKind::Unavailable
         };
 
