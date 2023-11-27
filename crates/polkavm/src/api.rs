@@ -595,6 +595,25 @@ impl Module {
         }
     }
 
+    /// The address at which the raw machine code will be loaded.
+    ///
+    /// Will return `None` unless compiled for the Linux sandbox.
+    /// Mostly only useful for debugging.
+    pub fn machine_code_origin(&self) -> Option<u64> {
+        if_compiler_is_supported! {
+            {
+                match self.0.compiled_module {
+                    #[cfg(target_os = "linux")]
+                    CompiledModuleKind::Linux(..) => Some(polkavm_common::zygote::VM_ADDR_NATIVE_CODE),
+                    CompiledModuleKind::Generic(..) => None,
+                    CompiledModuleKind::Unavailable => None,
+                }
+            } else {
+                None
+            }
+        }
+    }
+
     /// A map which makes it possible to map a position within the guest program
     /// into the exact range of native machine code instructions.
     ///

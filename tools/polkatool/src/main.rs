@@ -149,7 +149,8 @@ fn main_disassemble(input: PathBuf, format: DisassemblyFormat, output: Option<Pa
             None => bail!("currently selected VM backend doesn't provide a machine code map"),
         };
 
-        Some((code, instruction_map))
+        let code_origin = module.machine_code_origin().unwrap_or(0);
+        Some((code_origin, code, instruction_map))
     } else {
         None
     };
@@ -178,7 +179,14 @@ struct AssemblyFormatter {
 }
 
 impl AssemblyFormatter {
-    fn emit(&mut self, indent: bool, mut code: &[u8], mut position: usize, writer: &mut impl Write) -> Result<(), std::io::Error> {
+    fn emit(
+        &mut self,
+        indent: bool,
+        code_origin: u64,
+        mut code: &[u8],
+        mut position: usize,
+        writer: &mut impl Write,
+    ) -> Result<(), std::io::Error> {
         use iced_x86::Formatter;
 
         let mut formatter = iced_x86::NasmFormatter::new();
@@ -191,7 +199,6 @@ impl AssemblyFormatter {
         formatter.options_mut().set_branch_leading_zeros(false);
         formatter.options_mut().set_rip_relative_addresses(true);
 
-        let code_origin = polkavm_common::zygote::VM_ADDR_NATIVE_CODE;
         loop {
             let mut decoder = iced_x86::Decoder::with_ip(64, code, code_origin, iced_x86::DecoderOptions::NONE);
             if !decoder.can_decode() {
@@ -233,7 +240,7 @@ impl AssemblyFormatter {
 fn disassemble_into(
     format: DisassemblyFormat,
     blob: &polkavm_linker::ProgramBlob,
-    native: Option<(Vec<u8>, Vec<u32>)>,
+    native: Option<(u64, Vec<u8>, Vec<u32>)>,
     mut writer: impl Write,
 ) -> Result<(), String> {
     let mut instructions = Vec::new();
@@ -404,7 +411,7 @@ fn disassemble_into(
         }
 
         if matches!(format, DisassemblyFormat::Native | DisassemblyFormat::GuestAndNative) {
-            let (code, map) = native.as_ref().unwrap();
+            let (code_origin, code, map) = native.as_ref().unwrap();
             let code_position = map[nth_instruction] as usize;
             let next_code_position = map[nth_instruction + 1] as usize;
             let length = next_code_position - code_position;
@@ -412,6 +419,7 @@ fn disassemble_into(
                 let code_chunk = &code[code_position..next_code_position];
                 if let Err(error) = fmt.emit(
                     matches!(format, DisassemblyFormat::GuestAndNative),
+                    *code_origin,
                     code_chunk,
                     code_position,
                     &mut writer,
