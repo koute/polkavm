@@ -136,6 +136,9 @@ impl Backend for Ckbvm {
     }
 
     fn is_slow(&self) -> bool {
-        true
+        match self.0 {
+            CkbvmBackend::Asm => false,
+            CkbvmBackend::NonAsm => true,
+        }
     }
 }
