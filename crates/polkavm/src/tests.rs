@@ -496,6 +496,16 @@ fn basic_gas_metering(config: Config, gas_metering_kind: GasMeteringKind) {
         assert_eq!(instance.gas_remaining().unwrap(), Gas::new(0).unwrap());
         assert!(matches!(result, Err(ExecutionError::OutOfGas)), "unexpected result: {result:?}");
     }
+
+    {
+        core::mem::drop(instance);
+        let instance = instance_pre.instantiate().unwrap();
+        assert_eq!(instance.gas_remaining().unwrap(), Gas::new(0).unwrap());
+
+        let result = instance.get_typed_func::<(), i32>("main").unwrap().call(&mut (), ());
+        assert!(matches!(result, Err(ExecutionError::OutOfGas)), "unexpected result: {result:?}");
+        assert_eq!(instance.gas_remaining().unwrap(), Gas::new(0).unwrap());
+    }
 }
 
 fn basic_gas_metering_sync(config: Config) {

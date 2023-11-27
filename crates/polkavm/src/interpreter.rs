@@ -91,6 +91,10 @@ impl InterpretedInstance {
             in_new_execution: false,
         };
 
+        if interpreter.module.gas_metering().is_some() {
+            interpreter.gas_remaining = Some(0);
+        }
+
         interpreter.reset_memory();
         Ok(interpreter)
     }
