@@ -1,0 +1,9 @@
+[package]
+name = "test-blob"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[dependencies]
+polkavm-derive = { path = "../../crates/polkavm-derive" }
+simplealloc = { path = "../../crates/simplealloc" }
