@@ -2312,6 +2312,7 @@ impl OperationKind {
                     OperationKind::Add
                         | OperationKind::Sub
                         | OperationKind::Or
+                        | OperationKind::Xor
                         | OperationKind::ShiftLogicalLeft
                         | OperationKind::ShiftLogicalRight
                         | OperationKind::ShiftArithmeticRight
@@ -2427,6 +2428,17 @@ impl BlockRegs {
             BasicInst::RegImm { kind, dst, src, imm } => {
                 if let Some(value) = OperationKind::from(kind).apply(self.get_reg(src), RegValue::Constant(imm)) {
                     if let Some(new_instruction) = value.to_instruction(dst) {
+                        if new_instruction != instruction {
+                            return Some(new_instruction);
+                        }
+                    } else if value == self.get_reg(src) {
+                        let new_instruction = BasicInst::RegImm {
+                            kind: RegImmKind::Add,
+                            dst,
+                            src,
+                            imm: 0,
+                        };
+
                         if new_instruction != instruction {
                             return Some(new_instruction);
                         }
