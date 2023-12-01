@@ -133,6 +133,10 @@ pub enum RegImmKind {
     Xor = 0b100,                 // XORI
     Or = 0b110,                  // ORI
     And = 0b111,                 // ANDI
+
+    ShiftLogicalLeft,
+    ShiftLogicalRight,
+    ShiftArithmeticRight,
 }
 
 impl RegImmKind {
@@ -148,14 +152,6 @@ impl RegImmKind {
             _ => None,
         }
     }
-}
-
-#[derive(Copy, Clone, PartialEq, Eq, Debug, Hash)]
-#[repr(u8)]
-pub enum ShiftKind {
-    LogicalLeft,
-    LogicalRight,
-    ArithmeticRight,
 }
 
 #[derive(Copy, Clone, PartialEq, Eq, Debug, Hash)]
@@ -224,12 +220,6 @@ pub enum Inst {
         dst: Reg,
         src: Reg,
         imm: i32,
-    },
-    Shift {
-        kind: ShiftKind,
-        dst: Reg,
-        src: Reg,
-        amount: u8,
     },
     RegReg {
         kind: RegRegKind,
@@ -422,25 +412,25 @@ impl Inst {
                         return None;
                     }
 
-                    Some(Inst::Shift {
-                        kind: ShiftKind::LogicalLeft,
+                    Some(Inst::RegImm {
+                        kind: RegImmKind::ShiftLogicalLeft,
                         dst: Reg::decode(op >> 7),
                         src: Reg::decode(op >> 15),
-                        amount: bits(0, 4, op, 20) as u8,
+                        imm: bits(0, 4, op, 20) as i32,
                     })
                 }
                 0b101 => {
                     let kind = match (op & 0xfe000000) >> 24 {
-                        0b00000000 => ShiftKind::LogicalRight,
-                        0b01000000 => ShiftKind::ArithmeticRight,
+                        0b00000000 => RegImmKind::ShiftLogicalRight,
+                        0b01000000 => RegImmKind::ShiftArithmeticRight,
                         _ => return None,
                     };
 
-                    Some(Inst::Shift {
+                    Some(Inst::RegImm {
                         kind,
                         dst: Reg::decode(op >> 7),
                         src: Reg::decode(op >> 15),
-                        amount: bits(0, 4, op, 20) as u8,
+                        imm: bits(0, 4, op, 20) as i32,
                     })
                 }
                 _ => Some(Inst::RegImm {
@@ -550,31 +540,32 @@ impl Inst {
                         | unbits(12, 12, imm, 31),
                 )
             }
-            Inst::RegImm { kind, dst, src, imm } => {
-                Some(0b0010011 | ((kind as u32) << 12) | ((dst as u32) << 7) | ((src as u32) << 15) | sign_unext(imm as u32, 12)? << 20)
-            }
-            Inst::Shift {
-                kind,
-                dst,
-                src,
-                mut amount,
-            } => {
-                if amount > 32 {
-                    amount = 32;
-                }
+            Inst::RegImm { kind, dst, src, mut imm } => match kind {
+                RegImmKind::ShiftLogicalLeft | RegImmKind::ShiftLogicalRight | RegImmKind::ShiftArithmeticRight => {
+                    if imm > 32 {
+                        imm = 32;
+                    } else if imm < 0 {
+                        imm = 0;
+                    }
 
-                Some(
-                    0b0010011
-                        | match kind {
-                            ShiftKind::LogicalLeft => 0b001 << 12,
-                            ShiftKind::LogicalRight => 0b101 << 12,
-                            ShiftKind::ArithmeticRight => (0b101 << 12) | (1 << 30),
-                        }
-                        | ((dst as u32) << 7)
-                        | ((src as u32) << 15)
-                        | unbits(0, 4, amount as u32, 20),
-                )
-            }
+                    Some(
+                        0b0010011
+                            | match kind {
+                                RegImmKind::ShiftLogicalLeft => 0b001 << 12,
+                                RegImmKind::ShiftLogicalRight => 0b101 << 12,
+                                RegImmKind::ShiftArithmeticRight => (0b101 << 12) | (1 << 30),
+                                _ => unreachable!(),
+                            }
+                            | ((dst as u32) << 7)
+                            | ((src as u32) << 15)
+                            | unbits(0, 4, imm as u32, 20),
+                    )
+                }
+                _ => {
+                    Some(0b0010011 | ((kind as u32) << 12) | ((dst as u32) << 7) | ((src as u32) << 15) | sign_unext(imm as u32, 12)? << 20)
+                }
+            },
+
             Inst::RegReg { kind, dst, src1, src2 } => Some(
                 0b0110011
                     | ((kind as u32 & 0b00111) << 12)

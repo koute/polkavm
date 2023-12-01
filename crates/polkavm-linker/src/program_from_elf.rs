@@ -13,7 +13,7 @@ use std::sync::Arc;
 
 use crate::dwarf::Location;
 use crate::elf::{Elf, Section, SectionIndex};
-use crate::riscv::{BranchKind, Inst, LoadKind, Reg, RegImmKind, RegRegKind, ShiftKind, StoreKind};
+use crate::riscv::{BranchKind, Inst, LoadKind, Reg, RegImmKind, RegRegKind, StoreKind};
 
 #[derive(Debug)]
 pub enum ProgramFromElfErrorKind {
@@ -117,7 +117,7 @@ fn decode_inst(raw_inst: u32) -> Result<Option<Inst>, ProgramFromElfError> {
             check_reg(src1)?;
             check_reg(src2)?;
         }
-        Inst::RegImm { dst, src, .. } | Inst::Shift { dst, src, .. } => {
+        Inst::RegImm { dst, src, .. } => {
             check_reg(dst)?;
             check_reg(src)?;
         }
@@ -324,7 +324,6 @@ enum BasicInst<T> {
     // This is supposed to load the address from the GOT, instead of loading it directly as an immediate.
     LoadAddressIndirect { dst: Reg, target: T },
     RegImm { kind: RegImmKind, dst: Reg, src: Reg, imm: i32 },
-    Shift { kind: ShiftKind, dst: Reg, src: Reg, amount: u8 },
     RegReg { kind: RegRegKind, dst: Reg, src1: Reg, src2: Reg },
     Ecalli { syscall: u32 },
 }
@@ -345,7 +344,6 @@ impl<T> BasicInst<T> {
 
         match *self {
             BasicInst::RegImm { dst, .. }
-            | BasicInst::Shift { dst, .. }
             | BasicInst::RegReg { dst, .. }
             | BasicInst::LoadAddress { dst, .. }
             | BasicInst::LoadAddressIndirect { dst, .. } => dst == Reg::Zero,
@@ -360,7 +358,7 @@ impl<T> BasicInst<T> {
     fn src_mask(&self, imports: &[Import]) -> RegMask {
         match *self {
             BasicInst::LoadAbsolute { .. } | BasicInst::LoadAddress { .. } | BasicInst::LoadAddressIndirect { .. } => RegMask::empty(),
-            BasicInst::StoreAbsolute { src, .. } | BasicInst::RegImm { src, .. } | BasicInst::Shift { src, .. } => RegMask::from(src),
+            BasicInst::StoreAbsolute { src, .. } | BasicInst::RegImm { src, .. } => RegMask::from(src),
             BasicInst::LoadIndirect { base, .. } => RegMask::from(base),
             BasicInst::StoreIndirect { src, base, .. } => RegMask::from(src) | RegMask::from(base),
             BasicInst::RegReg { src1, src2, .. } => RegMask::from(src1) | RegMask::from(src2),
@@ -380,7 +378,6 @@ impl<T> BasicInst<T> {
             | BasicInst::LoadAddressIndirect { dst, .. }
             | BasicInst::LoadIndirect { dst, .. }
             | BasicInst::RegImm { dst, .. }
-            | BasicInst::Shift { dst, .. }
             | BasicInst::RegReg { dst, .. } => RegMask::from(dst),
 
             BasicInst::Ecalli { syscall } => imports
@@ -395,11 +392,9 @@ impl<T> BasicInst<T> {
         match *self {
             BasicInst::Ecalli { .. } | BasicInst::StoreAbsolute { .. } | BasicInst::StoreIndirect { .. } => true,
             BasicInst::LoadAbsolute { .. } | BasicInst::LoadIndirect { .. } => !config.elide_unnecessary_loads,
-            BasicInst::LoadAddress { .. }
-            | BasicInst::LoadAddressIndirect { .. }
-            | BasicInst::RegImm { .. }
-            | BasicInst::Shift { .. }
-            | BasicInst::RegReg { .. } => false,
+            BasicInst::LoadAddress { .. } | BasicInst::LoadAddressIndirect { .. } | BasicInst::RegImm { .. } | BasicInst::RegReg { .. } => {
+                false
+            }
         }
     }
 
@@ -412,7 +407,6 @@ impl<T> BasicInst<T> {
             BasicInst::LoadIndirect { kind, dst, base, offset } => BasicInst::LoadIndirect { kind, dst, base, offset },
             BasicInst::StoreIndirect { kind, src, base, offset } => BasicInst::StoreIndirect { kind, src, base, offset },
             BasicInst::RegImm { kind, dst, src, imm } => BasicInst::RegImm { kind, dst, src, imm },
-            BasicInst::Shift { kind, dst, src, amount } => BasicInst::Shift { kind, dst, src, amount },
             BasicInst::RegReg { kind, dst, src1, src2 } => BasicInst::RegReg { kind, dst, src1, src2 },
             BasicInst::Ecalli { syscall } => BasicInst::Ecalli { syscall },
         })
@@ -428,7 +422,6 @@ impl<T> BasicInst<T> {
             BasicInst::LoadIndirect { .. }
             | BasicInst::StoreIndirect { .. }
             | BasicInst::RegImm { .. }
-            | BasicInst::Shift { .. }
             | BasicInst::RegReg { .. }
             | BasicInst::Ecalli { .. } => (None, None),
         }
@@ -1340,7 +1333,6 @@ fn parse_code_section(
                     InstExt::Basic(BasicInst::StoreIndirect { kind, src, base, offset })
                 }
                 Inst::RegImm { kind, dst, src, imm } => InstExt::Basic(BasicInst::RegImm { kind, dst, src, imm }),
-                Inst::Shift { kind, dst, src, amount } => InstExt::Basic(BasicInst::Shift { kind, dst, src, amount }),
                 Inst::RegReg { kind, dst, src1, src2 } => InstExt::Basic(BasicInst::RegReg { kind, dst, src1, src2 }),
                 Inst::AddUpperImmediateToPc { .. } => {
                     return Err(ProgramFromElfError::other(
@@ -2268,6 +2260,9 @@ impl From<RegImmKind> for OperationKind {
             RegImmKind::Xor => Self::Xor,
             RegImmKind::SetLessThanUnsigned => Self::SetLessThanUnsigned,
             RegImmKind::SetLessThanSigned => Self::SetLessThanSigned,
+            RegImmKind::ShiftLogicalLeft => Self::ShiftLogicalLeft,
+            RegImmKind::ShiftLogicalRight => Self::ShiftLogicalRight,
+            RegImmKind::ShiftArithmeticRight => Self::ShiftArithmeticRight,
         }
     }
 }
@@ -3774,16 +3769,11 @@ fn emit_code(
                         RegImmKind::Xor => Opcode::xor_imm,
                         RegImmKind::Or => Opcode::or_imm,
                         RegImmKind::And => Opcode::and_imm,
+                        RegImmKind::ShiftLogicalLeft => Opcode::shift_logical_left_imm,
+                        RegImmKind::ShiftLogicalRight => Opcode::shift_logical_right_imm,
+                        RegImmKind::ShiftArithmeticRight => Opcode::shift_arithmetic_right_imm,
                     };
                     RawInstruction::new_with_regs2_imm(kind, cast_reg(dst), cast_reg(src), imm as u32)
-                }
-                BasicInst::Shift { kind, dst, src, amount } => {
-                    let kind = match kind {
-                        ShiftKind::LogicalLeft => Opcode::shift_logical_left_imm,
-                        ShiftKind::LogicalRight => Opcode::shift_logical_right_imm,
-                        ShiftKind::ArithmeticRight => Opcode::shift_arithmetic_right_imm,
-                    };
-                    RawInstruction::new_with_regs2_imm(kind, cast_reg(dst), cast_reg(src), amount as u32)
                 }
                 BasicInst::RegReg { kind, dst, src1, src2 } => {
                     let kind = match kind {
