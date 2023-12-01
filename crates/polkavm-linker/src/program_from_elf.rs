@@ -4436,35 +4436,53 @@ fn harvest_code_relocations(
                             )));
                         };
 
-                        let Inst::LoadUpperImmediate { dst: hi_reg, value: _ } = hi_inst else {
+                        let Inst::LoadUpperImmediate { dst: hi_dst, value: _ } = hi_inst else {
                             return Err(ProgramFromElfError::other(format!(
                                 "R_RISCV_HI20 for an unsupported instruction (1st): 0x{hi_inst_raw:08} ({hi_inst:?})"
                             )));
                         };
 
-                        let Inst::RegImm {
-                            kind: RegImmKind::Add,
-                            dst: lo_dst,
-                            src: lo_src,
-                            imm: _,
-                        } = lo_inst
-                        else {
-                            return Err(ProgramFromElfError::other(format!(
-                                "R_RISCV_HI20 for an unsupported instruction (2nd): 0x{lo_inst_raw:08} ({lo_inst:?})"
-                            )));
-                        };
+                        match lo_inst {
+                            Inst::RegImm {
+                                kind: RegImmKind::Add,
+                                dst,
+                                src: lo_src,
+                                imm: _,
+                            } => {
+                                if hi_dst != lo_src {
+                                    return Err(ProgramFromElfError::other(
+                                        "R_RISCV_HI20 for a pair of instructions with different destination registers: {hi_inst:?}, {lo_inst:?}",
+                                    ));
+                                }
 
-                        if hi_reg != lo_dst || lo_dst != lo_src {
-                            return Err(ProgramFromElfError::other(
-                                "R_RISCV_HI20 for a pair of instructions with different destination registers",
-                            ));
+                                instruction_overrides.insert(current_location, InstExt::nop());
+                                instruction_overrides
+                                    .insert(current_location.add(4), InstExt::Basic(BasicInst::LoadAddress { dst, target }));
+                            }
+                            Inst::Load {
+                                kind,
+                                dst,
+                                base: lo_base,
+                                offset: _,
+                            } => {
+                                if hi_dst != lo_base {
+                                    return Err(ProgramFromElfError::other(
+                                        "R_RISCV_HI20 for a pair of instructions with different destination registers: {hi_inst:?}, {lo_inst:?}",
+                                    ));
+                                }
+
+                                instruction_overrides.insert(current_location, InstExt::nop());
+                                instruction_overrides.insert(
+                                    current_location.add(4),
+                                    InstExt::Basic(BasicInst::LoadAbsolute { kind, dst, target }),
+                                );
+                            }
+                            _ => {
+                                return Err(ProgramFromElfError::other(format!(
+                                    "R_RISCV_HI20 for an unsupported instruction (2nd): 0x{lo_inst_raw:08} ({lo_inst:?})"
+                                )));
+                            }
                         }
-
-                        instruction_overrides.insert(current_location, InstExt::nop());
-                        instruction_overrides.insert(
-                            current_location.add(4),
-                            InstExt::Basic(BasicInst::LoadAddress { dst: hi_reg, target }),
-                        );
 
                         skip_lo12.insert(current_location.add(4));
 
