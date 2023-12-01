@@ -2249,6 +2249,7 @@ enum OperationKind {
     ShiftLogicalLeft,
     ShiftLogicalRight,
     ShiftArithmeticRight,
+    Mul,
 }
 
 impl From<RegImmKind> for OperationKind {
@@ -2280,6 +2281,7 @@ impl OperationKind {
             RegRegKind::ShiftLogicalLeft => Self::ShiftLogicalLeft,
             RegRegKind::ShiftLogicalRight => Self::ShiftLogicalRight,
             RegRegKind::ShiftArithmeticRight => Self::ShiftArithmeticRight,
+            RegRegKind::Mul => Self::Mul,
             _ => return None,
         })
     }
@@ -2297,6 +2299,7 @@ impl OperationKind {
             Self::ShiftLogicalLeft => ((lhs as u32).wrapping_shl(rhs as u32)) as i32,
             Self::ShiftLogicalRight => ((lhs as u32).wrapping_shr(rhs as u32)) as i32,
             Self::ShiftArithmeticRight => (lhs as i32).wrapping_shr(rhs as u32),
+            Self::Mul => (lhs as i32).wrapping_mul(rhs as i32),
         }
     }
 
