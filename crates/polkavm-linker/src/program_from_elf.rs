@@ -2323,6 +2323,9 @@ impl OperationKind {
             {
                 Some(lhs)
             }
+            (RegValue::Constant(0), _) | (_, RegValue::Constant(0)) if matches!(self, OperationKind::And | OperationKind::Mul) => {
+                Some(RegValue::Constant(0))
+            }
             _ => None,
         }
     }

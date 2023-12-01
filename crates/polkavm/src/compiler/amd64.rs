@@ -1071,8 +1071,6 @@ impl<'a> InstructionVisitor for Compiler<'a> {
             (Z, _, _) => self.nop(),
             // d = 0 & imm
             (_, Z, _) => self.clear_reg(d),
-            // d = s & 0
-            (_, _, 0) => self.clear_reg(d),
             // d = d & imm
             (_, _, _) if d == s => self.push(and((conv_reg(d), imm32(imm)))),
             // d = s & imm
