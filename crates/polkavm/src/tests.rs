@@ -445,6 +445,24 @@ fn pinky(config: Config) {
     }
 }
 
+fn test_blob(config: Config) {
+    let _ = env_logger::try_init();
+    let blob = get_blob(include_bytes!("../../../test-data/test-blob.elf.zst"));
+
+    let engine = Engine::new(&config).unwrap();
+    let module = Module::from_blob(&engine, &Default::default(), &blob).unwrap();
+    let linker = Linker::new(&engine);
+    let instance_pre = linker.instantiate_pre(&module).unwrap();
+    let instance = instance_pre.instantiate().unwrap();
+
+    {
+        let function = instance.get_typed_func::<(), u32>("push_one_to_global_vec").unwrap();
+        assert_eq!(function.call(&mut (), ()).unwrap(), 1);
+        assert_eq!(function.call(&mut (), ()).unwrap(), 2);
+        assert_eq!(function.call(&mut (), ()).unwrap(), 3);
+    }
+}
+
 fn basic_gas_metering(config: Config, gas_metering_kind: GasMeteringKind) {
     let _ = env_logger::try_init();
 
@@ -524,6 +542,7 @@ run_tests! {
     doom_o1_dwarf5
     doom_o3_dwarf2
     pinky
+    test_blob
 
     basic_gas_metering_sync
     basic_gas_metering_async
