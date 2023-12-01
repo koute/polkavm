@@ -1051,8 +1051,6 @@ impl<'a> InstructionVisitor for Compiler<'a> {
             (Z, _, _) => self.nop(),
             // d = 0 | imm
             (_, Z, _) => self.load_imm(d, imm),
-            // d = s | 0
-            (_, _, 0) => self.mov(d, s),
             // d = d | imm
             (_, _, _) if d == s => self.push(or((conv_reg(d), imm32(imm)))),
             // d = s | imm
@@ -1095,8 +1093,6 @@ impl<'a> InstructionVisitor for Compiler<'a> {
             (Z, _, _) => self.nop(),
             // d = 0 ^ imm
             (_, Z, _) => self.load_imm(d, imm),
-            // d = s ^ 0
-            (_, _, 0) => self.mov(d, s),
             // d = d ^ 0xfffffff
             (_, _, _) if d == s && imm == !0 => self.push(not(self.reg_size(), conv_reg(d))),
             // d = s ^ 0xfffffff
