@@ -35,7 +35,7 @@ use crate::config::GasMeteringKind;
 #[cfg(target_os = "linux")]
 #[allow(non_camel_case_types)]
 mod sys {
-    pub use polkavm_linux_raw::{c_void, c_int, size_t, c_ulong, siginfo_t, SIG_IGN, SIG_DFL, ucontext as ucontext_t};
+    pub use polkavm_linux_raw::{c_void, c_int, size_t, siginfo_t, SIG_IGN, SIG_DFL, ucontext as ucontext_t};
     pub const SIGSEGV: c_int = polkavm_linux_raw::SIGSEGV as c_int;
     pub const SIGILL: c_int = polkavm_linux_raw::SIGILL as c_int;
     pub const PROT_READ: c_int = polkavm_linux_raw::PROT_READ as c_int;
