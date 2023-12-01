@@ -3,6 +3,7 @@ name = "bench-prime-sieve"
 version = "0.1.0"
 edition = "2021"
 authors = ["Michael Barber <60610888+mike-barber@users.noreply.github.com>"]
+publish = false
 
 [lib]
 name = "bench_prime_sieve"
