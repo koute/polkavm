@@ -5,6 +5,10 @@ opt-level = 3
 codegen-units = 1
 debug = true
 
+[profile.no-lto]
+inherits = "release"
+lto = false
+
 [workspace]
 resolver = "2"
 members = [
@@ -14,4 +18,7 @@ members = [
     # Benchmarks:
     "bench-pinky",
     "bench-prime-sieve",
+
+    # Tests
+    "test-blob",
 ]
