@@ -3,6 +3,8 @@ use std::collections::BTreeMap;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
+use core::marker::PhantomData;
+
 use polkavm_common::abi::{
     GuestMemoryConfig, VM_MAXIMUM_EXPORT_COUNT, VM_MAXIMUM_EXTERN_ARG_COUNT, VM_MAXIMUM_IMPORT_COUNT, VM_MAXIMUM_INSTRUCTION_COUNT,
 };
@@ -778,7 +780,7 @@ impl FuncType {
     }
 }
 
-trait ExternFn<T> {
+trait ExternFn<T>: Send + Sync {
     fn call(&self, user_data: &mut T, access: BackendAccess, raw: &mut CallerRaw) -> Result<(), Trap>;
     fn typecheck(&self, prototype: &ExternFnPrototype) -> Result<(), Error>;
 }
@@ -1032,7 +1034,7 @@ macro_rules! impl_into_extern_fn {
     }};
 
     ($arg_count:tt $($args:ident)*) => {
-        impl<T, F, $($args,)* R> ExternFn<T> for (F, core::marker::PhantomData<(R, $($args),*)>)
+        impl<T, F, $($args,)* R> ExternFn<T> for (F, UnsafePhantomData<(R, $($args),*)>)
             where
             F: Fn(Caller<'_, T>, $($args),*) -> R + Send + Sync + 'static,
             $($args: AbiTy,)*
@@ -1085,7 +1087,7 @@ macro_rules! impl_into_extern_fn {
                 let callback = move |_caller: Caller<T>, $($args: $args),*| -> R {
                     self($($args),*)
                 };
-                ExternFnArc(Arc::new((callback, core::marker::PhantomData::<(R, $($args),*)>)))
+                ExternFnArc(Arc::new((callback, UnsafePhantomData(PhantomData::<(R, $($args),*)>))))
             }
         }
 
@@ -1096,7 +1098,7 @@ macro_rules! impl_into_extern_fn {
             R: ReturnTy,
         {
             fn _into_extern_fn(self) -> ExternFnArc<T> {
-                ExternFnArc(Arc::new((self, core::marker::PhantomData::<(R, $($args),*)>)))
+                ExternFnArc(Arc::new((self, UnsafePhantomData(PhantomData::<(R, $($args),*)>))))
             }
         }
 
@@ -1124,11 +1126,20 @@ impl_into_extern_fn!(4 A0 A1 A2 A3);
 impl_into_extern_fn!(5 A0 A1 A2 A3 A4);
 impl_into_extern_fn!(6 A0 A1 A2 A3 A4 A5);
 
+#[repr(transparent)]
+struct UnsafePhantomData<T>(PhantomData<T>);
+
+// SAFETY: This is only used to hold a type used exclusively at compile time, so regardless of whether it implements `Send` this will be safe.
+unsafe impl<T> Send for UnsafePhantomData<T> {}
+
+// SAFETY: This is only used to hold a type used exclusively at compile time, so regardless of whether it implements `Sync` this will be safe.
+unsafe impl<T> Sync for UnsafePhantomData<T> {}
+
 struct DynamicFn<T, F> {
     args: Vec<ExternTy>,
     return_ty: Option<ExternTy>,
     callback: F,
-    _phantom: core::marker::PhantomData<T>,
+    _phantom: UnsafePhantomData<T>,
 }
 
 polkavm_common::static_assert!(Reg::ARG_REGS.len() == VM_MAXIMUM_EXTERN_ARG_COUNT);
@@ -1269,7 +1280,7 @@ pub struct Linker<T> {
     host_functions: HashMap<String, ExternFnArc<T>>,
     #[allow(clippy::type_complexity)]
     fallback_handler: Option<FallbackHandlerArc<T>>,
-    phantom: core::marker::PhantomData<T>,
+    phantom: PhantomData<T>,
 }
 
 impl<T> Linker<T> {
@@ -1277,7 +1288,7 @@ impl<T> Linker<T> {
         Self {
             host_functions: Default::default(),
             fallback_handler: None,
-            phantom: core::marker::PhantomData,
+            phantom: PhantomData,
         }
     }
 
@@ -1306,7 +1317,7 @@ impl<T> Linker<T> {
                 args: ty.args,
                 return_ty: ty.return_ty,
                 callback: func,
-                _phantom: core::marker::PhantomData,
+                _phantom: UnsafePhantomData(PhantomData),
             })),
         );
 
@@ -1349,7 +1360,7 @@ impl<T> Linker<T> {
             module: module.clone(),
             host_functions,
             fallback_handler: self.fallback_handler.clone(),
-            _private: core::marker::PhantomData,
+            _private: PhantomData,
         })))
     }
 }
@@ -1358,7 +1369,7 @@ struct InstancePrePrivate<T> {
     module: Module,
     host_functions: HashMap<u32, ExternFnArc<T>>,
     fallback_handler: Option<FallbackHandlerArc<T>>,
-    _private: core::marker::PhantomData<T>,
+    _private: PhantomData<T>,
 }
 
 pub struct InstancePre<T>(Arc<InstancePrePrivate<T>>);
@@ -1669,7 +1680,7 @@ impl<T> Instance<T> {
         Ok(TypedFunc {
             instance: self.clone(),
             export_index,
-            _phantom: core::marker::PhantomData,
+            _phantom: PhantomData,
         })
     }
 
@@ -1976,7 +1987,7 @@ impl<T> Func<T> {
 pub struct TypedFunc<T, FnArgs, FnResult> {
     instance: Instance<T>,
     export_index: usize,
-    _phantom: core::marker::PhantomData<(FnArgs, FnResult)>,
+    _phantom: PhantomData<(FnArgs, FnResult)>,
 }
 
 impl<T, FnArgs, FnResult> TypedFunc<T, FnArgs, FnResult>

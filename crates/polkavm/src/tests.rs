@@ -547,3 +547,57 @@ run_tests! {
     basic_gas_metering_sync
     basic_gas_metering_async
 }
+
+// Source: https://users.rust-lang.org/t/a-macro-to-assert-that-a-type-does-not-implement-trait-bounds/31179
+macro_rules! assert_not_impl {
+    ($x:ty, $($t:path),+ $(,)*) => {
+        const _: fn() -> () = || {
+            struct Check<T: ?Sized>(T);
+            trait AmbiguousIfImpl<A> { fn some_item() { } }
+
+            impl<T: ?Sized> AmbiguousIfImpl<()> for Check<T> { }
+            impl<T: ?Sized $(+ $t)*> AmbiguousIfImpl<u8> for Check<T> { }
+
+            <Check::<$x> as AmbiguousIfImpl<_>>::some_item()
+        };
+    };
+}
+
+macro_rules! assert_impl {
+    ($x:ty, $($t:path),+ $(,)*) => {
+        const _: fn() -> () = || {
+            struct Check where $x: $($t),+;
+        };
+    };
+}
+
+macro_rules! assert_send_sync {
+    ($($x: ty,)+) => {
+        $(
+            assert_impl!($x, Send);
+            assert_impl!($x, Sync);
+        )+
+    }
+}
+
+assert_send_sync! {
+    crate::Config,
+    crate::Engine,
+    crate::Error,
+    crate::ExecutionConfig,
+    crate::Func<()>,
+    crate::Gas,
+    crate::Instance<()>,
+    crate::InstancePre<()>,
+    crate::Linker<()>,
+    crate::Module,
+    crate::ModuleConfig,
+    crate::ProgramBlob<'static>,
+    crate::Trap,
+    crate::TypedFunc<(), (), ()>,
+}
+
+assert_not_impl!(crate::Caller<'static, ()>, Send);
+assert_not_impl!(crate::Caller<'static, ()>, Sync);
+assert_not_impl!(crate::CallerRef<()>, Send);
+assert_not_impl!(crate::CallerRef<()>, Sync);
