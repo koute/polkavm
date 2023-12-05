@@ -435,7 +435,7 @@ fn prepare_sealed_memfd(name: &core::ffi::CStr, length: usize, populate: impl Fn
     populate(map.as_slice_mut());
     map.unmap()?;
 
-    let timestamp = linux_raw::sys_clock_gettime(linux_raw::CLOCK_MONOTONIC_RAW)?;
+    let mut start_timestamp = None;
     loop {
         if let Err(error) = linux_raw::sys_fcntl(
             memfd.borrow(),
@@ -445,10 +445,15 @@ fn prepare_sealed_memfd(name: &core::ffi::CStr, length: usize, populate: impl Fn
             if error.errno() == linux_raw::EBUSY {
                 // This will return EBUSY if the fd is still mapped, and since apparently munmap is asynchronous in the presence
                 // of multiple threads this can still sometimes randomly fail with EBUSY anyway, even though we did unmap the fd already.
-                let elapsed = linux_raw::sys_clock_gettime(linux_raw::CLOCK_MONOTONIC_RAW)? - timestamp;
-                if elapsed > core::time::Duration::from_secs(3) {
-                    // Just a fail-safe to make sure we don't deadlock.
-                    return Err(error);
+                let now = linux_raw::sys_clock_gettime(linux_raw::CLOCK_MONOTONIC_RAW)?;
+                if let Some(start_timestamp) = start_timestamp {
+                    let elapsed = now - start_timestamp;
+                    if elapsed > core::time::Duration::from_secs(3) {
+                        // Just a fail-safe to make sure we don't deadlock.
+                        return Err(error);
+                    }
+                } else {
+                    start_timestamp = Some(now);
                 }
 
                 continue;
