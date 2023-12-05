@@ -4,6 +4,7 @@
 extern crate polkavm_linux_raw as linux_raw;
 
 use polkavm_common::{
+    abi::VM_PAGE_SIZE,
     error::{ExecutionError, Trap},
     program::Reg,
     utils::{align_to_next_page_usize, slice_assume_init_mut, Access, AsUninitSliceMut, Gas},
@@ -412,7 +413,7 @@ const ZYGOTE_ADDRESS_TABLE: AddressTable = {
     address_table
 };
 
-fn prepare_sealed_memfd(name: &core::ffi::CStr, length: usize, populate: impl FnOnce(&mut [u8])) -> Result<Fd, Error> {
+fn prepare_sealed_memfd<const N: usize>(name: &core::ffi::CStr, length: usize, data: [&[u8]; N]) -> Result<Fd, Error> {
     let native_page_size = get_native_page_size();
     if length % native_page_size != 0 {
         return Err(Error::from_str("memfd size doesn't end on a page boundary"));
@@ -421,49 +422,17 @@ fn prepare_sealed_memfd(name: &core::ffi::CStr, length: usize, populate: impl Fn
     let memfd = linux_raw::sys_memfd_create(name, linux_raw::MFD_CLOEXEC | linux_raw::MFD_ALLOW_SEALING)?;
     linux_raw::sys_ftruncate(memfd.borrow(), length as linux_raw::c_ulong)?;
 
-    let mut map = unsafe {
-        linux_raw::Mmap::map(
-            core::ptr::null_mut(),
-            length,
-            linux_raw::PROT_READ | linux_raw::PROT_WRITE,
-            linux_raw::MAP_SHARED,
-            Some(memfd.borrow()),
-            0,
-        )?
-    };
-
-    populate(map.as_slice_mut());
-    map.unmap()?;
-
-    let mut start_timestamp = None;
-    loop {
-        if let Err(error) = linux_raw::sys_fcntl(
-            memfd.borrow(),
-            linux_raw::F_ADD_SEALS,
-            linux_raw::F_SEAL_SEAL | linux_raw::F_SEAL_SHRINK | linux_raw::F_SEAL_GROW | linux_raw::F_SEAL_WRITE,
-        ) {
-            if error.errno() == linux_raw::EBUSY {
-                // This will return EBUSY if the fd is still mapped, and since apparently munmap is asynchronous in the presence
-                // of multiple threads this can still sometimes randomly fail with EBUSY anyway, even though we did unmap the fd already.
-                let now = linux_raw::sys_clock_gettime(linux_raw::CLOCK_MONOTONIC_RAW)?;
-                if let Some(start_timestamp) = start_timestamp {
-                    let elapsed = now - start_timestamp;
-                    if elapsed > core::time::Duration::from_secs(3) {
-                        // Just a fail-safe to make sure we don't deadlock.
-                        return Err(error);
-                    }
-                } else {
-                    start_timestamp = Some(now);
-                }
-
-                continue;
-            } else {
-                return Err(error);
-            }
-        }
-
-        break;
+    let expected_bytes_written = data.iter().map(|slice| slice.len()).sum::<usize>();
+    let bytes_written = linux_raw::writev(memfd.borrow(), data)?;
+    if bytes_written != expected_bytes_written {
+        return Err(Error::from_str("failed to prepare memfd: incomplete write"));
     }
+
+    linux_raw::sys_fcntl(
+        memfd.borrow(),
+        linux_raw::F_ADD_SEALS,
+        linux_raw::F_SEAL_SEAL | linux_raw::F_SEAL_SHRINK | linux_raw::F_SEAL_GROW | linux_raw::F_SEAL_WRITE,
+    )?;
 
     Ok(memfd)
 }
@@ -474,10 +443,7 @@ fn prepare_zygote() -> Result<Fd, Error> {
     #[allow(clippy::unwrap_used)]
     // The size of the zygote blob is always going to be much less than the size of usize, so this never fails.
     let length_aligned = align_to_next_page_usize(native_page_size, ZYGOTE_BLOB.len()).unwrap();
-
-    prepare_sealed_memfd(cstr!("polkavm_zygote"), length_aligned, |buffer| {
-        buffer[..ZYGOTE_BLOB.len()].copy_from_slice(ZYGOTE_BLOB);
-    })
+    prepare_sealed_memfd(cstr!("polkavm_zygote"), length_aligned, [ZYGOTE_BLOB])
 }
 
 fn prepare_vmctx() -> Result<(Fd, Mmap), Error> {
@@ -850,33 +816,30 @@ impl super::Sandbox for Sandbox {
     }
 
     fn prepare_program(init: SandboxProgramInit, _: Self::AddressSpace, gas_metering: Option<GasMeteringKind>) -> Result<Self::Program, Self::Error> {
+        static PADDING: [u8; VM_PAGE_SIZE as usize] = [0; VM_PAGE_SIZE as usize];
+
         let native_page_size = get_native_page_size();
         let cfg = init.memory_config(native_page_size)?;
-        let mut code_range = 0..0;
+        let ro_data_padding = &PADDING[..cfg.ro_data_size() as usize - init.ro_data().len()];
+        let rw_data_padding = &PADDING[..cfg.rw_data_size() as usize - init.rw_data().len()];
+        let code_padding = &PADDING[..cfg.code_size() - init.code.len()];
+
         let memfd = prepare_sealed_memfd(
             cstr!("polkavm_program"),
             cfg.ro_data_size() as usize + cfg.rw_data_size() as usize + cfg.code_size() + cfg.jump_table_size(),
-            |buffer| {
-                let mut offset = 0;
-                macro_rules! append {
-                    ($slice:expr, $length:expr) => {
-                        assert!($slice.len() <= $length as usize);
-                        buffer[offset..offset + $slice.len()].copy_from_slice($slice);
-                        #[allow(unused_assignments)]
-                        {
-                            offset += $length as usize;
-                        }
-                    };
-                }
-
-                append!(init.ro_data(), cfg.ro_data_size());
-                append!(init.rw_data(), cfg.rw_data_size());
-
-                code_range = offset..offset + init.code.len();
-                append!(init.code, cfg.code_size());
-                append!(init.jump_table, cfg.jump_table_size());
-            },
+            [
+                init.ro_data(),
+                ro_data_padding,
+                init.rw_data(),
+                rw_data_padding,
+                init.code,
+                code_padding,
+                init.jump_table
+            ]
         )?;
+
+        let offset = cfg.ro_data_size() as usize + cfg.rw_data_size() as usize;
+        let code_range = offset..offset + init.code.len();
 
         Ok(SandboxProgram(Arc::new(SandboxProgramInner {
             memfd,
