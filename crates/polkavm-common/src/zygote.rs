@@ -71,7 +71,7 @@ pub const VM_ADDR_NATIVE_CODE: u64 = 0x100000000;
 pub const VM_ADDR_JUMP_TABLE: u64 = 0x800000000;
 
 /// The address where the return-to-host jump table vector physically resides.
-pub const VM_ADDR_JUMP_TABLE_RETURN_TO_HOST: u64 = 0xffffe0000;
+pub const VM_ADDR_JUMP_TABLE_RETURN_TO_HOST: u64 = VM_ADDR_JUMP_TABLE + ((crate::abi::VM_ADDR_RETURN_TO_HOST as u64) << 3);
 
 /// A special hostcall number set by the *host* to signal that the guest should stop executing the program.
 pub const HOSTCALL_ABORT_EXECUTION: u32 = !0;
@@ -404,7 +404,6 @@ impl VmCtx {
     }
 }
 
-static_assert!(VM_ADDR_JUMP_TABLE_RETURN_TO_HOST == VM_ADDR_JUMP_TABLE + ((crate::abi::VM_ADDR_RETURN_TO_HOST as u64) << 3));
 static_assert!(VM_ADDR_JUMP_TABLE_RETURN_TO_HOST > VM_ADDR_JUMP_TABLE);
 static_assert!(VM_ADDR_JUMP_TABLE_RETURN_TO_HOST % 0x4000 == 0);
 static_assert!(VM_SANDBOX_MAXIMUM_JUMP_TABLE_SIZE <= VM_SANDBOX_MAXIMUM_JUMP_TABLE_VIRTUAL_SIZE);
