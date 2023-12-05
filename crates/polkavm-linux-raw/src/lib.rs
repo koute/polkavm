@@ -73,7 +73,7 @@ pub use crate::arch_amd64_bindings::{
     __NR_pidfd_send_signal as SYS_pidfd_send_signal, __NR_pipe2 as SYS_pipe2, __NR_pivot_root as SYS_pivot_root, __NR_prctl as SYS_prctl,
     __NR_process_vm_readv as SYS_process_vm_readv, __NR_process_vm_writev as SYS_process_vm_writev, __NR_ptrace as SYS_ptrace,
     __NR_read as SYS_read, __NR_recvmsg as SYS_recvmsg, __NR_rt_sigaction as SYS_rt_sigaction, __NR_rt_sigprocmask as SYS_rt_sigprocmask,
-    __NR_rt_sigreturn as SYS_rt_sigreturn, __NR_seccomp as SYS_seccomp, __NR_sendmsg as SYS_sendmsg,
+    __NR_rt_sigreturn as SYS_rt_sigreturn, __NR_sched_yield as SYS_sched_yield, __NR_seccomp as SYS_seccomp, __NR_sendmsg as SYS_sendmsg,
     __NR_set_tid_address as SYS_set_tid_address, __NR_setdomainname as SYS_setdomainname, __NR_sethostname as SYS_sethostname,
     __NR_setrlimit as SYS_setrlimit, __NR_sigaltstack as SYS_sigaltstack, __NR_socketpair as SYS_socketpair, __NR_umount2 as SYS_umount2,
     __NR_unshare as SYS_unshare, __NR_waitid as SYS_waitid, __NR_write as SYS_write, __NR_writev as SYS_writev, __kernel_gid_t as gid_t,
@@ -892,6 +892,14 @@ fn sys_getdents64(fd: FdRef, buffer: &mut [u8]) -> Result<Option<usize>, Error> 
     } else {
         Ok(Some(bytes_read as usize))
     }
+}
+
+pub fn sys_sched_yield() -> Result<(), Error> {
+    // On Linux this always succeeds, although technically it could fail
+    // due to a seccomp sandbox, so let's return an error anyway.
+    let result = unsafe { syscall_readonly!(SYS_sched_yield) };
+    Error::from_syscall("sched_yield", result)?;
+    Ok(())
 }
 
 pub fn sys_socketpair(domain: u32, kind: u32, protocol: u32) -> Result<(Fd, Fd), Error> {
