@@ -61,8 +61,168 @@ where
 
 pub(crate) type OnHostcall<'a> = &'a mut dyn for<'r> FnMut(u32, BackendAccess<'r>) -> Result<(), Trap>;
 
+if_compiler_is_supported! {
+    {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        pub(crate) trait SandboxExt: Sandbox {
+            fn as_compiled_module(module: &Module) -> &CompiledModule<Self>;
+            fn as_sandbox_vec(sandbox_vec: &SandboxVec) -> &Mutex<Vec<Self>>;
+            fn reuse_or_spawn_sandbox(engine_state: &EngineState, module: &Module) -> Result<Self, Error> {
+                use crate::sandbox::SandboxConfig;
+
+                let mut sandbox_config = Self::Config::default();
+                sandbox_config.enable_logger(cfg!(test) || module.is_debug_trace_execution_enabled());
+
+                if let Some(sandbox) = engine_state.reuse_sandbox::<Self>() {
+                    Ok(sandbox)
+                } else {
+                    Self::spawn(&sandbox_config)
+                        .map_err(Error::from_display)
+                        .map_err(|error| error.context("instantiation failed: failed to create a sandbox"))
+                }
+            }
+
+            fn recycle_sandbox(engine_state: &EngineState, get_sandbox: impl FnOnce() -> Option<Self>) {
+                let Some(sandbox_cache) = engine_state.sandbox_cache.as_ref() else { return };
+                let sandboxes = Self::as_sandbox_vec(&sandbox_cache.sandboxes);
+
+                let mut count = sandbox_cache.available_workers.load(Ordering::Relaxed);
+                if count >= sandbox_cache.worker_limit {
+                    return;
+                }
+
+                loop {
+                    if let Err(new_count) = sandbox_cache.available_workers.compare_exchange(count, count + 1, Ordering::Relaxed, Ordering::Relaxed) {
+                        if new_count >= sandbox_cache.worker_limit {
+                            return;
+                        }
+
+                        count = new_count;
+                        continue;
+                    }
+
+                    break;
+                }
+
+                if let Some(sandbox) = get_sandbox() {
+                    let mut sandboxes = match sandboxes.lock() {
+                        Ok(sandboxes) => sandboxes,
+                        Err(poison) => poison.into_inner(),
+                    };
+
+                    sandboxes.push(sandbox);
+                } else {
+                    sandbox_cache.available_workers.fetch_sub(1, Ordering::Relaxed);
+                }
+            }
+        }
+
+        #[cfg(target_os = "linux")]
+        impl SandboxExt for SandboxLinux {
+            fn as_compiled_module(module: &Module) -> &CompiledModule<Self> {
+                match module.0.compiled_module {
+                    CompiledModuleKind::Linux(ref module) => module,
+                    _ => unreachable!(),
+                }
+            }
+
+            fn as_sandbox_vec(sandbox_vec: &SandboxVec) -> &Mutex<Vec<Self>> {
+                match sandbox_vec {
+                    SandboxVec::Linux(vec) => vec,
+                    _ => unreachable!(),
+                }
+            }
+        }
+
+        impl SandboxExt for SandboxGeneric {
+            fn as_compiled_module(module: &Module) -> &CompiledModule<Self> {
+                match module.0.compiled_module {
+                    CompiledModuleKind::Generic(ref module) => module,
+                    _ => unreachable!(),
+                }
+            }
+
+            fn as_sandbox_vec(sandbox_vec: &SandboxVec) -> &Mutex<Vec<Self>> {
+                match sandbox_vec {
+                    SandboxVec::Generic(vec) => vec,
+                    #[cfg(target_os = "linux")]
+                    SandboxVec::Linux(..) => unreachable!(),
+                }
+            }
+        }
+
+        pub(crate) enum SandboxVec {
+            #[cfg(target_os = "linux")]
+            Linux(Mutex<Vec<SandboxLinux>>),
+            Generic(Mutex<Vec<SandboxGeneric>>),
+        }
+
+        struct SandboxCache {
+            sandboxes: SandboxVec,
+            available_workers: AtomicUsize,
+            worker_limit: usize,
+        }
+
+        impl EngineState {
+            fn reuse_sandbox<S>(&self) -> Option<S> where S: SandboxExt {
+                let sandbox_cache = self.sandbox_cache.as_ref()?;
+                if sandbox_cache.available_workers.load(Ordering::Relaxed) == 0 {
+                    return None;
+                }
+
+                let sandboxes = S::as_sandbox_vec(&sandbox_cache.sandboxes);
+                let mut sandboxes = match sandboxes.lock() {
+                    Ok(sandboxes) => sandboxes,
+                    Err(poison) => poison.into_inner(),
+                };
+
+                let mut sandbox = sandboxes.pop()?;
+                sandbox_cache.available_workers.fetch_sub(1, Ordering::Relaxed);
+
+                if let Err(error) = sandbox.sync() {
+                    log::warn!("Failed to reuse a sandbox: {error}");
+                    None
+                } else {
+                    Some(sandbox)
+                }
+            }
+        }
+
+        fn spawn_sandboxes<S>(count: usize, debug_trace_execution: bool) -> Result<Vec<S>, Error> where S: Sandbox {
+            use crate::sandbox::SandboxConfig;
+
+            let mut sandbox_config = S::Config::default();
+            sandbox_config.enable_logger(cfg!(test) || debug_trace_execution);
+
+            let mut sandboxes = Vec::with_capacity(count);
+            for nth in 0..count {
+                let sandbox = S::spawn(&sandbox_config)
+                    .map_err(crate::Error::from_display)
+                    .map_err(|error| error.context(format!("failed to create a worker process ({} out of {})", nth + 1, count)))?;
+
+                sandboxes.push(sandbox);
+            }
+
+            Ok(sandboxes)
+        }
+    } else {
+        struct SandboxCache;
+    }
+}
+
+pub(crate) struct EngineState {
+    #[allow(dead_code)]
+    sandbox_cache: Option<SandboxCache>,
+}
+
 pub struct Engine {
-    config: Config,
+    selected_backend: BackendKind,
+    #[allow(dead_code)]
+    selected_sandbox: Option<SandboxKind>,
+    interpreter_enabled: bool,
+    debug_trace_execution: bool,
+    state: Arc<EngineState>,
 }
 
 impl Engine {
@@ -73,26 +233,77 @@ impl Engine {
             }
         }
 
-        if let Some(sandbox) = config.sandbox {
-            if !sandbox.is_supported() {
-                bail!("the '{sandbox}' backend is not supported on this platform")
-            }
+        if !config.allow_insecure && config.trace_execution {
+            bail!("cannot enable trace execution: `set_allow_insecure`/`POLKAVM_ALLOW_INSECURE` is not enabled");
         }
 
-        #[allow(clippy::collapsible_if)]
-        if !config.allow_insecure {
-            if config.trace_execution {
-                bail!("cannot enable trace execution: `set_allow_insecure`/`POLKAVM_ALLOW_INSECURE` is not enabled");
-            }
+        let debug_trace_execution = config.trace_execution;
+        let default_backend = if BackendKind::Compiler.is_supported() && SandboxKind::Linux.is_supported() {
+            BackendKind::Compiler
+        } else {
+            BackendKind::Interpreter
+        };
 
-            if let Some(sandbox) = config.sandbox {
-                if matches!(sandbox, SandboxKind::Generic) {
-                    bail!("cannot use the '{sandbox}' sandbox: this sandbox is not secure yet, and `set_allow_insecure`/`POLKAVM_ALLOW_INSECURE` is not enabled");
+        let selected_backend = config.backend.unwrap_or(default_backend);
+        log::debug!("Selected backend: '{selected_backend}'");
+
+        let (selected_sandbox, sandbox_cache) = if_compiler_is_supported! {
+            {
+                if selected_backend == BackendKind::Compiler {
+                    let default_sandbox = if SandboxKind::Linux.is_supported() {
+                        SandboxKind::Linux
+                    } else {
+                        SandboxKind::Generic
+                    };
+
+                    let selected_sandbox = config.sandbox.unwrap_or(default_sandbox);
+                    log::debug!("Selected sandbox: '{selected_sandbox}'");
+
+                    if !selected_sandbox.is_supported() {
+                        bail!("the '{selected_sandbox}' backend is not supported on this platform")
+                    }
+
+                    if selected_sandbox == SandboxKind::Generic && !config.allow_insecure {
+                        bail!("cannot use the '{selected_sandbox}' sandbox: this sandbox is not secure yet, and `set_allow_insecure`/`POLKAVM_ALLOW_INSECURE` is not enabled");
+                    }
+
+                    let sandboxes = match selected_sandbox {
+                        SandboxKind::Linux => {
+                            #[cfg(target_os = "linux")]
+                            {
+                                SandboxVec::Linux(Mutex::new(spawn_sandboxes(config.worker_count, debug_trace_execution)?))
+                            }
+
+                            #[cfg(not(target_os = "linux"))]
+                            {
+                                unreachable!()
+                            }
+                        },
+                        SandboxKind::Generic => SandboxVec::Generic(Mutex::new(spawn_sandboxes(config.worker_count, debug_trace_execution)?)),
+                    };
+
+                    let sandbox_cache = SandboxCache {
+                        sandboxes,
+                        available_workers: AtomicUsize::new(config.worker_count),
+                        worker_limit: config.worker_count,
+                    };
+
+                    (Some(selected_sandbox), Some(sandbox_cache))
+                } else {
+                    Default::default()
                 }
+            } else {
+                Default::default()
             }
-        }
+        };
 
-        Ok(Engine { config: config.clone() })
+        Ok(Engine {
+            selected_backend,
+            selected_sandbox,
+            interpreter_enabled: debug_trace_execution || selected_backend == BackendKind::Interpreter,
+            debug_trace_execution,
+            state: Arc::new(EngineState { sandbox_cache }),
+        })
     }
 }
 
@@ -133,31 +344,6 @@ struct ModulePrivate {
     interpreted_module: Option<InterpretedModule>,
     memory_config: GuestMemoryConfig,
     gas_metering: Option<GasMeteringKind>,
-}
-
-if_compiler_is_supported! {
-    pub(crate) trait AsCompiledModule<S> where S: Sandbox {
-        fn as_compiled_module(&self) -> Option<&CompiledModule<S>>;
-    }
-
-    #[cfg(target_os = "linux")]
-    impl AsCompiledModule<SandboxLinux> for Module {
-        fn as_compiled_module(&self) -> Option<&CompiledModule<SandboxLinux>> {
-            match self.0.compiled_module {
-                CompiledModuleKind::Linux(ref module) => Some(module),
-                _ => None
-            }
-        }
-    }
-
-    impl AsCompiledModule<SandboxGeneric> for Module {
-        fn as_compiled_module(&self) -> Option<&CompiledModule<SandboxGeneric>> {
-            match self.0.compiled_module {
-                CompiledModuleKind::Generic(ref module) => Some(module),
-                _ => None
-            }
-        }
-    }
 }
 
 /// A compiled PolkaVM program module.
@@ -425,63 +611,18 @@ impl Module {
         )
         .map_err(Error::from_static_str)?;
 
-        let debug_trace_execution = engine.config.trace_execution;
         let init = GuestProgramInit::new()
             .with_ro_data(blob.ro_data())
             .with_rw_data(blob.rw_data())
             .with_bss(blob.bss_size())
             .with_stack(blob.stack_size());
 
-        let default_backend = if BackendKind::Compiler.is_supported() && SandboxKind::Linux.is_supported() {
-            BackendKind::Compiler
-        } else {
-            BackendKind::Interpreter
-        };
-
-        let selected_backend = engine.config.backend.unwrap_or(default_backend);
-        log::debug!("Selected backend: '{selected_backend}'");
-
-        let compiler_enabled = selected_backend == BackendKind::Compiler;
-        let interpreter_enabled = debug_trace_execution || selected_backend == BackendKind::Interpreter;
-
-        let compiled_module = if compiler_enabled {
-            if_compiler_is_supported! {
-                {
-                    let default_sandbox = if SandboxKind::Linux.is_supported() {
-                        SandboxKind::Linux
-                    } else {
-                        SandboxKind::Generic
-                    };
-
-                    let selected_sandbox = engine.config.sandbox.unwrap_or(default_sandbox);
-                    log::debug!("Selected sandbox: '{selected_sandbox}'");
-
-                    match selected_sandbox {
-                        SandboxKind::Linux => {
-                            #[cfg(target_os = "linux")]
-                            {
-                                let module = CompiledModule::new(
-                                    config,
-                                    &instructions,
-                                    &exports,
-                                    &basic_block_by_jump_table_index,
-                                    &jump_table_index_by_basic_block,
-                                    &gas_cost_for_basic_block,
-                                    init,
-                                    debug_trace_execution,
-                                    jump_count,
-                                    basic_block_count,
-                                )?;
-                                CompiledModuleKind::Linux(module)
-                            }
-
-                            #[cfg(not(target_os = "linux"))]
-                            {
-                                log::debug!("Selected sandbox unavailable!");
-                                CompiledModuleKind::Unavailable
-                            }
-                        },
-                        SandboxKind::Generic => {
+        let compiled_module = if_compiler_is_supported! {
+            {
+                match engine.selected_sandbox {
+                    Some(SandboxKind::Linux) => {
+                        #[cfg(target_os = "linux")]
+                        {
                             let module = CompiledModule::new(
                                 config,
                                 &instructions,
@@ -490,24 +631,44 @@ impl Module {
                                 &jump_table_index_by_basic_block,
                                 &gas_cost_for_basic_block,
                                 init,
-                                debug_trace_execution,
+                                engine.debug_trace_execution,
                                 jump_count,
                                 basic_block_count,
                             )?;
-                            CompiledModuleKind::Generic(module)
+                            CompiledModuleKind::Linux(module)
                         }
+
+                        #[cfg(not(target_os = "linux"))]
+                        {
+                            log::debug!("Selected sandbox unavailable!");
+                            CompiledModuleKind::Unavailable
+                        }
+                    },
+                    Some(SandboxKind::Generic) => {
+                        let module = CompiledModule::new(
+                            config,
+                            &instructions,
+                            &exports,
+                            &basic_block_by_jump_table_index,
+                            &jump_table_index_by_basic_block,
+                            &gas_cost_for_basic_block,
+                            init,
+                            engine.debug_trace_execution,
+                            jump_count,
+                            basic_block_count,
+                        )?;
+                        CompiledModuleKind::Generic(module)
                     }
-                } else {
-                    CompiledModuleKind::Unavailable
+                    None => CompiledModuleKind::Unavailable
                 }
-            }
-        } else {
-            let _ = jump_count;
-            let _ = basic_block_count;
-            CompiledModuleKind::Unavailable
+            } else {{
+                let _ = jump_count;
+                let _ = basic_block_count;
+                CompiledModuleKind::Unavailable
+            }}
         };
 
-        let interpreted_module = if interpreter_enabled {
+        let interpreted_module = if engine.interpreter_enabled {
             Some(InterpretedModule::new(init, gas_cost_for_basic_block)?)
         } else {
             None
@@ -548,7 +709,7 @@ impl Module {
         );
 
         Ok(Module(Arc::new(ModulePrivate {
-            debug_trace_execution,
+            debug_trace_execution: engine.debug_trace_execution,
             instructions,
             exports,
             imports,
@@ -558,7 +719,7 @@ impl Module {
             jump_table_index_by_basic_block,
             basic_block_by_jump_table_index,
 
-            blob: if debug_trace_execution || selected_backend == BackendKind::Interpreter {
+            blob: if engine.debug_trace_execution || engine.selected_backend == BackendKind::Interpreter {
                 Some(blob.clone().into_owned())
             } else {
                 None
@@ -1277,6 +1438,7 @@ where
 type FallbackHandlerArc<T> = Arc<dyn Fn(Caller<'_, T>, u32) -> Result<(), Trap> + Send + Sync + 'static>;
 
 pub struct Linker<T> {
+    engine_state: Arc<EngineState>,
     host_functions: HashMap<String, ExternFnArc<T>>,
     #[allow(clippy::type_complexity)]
     fallback_handler: Option<FallbackHandlerArc<T>>,
@@ -1284,8 +1446,9 @@ pub struct Linker<T> {
 }
 
 impl<T> Linker<T> {
-    pub fn new(_engine: &Engine) -> Self {
+    pub fn new(engine: &Engine) -> Self {
         Self {
+            engine_state: engine.state.clone(),
             host_functions: Default::default(),
             fallback_handler: None,
             phantom: PhantomData,
@@ -1357,6 +1520,7 @@ impl<T> Linker<T> {
         }
 
         Ok(InstancePre(Arc::new(InstancePrePrivate {
+            engine_state: self.engine_state.clone(),
             module: module.clone(),
             host_functions,
             fallback_handler: self.fallback_handler.clone(),
@@ -1366,6 +1530,8 @@ impl<T> Linker<T> {
 }
 
 struct InstancePrePrivate<T> {
+    #[allow(dead_code)]
+    engine_state: Arc<EngineState>,
     module: Module,
     host_functions: HashMap<u32, ExternFnArc<T>>,
     fallback_handler: Option<FallbackHandlerArc<T>>,
@@ -1389,11 +1555,11 @@ impl<T> InstancePre<T> {
                 match compiled_module {
                     #[cfg(target_os = "linux")]
                     CompiledModuleKind::Linux(..) => {
-                        let compiled_instance = CompiledInstance::new(self.0.module.clone())?;
+                        let compiled_instance = CompiledInstance::new(self.0.engine_state.clone(), self.0.module.clone())?;
                         Some(InstanceBackend::CompiledLinux(compiled_instance))
                     },
                     CompiledModuleKind::Generic(..) => {
-                        let compiled_instance = CompiledInstance::new(self.0.module.clone())?;
+                        let compiled_instance = CompiledInstance::new(self.0.engine_state.clone(), self.0.module.clone())?;
                         Some(InstanceBackend::CompiledGeneric(compiled_instance))
                     },
                     CompiledModuleKind::Unavailable => None
