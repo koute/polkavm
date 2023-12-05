@@ -413,13 +413,47 @@ const ZYGOTE_ADDRESS_TABLE: AddressTable = {
     address_table
 };
 
-fn prepare_sealed_memfd<const N: usize>(name: &core::ffi::CStr, length: usize, data: [&[u8]; N]) -> Result<Fd, Error> {
+fn create_empty_memfd(name: &core::ffi::CStr) -> Result<Fd, Error> {
+    linux_raw::sys_memfd_create(name, linux_raw::MFD_CLOEXEC | linux_raw::MFD_ALLOW_SEALING)
+}
+
+// Creating these is relatively slow, so we can keep one ready to go in memory at all times to speed up instantiation.
+static CACHED_PROGRAM_MEMFD: core::sync::atomic::AtomicI32 = core::sync::atomic::AtomicI32::new(-1);
+
+fn create_program_memfd() -> Result<Fd, Error> {
+    let memfd_raw = CACHED_PROGRAM_MEMFD.load(Ordering::Relaxed);
+    if memfd_raw != -1 && CACHED_PROGRAM_MEMFD.compare_exchange(memfd_raw, -1, Ordering::Relaxed, Ordering::Relaxed).is_ok() {
+        Ok(Fd::from_raw_unchecked(memfd_raw))
+    } else {
+        create_empty_memfd(cstr!("polkavm_program"))
+    }
+}
+
+fn cache_program_memfd_if_necessary() {
+    if CACHED_PROGRAM_MEMFD.load(Ordering::Relaxed) != -1 {
+        return;
+    }
+
+    let memfd = match create_empty_memfd(cstr!("polkavm_program")) {
+        Ok(memfd) => memfd,
+        Err(error) => {
+            // This should never happen.
+            log::warn!("Failed to create a memfd: {error}");
+            return;
+        }
+    };
+
+    if CACHED_PROGRAM_MEMFD.compare_exchange(-1, memfd.raw(), Ordering::Relaxed, Ordering::Relaxed).is_ok() {
+        memfd.leak();
+    }
+}
+
+fn prepare_sealed_memfd<const N: usize>(memfd: Fd, length: usize, data: [&[u8]; N]) -> Result<Fd, Error> {
     let native_page_size = get_native_page_size();
     if length % native_page_size != 0 {
         return Err(Error::from_str("memfd size doesn't end on a page boundary"));
     }
 
-    let memfd = linux_raw::sys_memfd_create(name, linux_raw::MFD_CLOEXEC | linux_raw::MFD_ALLOW_SEALING)?;
     linux_raw::sys_ftruncate(memfd.borrow(), length as linux_raw::c_ulong)?;
 
     let expected_bytes_written = data.iter().map(|slice| slice.len()).sum::<usize>();
@@ -443,7 +477,7 @@ fn prepare_zygote() -> Result<Fd, Error> {
     #[allow(clippy::unwrap_used)]
     // The size of the zygote blob is always going to be much less than the size of usize, so this never fails.
     let length_aligned = align_to_next_page_usize(native_page_size, ZYGOTE_BLOB.len()).unwrap();
-    prepare_sealed_memfd(cstr!("polkavm_zygote"), length_aligned, [ZYGOTE_BLOB])
+    prepare_sealed_memfd(create_empty_memfd(cstr!("polkavm_zygote"))?, length_aligned, [ZYGOTE_BLOB])
 }
 
 fn prepare_vmctx() -> Result<(Fd, Mmap), Error> {
@@ -452,7 +486,7 @@ fn prepare_vmctx() -> Result<(Fd, Mmap), Error> {
     #[allow(clippy::unwrap_used)] // The size of VmCtx is always going to be much less than the size of usize, so this never fails.
     let length_aligned = align_to_next_page_usize(native_page_size, core::mem::size_of::<VmCtx>()).unwrap();
 
-    let memfd = linux_raw::sys_memfd_create(cstr!("polkavm_vmctx"), linux_raw::MFD_CLOEXEC | linux_raw::MFD_ALLOW_SEALING)?;
+    let memfd = create_empty_memfd(cstr!("polkavm_vmctx"))?;
     linux_raw::sys_ftruncate(memfd.borrow(), length_aligned as linux_raw::c_ulong)?;
     linux_raw::sys_fcntl(
         memfd.borrow(),
@@ -825,7 +859,7 @@ impl super::Sandbox for Sandbox {
         let code_padding = &PADDING[..cfg.code_size() - init.code.len()];
 
         let memfd = prepare_sealed_memfd(
-            cstr!("polkavm_program"),
+            create_program_memfd()?,
             cfg.ro_data_size() as usize + cfg.rw_data_size() as usize + cfg.code_size() + cfg.jump_table_size(),
             [
                 init.ro_data(),
@@ -1244,6 +1278,9 @@ impl Sandbox {
             if state != VMCTX_FUTEX_BUSY {
                 return Err(Error::from_str("internal error: unexpected worker process state").into());
             }
+
+            // We're going to be waiting anyway, so do some useful work if we can.
+            cache_program_memfd_if_necessary();
 
             for _ in 0..yield_target {
                 let _ = linux_raw::sys_sched_yield();
