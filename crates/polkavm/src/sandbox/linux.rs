@@ -1093,7 +1093,7 @@ impl super::Sandbox for Sandbox {
         self.wait_if_necessary(match args.on_hostcall {
             Some(ref mut on_hostcall) => Some(&mut *on_hostcall),
             None => None,
-        })?;
+        }, true)?;
 
         if args.is_async && args.on_hostcall.is_some() {
             return Err(Error::from_str("requested asynchronous execution with a borrowed hostcall handler").into());
@@ -1124,7 +1124,7 @@ impl super::Sandbox for Sandbox {
         }
 
         if !args.is_async {
-            self.wait_if_necessary(args.on_hostcall)?;
+            self.wait_if_necessary(args.on_hostcall, args.rpc_address == 0)?;
         }
 
         Ok(())
@@ -1158,7 +1158,7 @@ impl super::Sandbox for Sandbox {
     }
 
     fn sync(&mut self) -> Result<(), Self::Error> {
-        self.wait_if_necessary(None).map_err(|error| {
+        self.wait_if_necessary(None, true).map_err(|error| {
             match error {
                 ExecutionError::Trap(..) => Error::from_str("unexpected trap"),
                 ExecutionError::OutOfGas => Error::from_str("unexpected out of gas"),
@@ -1176,8 +1176,13 @@ impl Sandbox {
 
     #[inline(never)]
     #[cold]
-    fn wait(&mut self, mut on_hostcall: Option<OnHostcall<Self>>) -> Result<(), ExecutionError<Error>> {
+    fn wait(&mut self, mut on_hostcall: Option<OnHostcall<Self>>, low_latency: bool) -> Result<(), ExecutionError<Error>> {
         let mut spin_target = 0;
+        let mut yield_target = 0;
+        if low_latency {
+            yield_target = 20;
+        }
+
         'outer: loop {
             self.count_wait_loop_start += 1;
 
@@ -1240,6 +1245,13 @@ impl Sandbox {
                 return Err(Error::from_str("internal error: unexpected worker process state").into());
             }
 
+            for _ in 0..yield_target {
+                let _ = linux_raw::sys_sched_yield();
+                if self.vmctx().futex.load(Ordering::Relaxed) != VMCTX_FUTEX_BUSY {
+                    continue 'outer;
+                }
+            }
+
             for _ in 0..spin_target {
                 core::hint::spin_loop();
                 if self.vmctx().futex.load(Ordering::Relaxed) != VMCTX_FUTEX_BUSY {
@@ -1270,9 +1282,9 @@ impl Sandbox {
     }
 
     #[inline]
-    fn wait_if_necessary(&mut self, on_hostcall: Option<OnHostcall<Self>>) -> Result<(), ExecutionError<Error>> {
+    fn wait_if_necessary(&mut self, on_hostcall: Option<OnHostcall<Self>>, low_latency: bool) -> Result<(), ExecutionError<Error>> {
         if self.vmctx().futex.load(Ordering::Relaxed) != VMCTX_FUTEX_IDLE {
-            self.wait(on_hostcall)?;
+            self.wait(on_hostcall, low_latency)?;
         }
 
         Ok(())
