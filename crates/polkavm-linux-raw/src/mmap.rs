@@ -39,22 +39,27 @@ impl Mmap {
         self.unmap_inplace()
     }
 
+    #[inline]
     pub fn as_ptr(&self) -> *const c_void {
         self.pointer
     }
 
+    #[inline]
     pub fn as_mut_ptr(&self) -> *mut c_void {
         self.pointer
     }
 
+    #[inline]
     pub fn as_slice(&self) -> &[u8] {
         unsafe { core::slice::from_raw_parts(self.as_ptr().cast::<u8>(), self.length) }
     }
 
+    #[inline]
     pub fn as_slice_mut(&mut self) -> &mut [u8] {
         unsafe { core::slice::from_raw_parts_mut(self.as_mut_ptr().cast::<u8>(), self.length) }
     }
 
+    #[inline]
     pub fn len(&self) -> usize {
         self.length
     }
