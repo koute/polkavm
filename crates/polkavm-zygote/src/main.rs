@@ -490,6 +490,7 @@ unsafe fn initialize(mut stack: *mut usize) -> linux_raw::Fd {
         (if a == linux_raw::SYS_write => jump @3),
         (if a == linux_raw::SYS_recvmsg => jump @2),
         (if a == linux_raw::SYS_rt_sigreturn => jump @1),
+        (if a == linux_raw::SYS_sched_yield => jump @1),
         (seccomp_kill_thread),
 
         // SYS_recvmsg
@@ -551,7 +552,14 @@ unsafe fn main_loop(socket: linux_raw::Fd) -> ! {
     }
 
     loop {
-        if VMCTX.futex.load(Ordering::Relaxed) == VMCTX_FUTEX_IDLE {
+        'wait_loop: while VMCTX.futex.load(Ordering::Relaxed) == VMCTX_FUTEX_IDLE {
+            for _ in 0..20 {
+                let _ = linux_raw::sys_sched_yield();
+                if VMCTX.futex.load(Ordering::Relaxed) != VMCTX_FUTEX_IDLE {
+                    break 'wait_loop;
+                }
+            }
+
             match linux_raw::sys_futex_wait(&VMCTX.futex, VMCTX_FUTEX_IDLE, None) {
                 Ok(()) => continue,
                 Err(error) if error.errno() == linux_raw::EAGAIN || error.errno() == linux_raw::EINTR => continue,
