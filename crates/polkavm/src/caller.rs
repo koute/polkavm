@@ -12,6 +12,12 @@ pub(crate) struct CallerRaw {
     tracer: Option<Tracer>,
 }
 
+// SAFETY: Most of the methods of this struct are `unsafe` and the callers will uphold the invariants to ensure that this is safe.
+unsafe impl Send for CallerRaw {}
+
+// SAFETY: Most of the methods of this struct are `unsafe` and the callers will uphold the invariants to ensure that this is safe.
+unsafe impl Sync for CallerRaw {}
+
 impl CallerRaw {
     pub(crate) fn new(tracer: Option<Tracer>) -> Self {
         CallerRaw {
