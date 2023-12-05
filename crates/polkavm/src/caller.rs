@@ -1,5 +1,6 @@
 use crate::api::BackendAccess;
 use crate::tracer::Tracer;
+use crate::Gas;
 use core::mem::MaybeUninit;
 use polkavm_common::error::Trap;
 use polkavm_common::program::Reg;
@@ -123,6 +124,11 @@ impl CallerRaw {
 
         result
     }
+
+    unsafe fn gas_remaining(&self) -> Option<Gas> {
+        // SAFETY: The caller will make sure that the invariants hold.
+        unsafe { self.access() }.gas_remaining()
+    }
 }
 
 /// A handle used to access the execution context.
@@ -235,6 +241,11 @@ impl<'a, T> Caller<'a, T> {
         // SAFETY: This can only be called from inside of `Caller::wrap` so this is always valid.
         unsafe { self.raw.write_memory(address, data) }
     }
+
+    pub fn gas_remaining(&self) -> Option<Gas> {
+        // SAFETY: This can only be called from inside of `Caller::wrap` so this is always valid.
+        unsafe { self.raw.gas_remaining() }
+    }
 }
 
 /// A handle used to access the execution context, with erased lifetimes for convenience.
@@ -309,6 +320,13 @@ impl<T> CallerRef<T> {
 
         // SAFETY: We've made sure the lifetime is valid.
         unsafe { (*self.raw).write_memory(address, data) }
+    }
+
+    pub fn gas_remaining(&self) -> Option<Gas> {
+        self.check_lifetime_or_panic();
+
+        // SAFETY: We've made sure the lifetime is valid.
+        unsafe { (*self.raw).gas_remaining() }
     }
 }
 
