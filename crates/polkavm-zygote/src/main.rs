@@ -887,28 +887,13 @@ unsafe fn reconfigure(socket: linux_raw::FdRef) {
 #[inline(never)]
 unsafe fn clear_program() {
     let current = &mut *VMCTX.memory_config.get();
-    let user_memory_region_size = current.user_memory_region_size();
-    if user_memory_region_size > 0 {
-        linux_raw::sys_munmap(
-            current.user_memory_region_address() as *mut core::ffi::c_void,
-            user_memory_region_size as usize,
-        )
-        .unwrap_or_else(|error| abort_with_error("failed to unmap user memory", error));
+    if current.user_memory_region_size() > 0 || current.stack_size() > 0 || current.code_size() > 0 {
+        polkavm_common::static_assert!(VM_ADDR_NATIVE_CODE + (VM_SANDBOX_MAXIMUM_NATIVE_CODE_SIZE as u64) < 0x200000000);
+        linux_raw::sys_munmap(core::ptr::null_mut(), 0x200000000)
+            .unwrap_or_else(|error| abort_with_error("failed to unmap user accessible memory", error));
 
         current.clear_user_memory_sizes();
-    }
-
-    if current.stack_size() > 0 {
-        linux_raw::sys_munmap(current.stack_address_low() as *mut core::ffi::c_void, current.stack_size() as usize)
-            .unwrap_or_else(|error| abort_with_error("failed to unmap user stack", error));
-
         current.clear_stack_size();
-    }
-
-    if current.code_size() > 0 {
-        linux_raw::sys_munmap(VM_ADDR_NATIVE_CODE as *mut core::ffi::c_void, current.code_size())
-            .unwrap_or_else(|error| abort_with_error("failed to unmap user code", error));
-
         current.clear_code_size();
     }
 
