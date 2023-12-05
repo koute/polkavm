@@ -51,6 +51,19 @@ fn benchmark_compilation<T: Backend>(count: u64, backend: T, path: &Path) -> cor
     start.elapsed()
 }
 
+fn benchmark_oneshot<T: Backend>(count: u64, backend: T, path: &Path) -> core::time::Duration {
+    let mut engine = backend.create();
+    let blob = backend.load(path);
+    let start = std::time::Instant::now();
+    for _ in 0..count {
+        let module = backend.compile(&mut engine, &blob);
+        let mut instance = backend.spawn(&mut engine, &module);
+        backend.initialize(&mut instance);
+        backend.run(&mut instance);
+    }
+    start.elapsed()
+}
+
 #[cfg(feature = "criterion")]
 fn criterion_main(c: &mut Criterion, benches: &[Benchmark]) {
     let mut by_name = std::collections::BTreeMap::new();
@@ -85,6 +98,18 @@ fn criterion_main(c: &mut Criterion, benches: &[Benchmark]) {
 
                 group.bench_function(backend.name(), |b| {
                     b.iter_custom(|count| benchmark_compilation(count, backend, &bench.path));
+                });
+            }
+        }
+        group.finish();
+    }
+
+    for (name, variants) in &by_name {
+        let mut group = c.benchmark_group(format!("oneshot/{}", name));
+        for bench in variants {
+            for backend in bench.kind.matching_backends() {
+                group.bench_function(backend.name(), |b| {
+                    b.iter_custom(|count| benchmark_oneshot(count, backend, &bench.path));
                 });
             }
         }
@@ -198,6 +223,7 @@ fn find_benchmarks() -> Result<Vec<Benchmark>, std::io::Error> {
 enum BenchVariant {
     Runtime,
     Compilation,
+    Oneshot,
 }
 
 impl BenchVariant {
@@ -205,6 +231,7 @@ impl BenchVariant {
         match self {
             BenchVariant::Runtime => "runtime",
             BenchVariant::Compilation => "compilation",
+            BenchVariant::Oneshot => "oneshot",
         }
     }
 }
@@ -216,7 +243,7 @@ fn pick_benchmark(benchmark: Option<String>) -> (BenchVariant, Benchmark, Backen
     let mut found = Vec::new();
     for bench in &benches {
         for backend in bench.kind.matching_backends() {
-            for variant in [BenchVariant::Runtime, BenchVariant::Compilation] {
+            for variant in [BenchVariant::Runtime, BenchVariant::Compilation, BenchVariant::Oneshot] {
                 if matches!(variant, BenchVariant::Compilation) && !backend.is_compiled() {
                     continue;
                 }
@@ -426,7 +453,7 @@ fn main() {
             let benches = find_benchmarks().unwrap();
             for bench in &benches {
                 for backend in bench.kind.matching_backends() {
-                    for variant in [BenchVariant::Runtime, BenchVariant::Compilation] {
+                    for variant in [BenchVariant::Runtime, BenchVariant::Compilation, BenchVariant::Oneshot] {
                         if matches!(variant, BenchVariant::Compilation) && !backend.is_compiled() {
                             continue;
                         }
@@ -459,6 +486,10 @@ fn main() {
                     BenchVariant::Compilation => {
                         let count = if cfg!(miri) { 1 } else { iteration_limit.unwrap_or(128) };
                         benchmark_compilation(count, backend, &bench.path) / count as u32
+                    }
+                    BenchVariant::Oneshot => {
+                        let count = iteration_limit.unwrap_or(10);
+                        benchmark_oneshot(count, backend, &bench.path) / count as u32
                     }
                 };
 
@@ -514,6 +545,20 @@ fn main() {
                     },
                     move |(engine, blob)| {
                         backend.compile(engine, blob);
+                    },
+                ),
+                BenchVariant::Oneshot => prepare_for_profiling(
+                    iteration_limit,
+                    move || {
+                        let engine = backend.create();
+                        let blob = backend.load(&bench.path);
+                        ((engine, blob), None)
+                    },
+                    move |(engine, blob)| {
+                        let module = backend.compile(engine, blob);
+                        let mut instance = backend.spawn(engine, &module);
+                        backend.initialize(&mut instance);
+                        backend.run(&mut instance);
                     },
                 ),
             };
