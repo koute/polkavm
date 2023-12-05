@@ -3,6 +3,14 @@
 version = 3
 
 [[package]]
+name = "bench-minimal"
+version = "0.1.0"
+dependencies = [
+ "polkavm-derive",
+ "simplealloc",
+]
+
+[[package]]
 name = "bench-pinky"
 version = "0.1.0"
 dependencies = [

@@ -16,6 +16,7 @@ members = [
     "example-hello-world",
 
     # Benchmarks:
+    "bench-minimal",
     "bench-pinky",
     "bench-prime-sieve",
 
