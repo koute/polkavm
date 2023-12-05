@@ -280,15 +280,15 @@ impl RawImm {
 
 #[derive(Copy, Clone, PartialEq, Eq, Debug)]
 pub enum MemOp {
-    /// [segment:base + offset]
+    /// segment:base + offset
     BaseOffset(Option<SegReg>, RegSize, Reg, i32),
-    /// [segment:base + index * scale + offset]
+    /// segment:base + index * scale + offset
     BaseIndexScaleOffset(Option<SegReg>, RegSize, Reg, RegIndex, Scale, i32),
-    /// [segment:base * scale + offset]
+    /// segment:base * scale + offset
     IndexScaleOffset(Option<SegReg>, RegSize, RegIndex, Scale, i32),
-    /// [segment:offset]
+    /// segment:offset
     Offset(Option<SegReg>, RegSize, i32),
-    /// [segment:rip + offset]
+    /// segment:rip + offset
     RipRelative(Option<SegReg>, i32),
 }
 
