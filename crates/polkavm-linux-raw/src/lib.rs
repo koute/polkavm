@@ -76,19 +76,19 @@ pub use crate::arch_amd64_bindings::{
     __NR_rt_sigreturn as SYS_rt_sigreturn, __NR_seccomp as SYS_seccomp, __NR_sendmsg as SYS_sendmsg,
     __NR_set_tid_address as SYS_set_tid_address, __NR_setdomainname as SYS_setdomainname, __NR_sethostname as SYS_sethostname,
     __NR_setrlimit as SYS_setrlimit, __NR_sigaltstack as SYS_sigaltstack, __NR_socketpair as SYS_socketpair, __NR_umount2 as SYS_umount2,
-    __NR_unshare as SYS_unshare, __NR_waitid as SYS_waitid, __NR_write as SYS_write, __kernel_gid_t as gid_t, __kernel_pid_t as pid_t,
-    __kernel_uid_t as uid_t, __user_cap_data_struct, __user_cap_header_struct, iovec, linux_dirent64, rlimit, rusage,
-    sigaction as kernel_sigaction, siginfo_t, sigset_t as kernel_sigset_t, timespec, AT_EMPTY_PATH, AT_MINSIGSTKSZ, AT_NULL, AT_PAGESZ,
-    AT_SYSINFO_EHDR, CLOCK_MONOTONIC_RAW, CLONE_CLEAR_SIGHAND, CLONE_NEWCGROUP, CLONE_NEWIPC, CLONE_NEWNET, CLONE_NEWNS, CLONE_NEWPID,
-    CLONE_NEWUSER, CLONE_NEWUTS, CLONE_PIDFD, E2BIG, EACCES, EAGAIN, EBADF, EBUSY, ECHILD, EDOM, EEXIST, EFAULT, EFBIG, EINTR, EINVAL, EIO,
-    EISDIR, EMFILE, EMLINK, ENFILE, ENODEV, ENOENT, ENOEXEC, ENOMEM, ENOSPC, ENOTBLK, ENOTDIR, ENOTTY, ENXIO, EPERM, EPIPE, ERANGE, EROFS,
-    ESPIPE, ESRCH, ETIMEDOUT, ETXTBSY, EXDEV, FUTEX_WAIT, FUTEX_WAKE, F_ADD_SEALS, F_SEAL_GROW, F_SEAL_SEAL, F_SEAL_SHRINK, F_SEAL_WRITE,
-    MADV_DONTNEED, MAP_ANONYMOUS, MAP_FIXED, MAP_POPULATE, MAP_PRIVATE, MAP_SHARED, MFD_ALLOW_SEALING, MFD_CLOEXEC, MINSIGSTKSZ,
-    MREMAP_FIXED, MREMAP_MAYMOVE, MS_BIND, MS_NODEV, MS_NOEXEC, MS_NOSUID, MS_PRIVATE, MS_RDONLY, MS_REC, O_CLOEXEC, O_DIRECTORY, O_PATH,
-    O_RDONLY, O_RDWR, O_WRONLY, PROT_EXEC, PROT_READ, PROT_WRITE, P_ALL, P_PGID, P_PID, P_PIDFD, RLIMIT_DATA, RLIMIT_FSIZE, RLIMIT_LOCKS,
-    RLIMIT_MEMLOCK, RLIMIT_MSGQUEUE, RLIMIT_NOFILE, RLIMIT_NPROC, RLIMIT_STACK, SA_NODEFER, SA_ONSTACK, SA_RESTORER, SA_SIGINFO,
-    SECCOMP_RET_ALLOW, SECCOMP_RET_KILL_THREAD, SECCOMP_SET_MODE_FILTER, SIGCONT, SIGFPE, SIGILL, SIGKILL, SIGSEGV, SIGSTOP, SIG_BLOCK,
-    SIG_SETMASK, SIG_UNBLOCK, WEXITED, WNOHANG, _LINUX_CAPABILITY_VERSION_3, __WALL,
+    __NR_unshare as SYS_unshare, __NR_waitid as SYS_waitid, __NR_write as SYS_write, __NR_writev as SYS_writev, __kernel_gid_t as gid_t,
+    __kernel_pid_t as pid_t, __kernel_uid_t as uid_t, __user_cap_data_struct, __user_cap_header_struct, iovec, linux_dirent64, rlimit,
+    rusage, sigaction as kernel_sigaction, siginfo_t, sigset_t as kernel_sigset_t, timespec, AT_EMPTY_PATH, AT_MINSIGSTKSZ, AT_NULL,
+    AT_PAGESZ, AT_SYSINFO_EHDR, CLOCK_MONOTONIC_RAW, CLONE_CLEAR_SIGHAND, CLONE_NEWCGROUP, CLONE_NEWIPC, CLONE_NEWNET, CLONE_NEWNS,
+    CLONE_NEWPID, CLONE_NEWUSER, CLONE_NEWUTS, CLONE_PIDFD, E2BIG, EACCES, EAGAIN, EBADF, EBUSY, ECHILD, EDOM, EEXIST, EFAULT, EFBIG,
+    EINTR, EINVAL, EIO, EISDIR, EMFILE, EMLINK, ENFILE, ENODEV, ENOENT, ENOEXEC, ENOMEM, ENOSPC, ENOTBLK, ENOTDIR, ENOTTY, ENXIO, EPERM,
+    EPIPE, ERANGE, EROFS, ESPIPE, ESRCH, ETIMEDOUT, ETXTBSY, EXDEV, FUTEX_WAIT, FUTEX_WAKE, F_ADD_SEALS, F_SEAL_GROW, F_SEAL_SEAL,
+    F_SEAL_SHRINK, F_SEAL_WRITE, MADV_DONTNEED, MAP_ANONYMOUS, MAP_FIXED, MAP_POPULATE, MAP_PRIVATE, MAP_SHARED, MFD_ALLOW_SEALING,
+    MFD_CLOEXEC, MINSIGSTKSZ, MREMAP_FIXED, MREMAP_MAYMOVE, MS_BIND, MS_NODEV, MS_NOEXEC, MS_NOSUID, MS_PRIVATE, MS_RDONLY, MS_REC,
+    O_CLOEXEC, O_DIRECTORY, O_PATH, O_RDONLY, O_RDWR, O_WRONLY, PROT_EXEC, PROT_READ, PROT_WRITE, P_ALL, P_PGID, P_PID, P_PIDFD,
+    RLIMIT_DATA, RLIMIT_FSIZE, RLIMIT_LOCKS, RLIMIT_MEMLOCK, RLIMIT_MSGQUEUE, RLIMIT_NOFILE, RLIMIT_NPROC, RLIMIT_STACK, SA_NODEFER,
+    SA_ONSTACK, SA_RESTORER, SA_SIGINFO, SECCOMP_RET_ALLOW, SECCOMP_RET_KILL_THREAD, SECCOMP_SET_MODE_FILTER, SIGCONT, SIGFPE, SIGILL,
+    SIGKILL, SIGSEGV, SIGSTOP, SIG_BLOCK, SIG_SETMASK, SIG_UNBLOCK, WEXITED, WNOHANG, _LINUX_CAPABILITY_VERSION_3, __WALL,
 };
 
 impl siginfo_t {
@@ -1070,6 +1070,12 @@ pub unsafe fn sys_process_vm_writev(pid: pid_t, local_iovec: &[iovec], remote_io
     Ok(result as usize)
 }
 
+pub unsafe fn sys_writev(fd: FdRef, iv: &[iovec]) -> Result<usize, Error> {
+    let result = unsafe { syscall!(SYS_writev, fd, iv, iv.len()) };
+    Error::from_syscall("writev", result)?;
+    Ok(result as usize)
+}
+
 pub fn sys_sendmsg(fd: FdRef, message: &msghdr, flags: u32) -> Result<usize, Error> {
     let result = unsafe { syscall_readonly!(SYS_sendmsg, fd.raw(), message as *const msghdr, flags) };
     Error::from_syscall("sendmsg", result)?;
@@ -1363,6 +1369,14 @@ pub fn vm_write_memory<const N_LOCAL: usize, const N_REMOTE: usize>(
         iov_len: length as u64,
     });
     unsafe { sys_process_vm_writev(pid, &local_iovec, &remote_iovec) }
+}
+
+pub fn writev<const N: usize>(fd: FdRef, list: [&[u8]; N]) -> Result<usize, Error> {
+    let iv = list.map(|slice| iovec {
+        iov_base: (slice.as_ptr() as *mut u8).cast(),
+        iov_len: slice.len() as u64,
+    });
+    unsafe { sys_writev(fd, &iv) }
 }
 
 #[inline(always)] // To prevent the buffer from being copied.
