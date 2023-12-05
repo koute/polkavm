@@ -101,5 +101,6 @@ function build_benchmark() {
     fi
 }
 
+build_benchmark "bench-minimal"
 build_benchmark "bench-pinky"
 build_benchmark "bench-prime-sieve"
