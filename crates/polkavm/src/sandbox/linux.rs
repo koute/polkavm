@@ -1127,6 +1127,10 @@ impl super::Sandbox for Sandbox {
             None => None,
         })?;
 
+        if args.is_async && args.on_hostcall.is_some() {
+            return Err(Error::from_str("requested asynchronous execution with a borrowed hostcall handler").into());
+        }
+
         unsafe {
             if let Some(program) = args.program {
                 *self.vmctx().new_memory_config.get() = program.0.memory_config;
@@ -1151,7 +1155,10 @@ impl super::Sandbox for Sandbox {
             }
         }
 
-        self.wait_if_necessary(args.on_hostcall)?;
+        if !args.is_async {
+            self.wait_if_necessary(args.on_hostcall)?;
+        }
+
         Ok(())
     }
 
@@ -1180,6 +1187,16 @@ impl super::Sandbox for Sandbox {
         if self.gas_metering.is_none() { return Ok(None) };
         let value = unsafe { *self.vmctx().gas().get() };
         super::get_gas_remaining(value).map(Some)
+    }
+
+    fn sync(&mut self) -> Result<(), Self::Error> {
+        self.wait_if_necessary(None).map_err(|error| {
+            match error {
+                ExecutionError::Trap(..) => Error::from_str("unexpected trap"),
+                ExecutionError::OutOfGas => Error::from_str("unexpected out of gas"),
+                ExecutionError::Error(error) => error,
+            }
+        })
     }
 }
 

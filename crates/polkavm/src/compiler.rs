@@ -1,5 +1,6 @@
 use std::borrow::Cow;
 use std::collections::HashMap;
+use std::sync::Arc;
 
 use polkavm_assembler::{Assembler, Label};
 use polkavm_common::error::{ExecutionError, Trap};
@@ -10,10 +11,10 @@ use polkavm_common::zygote::{
 };
 use polkavm_common::abi::VM_CODE_ADDRESS_ALIGNMENT;
 
-use crate::api::{BackendAccess, ExecutionConfig, Module, OnHostcall, AsCompiledModule};
+use crate::api::{BackendAccess, EngineState, ExecutionConfig, Module, OnHostcall, SandboxExt};
 use crate::error::{bail, Error};
 
-use crate::sandbox::{Sandbox, SandboxConfig, SandboxProgram, SandboxProgramInit, ExecuteArgs};
+use crate::sandbox::{Sandbox, SandboxProgram, SandboxProgramInit, ExecuteArgs};
 use crate::config::{GasMeteringKind, ModuleConfig, SandboxKind};
 
 #[cfg(target_arch = "x86_64")]
@@ -360,42 +361,28 @@ impl<S> CompiledModule<S> where S: Sandbox {
     }
 }
 
-pub(crate) struct CompiledInstance<S> {
+pub(crate) struct CompiledInstance<S> where S: SandboxExt {
+    engine_state: Arc<EngineState>,
     module: Module,
-    sandbox: S,
+    sandbox: Option<S>,
 }
 
-impl<S> CompiledInstance<S> where S: Sandbox, Module: AsCompiledModule<S> {
-    pub fn new(module: Module) -> Result<CompiledInstance<S>, Error> {
-        let compiled_module = module
-            .as_compiled_module()
-            .expect("internal error: tried to spawn a compiled instance without a compiled module");
-
-        let mut sandbox_config = S::Config::default();
-        sandbox_config.enable_logger(cfg!(test) || module.is_debug_trace_execution_enabled());
-
-        // TODO: This is really slow as it will always spawn a new process from scratch. Cache this.
-        let mut sandbox = S::spawn(&sandbox_config)
-            .map_err(Error::from_display)
-            .map_err(|error| error.context("instantiation failed: failed to create a sandbox"))?;
-
+impl<S> CompiledInstance<S> where S: SandboxExt {
+    pub fn new(engine_state: Arc<EngineState>, module: Module) -> Result<CompiledInstance<S>, Error> {
         let mut args = ExecuteArgs::new();
-        args.set_program(&compiled_module.sandbox_program);
+        args.set_program(&S::as_compiled_module(&module).sandbox_program);
+
+        let mut sandbox = S::reuse_or_spawn_sandbox(&engine_state, &module)?;
         sandbox
             .execute(args)
             .map_err(Error::from_display)
             .map_err(|error| error.context("instantiation failed: failed to upload the program into the sandbox"))?;
 
-        Ok(CompiledInstance { module, sandbox })
+        Ok(CompiledInstance { engine_state, module, sandbox: Some(sandbox) })
     }
 
     pub fn call(&mut self, export_index: usize, on_hostcall: OnHostcall, config: &ExecutionConfig) -> Result<(), ExecutionError<Error>> {
-        let compiled_module = self
-            .module
-            .as_compiled_module()
-            .expect("internal error: tried to call into a compiled instance without a compiled module");
-
-        let address = compiled_module.export_trampolines[export_index];
+        let address = S::as_compiled_module(&self.module).export_trampolines[export_index];
         let mut exec_args = ExecuteArgs::<S>::new();
 
         if config.reset_memory_after_execution {
@@ -424,14 +411,15 @@ impl<S> CompiledInstance<S> where S: Sandbox, Module: AsCompiledModule<S> {
         let mut on_hostcall = wrap_on_hostcall(on_hostcall);
         exec_args.set_on_hostcall(&mut on_hostcall);
 
-        let result = match self.sandbox.execute(exec_args) {
+        let sandbox = self.sandbox.as_mut().unwrap();
+        let result = match sandbox.execute(exec_args) {
             Ok(()) => Ok(()),
             Err(ExecutionError::Trap(trap)) => Err(ExecutionError::Trap(trap)),
             Err(ExecutionError::Error(error)) => return Err(ExecutionError::Error(Error::from_display(error))),
             Err(ExecutionError::OutOfGas) => return Err(ExecutionError::OutOfGas),
         };
 
-        if self.module.gas_metering().is_some() && self.sandbox.gas_remaining_impl().is_err() {
+        if self.module.gas_metering().is_some() && sandbox.gas_remaining_impl().is_err() {
             return Err(ExecutionError::OutOfGas);
         }
 
@@ -439,10 +427,28 @@ impl<S> CompiledInstance<S> where S: Sandbox, Module: AsCompiledModule<S> {
     }
 
     pub fn access(&'_ mut self) -> S::Access<'_> {
-        self.sandbox.access()
+        self.sandbox.as_mut().unwrap().access()
     }
 
     pub fn sandbox(&self) -> &S {
-        &self.sandbox
+        self.sandbox.as_ref().unwrap()
+    }
+}
+
+impl<S> Drop for CompiledInstance<S> where S: SandboxExt {
+    fn drop(&mut self) {
+        S::recycle_sandbox(&self.engine_state, || {
+            let mut sandbox = self.sandbox.take()?;
+            let mut exec_args = ExecuteArgs::<S>::new();
+            exec_args.set_clear_program_after_execution();
+            exec_args.set_gas(polkavm_common::utils::Gas::MIN);
+            exec_args.set_async(true);
+            if let Err(error) = sandbox.execute(exec_args) {
+                log::warn!("Failed to cache a sandbox worker process due to an error: {error}");
+                None
+            } else {
+                Some(sandbox)
+            }
+        })
     }
 }

@@ -1056,6 +1056,10 @@ impl super::Sandbox for Sandbox {
         let value = self.vmctx().gas;
         super::get_gas_remaining(value).map(Some)
     }
+
+    fn sync(&mut self) -> Result<(), Self::Error> {
+        Ok(())
+    }
 }
 
 pub struct SandboxAccess<'a> {

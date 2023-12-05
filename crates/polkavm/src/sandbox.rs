@@ -112,6 +112,7 @@ pub(crate) trait Sandbox: Sized {
     fn vmctx_regs_offset() -> usize;
     fn vmctx_gas_offset() -> usize;
     fn gas_remaining_impl(&self) -> Result<Option<Gas>, OutOfGas>;
+    fn sync(&mut self) -> Result<(), Self::Error>;
 }
 
 pub(crate) type OnHostcall<'a, T> = &'a mut dyn for<'r> FnMut(u32, <T as Sandbox>::Access<'r>) -> Result<(), Trap>;
@@ -179,6 +180,7 @@ pub(crate) struct ExecuteArgs<'a, T> where T: Sandbox + 'a {
     on_hostcall: Option<OnHostcall<'a, T>>,
     initial_regs: &'a [u32],
     gas: Option<Gas>,
+    is_async: bool,
 }
 
 impl<'a, T> Default for ExecuteArgs<'a, T> where T: Sandbox {
@@ -198,6 +200,7 @@ impl<'a, T> ExecuteArgs<'a, T> where T: Sandbox {
             on_hostcall: None,
             initial_regs: EMPTY_REGS,
             gas: None,
+            is_async: false,
         }
     }
 
@@ -236,6 +239,11 @@ impl<'a, T> ExecuteArgs<'a, T> where T: Sandbox {
     #[inline]
     pub fn set_gas(&mut self, gas: Gas) {
         self.gas = Some(gas);
+    }
+
+    #[inline]
+    pub fn set_async(&mut self, value: bool) {
+        self.is_async = value;
     }
 
     fn get_gas(&self, gas_metering: Option<GasMeteringKind>) -> Option<u64> {

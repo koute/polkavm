@@ -98,6 +98,7 @@ pub struct Config {
     pub(crate) sandbox: Option<SandboxKind>,
     pub(crate) trace_execution: bool,
     pub(crate) allow_insecure: bool,
+    pub(crate) worker_count: usize,
 }
 
 impl Default for Config {
@@ -128,6 +129,7 @@ impl Config {
             sandbox: None,
             trace_execution: false,
             allow_insecure: false,
+            worker_count: 2,
         }
     }
 
@@ -210,6 +212,21 @@ impl Config {
     /// Corresponding environment variable: `POLKAVM_ALLOW_INSECURE` (`true`, `false`)
     pub fn set_allow_insecure(&mut self, value: bool) -> &mut Self {
         self.allow_insecure = value;
+        self
+    }
+
+    /// Sets the number of worker sandboxes that will be permanently kept alive by the engine.
+    ///
+    /// This doesn't limit the number of instances that can be instantiated at the same time;
+    /// it will just tell the engine how many sandboxes should be cached between instantiations.
+    ///
+    /// For the Linux sandbox this will decide how many worker processes are kept alive.
+    ///
+    /// This only has an effect when using a recompiler. For the interpreter this setting will be ignored.
+    ///
+    /// Default: `2`
+    pub fn set_worker_count(&mut self, value: usize) -> &mut Self {
+        self.worker_count = value;
         self
     }
 }
