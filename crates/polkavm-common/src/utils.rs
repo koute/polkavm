@@ -199,14 +199,24 @@ impl Gas {
     /// The minimum possible available gas.
     pub const MIN: Self = Gas(0);
 
-    /// Constructs a new gas value, checking whether it's not greater than [`Gas::MAX`].
+    /// Constructs a new gas value. Alias for [`Gas::from_u64`].
     pub const fn new(gas: u64) -> Option<Self> {
+        Self::from_u64(gas)
+    }
+
+    /// Constructs a new gas value from an `u64`, checking whether it's in range between [`Gas::MIN`] and [`Gas::MAX`].
+    pub const fn from_u64(gas: u64) -> Option<Self> {
         let gas = Self(gas);
         if gas.0 > Self::MAX.0 {
             None
         } else {
             Some(gas)
         }
+    }
+
+    /// Constructs a new gas value from an `i64`, checking whether it's in range between [`Gas::MIN`] and [`Gas::MAX`].
+    pub const fn from_i64(gas: i64) -> Option<Self> {
+        Self::from_u64(gas as u64)
     }
 
     /// Gets the raw gas value.
@@ -229,7 +239,14 @@ impl From<u32> for Gas {
 impl TryFrom<u64> for Gas {
     type Error = &'static str;
     fn try_from(gas: u64) -> Result<Self, Self::Error> {
-        Self::new(gas).ok_or("out of range gas")
+        Self::from_u64(gas).ok_or("out of range gas")
+    }
+}
+
+impl TryFrom<i64> for Gas {
+    type Error = &'static str;
+    fn try_from(gas: i64) -> Result<Self, Self::Error> {
+        Self::from_i64(gas).ok_or("out of range gas")
     }
 }
 
