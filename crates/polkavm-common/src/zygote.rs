@@ -254,7 +254,7 @@ const REG_COUNT: usize = crate::program::Reg::ALL_NON_ZERO.len();
 pub struct VmCtxSyscall {
     // NOTE: The order of fields here can matter for performance!
     /// The current gas counter.
-    pub gas: UnsafeCell<u64>,
+    pub gas: UnsafeCell<i64>,
     /// The hostcall number that was triggered.
     pub hostcall: UnsafeCell<u32>,
     /// A dump of all of the registers of the VM.
@@ -379,7 +379,7 @@ impl VmCtx {
     // when we shuffle things around in the structure.
 
     #[inline(always)]
-    pub const fn gas(&self) -> &UnsafeCell<u64> {
+    pub const fn gas(&self) -> &UnsafeCell<i64> {
         &self.syscall_ffi.0.gas
     }
 

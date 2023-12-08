@@ -534,6 +534,68 @@ fn basic_gas_metering_async(config: Config) {
     basic_gas_metering(config, GasMeteringKind::Async);
 }
 
+fn consume_gas_in_host_function(config: Config, gas_metering_kind: GasMeteringKind) {
+    let _ = env_logger::try_init();
+
+    let mut builder = ProgramBlobBuilder::new();
+    builder.add_export(0, &FnMetadata::new("main", &[], Some(I32)));
+    builder.add_import(0, &FnMetadata::new("hostfn", &[], Some(I32)));
+    builder.set_code(&[asm::ecalli(0), asm::ret()]);
+
+    let blob = ProgramBlob::parse(builder.into_vec()).unwrap();
+    let engine = Engine::new(&config).unwrap();
+    let mut module_config = ModuleConfig::default();
+    module_config.set_gas_metering(Some(gas_metering_kind));
+
+    let module = Module::from_blob(&engine, &module_config, &blob).unwrap();
+    let mut linker = Linker::new(&engine);
+    linker
+        .func_wrap("hostfn", |mut caller: Caller<u64>| -> u32 {
+            assert_eq!(caller.gas_remaining().unwrap().get(), 1);
+            caller.consume_gas(*caller.data());
+            666
+        })
+        .unwrap();
+
+    let instance_pre = linker.instantiate_pre(&module).unwrap();
+    let instance = instance_pre.instantiate().unwrap();
+
+    {
+        let mut config = ExecutionConfig::default();
+        config.set_gas(Gas::new(3).unwrap());
+
+        let result = instance.get_typed_func::<(), i32>("main").unwrap().call_ex(&mut 0, (), config);
+        assert!(matches!(result, Ok(666)), "unexpected result: {result:?}");
+        assert_eq!(instance.gas_remaining().unwrap(), Gas::new(1).unwrap());
+    }
+
+    {
+        let mut config = ExecutionConfig::default();
+        config.set_gas(Gas::new(3).unwrap());
+
+        let result = instance.get_typed_func::<(), i32>("main").unwrap().call_ex(&mut 1, (), config);
+        assert!(matches!(result, Ok(666)), "unexpected result: {result:?}");
+        assert_eq!(instance.gas_remaining().unwrap(), Gas::new(0).unwrap());
+    }
+
+    {
+        let mut config = ExecutionConfig::default();
+        config.set_gas(Gas::new(3).unwrap());
+
+        let result = instance.get_typed_func::<(), i32>("main").unwrap().call_ex(&mut 2, (), config);
+        assert_eq!(instance.gas_remaining().unwrap(), Gas::new(0).unwrap());
+        assert!(matches!(result, Err(ExecutionError::OutOfGas)), "unexpected result: {result:?}");
+    }
+}
+
+fn consume_gas_in_host_function_sync(config: Config) {
+    consume_gas_in_host_function(config, GasMeteringKind::Sync);
+}
+
+fn consume_gas_in_host_function_async(config: Config) {
+    consume_gas_in_host_function(config, GasMeteringKind::Async);
+}
+
 run_tests! {
     caller_and_caller_ref_work
     caller_split_works
@@ -546,6 +608,8 @@ run_tests! {
 
     basic_gas_metering_sync
     basic_gas_metering_async
+    consume_gas_in_host_function_sync
+    consume_gas_in_host_function_async
 }
 
 // Source: https://users.rust-lang.org/t/a-macro-to-assert-that-a-type-does-not-implement-trait-bounds/31179

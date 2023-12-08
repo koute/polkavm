@@ -1187,8 +1187,8 @@ impl super::Sandbox for Sandbox {
 
     fn gas_remaining_impl(&self) -> Result<Option<Gas>, super::OutOfGas> {
         if self.gas_metering.is_none() { return Ok(None) };
-        let value = unsafe { *self.vmctx().gas().get() };
-        super::get_gas_remaining(value).map(Some)
+        let raw_gas = unsafe { *self.vmctx().gas().get() };
+        Gas::from_i64(raw_gas).ok_or(super::OutOfGas).map(Some)
     }
 
     fn sync(&mut self) -> Result<(), Self::Error> {
@@ -1464,5 +1464,12 @@ impl<'a> Access<'a> for SandboxAccess<'a> {
     fn gas_remaining(&self) -> Option<Gas> {
         use super::Sandbox;
         self.sandbox.gas_remaining_impl().ok().unwrap_or(Some(Gas::MIN))
+    }
+
+    fn consume_gas(&mut self, gas: u64) {
+        if self.sandbox.gas_metering.is_none() { return }
+        let gas_remaining = unsafe { &mut *self.sandbox.vmctx().gas().get() };
+        *gas_remaining = gas_remaining.checked_sub_unsigned(gas).unwrap_or(-1);
+
     }
 }

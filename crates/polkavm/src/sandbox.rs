@@ -65,22 +65,6 @@ pub(crate) fn assert_native_page_size() {
 #[derive(Copy, Clone, PartialEq, Eq, Debug)]
 pub(crate) struct OutOfGas;
 
-fn get_gas_remaining(raw_gas: u64) -> Result<Gas, OutOfGas> {
-    Gas::new(raw_gas).ok_or(OutOfGas)
-}
-
-#[test]
-fn test_get_gas_remaining() {
-    assert_eq!(get_gas_remaining(0), Ok(Gas::new(0).unwrap()));
-    assert_eq!(get_gas_remaining(1), Ok(Gas::new(1).unwrap()));
-    assert_eq!(get_gas_remaining((-1_i64) as u64), Err(OutOfGas));
-    assert_eq!(get_gas_remaining(Gas::MIN.get()), Ok(Gas::MIN));
-    assert_eq!(get_gas_remaining(Gas::MAX.get()), Ok(Gas::MAX));
-
-    // We should never have such gas values, but test it anyway.
-    assert_eq!(get_gas_remaining(Gas::MAX.get() + 1), Err(OutOfGas));
-}
-
 pub trait SandboxConfig: Default {
     fn enable_logger(&mut self, value: bool);
 }
@@ -246,7 +230,7 @@ impl<'a, T> ExecuteArgs<'a, T> where T: Sandbox {
         self.is_async = value;
     }
 
-    fn get_gas(&self, gas_metering: Option<GasMeteringKind>) -> Option<u64> {
+    fn get_gas(&self, gas_metering: Option<GasMeteringKind>) -> Option<i64> {
         if self.program.is_none() && self.gas.is_none() && gas_metering.is_some() {
             // Keep whatever value was set there previously.
             return None;
@@ -254,7 +238,7 @@ impl<'a, T> ExecuteArgs<'a, T> where T: Sandbox {
 
         let gas = self.gas.unwrap_or(Gas::MIN);
         if gas_metering.is_some() {
-            Some(gas.get())
+            Some(gas.get() as i64)
         } else {
             Some(0)
         }

@@ -425,7 +425,7 @@ struct VmCtx {
     return_address: usize,
     return_stack_pointer: usize,
 
-    gas: u64,
+    gas: i64,
 
     program_range: Range<u64>,
     trap_triggered: bool,
@@ -1053,8 +1053,8 @@ impl super::Sandbox for Sandbox {
     fn gas_remaining_impl(&self) -> Result<Option<Gas>, super::OutOfGas> {
         let Some(program) = self.program.as_ref() else { return Ok(None) };
         if program.0.gas_metering.is_none() { return Ok(None) };
-        let value = self.vmctx().gas;
-        super::get_gas_remaining(value).map(Some)
+        let raw_gas = self.vmctx().gas;
+        Gas::from_i64(raw_gas).ok_or(super::OutOfGas).map(Some)
     }
 
     fn sync(&mut self) -> Result<(), Self::Error> {
@@ -1163,5 +1163,14 @@ impl<'a> Access<'a> for SandboxAccess<'a> {
     fn gas_remaining(&self) -> Option<Gas> {
         use super::Sandbox;
         self.sandbox.gas_remaining_impl().ok().unwrap_or(Some(Gas::MIN))
+    }
+
+    fn consume_gas(&mut self, gas: u64) {
+        if self.sandbox.program.as_ref().and_then(|program| program.0.gas_metering).is_none() {
+            return;
+        }
+
+        let gas_remaining = &mut self.sandbox.vmctx_mut().gas;
+        *gas_remaining = gas_remaining.checked_sub_unsigned(gas).unwrap_or(-1);
     }
 }
