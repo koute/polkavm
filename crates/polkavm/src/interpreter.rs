@@ -248,6 +248,16 @@ impl InterpretedInstance {
 
         Ok(())
     }
+
+    fn check_gas(&mut self) -> Result<(), ExecutionError> {
+        if let Some(ref mut gas_remaining) = self.gas_remaining {
+            if *gas_remaining < 0 {
+                return Err(ExecutionError::OutOfGas);
+            }
+        }
+
+        Ok(())
+    }
 }
 
 pub struct InterpretedAccess<'a> {
@@ -313,6 +323,12 @@ impl<'a> Access<'a> for InterpretedAccess<'a> {
     fn gas_remaining(&self) -> Option<Gas> {
         let gas = self.instance.gas_remaining?;
         Some(Gas::new(gas as u64).unwrap_or(Gas::MIN))
+    }
+
+    fn consume_gas(&mut self, gas: u64) {
+        if let Some(ref mut gas_remaining) = self.instance.gas_remaining {
+            *gas_remaining = gas_remaining.checked_sub_unsigned(gas).unwrap_or(-1);
+        }
     }
 }
 
@@ -542,6 +558,7 @@ impl<'a, 'b> InstructionVisitor for Visitor<'a, 'b> {
             let access = BackendAccess::Interpreted(self.inner.access());
             (on_hostcall)(imm, access).map_err(ExecutionError::Trap)?;
             self.inner.nth_instruction += 1;
+            self.inner.check_gas()?;
             Ok(())
         } else {
             log::debug!("Hostcall called without any hostcall handler set!");

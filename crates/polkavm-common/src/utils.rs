@@ -268,6 +268,8 @@ pub trait Access<'a> {
     /// if the program ended up consuming *exactly* the amount of gas that it was provided with!
     fn gas_remaining(&self) -> Option<Gas>;
 
+    fn consume_gas(&mut self, gas: u64);
+
     #[cfg(feature = "alloc")]
     fn read_memory_into_new_vec(&self, address: u32, length: u32) -> Result<Vec<u8>, Self::Error> {
         let mut buffer = Vec::new();

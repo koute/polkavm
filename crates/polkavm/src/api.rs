@@ -1767,6 +1767,10 @@ impl<'a> Access<'a> for BackendAccess<'a> {
     fn gas_remaining(&self) -> Option<Gas> {
         access_backend!(self, |access| access.gas_remaining())
     }
+
+    fn consume_gas(&mut self, gas: u64) {
+        access_backend!(self, |access| access.consume_gas(gas))
+    }
 }
 
 struct InstancePrivateMut {
