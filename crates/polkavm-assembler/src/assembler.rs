@@ -300,12 +300,23 @@ impl InstBuf {
         core::ptr::write_unaligned(output.add(8).cast::<u64>(), u64::from_le(self.out_2));
     }
 
+    #[cold]
+    fn reserve(output: &mut Vec<u8>) {
+        output.reserve(16);
+        assert!(output.spare_capacity_mut().len() >= 16);
+    }
+
     #[inline]
     pub fn encode_into(self, output: &mut Vec<u8>) {
         // NOTE: This `if` actually matters and should not be removed, even though `reserve` would be a no-op anyway in such case.
         if output.spare_capacity_mut().len() < 16 {
-            output.reserve(16);
-            assert!(output.spare_capacity_mut().len() >= 16);
+            Self::reserve(output);
+            if output.spare_capacity_mut().len() < 16 {
+                // SAFETY: `reserve` made sure that we have this much capacity, so this is safe.
+                unsafe {
+                    core::hint::unreachable_unchecked();
+                }
+            }
         }
 
         // SAFETY: We've made sure that there is at least 16 bytes of spare capacity,
