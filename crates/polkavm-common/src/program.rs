@@ -1028,7 +1028,6 @@ pub struct ProgramBlob<'a> {
 struct Reader<'a> {
     blob: &'a [u8],
     position: usize,
-    previous_position: usize,
 }
 
 impl<'a> Reader<'a> {
@@ -1041,24 +1040,22 @@ impl<'a> Reader<'a> {
     }
 
     fn read_varint(&mut self) -> Result<u32, ProgramParseError> {
+        let offset = self.position;
         let first_byte = self.read_byte()?;
-        let (length, value) =
-            read_varint(&self.blob[self.position..], first_byte).ok_or(ProgramParseError(ProgramParseErrorKind::FailedToReadVarint {
-                offset: self.previous_position,
-            }))?;
+        let (length, value) = read_varint(&self.blob[self.position..], first_byte)
+            .ok_or(ProgramParseError(ProgramParseErrorKind::FailedToReadVarint { offset }))?;
         self.position += length;
         Ok(value)
     }
 
     fn read_string_with_length(&mut self) -> Result<&'a str, ProgramParseError> {
+        let offset = self.position;
         let length = self.read_varint()?;
         let range = self.read_slice_as_range(length)?;
         let slice = &self.blob[range];
         core::str::from_utf8(slice)
             .ok()
-            .ok_or(ProgramParseError(ProgramParseErrorKind::FailedToReadStringNonUtf {
-                offset: self.previous_position,
-            }))
+            .ok_or(ProgramParseError(ProgramParseErrorKind::FailedToReadStringNonUtf { offset }))
     }
 
     fn read_slice_as_range(&mut self, count: u32) -> Result<Range<usize>, ProgramParseError> {
@@ -1070,7 +1067,8 @@ impl<'a> Reader<'a> {
                 actual_count: self.blob.len() - self.position,
             }));
         };
-        self.previous_position = core::mem::replace(&mut self.position, range.end);
+
+        self.position = range.end;
         Ok(range)
     }
 
@@ -1156,7 +1154,6 @@ impl<'a> ProgramBlob<'a> {
         let mut reader = Reader {
             blob: &program.blob,
             position: BLOB_MAGIC.len(),
-            previous_position: 0,
         };
 
         let blob_version = reader.read_byte()?;
@@ -1208,7 +1205,7 @@ impl<'a> ProgramBlob<'a> {
         }
 
         Err(ProgramParseError(ProgramParseErrorKind::UnexpectedSection {
-            offset: reader.previous_position,
+            offset: reader.position - 1,
             section,
         }))
     }
@@ -1242,7 +1239,6 @@ impl<'a> ProgramBlob<'a> {
         Reader {
             blob: &self.blob[..range.end],
             position: range.start,
-            previous_position: 0,
         }
     }
 
