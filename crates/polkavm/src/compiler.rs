@@ -45,10 +45,6 @@ struct Compiler<'a> {
     vmctx_regs_offset: usize,
     vmctx_gas_offset: usize,
     is_last_instruction: bool,
-
-    /// Whether we're compiling a 64-bit program. Currently totally broken and mostly unimplemented.
-    // TODO: Fix this.
-    regs_are_64bit: bool,
 }
 
 struct CompilationResult<'a> {
@@ -113,7 +109,6 @@ impl<'a> Compiler<'a> {
             sandbox_kind,
             gas_metering: config.gas_metering,
             native_code_address,
-            regs_are_64bit: false,
             debug_trace_execution,
             address_table,
             vmctx_regs_offset,

@@ -168,12 +168,9 @@ fn zero_imm_from_size(kind: Size) -> ImmKind {
 impl<'a> Compiler<'a> {
     pub const PADDING_BYTE: u8 = 0x90; // NOP
 
+    #[inline]
     fn reg_size(&self) -> RegSize {
-        if !self.regs_are_64bit {
-            RegSize::R32
-        } else {
-            RegSize::R64
-        }
+        RegSize::R32
     }
 
     fn imm_zero(&self) -> ImmKind {
@@ -193,10 +190,6 @@ impl<'a> Compiler<'a> {
 
     #[inline(always)]
     fn store(&mut self, src: Reg, base: Reg, offset: u32, kind: Size) {
-        if self.regs_are_64bit {
-            todo!();
-        }
-
         load_store_operand!(self, base, offset, |dst| {
             if src != Reg::Zero {
                 self.push(store(kind, dst, conv_reg(src)));
@@ -208,10 +201,6 @@ impl<'a> Compiler<'a> {
 
     #[inline(always)]
     fn load(&mut self, dst: Reg, base: Reg, offset: u32, kind: LoadKind) {
-        if self.regs_are_64bit {
-            todo!();
-        }
-
         load_store_operand!(self, base, offset, |src| {
             if dst != Reg::Zero {
                 self.push(load(kind, conv_reg(dst), src));
@@ -235,11 +224,14 @@ impl<'a> Compiler<'a> {
             return;
         }
 
-        if !self.regs_are_64bit {
-            self.push(mov_imm(conv_reg(reg), imm32(0xffffffff)));
-        } else {
-            self.clear_reg(reg);
-            self.push(not(Size::U64, conv_reg(reg)));
+        match self.reg_size() {
+            RegSize::R32 => {
+                self.push(mov_imm(conv_reg(reg), imm32(0xffffffff)));
+            },
+            RegSize::R64 => {
+                self.clear_reg(reg);
+                self.push(not(Size::U64, conv_reg(reg)));
+            }
         }
     }
 
@@ -596,10 +588,6 @@ impl<'a> Compiler<'a> {
     }
 
     fn save_registers_to_vmctx(&mut self) {
-        if self.regs_are_64bit {
-            todo!();
-        }
-
         let regs_base = self.load_vmctx_field_address(self.vmctx_regs_offset);
         for (nth, reg) in Reg::ALL_NON_ZERO.iter().copied().enumerate() {
             self.push(store(Size::U32, reg_indirect(RegSize::R64, regs_base + nth as i32 * 4), conv_reg(reg)));
@@ -607,10 +595,6 @@ impl<'a> Compiler<'a> {
     }
 
     fn restore_registers_from_vmctx(&mut self) {
-        if self.regs_are_64bit {
-            todo!();
-        }
-
         let regs_base = self.load_vmctx_field_address(self.vmctx_regs_offset);
         for (nth, reg) in Reg::ALL_NON_ZERO.iter().copied().enumerate() {
             self.push(load(LoadKind::U32, conv_reg(reg), reg_indirect(RegSize::R64, regs_base + nth as i32 * 4)));
@@ -618,10 +602,6 @@ impl<'a> Compiler<'a> {
     }
 
     pub(crate) fn emit_export_trampolines(&mut self) {
-        if self.regs_are_64bit {
-            todo!();
-        }
-
         for export in self.exports {
             log::trace!("Emitting trampoline: export: '{}'", export.prototype().name());
 
@@ -645,10 +625,6 @@ impl<'a> Compiler<'a> {
     }
 
     pub(crate) fn emit_sysreturn(&mut self) -> Label {
-        if self.regs_are_64bit {
-            todo!();
-        }
-
         log::trace!("Emitting trampoline: sysreturn");
         let label = self.asm.create_label();
 
@@ -913,10 +889,6 @@ impl<'a> InstructionVisitor for Compiler<'a> {
     }
 
     fn mul_upper_signed_signed(&mut self, d: Reg, s1: Reg, s2: Reg) -> Self::ReturnTy {
-        if self.regs_are_64bit {
-            todo!();
-        }
-
         match (d, s1, s2) {
             // 0 = s1 * s2
             (Z, _, _) => self.nop(),
@@ -935,10 +907,6 @@ impl<'a> InstructionVisitor for Compiler<'a> {
     }
 
     fn mul_upper_unsigned_unsigned(&mut self, d: Reg, s1: Reg, s2: Reg) -> Self::ReturnTy {
-        if self.regs_are_64bit {
-            todo!();
-        }
-
         match (d, s1, s2) {
             // 0 = s1 * s2
             (Z, _, _) => self.nop(),
@@ -966,10 +934,6 @@ impl<'a> InstructionVisitor for Compiler<'a> {
     }
 
     fn mul_upper_signed_unsigned(&mut self, d: Reg, s1: Reg, s2: Reg) -> Self::ReturnTy {
-        if self.regs_are_64bit {
-            todo!();
-        }
-
         // This instruction is equivalent to:
         //   let s1: i32;
         //   let s2: u32;
@@ -1042,10 +1006,6 @@ impl<'a> InstructionVisitor for Compiler<'a> {
     }
 
     fn or_imm(&mut self, d: Reg, s: Reg, imm: u32) -> Self::ReturnTy {
-        if self.regs_are_64bit {
-            todo!();
-        }
-
         match (d, s, imm) {
             // 0 = s | imm
             (Z, _, _) => self.nop(),
@@ -1062,10 +1022,6 @@ impl<'a> InstructionVisitor for Compiler<'a> {
     }
 
     fn and_imm(&mut self, d: Reg, s: Reg, imm: u32) -> Self::ReturnTy {
-        if self.regs_are_64bit {
-            todo!();
-        }
-
         match (d, s, imm) {
             // 0 = s & imm
             (Z, _, _) => self.nop(),
@@ -1082,10 +1038,6 @@ impl<'a> InstructionVisitor for Compiler<'a> {
     }
 
     fn xor_imm(&mut self, d: Reg, s: Reg, imm: u32) -> Self::ReturnTy {
-        if self.regs_are_64bit {
-            todo!();
-        }
-
         match (d, s, imm) {
             // 0 = s ^ imm
             (Z, _, _) => self.nop(),
@@ -1109,10 +1061,6 @@ impl<'a> InstructionVisitor for Compiler<'a> {
     }
 
     fn add_imm(&mut self, d: Reg, s: Reg, imm: u32) -> Self::ReturnTy {
-        if self.regs_are_64bit {
-            todo!();
-        }
-
         match (d, s, imm) {
             // 0 = s + imm
             (Z, _, _) => self.nop(),
@@ -1188,10 +1136,6 @@ impl<'a> InstructionVisitor for Compiler<'a> {
     }
 
     fn jump_and_link_register(&mut self, ra: Reg, base: Reg, offset: u32) -> Self::ReturnTy {
-        if self.regs_are_64bit {
-            todo!();
-        }
-
         let return_address = if ra != Reg::Zero {
             let index = self.jump_table_index_by_basic_block.get(&self.next_basic_block())
                 .copied()
