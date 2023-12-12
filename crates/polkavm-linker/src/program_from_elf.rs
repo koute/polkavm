@@ -1,4 +1,4 @@
-use polkavm_common::abi::{GuestMemoryConfig, VM_ADDR_USER_MEMORY, VM_CODE_ADDRESS_ALIGNMENT, VM_PAGE_SIZE};
+use polkavm_common::abi::{GuestMemoryConfig, VM_ADDR_USER_MEMORY, VM_CODE_ADDRESS_ALIGNMENT, VM_MAX_PAGE_SIZE, VM_PAGE_SIZE};
 use polkavm_common::elf::{FnMetadata, ImportMetadata, INSTRUCTION_ECALLI};
 use polkavm_common::program::Reg as PReg;
 use polkavm_common::program::{self, FrameKind, Instruction, LineProgramOp, ProgramBlob};
@@ -679,7 +679,7 @@ fn extract_memory_config(
         }
     }
 
-    assert_eq!(memory_end % VM_PAGE_SIZE as u64, 0);
+    assert_eq!(memory_end % VM_MAX_PAGE_SIZE as u64, 0);
 
     let ro_data_address = memory_end;
     for &section_index in sections_ro_data {
@@ -724,10 +724,11 @@ fn extract_memory_config(
     }
 
     assert_eq!(memory_end % VM_PAGE_SIZE as u64, 0);
+    memory_end = align_to_next_page_u64(VM_MAX_PAGE_SIZE as u64, memory_end).unwrap();
 
     if ro_data_size > 0 {
         // Add a guard page between read-only data and read-write data.
-        memory_end += u64::from(VM_PAGE_SIZE);
+        memory_end += u64::from(VM_MAX_PAGE_SIZE);
     }
 
     let mut rw_data = Vec::new();

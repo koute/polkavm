@@ -1,40 +1,46 @@
 //! Everything in this module affects the ABI of the guest programs, either by affecting
 //! their observable behavior (no matter how obscure), or changing which programs are accepted by the VM.
 
-use crate::utils::align_to_next_page_u64;
+use crate::utils::{align_to_next_page_u32, align_to_next_page_u64};
 use core::ops::Range;
+
+const ADDRESS_SPACE_SIZE: u64 = 0x100000000_u64;
 
 /// The page size of the VM.
 ///
 /// This is the minimum granularity with which the VM can allocate memory.
 pub const VM_PAGE_SIZE: u32 = 0x4000;
 
+/// The maximum page size of the VM.
+pub const VM_MAX_PAGE_SIZE: u32 = 0x10000;
+
+static_assert!(VM_PAGE_SIZE <= VM_MAX_PAGE_SIZE);
+static_assert!(VM_MAX_PAGE_SIZE % VM_PAGE_SIZE == 0);
+
 /// The address at which the program's memory starts inside of the VM.
 ///
 /// This is directly accessible by the program running inside of the VM.
-pub const VM_ADDR_USER_MEMORY: u32 = 0x00010000;
+pub const VM_ADDR_USER_MEMORY: u32 = VM_MAX_PAGE_SIZE;
 
 /// The address at which the program's stack starts inside of the VM.
 ///
 /// This is directly accessible by the program running inside of the VM.
-pub const VM_ADDR_USER_STACK_HIGH: u32 = 0xffffc000;
-static_assert!(0xffffffff - VM_PAGE_SIZE as u64 + 1 == VM_ADDR_USER_STACK_HIGH as u64);
+pub const VM_ADDR_USER_STACK_HIGH: u32 = (ADDRESS_SPACE_SIZE - VM_MAX_PAGE_SIZE as u64) as u32;
 
 /// The address which, when jumped to, will return to the host.
 ///
 /// There isn't actually anything there; it's just a virtual address.
-pub const VM_ADDR_RETURN_TO_HOST: u32 = 0xffffc000;
+pub const VM_ADDR_RETURN_TO_HOST: u32 = 0xffff0000;
 static_assert!(VM_ADDR_RETURN_TO_HOST & 0b11 == 0);
 
 /// The total maximum amount of memory a program can use.
 ///
 /// This is the whole 32-bit address space, except:
-///   * the guard pages at the start,
+///   * the guard page at the start,
 ///   * the guard page between read-only data and read-write data
 ///   * the guard page between the heap and the stack,
 ///   * and the guard page at the end.
-pub const VM_MAXIMUM_MEMORY_SIZE: u32 = 0xfffe4000;
-static_assert!(VM_MAXIMUM_MEMORY_SIZE as u64 == (1_u64 << 32) - VM_ADDR_USER_MEMORY as u64 - VM_PAGE_SIZE as u64 * 3);
+pub const VM_MAXIMUM_MEMORY_SIZE: u32 = (ADDRESS_SPACE_SIZE - VM_MAX_PAGE_SIZE as u64 * 4) as u32;
 
 /// The maximum number of VM instructions a program can be composed of.
 pub const VM_MAXIMUM_INSTRUCTION_COUNT: u32 = 2 * 1024 * 1024;
@@ -94,7 +100,7 @@ impl GuestMemoryConfig {
         // We already checked that these are less than the maximum memory size, so these cannot fail
         // because the maximum memory size is going to be vastly smaller than what an u64 can hold.
         const _: () = {
-            assert!(VM_MAXIMUM_MEMORY_SIZE as u64 + VM_PAGE_SIZE as u64 <= u32::MAX as u64);
+            assert!(VM_MAXIMUM_MEMORY_SIZE as u64 + VM_MAX_PAGE_SIZE as u64 <= u32::MAX as u64);
         };
 
         let ro_data_size = match align_to_next_page_u64(VM_PAGE_SIZE as u64, ro_data_size) {
@@ -204,7 +210,10 @@ impl GuestMemoryConfig {
         if self.ro_data_size == 0 {
             self.user_memory_region_address()
         } else {
-            self.ro_data_address() + self.ro_data_size + VM_PAGE_SIZE
+            match align_to_next_page_u32(VM_MAX_PAGE_SIZE, self.ro_data_address() + self.ro_data_size) {
+                Some(offset) => offset + VM_MAX_PAGE_SIZE,
+                None => unreachable!(),
+            }
         }
     }
 

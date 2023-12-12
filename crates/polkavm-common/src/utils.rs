@@ -131,6 +131,7 @@ macro_rules! define_align_to_next_page {
     };
 }
 
+define_align_to_next_page!(align_to_next_page_u32, u32);
 define_align_to_next_page!(align_to_next_page_u64, u64);
 define_align_to_next_page!(align_to_next_page_usize, usize);
 
