@@ -1,3 +1,4 @@
+use polkavm_common::program::ProgramParseError;
 use std::borrow::Cow;
 
 macro_rules! bail {
@@ -16,6 +17,12 @@ pub struct Error {
 impl From<String> for Error {
     fn from(string: String) -> Self {
         Error { message: string.into() }
+    }
+}
+
+impl From<ProgramParseError> for Error {
+    fn from(error: ProgramParseError) -> Self {
+        Self::from_display(error)
     }
 }
 

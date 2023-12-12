@@ -10,6 +10,7 @@ use polkavm_common::program::{InstructionVisitor, Reg};
 use polkavm_common::abi::VM_CODE_ADDRESS_ALIGNMENT;
 use polkavm_common::zygote::VM_ADDR_VMCTX;
 
+use crate::api::VisitorWrapper;
 use crate::config::GasMeteringKind;
 use crate::compiler::{Compiler, SandboxKind};
 
@@ -672,28 +673,33 @@ impl<'a> Compiler<'a> {
         self.push(jmp(TMP_REG));
     }
 
+    #[cold]
     pub(crate) fn trace_execution(&mut self, nth_instruction: usize) {
         self.push(mov_imm(TMP_REG, imm32(nth_instruction as u32)));
         self.push(call_label32(self.trace_label));
     }
 
-    pub(crate) fn emit_gas_metering(&mut self, kind: GasMeteringKind, cost: u32) {
-        let cost = cost as i32;
-        assert!(cost >= 0);
-
-        self.push(sub((self.vmctx_field(self.vmctx_gas_offset), imm64(cost))));
+    pub(crate) fn emit_gas_metering_stub(&mut self, kind: GasMeteringKind) {
+        self.push(sub((self.vmctx_field(self.vmctx_gas_offset), imm64(i32::MAX))));
         if matches!(kind, GasMeteringKind::Sync) {
             self.push(cmp((self.vmctx_field(self.vmctx_gas_offset), imm64(0))));
             self.push(jcc_label32(Condition::Sign, self.trap_label));
         }
     }
+
+    pub(crate) fn emit_weight(&mut self, offset: usize, cost: u32) {
+        let length = sub((self.vmctx_field(self.vmctx_gas_offset), imm64(i32::MAX))).len();
+        let xs = cost.to_le_bytes();
+        self.asm.code_mut()[offset + length - 4..offset + length].copy_from_slice(&xs);
+    }
 }
 
-impl<'a> InstructionVisitor for Compiler<'a> {
+impl<'a> InstructionVisitor for VisitorWrapper<'a, Compiler<'a>> {
     type ReturnTy = ();
 
     fn trap(&mut self) -> Self::ReturnTy {
-        self.push(jmp_label32(self.trap_label));
+        let trap_label = self.trap_label;
+        self.push(jmp_label32(trap_label));
         self.start_new_basic_block();
     }
 
@@ -702,8 +708,9 @@ impl<'a> InstructionVisitor for Compiler<'a> {
     }
 
     fn ecalli(&mut self, imm: u32) -> Self::ReturnTy {
+        let ecall_label = self.ecall_label;
         self.push(mov_imm(TMP_REG, imm32(imm)));
-        self.push(call_label32(self.ecall_label));
+        self.push(call_label32(ecall_label));
     }
 
     fn set_less_than_unsigned(&mut self, dst: Reg, s1: Reg, s2: Reg) -> Self::ReturnTy {
@@ -727,6 +734,7 @@ impl<'a> InstructionVisitor for Compiler<'a> {
     }
 
     fn xor(&mut self, d: Reg, s1: Reg, s2: Reg) -> Self::ReturnTy {
+        let reg_size = self.reg_size();
         match (d, s1, s2) {
             // 0 = s1 ^ s2
             (Z, _, _) => self.nop(),
@@ -741,18 +749,19 @@ impl<'a> InstructionVisitor for Compiler<'a> {
             // d = s1 ^ 0
             (_, _, Z) => self.mov(d, s1),
             // d = d ^ s2
-            (_, _, _) if d == s1 => self.push(xor((self.reg_size(), conv_reg(d), conv_reg(s2)))),
+            (_, _, _) if d == s1 => self.push(xor((reg_size, conv_reg(d), conv_reg(s2)))),
             // d = s1 ^ d
-            (_, _, _) if d == s2 => self.push(xor((self.reg_size(), conv_reg(d), conv_reg(s1)))),
+            (_, _, _) if d == s2 => self.push(xor((reg_size, conv_reg(d), conv_reg(s1)))),
             // d = s1 ^ s2
             _ => {
                 self.mov(d, s1);
-                self.push(xor((self.reg_size(), conv_reg(d), conv_reg(s2))));
+                self.push(xor((reg_size, conv_reg(d), conv_reg(s2))));
             }
         }
     }
 
     fn and(&mut self, d: Reg, s1: Reg, s2: Reg) -> Self::ReturnTy {
+        let reg_size = self.reg_size();
         match (d, s1, s2) {
             // 0 = s1 & s2
             (Z, _, _) => self.nop(),
@@ -765,18 +774,19 @@ impl<'a> InstructionVisitor for Compiler<'a> {
             // d = s & s
             (_, _, _) if s1 == s2 => self.mov(d, s1),
             // d = d & s2
-            (_, _, _) if d == s1 => self.push(and((self.reg_size(), conv_reg(d), conv_reg(s2)))),
+            (_, _, _) if d == s1 => self.push(and((reg_size, conv_reg(d), conv_reg(s2)))),
             // d = s1 & d
-            (_, _, _) if d == s2 => self.push(and((self.reg_size(), conv_reg(d), conv_reg(s1)))),
+            (_, _, _) if d == s2 => self.push(and((reg_size, conv_reg(d), conv_reg(s1)))),
             // d = s1 & s2
             _ => {
                 self.mov(d, s1);
-                self.push(and((self.reg_size(), conv_reg(d), conv_reg(s2))));
+                self.push(and((reg_size, conv_reg(d), conv_reg(s2))));
             }
         }
     }
 
     fn or(&mut self, d: Reg, s1: Reg, s2: Reg) -> Self::ReturnTy {
+        let reg_size = self.reg_size();
         match (d, s1, s2) {
             // 0 = s1 | s2
             (Z, _, _) => self.nop(),
@@ -795,18 +805,19 @@ impl<'a> InstructionVisitor for Compiler<'a> {
             // d = s | s
             (_, _, _) if s1 == s2 => self.mov(d, s1),
             // d = d | s2
-            (_, _, _) if d == s1 => self.push(or((self.reg_size(), conv_reg(d), conv_reg(s2)))),
+            (_, _, _) if d == s1 => self.push(or((reg_size, conv_reg(d), conv_reg(s2)))),
             // d = s1 | d
-            (_, _, _) if d == s2 => self.push(or((self.reg_size(), conv_reg(d), conv_reg(s1)))),
+            (_, _, _) if d == s2 => self.push(or((reg_size, conv_reg(d), conv_reg(s1)))),
             // d = s1 | s2
             _ => {
                 self.mov(d, s1);
-                self.push(or((self.reg_size(), conv_reg(d), conv_reg(s2))));
+                self.push(or((reg_size, conv_reg(d), conv_reg(s2))));
             }
         }
     }
 
     fn add(&mut self, d: Reg, s1: Reg, s2: Reg) -> Self::ReturnTy {
+        let reg_size = self.reg_size();
         match (d, s1, s2) {
             // 0 = s1 + s2
             (Z, _, _) => self.nop(),
@@ -821,31 +832,32 @@ impl<'a> InstructionVisitor for Compiler<'a> {
             // d = s1 + 0
             (_, _, Z) => self.mov(d, s1),
             // d = d + s2
-            (_, _, _) if d == s1 => self.push(add((self.reg_size(), conv_reg(d), conv_reg(s2)))),
+            (_, _, _) if d == s1 => self.push(add((reg_size, conv_reg(d), conv_reg(s2)))),
             // d = s1 + d
-            (_, _, _) if d == s2 => self.push(add((self.reg_size(), conv_reg(d), conv_reg(s1)))),
+            (_, _, _) if d == s2 => self.push(add((reg_size, conv_reg(d), conv_reg(s1)))),
             // d = s1 + s2
             _ => {
                 if d != s1 {
                     self.mov(d, s1);
                 }
-                self.push(add((self.reg_size(), conv_reg(d), conv_reg(s2))));
+                self.push(add((reg_size, conv_reg(d), conv_reg(s2))));
             }
         }
     }
 
     fn sub(&mut self, d: Reg, s1: Reg, s2: Reg) -> Self::ReturnTy {
+        let reg_size = self.reg_size();
         match (d, s1, s2) {
             // 0 = s1 - s2
             (Z, _, _) => self.nop(),
             // d = s - s
             (_, _, _) if s1 == s2 => self.clear_reg(d),
             // d = 0 - d
-            (_, Z, _) if d == s2 => self.push(neg(self.reg_size(), conv_reg(d))),
+            (_, Z, _) if d == s2 => self.push(neg(reg_size, conv_reg(d))),
             // d = 0 - s2
             (_, Z, _) => {
                 self.mov(d, s2);
-                self.push(neg(self.reg_size(), conv_reg(d)));
+                self.push(neg(reg_size, conv_reg(d)));
             }
             // d = d - 0
             (_, _, Z) if d == s1 => self.nop(),
@@ -854,21 +866,22 @@ impl<'a> InstructionVisitor for Compiler<'a> {
             // d = d - d
             (_, _, _) if d == s1 && d == s2 => self.clear_reg(d),
             // d = d - s2
-            (_, _, _) if d == s1 => self.push(sub((self.reg_size(), conv_reg(d), conv_reg(s2)))),
+            (_, _, _) if d == s1 => self.push(sub((reg_size, conv_reg(d), conv_reg(s2)))),
             // d = s1 - d
             (_, _, _) if d == s2 => {
-                self.push(neg(self.reg_size(), conv_reg(d)));
-                self.push(add((self.reg_size(), conv_reg(d), conv_reg(s1))));
+                self.push(neg(reg_size, conv_reg(d)));
+                self.push(add((reg_size, conv_reg(d), conv_reg(s1))));
             }
             // d = s1 - s2
             _ => {
                 self.mov(d, s1);
-                self.push(sub((self.reg_size(), conv_reg(d), conv_reg(s2))));
+                self.push(sub((reg_size, conv_reg(d), conv_reg(s2))));
             }
         }
     }
 
     fn mul(&mut self, d: Reg, s1: Reg, s2: Reg) -> Self::ReturnTy {
+        let reg_size = self.reg_size();
         match (d, s1, s2) {
             // 0 = s1 * s2
             (Z, _, _) => self.nop(),
@@ -877,13 +890,13 @@ impl<'a> InstructionVisitor for Compiler<'a> {
             // d = s1 * 0
             (_, _, Z) => self.clear_reg(d),
             // d = d * s2
-            (_, _, _) if d == s1 => self.push(imul(self.reg_size(), conv_reg(d), conv_reg(s2))),
+            (_, _, _) if d == s1 => self.push(imul(reg_size, conv_reg(d), conv_reg(s2))),
             // d = s1 * d
-            (_, _, _) if d == s2 => self.push(imul(self.reg_size(), conv_reg(d), conv_reg(s1))),
+            (_, _, _) if d == s2 => self.push(imul(reg_size, conv_reg(d), conv_reg(s1))),
             // d = s1 * s2
             _ => {
                 self.mov(d, s1);
-                self.push(imul(self.reg_size(), conv_reg(d), conv_reg(s2)));
+                self.push(imul(reg_size, conv_reg(d), conv_reg(s2)));
             }
         }
     }
@@ -1038,17 +1051,18 @@ impl<'a> InstructionVisitor for Compiler<'a> {
     }
 
     fn xor_imm(&mut self, d: Reg, s: Reg, imm: u32) -> Self::ReturnTy {
+        let reg_size = self.reg_size();
         match (d, s, imm) {
             // 0 = s ^ imm
             (Z, _, _) => self.nop(),
             // d = 0 ^ imm
             (_, Z, _) => self.load_imm(d, imm),
             // d = d ^ 0xfffffff
-            (_, _, _) if d == s && imm == !0 => self.push(not(self.reg_size(), conv_reg(d))),
+            (_, _, _) if d == s && imm == !0 => self.push(not(reg_size, conv_reg(d))),
             // d = s ^ 0xfffffff
             (_, _, _) if imm == !0 => {
                 self.mov(d, s);
-                self.push(not(self.reg_size(), conv_reg(d)))
+                self.push(not(reg_size, conv_reg(d)))
             }
             // d = d ^ imm
             (_, _, _) if d == s => self.push(xor((conv_reg(d), imm32(imm)))),
@@ -1061,6 +1075,7 @@ impl<'a> InstructionVisitor for Compiler<'a> {
     }
 
     fn add_imm(&mut self, d: Reg, s: Reg, imm: u32) -> Self::ReturnTy {
+        let reg_size = self.reg_size();
         match (d, s, imm) {
             // 0 = s + imm
             (Z, _, _) => self.nop(),
@@ -1069,12 +1084,12 @@ impl<'a> InstructionVisitor for Compiler<'a> {
             // d = s + 0
             (_, _, 0) => self.mov(d, s),
             // d = d + 1
-            (_, _, 1) if d == s => self.push(inc(self.reg_size(), conv_reg(d))),
+            (_, _, 1) if d == s => self.push(inc(reg_size, conv_reg(d))),
             // d = d + imm
             (_, _, _) if d == s => self.push(add((conv_reg(d), imm32(imm)))),
             // d = s + imm
             (_, _, _) => {
-                self.push(lea(self.reg_size(), conv_reg(d), reg_indirect(self.reg_size(), conv_reg(s) + imm as i32)));
+                self.push(lea(reg_size, conv_reg(d), reg_indirect(reg_size, conv_reg(s) + imm as i32)));
             }
         }
     }
@@ -1175,7 +1190,8 @@ impl<'a> InstructionVisitor for Compiler<'a> {
                 },
                 SandboxKind::Generic => {
                     // // TODO: This also could be more efficient.
-                    self.push(lea_rip_label(TMP_REG, self.jump_table_label));
+                    let jump_table_label = self.jump_table_label;
+                    self.push(lea_rip_label(TMP_REG, jump_table_label));
                     self.push(push(conv_reg(base)));
                     self.push(shl_imm(RegSize::R64, conv_reg(base), 3));
                     if offset > 0 {

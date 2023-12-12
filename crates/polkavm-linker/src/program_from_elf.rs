@@ -1,7 +1,7 @@
 use polkavm_common::abi::{GuestMemoryConfig, VM_ADDR_USER_MEMORY, VM_CODE_ADDRESS_ALIGNMENT, VM_PAGE_SIZE};
 use polkavm_common::elf::{FnMetadata, ImportMetadata, INSTRUCTION_ECALLI};
 use polkavm_common::program::Reg as PReg;
-use polkavm_common::program::{self, FrameKind, LineProgramOp, Opcode, ProgramBlob, RawInstruction};
+use polkavm_common::program::{self, FrameKind, Instruction, LineProgramOp, ProgramBlob};
 use polkavm_common::utils::align_to_next_page_u64;
 use polkavm_common::varint;
 use polkavm_common::writer::{ProgramBlobBuilder, Writer};
@@ -3675,7 +3675,7 @@ fn emit_code(
     used_blocks: &[BlockTarget],
     used_imports: &HashSet<u32>,
     jump_target_for_block: &[Option<JumpTarget>],
-) -> Result<Vec<(SourceStack, RawInstruction)>, ProgramFromElfError> {
+) -> Result<Vec<(SourceStack, Instruction)>, ProgramFromElfError> {
     let can_fallthrough_to_next_block = calculate_whether_can_fallthrough(all_blocks, used_blocks);
     let get_data_address = |target: SectionTarget| -> Result<u32, ProgramFromElfError> {
         if let Some(base_address) = base_address_for_section.get(&target.section_index) {
@@ -3702,7 +3702,7 @@ fn emit_code(
     };
 
     let mut basic_block_delimited = true;
-    let mut code: Vec<(SourceStack, RawInstruction)> = Vec::new();
+    let mut code: Vec<(SourceStack, Instruction)> = Vec::new();
     for block_target in used_blocks {
         let block = &all_blocks[block_target.index()];
 
@@ -3714,41 +3714,76 @@ fn emit_code(
                     offset_range: (block.source.offset_range.start..block.source.offset_range.start + 4).into(),
                 }
                 .into(),
-                RawInstruction::new_argless(Opcode::fallthrough),
+                Instruction::fallthrough,
             ));
         }
 
-        fn conv_load_kind(kind: LoadKind) -> Opcode {
-            match kind {
-                LoadKind::I8 => Opcode::load_i8,
-                LoadKind::I16 => Opcode::load_i16,
-                LoadKind::U32 => Opcode::load_u32,
-                LoadKind::U8 => Opcode::load_u8,
-                LoadKind::U16 => Opcode::load_u16,
-            }
-        }
+        macro_rules! codegen {
+            (
+                args = $args:tt,
+                kind = $kind:expr,
 
-        fn conv_store_kind(kind: StoreKind) -> Opcode {
-            match kind {
-                StoreKind::U32 => Opcode::store_u32,
-                StoreKind::U8 => Opcode::store_u8,
-                StoreKind::U16 => Opcode::store_u16,
+                {
+                    $($p:pat => $inst:ident,)+
+                }
+            ) => {
+                match $kind {
+                    $(
+                        $p => Instruction::$inst $args
+                    ),+
+                }
             }
         }
 
         for (source, op) in &block.ops {
             let op = match *op {
                 BasicInst::LoadAbsolute { kind, dst, target } => {
-                    RawInstruction::new_with_regs2_imm(conv_load_kind(kind), cast_reg(dst), cast_reg(Reg::Zero), get_data_address(target)?)
+                    codegen! {
+                        args = (cast_reg(dst), cast_reg(Reg::Zero), get_data_address(target)?),
+                        kind = kind,
+                        {
+                            LoadKind::I8 => load_i8,
+                            LoadKind::I16 => load_i16,
+                            LoadKind::U32 => load_u32,
+                            LoadKind::U8 => load_u8,
+                            LoadKind::U16 => load_u16,
+                        }
+                    }
                 }
                 BasicInst::StoreAbsolute { kind, src, target } => {
-                    RawInstruction::new_with_regs2_imm(conv_store_kind(kind), cast_reg(src), cast_reg(Reg::Zero), get_data_address(target)?)
+                    codegen! {
+                        args = (cast_reg(src), cast_reg(Reg::Zero), get_data_address(target)?),
+                        kind = kind,
+                        {
+                            StoreKind::U32 => store_u32,
+                            StoreKind::U16 => store_u16,
+                            StoreKind::U8 => store_u8,
+                        }
+                    }
                 }
                 BasicInst::LoadIndirect { kind, dst, base, offset } => {
-                    RawInstruction::new_with_regs2_imm(conv_load_kind(kind), cast_reg(dst), cast_reg(base), offset as u32)
+                    codegen! {
+                        args = (cast_reg(dst), cast_reg(base), offset as u32),
+                        kind = kind,
+                        {
+                            LoadKind::I8 => load_i8,
+                            LoadKind::I16 => load_i16,
+                            LoadKind::U32 => load_u32,
+                            LoadKind::U8 => load_u8,
+                            LoadKind::U16 => load_u16,
+                        }
+                    }
                 }
                 BasicInst::StoreIndirect { kind, src, base, offset } => {
-                    RawInstruction::new_with_regs2_imm(conv_store_kind(kind), cast_reg(src), cast_reg(base), offset as u32)
+                    codegen! {
+                        args = (cast_reg(src), cast_reg(base), offset as u32),
+                        kind = kind,
+                        {
+                            StoreKind::U32 => store_u32,
+                            StoreKind::U16 => store_u16,
+                            StoreKind::U8 => store_u8,
+                        }
+                    }
                 }
                 BasicInst::LoadAddress { dst, target } => {
                     let value = match target {
@@ -3762,7 +3797,7 @@ fn emit_code(
                         AnyTarget::Data(target) => get_data_address(target)?,
                     };
 
-                    RawInstruction::new_with_regs2_imm(Opcode::add_imm, cast_reg(dst), cast_reg(Reg::Zero), value)
+                    Instruction::add_imm(cast_reg(dst), cast_reg(Reg::Zero), value)
                 }
                 BasicInst::LoadAddressIndirect { dst, target } => {
                     let Some(&offset) = target_to_got_offset.get(&target) else {
@@ -3777,61 +3812,62 @@ fn emit_code(
                     };
 
                     let value = get_data_address(target)?;
-                    RawInstruction::new_with_regs2_imm(conv_load_kind(LoadKind::U32), cast_reg(dst), cast_reg(Reg::Zero), value)
+                    Instruction::load_u32(cast_reg(dst), cast_reg(Reg::Zero), value)
                 }
                 BasicInst::RegImm { kind, dst, src, imm } => {
-                    let kind = match kind {
-                        RegImmKind::Add => Opcode::add_imm,
-                        RegImmKind::SetLessThanSigned => Opcode::set_less_than_signed_imm,
-                        RegImmKind::SetLessThanUnsigned => Opcode::set_less_than_unsigned_imm,
-                        RegImmKind::Xor => Opcode::xor_imm,
-                        RegImmKind::Or => Opcode::or_imm,
-                        RegImmKind::And => Opcode::and_imm,
-                        RegImmKind::ShiftLogicalLeft => Opcode::shift_logical_left_imm,
-                        RegImmKind::ShiftLogicalRight => Opcode::shift_logical_right_imm,
-                        RegImmKind::ShiftArithmeticRight => Opcode::shift_arithmetic_right_imm,
-                    };
-                    RawInstruction::new_with_regs2_imm(kind, cast_reg(dst), cast_reg(src), imm as u32)
+                    codegen! {
+                        args = (cast_reg(dst), cast_reg(src), imm as u32),
+                        kind = kind,
+                        {
+                            RegImmKind::Add => add_imm,
+                            RegImmKind::SetLessThanSigned => set_less_than_signed_imm,
+                            RegImmKind::SetLessThanUnsigned => set_less_than_unsigned_imm,
+                            RegImmKind::Xor => xor_imm,
+                            RegImmKind::Or => or_imm,
+                            RegImmKind::And => and_imm,
+                            RegImmKind::ShiftLogicalLeft => shift_logical_left_imm,
+                            RegImmKind::ShiftLogicalRight => shift_logical_right_imm,
+                            RegImmKind::ShiftArithmeticRight => shift_arithmetic_right_imm,
+                        }
+                    }
                 }
                 BasicInst::RegReg { kind, dst, src1, src2 } => {
-                    let kind = match kind {
-                        RegRegKind::Add => Opcode::add,
-                        RegRegKind::Sub => Opcode::sub,
-                        RegRegKind::ShiftLogicalLeft => Opcode::shift_logical_left,
-                        RegRegKind::SetLessThanSigned => Opcode::set_less_than_signed,
-                        RegRegKind::SetLessThanUnsigned => Opcode::set_less_than_unsigned,
-                        RegRegKind::Xor => Opcode::xor,
-                        RegRegKind::ShiftLogicalRight => Opcode::shift_logical_right,
-                        RegRegKind::ShiftArithmeticRight => Opcode::shift_arithmetic_right,
-                        RegRegKind::Or => Opcode::or,
-                        RegRegKind::And => Opcode::and,
-                        RegRegKind::Mul => Opcode::mul,
-                        RegRegKind::MulUpperSignedSigned => Opcode::mul_upper_signed_signed,
-                        RegRegKind::MulUpperUnsignedUnsigned => Opcode::mul_upper_unsigned_unsigned,
-                        RegRegKind::MulUpperSignedUnsigned => Opcode::mul_upper_signed_unsigned,
-                        RegRegKind::Div => Opcode::div_signed,
-                        RegRegKind::DivUnsigned => Opcode::div_unsigned,
-                        RegRegKind::Rem => Opcode::rem_signed,
-                        RegRegKind::RemUnsigned => Opcode::rem_unsigned,
-                    };
-                    RawInstruction::new_with_regs3(kind, cast_reg(dst), cast_reg(src1), cast_reg(src2))
+                    codegen! {
+                        args = (cast_reg(dst), cast_reg(src1), cast_reg(src2)),
+                        kind = kind,
+                        {
+                            RegRegKind::Add => add,
+                            RegRegKind::Sub => sub,
+                            RegRegKind::ShiftLogicalLeft => shift_logical_left,
+                            RegRegKind::SetLessThanSigned => set_less_than_signed,
+                            RegRegKind::SetLessThanUnsigned => set_less_than_unsigned,
+                            RegRegKind::Xor => xor,
+                            RegRegKind::ShiftLogicalRight => shift_logical_right,
+                            RegRegKind::ShiftArithmeticRight => shift_arithmetic_right,
+                            RegRegKind::Or => or,
+                            RegRegKind::And => and,
+                            RegRegKind::Mul => mul,
+                            RegRegKind::MulUpperSignedSigned => mul_upper_signed_signed,
+                            RegRegKind::MulUpperUnsignedUnsigned => mul_upper_unsigned_unsigned,
+                            RegRegKind::MulUpperSignedUnsigned => mul_upper_signed_unsigned,
+                            RegRegKind::Div => div_signed,
+                            RegRegKind::DivUnsigned => div_unsigned,
+                            RegRegKind::Rem => rem_signed,
+                            RegRegKind::RemUnsigned => rem_unsigned,
+                        }
+                    }
                 }
                 BasicInst::Ecalli { syscall } => {
                     assert!(used_imports.contains(&syscall));
-                    RawInstruction::new_with_imm(Opcode::ecalli, syscall)
+                    Instruction::ecalli(syscall)
                 }
             };
 
             code.push((source.clone(), op));
         }
 
-        fn unconditional_jump(target: JumpTarget) -> RawInstruction {
-            RawInstruction::new_with_regs2_imm(
-                Opcode::jump_and_link_register,
-                cast_reg(Reg::Zero),
-                cast_reg(Reg::Zero),
-                target.static_target,
-            )
+        fn unconditional_jump(target: JumpTarget) -> Instruction {
+            Instruction::jump_and_link_register(cast_reg(Reg::Zero), cast_reg(Reg::Zero), target.static_target)
         }
 
         match block.next.instruction {
@@ -3852,18 +3888,13 @@ fn emit_code(
 
                 code.push((
                     block.next.source.clone(),
-                    RawInstruction::new_with_regs2_imm(
-                        Opcode::jump_and_link_register,
-                        cast_reg(ra),
-                        cast_reg(Reg::Zero),
-                        target.static_target,
-                    ),
+                    Instruction::jump_and_link_register(cast_reg(ra), cast_reg(Reg::Zero), target.static_target),
                 ));
             }
             ControlInst::JumpIndirect { base, offset } => {
                 code.push((
                     block.next.source.clone(),
-                    RawInstruction::new_with_regs2_imm(Opcode::jump_and_link_register, cast_reg(Reg::Zero), cast_reg(base), offset as u32),
+                    Instruction::jump_and_link_register(cast_reg(Reg::Zero), cast_reg(base), offset as u32),
                 ));
             }
             ControlInst::CallIndirect {
@@ -3876,7 +3907,7 @@ fn emit_code(
                 get_jump_target(target_return)?;
                 code.push((
                     block.next.source.clone(),
-                    RawInstruction::new_with_regs2_imm(Opcode::jump_and_link_register, cast_reg(ra), cast_reg(base), offset as u32),
+                    Instruction::jump_and_link_register(cast_reg(ra), cast_reg(base), offset as u32),
                 ));
             }
             ControlInst::Branch {
@@ -3891,22 +3922,23 @@ fn emit_code(
                 let target_true = get_jump_target(target_true)?;
                 get_jump_target(target_false)?;
 
-                let kind = match kind {
-                    BranchKind::Eq => Opcode::branch_eq,
-                    BranchKind::NotEq => Opcode::branch_not_eq,
-                    BranchKind::LessSigned => Opcode::branch_less_signed,
-                    BranchKind::GreaterOrEqualSigned => Opcode::branch_greater_or_equal_signed,
-                    BranchKind::LessUnsigned => Opcode::branch_less_unsigned,
-                    BranchKind::GreaterOrEqualUnsigned => Opcode::branch_greater_or_equal_unsigned,
+                let instruction = codegen! {
+                    args = (cast_reg(src1), cast_reg(src2), target_true.static_target),
+                    kind = kind,
+                    {
+                        BranchKind::Eq => branch_eq,
+                        BranchKind::NotEq => branch_not_eq,
+                        BranchKind::LessSigned => branch_less_signed,
+                        BranchKind::GreaterOrEqualSigned => branch_greater_or_equal_signed,
+                        BranchKind::LessUnsigned => branch_less_unsigned,
+                        BranchKind::GreaterOrEqualUnsigned => branch_greater_or_equal_unsigned,
+                    }
                 };
 
-                code.push((
-                    block.next.source.clone(),
-                    RawInstruction::new_with_regs2_imm(kind, cast_reg(src1), cast_reg(src2), target_true.static_target),
-                ));
+                code.push((block.next.source.clone(), instruction));
             }
             ControlInst::Unimplemented => {
-                code.push((block.next.source.clone(), RawInstruction::new_argless(Opcode::trap)));
+                code.push((block.next.source.clone(), Instruction::trap));
             }
         }
     }

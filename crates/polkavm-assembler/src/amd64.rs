@@ -2157,7 +2157,7 @@ mod tests {
             }
 
             self.disassembly_1.pop();
-            disassemble_into(code, &mut self.disassembly_2);
+            disassemble_into(&code, &mut self.disassembly_2);
             assert_eq!(self.disassembly_1, self.disassembly_2, "broken encoding for: {inst:?}");
         }
     }
@@ -2244,7 +2244,7 @@ mod tests {
         let mut asm = crate::Assembler::new();
         let label = asm.forward_declare_label();
         asm.push_with_label(label, jmp_label8(label));
-        let disassembly = disassemble(asm.finalize());
+        let disassembly = disassemble(&asm.finalize());
         assert_eq!(disassembly, "00000000 ebfe jmp short 0x0");
     }
 
@@ -2254,7 +2254,7 @@ mod tests {
         let mut asm = crate::Assembler::new();
         let label = asm.forward_declare_label();
         asm.push_with_label(label, jmp_label32(label));
-        let disassembly = disassemble(asm.finalize());
+        let disassembly = disassemble(&asm.finalize());
         assert_eq!(disassembly, "00000000 e9fbffffff jmp 0x0");
     }
 
@@ -2264,7 +2264,7 @@ mod tests {
         let mut asm = crate::Assembler::new();
         let label = asm.forward_declare_label();
         asm.push_with_label(label, call_label32(label));
-        let disassembly = disassemble(asm.finalize());
+        let disassembly = disassemble(&asm.finalize());
         assert_eq!(disassembly, "00000000 e8fbffffff call 0x0");
     }
 
@@ -2275,7 +2275,7 @@ mod tests {
             let mut asm = crate::Assembler::new();
             let label = asm.forward_declare_label();
             asm.push_with_label(label, jcc_label8(cond, label));
-            let disassembly = disassemble(asm.finalize());
+            let disassembly = disassemble(&asm.finalize());
             assert_eq!(
                 disassembly,
                 format!("00000000 {:02x}fe j{} short 0x0", 0x70 + cond as u8, cond.suffix())
@@ -2291,7 +2291,7 @@ mod tests {
             let label = asm.forward_declare_label();
             asm.push(jcc_label8(cond, label));
             asm.push_with_label(label, nop());
-            let disassembly = disassemble(asm.finalize());
+            let disassembly = disassemble(&asm.finalize());
             assert_eq!(
                 disassembly,
                 format!(
@@ -2311,7 +2311,7 @@ mod tests {
             let label = asm.forward_declare_label();
             asm.push_with_label(label, nop());
             asm.push(jcc_label8(cond, label));
-            let disassembly = disassemble(asm.finalize());
+            let disassembly = disassemble(&asm.finalize());
             assert_eq!(
                 disassembly,
                 format!(
@@ -2331,7 +2331,7 @@ mod tests {
             let label = asm.forward_declare_label();
             asm.push(jcc_label32(cond, label));
             asm.push_with_label(label, nop());
-            let disassembly = disassemble(asm.finalize());
+            let disassembly = disassemble(&asm.finalize());
             assert_eq!(
                 disassembly,
                 format!(
@@ -2349,7 +2349,7 @@ mod tests {
         let mut asm = crate::Assembler::new();
         let label = asm.forward_declare_label();
         asm.push_with_label(label, lea_rip_label(super::Reg::rax, label));
-        let disassembly = disassemble(asm.finalize());
+        let disassembly = disassemble(&asm.finalize());
         assert_eq!(disassembly, "00000000 488d05f9ffffff lea rax, [rip-0x7]");
     }
 
@@ -2360,7 +2360,7 @@ mod tests {
         let label = asm.forward_declare_label();
         asm.push(lea_rip_label(super::Reg::rax, label));
         asm.push_with_label(label, nop());
-        let disassembly = disassemble(asm.finalize());
+        let disassembly = disassemble(&asm.finalize());
         assert_eq!(disassembly, "00000000 488d0500000000 lea rax, [rip]\n00000007 90 nop");
     }
 }

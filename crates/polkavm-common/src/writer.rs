@@ -1,5 +1,5 @@
 use crate::elf::FnMetadata;
-use crate::program::{self, RawInstruction};
+use crate::program::{self, Instruction};
 use alloc::vec::Vec;
 use core::ops::Range;
 
@@ -14,6 +14,8 @@ pub struct ProgramBlobBuilder {
     jump_table: Vec<u8>,
     code: Vec<u8>,
     custom: Vec<(u8, Vec<u8>)>,
+    instruction_count: u32,
+    basic_block_count: u32,
 }
 
 impl ProgramBlobBuilder {
@@ -53,11 +55,30 @@ impl ProgramBlobBuilder {
         }
     }
 
-    pub fn set_code(&mut self, code: &[RawInstruction]) {
+    pub fn set_code(&mut self, code: &[Instruction]) {
+        self.instruction_count = 0;
+        self.basic_block_count = 0;
         for instruction in code {
             let mut buffer = [0; program::MAX_INSTRUCTION_LENGTH];
             let length = instruction.serialize_into(&mut buffer);
             self.code.extend_from_slice(&buffer[..length]);
+            self.instruction_count += 1;
+
+            use crate::program::Opcode as O;
+            match instruction.opcode() {
+                O::trap
+                | O::fallthrough
+                | O::jump_and_link_register
+                | O::branch_less_unsigned
+                | O::branch_less_signed
+                | O::branch_greater_or_equal_unsigned
+                | O::branch_greater_or_equal_signed
+                | O::branch_eq
+                | O::branch_not_eq => {
+                    self.basic_block_count += 1;
+                }
+                _ => {}
+            }
         }
     }
 
@@ -102,7 +123,11 @@ impl ProgramBlobBuilder {
         }
 
         writer.push_section(program::SECTION_JUMP_TABLE, &self.jump_table);
-        writer.push_section(program::SECTION_CODE, &self.code);
+        writer.push_section_inplace(program::SECTION_CODE, |writer| {
+            writer.push_varint(self.instruction_count);
+            writer.push_varint(self.basic_block_count);
+            writer.push_raw_bytes(&self.code);
+        });
 
         for (section, contents) in self.custom {
             writer.push_section(section, &contents);

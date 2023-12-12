@@ -23,6 +23,30 @@ impl Default for Assembler {
     }
 }
 
+#[repr(transparent)]
+pub struct AssembledCode<'a>(&'a mut Assembler);
+
+impl<'a> core::ops::Deref for AssembledCode<'a> {
+    type Target = [u8];
+
+    #[inline]
+    fn deref(&self) -> &Self::Target {
+        &self.0.code
+    }
+}
+
+impl<'a> From<AssembledCode<'a>> for Vec<u8> {
+    fn from(code: AssembledCode<'a>) -> Vec<u8> {
+        core::mem::take(&mut code.0.code)
+    }
+}
+
+impl<'a> Drop for AssembledCode<'a> {
+    fn drop(&mut self) {
+        self.0.clear();
+    }
+}
+
 impl Assembler {
     pub const fn new() -> Self {
         Assembler {
@@ -136,7 +160,7 @@ impl Assembler {
         self
     }
 
-    pub fn finalize(&mut self) -> &[u8] {
+    pub fn finalize(&mut self) -> AssembledCode {
         for fixup in self.fixups.drain(..) {
             let origin = fixup.instruction_offset + fixup.instruction_length as usize;
             let target_absolute = self.labels[fixup.target_label.0 as usize];
@@ -157,7 +181,8 @@ impl Assembler {
                 unreachable!()
             }
         }
-        &self.code
+
+        AssembledCode(self)
     }
 
     pub fn is_empty(&self) -> bool {
@@ -166,6 +191,10 @@ impl Assembler {
 
     pub fn len(&self) -> usize {
         self.code.len()
+    }
+
+    pub fn code_mut(&mut self) -> &mut [u8] {
+        &mut self.code
     }
 
     pub fn spare_capacity(&self) -> usize {

@@ -107,6 +107,75 @@ impl core::fmt::Display for Reg {
     }
 }
 
+#[doc(hidden)]
+pub struct VisitorHelper<'a, T> {
+    pub visitor: T,
+    reader: Reader<'a>,
+}
+
+impl<'a, T> VisitorHelper<'a, T> {
+    #[inline]
+    pub fn run<E>(
+        blob: &'a ProgramBlob<'a>,
+        visitor: T,
+        decode_table: &[fn(&mut Self) -> <T as InstructionVisitor>::ReturnTy; 256],
+    ) -> (T, <T as InstructionVisitor>::ReturnTy)
+    where
+        T: ParsingVisitor<E>,
+    {
+        let mut state = VisitorHelper {
+            visitor,
+            reader: blob.get_section_reader(blob.code.clone()),
+        };
+
+        let mut result = Ok(());
+        loop {
+            let Ok(opcode) = state.reader.read_byte() else { break };
+            result = state.visitor.on_pre_visit(state.reader.position - 1, opcode);
+            if result.is_err() {
+                break;
+            }
+
+            result = decode_table[opcode as usize](&mut state);
+            if result.is_err() {
+                break;
+            }
+
+            result = state.visitor.on_post_visit();
+            if result.is_err() {
+                break;
+            }
+        }
+
+        (state.visitor, result)
+    }
+
+    #[cold]
+    pub fn unknown_opcode<U, E>(&mut self) -> <T as InstructionVisitor>::ReturnTy
+    where
+        T: InstructionVisitor<ReturnTy = Result<U, E>>,
+        E: From<ProgramParseError>,
+    {
+        let error = ProgramParseError::unexpected_instruction(self.reader.origin + self.reader.position - 1);
+        Err(error.into())
+    }
+
+    #[inline(always)]
+    pub fn read_varint(&mut self) -> Result<u32, ProgramParseError> {
+        self.reader.read_varint()
+    }
+
+    #[inline(always)]
+    pub fn read_reg(&mut self) -> Result<Reg, ProgramParseError> {
+        self.reader.read_reg()
+    }
+
+    #[inline(always)]
+    pub fn read_regs2(&mut self) -> Result<(Reg, Reg), ProgramParseError> {
+        self.reader.read_regs2()
+    }
+}
+
 macro_rules! define_opcodes {
     (@impl_shared $($name:ident = $value:expr,)+) => {
         #[allow(non_camel_case_types)]
@@ -163,77 +232,226 @@ macro_rules! define_opcodes {
     };
 
     (
+        $d:tt
         [$($name_argless:ident = $value_argless:expr,)+]
         [$($name_with_imm:ident = $value_with_imm:expr,)+]
         [$($name_with_regs3:ident = $value_with_regs3:expr,)+]
         [$($name_with_regs2_imm:ident = $value_with_regs2_imm:expr,)+]
     ) => {
+        pub trait ParsingVisitor<E>: InstructionVisitor<ReturnTy = Result<(), E>> /*where E: From<ProgramParseError>,*/ {
+            fn on_pre_visit(&mut self, _offset: usize, _opcode: u8) -> Self::ReturnTy {
+                Ok(())
+            }
+
+            fn on_post_visit(&mut self) -> Self::ReturnTy {
+                Ok(())
+            }
+        }
+
         pub trait InstructionVisitor {
             type ReturnTy;
+
             $(fn $name_argless(&mut self) -> Self::ReturnTy;)+
             $(fn $name_with_imm(&mut self, imm: u32) -> Self::ReturnTy;)+
             $(fn $name_with_regs3(&mut self, reg1: Reg, reg2: Reg, reg3: Reg) -> Self::ReturnTy;)+
             $(fn $name_with_regs2_imm(&mut self, reg1: Reg, reg2: Reg, imm: u32) -> Self::ReturnTy;)+
         }
 
-        impl RawInstruction {
-            pub fn visit<T>(self, visitor: &mut T) -> T::ReturnTy where T: InstructionVisitor {
-                // SAFETY: If a given opcode is set then we have a guarantee the arguments are also
-                // properly set, in which case calling the `*_unchecked` methods is safe.
-                #[allow(unsafe_code)]
-                unsafe {
-                    match self.op as usize {
-                        $($value_argless => visitor.$name_argless(),)+
-                        $($value_with_imm => visitor.$name_with_imm(self.imm_or_reg),)+
-                        $($value_with_regs3 => visitor.$name_with_regs3(self.reg1_unchecked(), self.reg2_unchecked(), self.reg3_unchecked()),)+
-                        $($value_with_regs2_imm => visitor.$name_with_regs2_imm(self.reg1_unchecked(), self.reg2_unchecked(), self.imm_or_reg),)+
-                        _ => unreachable!()
-                    }
+        #[macro_export]
+        macro_rules! implement_instruction_visitor {
+            (impl<$d($visitor_ty_params:tt),*> $visitor_ty:ty, $method:ident) => {
+                impl<$d($visitor_ty_params),*> polkavm_common::program::InstructionVisitor for $visitor_ty {
+                    type ReturnTy = ();
+
+                    $(fn $name_argless(&mut self) -> Self::ReturnTy {
+                        self.$method(polkavm_common::program::Instruction::$name_argless);
+                    })+
+                    $(fn $name_with_imm(&mut self, imm: u32) -> Self::ReturnTy {
+                        self.$method(polkavm_common::program::Instruction::$name_with_imm(imm));
+                    })+
+                    $(fn $name_with_regs3(&mut self, reg1: Reg, reg2: Reg, reg3: Reg) -> Self::ReturnTy {
+                        self.$method(polkavm_common::program::Instruction::$name_with_regs3(reg1, reg2, reg3));
+                    })+
+                    $(fn $name_with_regs2_imm(&mut self, reg1: Reg, reg2: Reg, imm: u32) -> Self::ReturnTy {
+                        self.$method(polkavm_common::program::Instruction::$name_with_regs2_imm(reg1, reg2, imm));
+                    })+
                 }
             }
         }
 
-        impl core::fmt::Display for RawInstruction {
+        pub use implement_instruction_visitor;
+
+        #[derive(Copy, Clone, PartialEq, Eq, Debug)]
+        #[allow(non_camel_case_types)]
+        pub enum Instruction {
+            $($name_argless,)+
+            $($name_with_imm(u32),)+
+            $($name_with_regs3(Reg, Reg, Reg),)+
+            $($name_with_regs2_imm(Reg, Reg, u32),)+
+        }
+
+        impl Instruction {
+            pub fn visit<T>(self, visitor: &mut T) -> T::ReturnTy where T: InstructionVisitor {
+                match self {
+                    $(Self::$name_argless => visitor.$name_argless(),)+
+                    $(Self::$name_with_imm(imm) => visitor.$name_with_imm(imm),)+
+                    $(Self::$name_with_regs3(reg1, reg2, reg3) => visitor.$name_with_regs3(reg1, reg2, reg3),)+
+                    $(Self::$name_with_regs2_imm(reg1, reg2, imm) => visitor.$name_with_regs2_imm(reg1, reg2, imm),)+
+                }
+            }
+
+            pub fn serialize_into(self, buffer: &mut [u8]) -> usize {
+                match self {
+                    $(Self::$name_argless => Self::serialize_argless(buffer, Opcode::$name_argless),)+
+                    $(Self::$name_with_imm(imm) => Self::serialize_with_imm(buffer, Opcode::$name_with_imm, imm),)+
+                    $(Self::$name_with_regs3(reg1, reg2, reg3) => Self::serialize_with_regs3(buffer, Opcode::$name_with_regs3, reg1, reg2, reg3),)+
+                    $(Self::$name_with_regs2_imm(reg1, reg2, imm) => Self::serialize_with_regs2_imm(buffer, Opcode::$name_with_regs2_imm, reg1, reg2, imm),)+
+                }
+            }
+
+            pub fn opcode(self) -> Opcode {
+                match self {
+                    $(Self::$name_argless => Opcode::$name_argless,)+
+                    $(Self::$name_with_imm(..) => Opcode::$name_with_imm,)+
+                    $(Self::$name_with_regs3(..) => Opcode::$name_with_regs3,)+
+                    $(Self::$name_with_regs2_imm(..) => Opcode::$name_with_regs2_imm,)+
+                }
+            }
+        }
+
+        impl core::fmt::Display for Instruction {
             fn fmt(&self, fmt: &mut core::fmt::Formatter) -> core::fmt::Result {
                 self.visit(fmt)
             }
         }
 
+        fn parse_instruction_impl(opcode: u8, reader: &mut Reader) -> Result<Instruction, ProgramParseError> {
+            Ok(match opcode {
+                $($value_argless => Instruction::$name_argless,)+
+                $($value_with_imm => Instruction::$name_with_imm(reader.read_varint()?),)+
+                $($value_with_regs3 => {
+                    let (reg1, reg2) = reader.read_regs2()?;
+                    let reg3 = reader.read_reg()?;
+                    Instruction::$name_with_regs3(reg1, reg2, reg3)
+                },)+
+                $($value_with_regs2_imm => {
+                    let (reg1, reg2) = reader.read_regs2()?;
+                    let imm = reader.read_varint()?;
+                    Instruction::$name_with_regs2_imm(reg1, reg2, imm)
+                },)+
+                _ => return Err(ProgramParseError::unexpected_instruction(reader.origin + reader.position - 1))
+            })
+        }
+
         pub mod asm {
-            use super::{RawInstruction, Opcode, Reg};
+            use super::{Instruction, Reg};
 
             $(
-                pub fn $name_argless() -> RawInstruction {
-                    RawInstruction::new_argless(Opcode::$name_argless)
+                pub fn $name_argless() -> Instruction {
+                    Instruction::$name_argless
                 }
             )+
 
             $(
-                pub fn $name_with_imm(imm: u32) -> RawInstruction {
-                    RawInstruction::new_with_imm(Opcode::$name_with_imm, imm)
+                pub fn $name_with_imm(imm: u32) -> Instruction {
+                    Instruction::$name_with_imm(imm)
                 }
             )+
 
             $(
-                pub fn $name_with_regs3(reg1: Reg, reg2: Reg, reg3: Reg) -> RawInstruction {
-                    RawInstruction::new_with_regs3(Opcode::$name_with_regs3, reg1, reg2, reg3)
+                pub fn $name_with_regs3(reg1: Reg, reg2: Reg, reg3: Reg) -> Instruction {
+                    Instruction::$name_with_regs3(reg1, reg2, reg3)
                 }
             )+
 
             $(
-                pub fn $name_with_regs2_imm(reg1: Reg, reg2: Reg, imm: u32) -> RawInstruction {
-                    RawInstruction::new_with_regs2_imm(Opcode::$name_with_regs2_imm, reg1, reg2, imm)
+                pub fn $name_with_regs2_imm(reg1: Reg, reg2: Reg, imm: u32) -> Instruction {
+                    Instruction::$name_with_regs2_imm(reg1, reg2, imm)
                 }
             )+
 
-            pub fn ret() -> RawInstruction {
+            pub fn ret() -> Instruction {
                 jump_and_link_register(Reg::Zero, Reg::RA, 0)
             }
 
-            pub fn load_imm(dst: Reg, value: u32) -> RawInstruction {
+            pub fn load_imm(dst: Reg, value: u32) -> Instruction {
                 add_imm(dst, Reg::Zero, value)
             }
         }
+
+        #[macro_export]
+        macro_rules! prepare_visitor {
+            ($visitor_ty:ident<$d($visitor_ty_params:tt),*>) => {{
+                use polkavm_common::program::{
+                    InstructionVisitor,
+                    VisitorHelper,
+                };
+
+                type ReturnTy<$d($visitor_ty_params),*> = <$visitor_ty<$d($visitor_ty_params),*> as InstructionVisitor>::ReturnTy;
+                type VisitFn<'_code, $d($visitor_ty_params),*> = fn(state: &mut VisitorHelper<'_code, $visitor_ty<$d($visitor_ty_params),*>>) -> ReturnTy<$d($visitor_ty_params),*>;
+
+                static DECODE_TABLE: [VisitFn; 256] = {
+                    let mut table = [VisitorHelper::unknown_opcode as VisitFn; 256];
+                    $({
+                        fn $name_argless<'_code, $d($visitor_ty_params),*>(state: &mut VisitorHelper<'_code, $visitor_ty<$d($visitor_ty_params),*>>) -> ReturnTy<$d($visitor_ty_params),*>{
+                            state.visitor.$name_argless()
+                        }
+
+                        table[$value_argless] = $name_argless;
+                    })*
+                    $({
+                        fn $name_with_imm<'_code, $d($visitor_ty_params),*>(state: &mut VisitorHelper<'_code, $visitor_ty<$d($visitor_ty_params),*>>) -> ReturnTy<$d($visitor_ty_params),*>{
+                            let imm = state.read_varint()?;
+                            state.visitor.$name_with_imm(imm)
+                        }
+
+                        table[$value_with_imm] = $name_with_imm;
+                    })*
+
+                    $({
+                        fn $name_with_regs3<'_code, $d($visitor_ty_params),*>(state: &mut VisitorHelper<'_code, $visitor_ty<$d($visitor_ty_params),*>>) -> ReturnTy<$d($visitor_ty_params),*>{
+                            let (reg1, reg2) = state.read_regs2()?;
+                            let reg3 = state.read_reg()?;
+
+                            state.visitor.$name_with_regs3(reg1, reg2, reg3)
+                        }
+
+                        table[$value_with_regs3] = $name_with_regs3;
+                    })*
+
+                    $({
+                        fn $name_with_regs2_imm<'_code, $d($visitor_ty_params),*>(state: &mut VisitorHelper<'_code, $visitor_ty<$d($visitor_ty_params),*>>) -> ReturnTy<$d($visitor_ty_params),*>{
+                            let (reg1, reg2) = state.read_regs2()?;
+                            let imm = state.read_varint()?;
+
+                            state.visitor.$name_with_regs2_imm(reg1, reg2, imm)
+                        }
+
+                        table[$value_with_regs2_imm] = $name_with_regs2_imm;
+                    })*
+
+                    table
+                };
+
+                #[inline]
+                fn run<$d($visitor_ty_params),*>(
+                    blob: &ProgramBlob,
+                    visitor: $visitor_ty<$d($visitor_ty_params),*>,
+                )
+                    -> ($visitor_ty<$d($visitor_ty_params),*>, <$visitor_ty<$d($visitor_ty_params),*> as InstructionVisitor>::ReturnTy)
+                {
+                    let decode_table: &[VisitFn; 256] = &DECODE_TABLE;
+                    // SAFETY: Here we transmute the lifetimes which were unnecessarily extended to be 'static due to the table here being a `static`.
+                    let decode_table: &[VisitFn; 256] = unsafe { core::mem::transmute(decode_table) };
+
+                    VisitorHelper::run(blob, visitor, decode_table)
+                }
+
+                run
+            }};
+        }
+
+        pub use prepare_visitor;
 
         define_opcodes!(
             @impl_shared
@@ -246,6 +464,7 @@ macro_rules! define_opcodes {
 }
 
 define_opcodes! {
+    $
     // 1 byte instructions
     // Instructions with no args.
     [
@@ -317,20 +536,44 @@ define_opcodes! {
     ]
 }
 
-pub const MAX_INSTRUCTION_LENGTH: usize = MAX_VARINT_LENGTH + 2;
+impl Instruction {
+    pub fn deserialize(input: &[u8]) -> Option<(usize, Self)> {
+        let mut reader = Reader {
+            blob: input,
+            origin: 0,
+            position: 0,
+        };
 
-#[derive(Copy, Clone, PartialEq, Eq)]
-pub struct RawInstruction {
-    op: Opcode,
-    regs: u8,
-    imm_or_reg: u32,
-}
+        let opcode = reader.read_byte().ok()?;
+        let instruction = parse_instruction_impl(opcode, &mut reader).ok()?;
+        Some((reader.position, instruction))
+    }
 
-impl core::fmt::Debug for RawInstruction {
-    fn fmt(&self, fmt: &mut core::fmt::Formatter) -> core::fmt::Result {
-        write!(fmt, "({:02x} {:02x} {:08x}) {}", self.op as u8, self.regs, self.imm_or_reg, self)
+    fn serialize_argless(buffer: &mut [u8], opcode: Opcode) -> usize {
+        buffer[0] = opcode as u8;
+        1
+    }
+
+    fn serialize_with_imm(buffer: &mut [u8], opcode: Opcode, imm: u32) -> usize {
+        buffer[0] = opcode as u8;
+        write_varint(imm, &mut buffer[1..]) + 1
+    }
+
+    fn serialize_with_regs3(buffer: &mut [u8], opcode: Opcode, reg1: Reg, reg2: Reg, reg3: Reg) -> usize {
+        buffer[0] = opcode as u8;
+        buffer[1] = reg1 as u8 | (reg2 as u8) << 4;
+        buffer[2] = reg3 as u8;
+        3
+    }
+
+    fn serialize_with_regs2_imm(buffer: &mut [u8], opcode: Opcode, reg1: Reg, reg2: Reg, imm: u32) -> usize {
+        buffer[0] = opcode as u8;
+        buffer[1] = reg1 as u8 | (reg2 as u8) << 4;
+        write_varint(imm, &mut buffer[2..]) + 2
     }
 }
+
+pub const MAX_INSTRUCTION_LENGTH: usize = MAX_VARINT_LENGTH + 2;
 
 impl<'a> InstructionVisitor for core::fmt::Formatter<'a> {
     type ReturnTy = core::fmt::Result;
@@ -607,211 +850,6 @@ impl<'a> InstructionVisitor for core::fmt::Formatter<'a> {
     }
 }
 
-impl RawInstruction {
-    #[inline]
-    pub fn new_argless(op: Opcode) -> Self {
-        assert_eq!(op as u8 & 0b11_000000, 0b00_000000);
-        RawInstruction {
-            op,
-            regs: 0,
-            imm_or_reg: 0,
-        }
-    }
-
-    #[inline]
-    pub fn new_with_imm(op: Opcode, imm: u32) -> Self {
-        assert_eq!(op as u8 & 0b11_000000, 0b01_000000);
-        RawInstruction {
-            op,
-            regs: 0,
-            imm_or_reg: imm,
-        }
-    }
-
-    #[inline]
-    pub fn new_with_regs3(op: Opcode, reg1: Reg, reg2: Reg, reg3: Reg) -> Self {
-        assert_eq!(op as u8 & 0b11_000000, 0b10_000000);
-        RawInstruction {
-            op,
-            regs: reg1 as u8 | (reg2 as u8) << 4,
-            imm_or_reg: reg3 as u32,
-        }
-    }
-
-    #[inline]
-    pub fn new_with_regs2_imm(op: Opcode, reg1: Reg, reg2: Reg, imm: u32) -> Self {
-        assert_eq!(op as u8 & 0b11_000000, 0b11_000000);
-        RawInstruction {
-            op,
-            regs: reg1 as u8 | (reg2 as u8) << 4,
-            imm_or_reg: imm,
-        }
-    }
-
-    #[inline]
-    pub fn op(self) -> Opcode {
-        self.op
-    }
-
-    #[inline]
-    pub fn reg1(self) -> Reg {
-        Reg::from_u8(self.regs & 0b00001111).unwrap_or_else(|| unreachable!())
-    }
-
-    #[inline]
-    pub fn reg2(self) -> Reg {
-        Reg::from_u8(self.regs >> 4).unwrap_or_else(|| unreachable!())
-    }
-
-    #[inline]
-    pub fn reg3(self) -> Reg {
-        Reg::from_u8(self.imm_or_reg as u8).unwrap_or_else(|| unreachable!())
-    }
-
-    #[inline]
-    #[allow(unsafe_code)]
-    unsafe fn reg1_unchecked(self) -> Reg {
-        core::mem::transmute(self.raw_reg1())
-    }
-
-    #[inline]
-    #[allow(unsafe_code)]
-    unsafe fn reg2_unchecked(self) -> Reg {
-        core::mem::transmute(self.raw_reg2())
-    }
-
-    #[inline]
-    #[allow(unsafe_code)]
-    unsafe fn reg3_unchecked(self) -> Reg {
-        core::mem::transmute(self.raw_reg3())
-    }
-
-    #[inline]
-    pub fn raw_reg1(self) -> u8 {
-        self.regs & 0b00001111
-    }
-
-    #[inline]
-    pub fn raw_reg2(self) -> u8 {
-        self.regs >> 4
-    }
-
-    #[inline]
-    pub fn raw_reg3(self) -> u8 {
-        self.imm_or_reg as u8
-    }
-
-    #[inline]
-    pub fn raw_imm_or_reg3(self) -> u32 {
-        self.imm_or_reg
-    }
-
-    pub fn deserialize(input: &[u8]) -> Option<(usize, Self)> {
-        let op = Opcode::from_u8(*input.get(0)?)?;
-
-        let mut position = 1;
-        let mut output = RawInstruction {
-            op,
-            regs: 0,
-            imm_or_reg: 0,
-        };
-
-        // Should we load the registers mask?
-        if op as u8 & 0b10000000 != 0 {
-            output.regs = *input.get(position)?;
-            if matches!(output.regs & 0b1111, 14 | 15) || matches!(output.regs >> 4, 14 | 15) {
-                // Invalid register.
-                return None;
-            }
-            position += 1;
-        }
-
-        // Is there at least another byte to load?
-        if op as u8 & 0b11000000 != 0 {
-            let first_byte = *input.get(position)?;
-            position += 1;
-
-            if op as u8 & 0b11_000000 == 0b10_000000 {
-                // It's the third register.
-                if first_byte > 13 {
-                    // Invalid register.
-                    return None;
-                }
-
-                output.imm_or_reg = first_byte as u32;
-            } else {
-                // It's an immediate.
-                let (length, imm_or_reg) = read_varint(&input[position..], first_byte)?;
-                position += length;
-                output.imm_or_reg = imm_or_reg;
-            }
-        }
-
-        Some((position, output))
-    }
-
-    #[inline]
-    pub fn serialize_into(self, buffer: &mut [u8]) -> usize {
-        assert!(buffer.len() >= MAX_INSTRUCTION_LENGTH);
-        buffer[0] = self.op as u8;
-
-        let mut length = 1;
-        if self.op as u8 & 0b10000000 != 0 {
-            buffer[1] = self.regs;
-            length += 1;
-        }
-
-        if self.op as u8 & 0b11000000 != 0 {
-            length += write_varint(self.imm_or_reg, &mut buffer[length..]);
-        }
-
-        length
-    }
-}
-
-macro_rules! test_serde {
-    ($($serialized:expr => $deserialized:expr,)+) => {
-        #[test]
-        fn test_deserialize_raw_instruction() {
-            $(
-                assert_eq!(
-                    RawInstruction::deserialize(&$serialized).unwrap(),
-                    ($serialized.len(), $deserialized),
-                    "failed to deserialize: {:?}", $serialized
-                );
-            )+
-        }
-
-        #[test]
-        fn test_serialize_raw_instruction() {
-            $(
-                {
-                    let mut buffer = [0; MAX_INSTRUCTION_LENGTH];
-                    let byte_count = $deserialized.serialize_into(&mut buffer);
-                    assert_eq!(byte_count, $serialized.len());
-                    assert_eq!(&buffer[..byte_count], $serialized);
-                    assert!(buffer[byte_count..].iter().all(|&byte| byte == 0));
-                }
-            )+
-        }
-    };
-}
-
-test_serde! {
-    [0b01_111111, 0b01111111] => RawInstruction { op: Opcode::ecalli, regs: 0, imm_or_reg: 0b01111111 },
-    [0b01_111111, 0b10111111, 0b00000000] => RawInstruction { op: Opcode::ecalli, regs: 0, imm_or_reg: 0b00111111_00000000 },
-    [0b01_111111, 0b10111111, 0b10101010] => RawInstruction { op: Opcode::ecalli, regs: 0, imm_or_reg: 0b00111111_10101010 },
-    [0b01_111111, 0b10111111, 0b01010101] => RawInstruction { op: Opcode::ecalli, regs: 0, imm_or_reg: 0b00111111_01010101 },
-    [0b01_111111, 0b10000001, 0b11111111] => RawInstruction { op: Opcode::ecalli, regs: 0, imm_or_reg: 0b00000001_11111111 },
-    [0b01_111111, 0b11000001, 0b10101010, 0b01010101] => RawInstruction { op: Opcode::ecalli, regs: 0, imm_or_reg: 0b00000001_01010101_10101010 },
-
-    [0b00_000000] => RawInstruction { op: Opcode::trap, regs: 0, imm_or_reg: 0 },
-
-    [0b10_000000, 0b00100001, 0b00000100] => RawInstruction { op: Opcode::set_less_than_unsigned, regs: 0b00100001, imm_or_reg: 0b00000100 },
-
-    [0b11_000000, 0b00100001, 0b10111111, 0b00000000] => RawInstruction { op: Opcode::set_less_than_unsigned_imm, regs: 0b00100001, imm_or_reg: 0b00111111_00000000 },
-}
-
 #[derive(Debug)]
 pub struct ProgramParseError(ProgramParseErrorKind);
 
@@ -821,6 +859,9 @@ enum ProgramParseErrorKind {
         offset: usize,
     },
     FailedToReadStringNonUtf {
+        offset: usize,
+    },
+    FailedToReadInstructionArguments {
         offset: usize,
     },
     UnexpectedSection {
@@ -841,6 +882,32 @@ enum ProgramParseErrorKind {
     Other(&'static str),
 }
 
+impl ProgramParseError {
+    #[cold]
+    fn unexpected_instruction(offset: usize) -> ProgramParseError {
+        ProgramParseError(ProgramParseErrorKind::UnexpectedInstruction { offset })
+    }
+
+    #[cold]
+    fn failed_to_read_instruction_arguments(offset: usize) -> ProgramParseError {
+        ProgramParseError(ProgramParseErrorKind::FailedToReadInstructionArguments { offset })
+    }
+
+    #[cold]
+    fn failed_to_read_varint(offset: usize) -> ProgramParseError {
+        ProgramParseError(ProgramParseErrorKind::FailedToReadVarint { offset })
+    }
+
+    #[cold]
+    fn unexpected_end_of_file(offset: usize, expected_count: usize, actual_count: usize) -> ProgramParseError {
+        ProgramParseError(ProgramParseErrorKind::UnexpectedEnd {
+            offset,
+            expected_count,
+            actual_count,
+        })
+    }
+}
+
 impl core::fmt::Display for ProgramParseError {
     fn fmt(&self, fmt: &mut core::fmt::Formatter) -> core::fmt::Result {
         match self.0 {
@@ -855,6 +922,13 @@ impl core::fmt::Display for ProgramParseError {
                 write!(
                     fmt,
                     "failed to parse program blob: failed to parse a string at offset 0x{:x} (not valid UTF-8)",
+                    offset
+                )
+            }
+            ProgramParseErrorKind::FailedToReadInstructionArguments { offset } => {
+                write!(
+                    fmt,
+                    "failed to parse program blob: failed to parse instruction arguments at offset 0x{:x}",
                     offset
                 )
             }
@@ -1022,11 +1096,15 @@ pub struct ProgramBlob<'a> {
     debug_strings: Range<usize>,
     debug_line_program_ranges: Range<usize>,
     debug_line_programs: Range<usize>,
+
+    instruction_count: u32,
+    basic_block_count: u32,
 }
 
 #[derive(Clone)]
 struct Reader<'a> {
     blob: &'a [u8],
+    origin: usize,
     position: usize,
 }
 
@@ -1035,17 +1113,51 @@ impl<'a> Reader<'a> {
         self.read_slice_as_range(count).map(|_| ())
     }
 
+    fn finish(&mut self) {
+        self.position = self.blob.len();
+    }
+
+    #[inline(always)]
     fn read_byte(&mut self) -> Result<u8, ProgramParseError> {
         Ok(self.blob[self.read_slice_as_range(1)?][0])
     }
 
+    #[inline(always)]
     fn read_varint(&mut self) -> Result<u32, ProgramParseError> {
         let offset = self.position;
         let first_byte = self.read_byte()?;
         let (length, value) = read_varint(&self.blob[self.position..], first_byte)
-            .ok_or(ProgramParseError(ProgramParseErrorKind::FailedToReadVarint { offset }))?;
+            .ok_or_else(|| ProgramParseError::failed_to_read_varint(self.origin + offset))?;
         self.position += length;
         Ok(value)
+    }
+
+    #[inline(always)]
+    fn read_reg(&mut self) -> Result<Reg, ProgramParseError> {
+        let reg = self.read_byte()?;
+        if let Some(reg) = Reg::from_u8(reg) {
+            return Ok(reg);
+        }
+
+        Err(ProgramParseError::failed_to_read_instruction_arguments(
+            self.origin + self.position - 1,
+        ))
+    }
+
+    #[inline(always)]
+    fn read_regs2(&mut self) -> Result<(Reg, Reg), ProgramParseError> {
+        let regs = self.read_byte()?;
+        let reg1 = regs & 0b1111;
+        let reg2 = regs >> 4;
+        if let Some(reg1) = Reg::from_u8(reg1) {
+            if let Some(reg2) = Reg::from_u8(reg2) {
+                return Ok((reg1, reg2));
+            }
+        }
+
+        Err(ProgramParseError::failed_to_read_instruction_arguments(
+            self.origin + self.position - 1,
+        ))
     }
 
     fn read_string_with_length(&mut self) -> Result<&'a str, ProgramParseError> {
@@ -1055,17 +1167,19 @@ impl<'a> Reader<'a> {
         let slice = &self.blob[range];
         core::str::from_utf8(slice)
             .ok()
-            .ok_or(ProgramParseError(ProgramParseErrorKind::FailedToReadStringNonUtf { offset }))
+            .ok_or(ProgramParseError(ProgramParseErrorKind::FailedToReadStringNonUtf {
+                offset: self.origin + offset,
+            }))
     }
 
     fn read_slice_as_range(&mut self, count: u32) -> Result<Range<usize>, ProgramParseError> {
         let range = self.position..self.position + count as usize;
         if self.blob.get(range.clone()).is_none() {
-            return Err(ProgramParseError(ProgramParseErrorKind::UnexpectedEnd {
-                offset: self.position,
-                expected_count: count as usize,
-                actual_count: self.blob.len() - self.position,
-            }));
+            return Err(ProgramParseError::unexpected_end_of_file(
+                self.origin + self.position,
+                count as usize,
+                self.blob.len() - self.position,
+            ));
         };
 
         self.position = range.end;
@@ -1153,6 +1267,7 @@ impl<'a> ProgramBlob<'a> {
 
         let mut reader = Reader {
             blob: &program.blob,
+            origin: 0,
             position: BLOB_MAGIC.len(),
         };
 
@@ -1182,7 +1297,32 @@ impl<'a> ProgramBlob<'a> {
         reader.read_section_range_into(&mut section, &mut program.imports, SECTION_IMPORTS)?;
         reader.read_section_range_into(&mut section, &mut program.exports, SECTION_EXPORTS)?;
         reader.read_section_range_into(&mut section, &mut program.jump_table, SECTION_JUMP_TABLE)?;
-        reader.read_section_range_into(&mut section, &mut program.code, SECTION_CODE)?;
+
+        if section == SECTION_CODE {
+            let section_length = reader.read_varint()?;
+            let initial_position = reader.position;
+            let instruction_count = reader.read_varint()?;
+            let basic_block_count = reader.read_varint()?;
+            let header_size = (reader.position - initial_position) as u32;
+            if section_length < header_size {
+                return Err(ProgramParseError(ProgramParseErrorKind::Other("the code section is too short")));
+            }
+
+            let body_length = section_length - header_size;
+            if instruction_count > body_length {
+                return Err(ProgramParseError(ProgramParseErrorKind::Other("invalid instruction count")));
+            }
+
+            if basic_block_count > body_length {
+                return Err(ProgramParseError(ProgramParseErrorKind::Other("invalid basic block count")));
+            }
+
+            program.instruction_count = instruction_count;
+            program.basic_block_count = basic_block_count;
+            program.code = reader.read_slice_as_range(body_length)?;
+            section = reader.read_byte()?;
+        }
+
         reader.read_section_range_into(&mut section, &mut program.debug_strings, SECTION_OPT_DEBUG_STRINGS)?;
         reader.read_section_range_into(&mut section, &mut program.debug_line_programs, SECTION_OPT_DEBUG_LINE_PROGRAMS)?;
         reader.read_section_range_into(
@@ -1235,10 +1375,29 @@ impl<'a> ProgramBlob<'a> {
         &self.blob[self.code.clone()]
     }
 
+    /// Returns the number of instructions the code section should contain.
+    ///
+    /// NOTE: It is safe to preallocate memory based on this value as we make sure
+    /// that it is no larger than the the physical size of the code section, however
+    /// we do not verify that it is actually true, so it should *not* be blindly trusted!
+    pub fn instruction_count(&self) -> u32 {
+        self.instruction_count
+    }
+
+    /// Returns the number of basic blocks the code section should contain.
+    ///
+    /// NOTE: It is safe to preallocate memory based on this value as we make sure
+    /// that it is no larger than the the physical size of the code section, however
+    /// we do not verify that it is actually true, so it should *not* be blindly trusted!
+    pub fn basic_block_count(&self) -> u32 {
+        self.basic_block_count
+    }
+
     fn get_section_reader(&self, range: Range<usize>) -> Reader {
         Reader {
-            blob: &self.blob[..range.end],
-            position: range.start,
+            blob: &self.blob[range.start..range.end],
+            origin: range.start,
+            position: 0,
         }
     }
 
@@ -1361,38 +1520,34 @@ impl<'a> ProgramBlob<'a> {
     }
 
     /// Returns an iterator over program instructions.
-    pub fn instructions(&'_ self) -> impl Iterator<Item = Result<RawInstruction, ProgramParseError>> + Clone + '_ {
+    pub fn instructions(&'_ self) -> impl Iterator<Item = Result<Instruction, ProgramParseError>> + Clone + '_ {
         #[derive(Clone)]
         struct CodeIterator<'a> {
-            code_section_position: usize,
-            position: usize,
-            code: &'a [u8],
+            reader: Reader<'a>,
         }
 
         impl<'a> Iterator for CodeIterator<'a> {
-            type Item = Result<RawInstruction, ProgramParseError>;
+            type Item = Result<Instruction, ProgramParseError>;
             fn next(&mut self) -> Option<Self::Item> {
-                let slice = &self.code[self.position..];
-                if slice.is_empty() {
+                if self.reader.is_eof() {
                     return None;
                 }
 
-                if let Some((bytes_consumed, instruction)) = RawInstruction::deserialize(slice) {
-                    self.position += bytes_consumed;
-                    return Some(Ok(instruction));
+                let result = (|| -> Result<Instruction, ProgramParseError> {
+                    let opcode = self.reader.read_byte()?;
+                    parse_instruction_impl(opcode, &mut self.reader)
+                })();
+
+                if result.is_err() {
+                    self.reader.finish();
                 }
 
-                let offset = self.code_section_position + self.position;
-                self.position = self.code.len();
-
-                Some(Err(ProgramParseError(ProgramParseErrorKind::UnexpectedInstruction { offset })))
+                Some(result)
             }
         }
 
         CodeIterator {
-            code_section_position: self.code.start,
-            position: 0,
-            code: self.code(),
+            reader: self.get_section_reader(self.code.clone()),
         }
     }
 
@@ -1514,6 +1669,9 @@ impl<'a> ProgramBlob<'a> {
             debug_strings: self.debug_strings,
             debug_line_program_ranges: self.debug_line_program_ranges,
             debug_line_programs: self.debug_line_programs,
+
+            instruction_count: self.instruction_count,
+            basic_block_count: self.basic_block_count,
         }
     }
 }

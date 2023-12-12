@@ -281,7 +281,7 @@ macro_rules! sandbox_tests {
                 let code = asm.finalize();
                 let address_space = Sandbox::reserve_address_space().unwrap();
                 let native_code_address = address_space.native_code_address();
-                let program = Sandbox::prepare_program(init.with_code(code), address_space, None).unwrap();
+                let program = Sandbox::prepare_program(init.with_code(&code), address_space, None).unwrap();
 
                 const THREAD_COUNT: usize = 32;
                 let barrier = std::sync::Arc::new(std::sync::Barrier::new(THREAD_COUNT));
@@ -339,7 +339,7 @@ macro_rules! sandbox_tests {
                 let code = asm.finalize();
                 let address_space = Sandbox::reserve_address_space().unwrap();
                 let native_code_address = address_space.native_code_address();
-                let program = Sandbox::prepare_program(init.with_code(code), address_space, None).unwrap();
+                let program = Sandbox::prepare_program(init.with_code(&code), address_space, None).unwrap();
                 let mut args = ExecuteArgs::new();
                 args.set_program(&program);
                 args.set_call(native_code_address);
@@ -377,7 +377,7 @@ macro_rules! sandbox_tests {
                 let code = asm.finalize();
                 let address_space = Sandbox::reserve_address_space().unwrap();
                 let native_code_address = address_space.native_code_address();
-                let program = Sandbox::prepare_program(init.with_code(code), address_space, None).unwrap();
+                let program = Sandbox::prepare_program(init.with_code(&code), address_space, None).unwrap();
 
                 let mut sandbox = Sandbox::spawn(&Default::default()).unwrap();
                 assert!(sandbox.access().read_memory_into_new_vec(mem.rw_data_address(), 4).is_err());
@@ -463,7 +463,7 @@ macro_rules! sandbox_tests {
                 let code = asm.finalize();
                 let address_space = Sandbox::reserve_address_space().unwrap();
                 let native_code_address = address_space.native_code_address();
-                let program = Sandbox::prepare_program(init.with_code(code), address_space, None).unwrap();
+                let program = Sandbox::prepare_program(init.with_code(&code), address_space, None).unwrap();
 
                 let mut sandbox = Sandbox::spawn(&Default::default()).unwrap();
                 {
@@ -523,7 +523,7 @@ macro_rules! sandbox_tests {
                 let code = asm.finalize();
                 let address_space = Sandbox::reserve_address_space().unwrap();
                 let native_code_address = address_space.native_code_address();
-                let program = Sandbox::prepare_program(init.with_code(code), address_space, None).unwrap();
+                let program = Sandbox::prepare_program(init.with_code(&code), address_space, None).unwrap();
                 let mut sandbox = Sandbox::spawn(&Default::default()).unwrap();
 
                 {
