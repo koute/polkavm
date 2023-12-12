@@ -5,13 +5,13 @@ use std::sync::Arc;
 use polkavm_assembler::{Assembler, Label};
 use polkavm_common::error::{ExecutionError, Trap};
 use polkavm_common::init::GuestProgramInit;
-use polkavm_common::program::{InstructionVisitor, ProgramExport, RawInstruction};
+use polkavm_common::program::{ProgramExport, Instruction};
 use polkavm_common::zygote::{
     AddressTable, VM_COMPILER_MAXIMUM_EPILOGUE_LENGTH, VM_COMPILER_MAXIMUM_INSTRUCTION_LENGTH,
 };
 use polkavm_common::abi::VM_CODE_ADDRESS_ALIGNMENT;
 
-use crate::api::{BackendAccess, EngineState, ExecutionConfig, Module, OnHostcall, SandboxExt};
+use crate::api::{BackendAccess, EngineState, ExecutionConfig, Module, OnHostcall, SandboxExt, VisitorWrapper};
 use crate::error::{bail, Error};
 
 use crate::sandbox::{Sandbox, SandboxProgram, SandboxProgramInit, ExecuteArgs};
@@ -20,15 +20,14 @@ use crate::config::{GasMeteringKind, ModuleConfig, SandboxKind};
 #[cfg(target_arch = "x86_64")]
 mod amd64;
 
-struct Compiler<'a> {
+pub(crate) struct Compiler<'a> {
     asm: Assembler,
     exports: &'a [ProgramExport<'a>],
-    instructions: &'a [RawInstruction],
     basic_block_by_jump_table_index: &'a [u32],
     jump_table_index_by_basic_block: &'a HashMap<u32, u32>,
-    gas_cost_for_basic_block: &'a [u32],
     nth_basic_block_to_label: Vec<Label>,
     nth_basic_block_to_label_pending: Vec<Option<Label>>,
+    nth_basic_block_to_machine_code_offset: Vec<usize>,
     pending_label_count: usize,
     jump_table: Vec<u8>,
     export_to_label: HashMap<u32, Label>,
@@ -44,34 +43,36 @@ struct Compiler<'a> {
     address_table: AddressTable,
     vmctx_regs_offset: usize,
     vmctx_gas_offset: usize,
+    nth_instruction_to_code_offset_map: Vec<u32>,
+    init: GuestProgramInit<'a>,
     is_last_instruction: bool,
 }
 
 struct CompilationResult<'a> {
-    code: &'a [u8],
-    jump_table: &'a [u8],
-    export_trampolines: &'a [u64],
+    code: Vec<u8>,
+    jump_table: Vec<u8>,
+    export_trampolines: Vec<u64>,
     sysreturn_address: u64,
     nth_instruction_to_code_offset_map: Vec<u32>,
+    init: GuestProgramInit<'a>,
 }
 
 impl<'a> Compiler<'a> {
     #[allow(clippy::too_many_arguments)]
     fn new(
         config: &ModuleConfig,
-        instructions: &'a [RawInstruction],
         exports: &'a [ProgramExport<'a>],
         basic_block_by_jump_table_index: &'a [u32],
         jump_table_index_by_basic_block: &'a HashMap<u32, u32>,
-        gas_cost_for_basic_block: &'a [u32],
         sandbox_kind: SandboxKind,
         address_table: AddressTable,
         vmctx_regs_offset: usize,
         vmctx_gas_offset: usize,
         debug_trace_execution: bool,
         native_code_address: u64,
-        jump_count: usize,
+        instruction_count: usize,
         basic_block_count: usize,
+        init: GuestProgramInit<'a>,
     ) -> Self {
         let mut asm = Assembler::new();
         let ecall_label = asm.forward_declare_label();
@@ -79,25 +80,31 @@ impl<'a> Compiler<'a> {
         let trace_label = asm.forward_declare_label();
         let jump_table_label = asm.forward_declare_label();
 
-        let mut nth_basic_block_to_label = Vec::new();
-        nth_basic_block_to_label.reserve(basic_block_count);
+        let nth_basic_block_to_label = Vec::with_capacity(basic_block_count);
+        let mut nth_basic_block_to_machine_code_offset = Vec::new();
+        if config.gas_metering.is_some() {
+            nth_basic_block_to_machine_code_offset.reserve(basic_block_count);
+        }
 
         let mut nth_basic_block_to_label_pending = Vec::new();
         nth_basic_block_to_label_pending.resize(basic_block_count, None);
 
-        asm.reserve_code(instructions.len() * 16);
-        asm.reserve_labels(basic_block_count * 2);
-        asm.reserve_fixups(jump_count * 2);
+        let nth_instruction_to_code_offset_map: Vec<u32> = Vec::with_capacity(instruction_count + 1);
+        polkavm_common::static_assert!(polkavm_common::zygote::VM_SANDBOX_MAXIMUM_NATIVE_CODE_SIZE < u32::MAX);
 
-        Compiler {
+        asm.reserve_code(instruction_count * 16);
+        asm.reserve_labels(basic_block_count * 2);
+        asm.reserve_fixups(basic_block_count);
+        asm.set_origin(native_code_address);
+
+        let mut compiler = Compiler {
             asm,
-            instructions,
             exports,
             basic_block_by_jump_table_index,
             jump_table_index_by_basic_block,
-            gas_cost_for_basic_block,
             nth_basic_block_to_label,
             nth_basic_block_to_label_pending,
+            nth_basic_block_to_machine_code_offset,
             pending_label_count: 0,
             jump_table: Default::default(),
             export_to_label: Default::default(),
@@ -113,52 +120,29 @@ impl<'a> Compiler<'a> {
             address_table,
             vmctx_regs_offset,
             vmctx_gas_offset,
-            is_last_instruction: false,
-        }
+            nth_instruction_to_code_offset_map,
+            init,
+            is_last_instruction: instruction_count == 0,
+        };
+
+        compiler.start_new_basic_block();
+        compiler
     }
 
-    fn finalize(&mut self) -> Result<CompilationResult, Error> {
-        assert_eq!(self.asm.len(), 0);
-        self.asm.set_origin(self.native_code_address);
+    fn finalize(mut self, gas_cost_for_basic_block: &[u32]) -> Result<CompilationResult<'a>, Error> {
+        let epilogue_start = self.asm.len();
+        self.nth_instruction_to_code_offset_map.push(epilogue_start as u32);
 
-        let mut nth_instruction_to_code_offset_map: Vec<u32> = Vec::with_capacity(self.instructions.len() + 1);
-        polkavm_common::static_assert!(polkavm_common::zygote::VM_SANDBOX_MAXIMUM_NATIVE_CODE_SIZE < u32::MAX);
-
-        self.start_new_basic_block();
-
-        for nth_instruction in 0..self.instructions.len() {
-            let initial_length = self.asm.len();
-            nth_instruction_to_code_offset_map.push(initial_length as u32);
-
-            let instruction = self.instructions[nth_instruction];
-            log::trace!("Compiling {}/{}: {}", nth_instruction, self.instructions.len() - 1, instruction);
-
-            if self.debug_trace_execution {
-                self.trace_execution(nth_instruction);
-            }
-
-            self.is_last_instruction = nth_instruction + 1 == self.instructions.len();
-            instruction.visit(self);
-
-            if !self.debug_trace_execution {
-                let instruction_length = self.asm.len() - initial_length;
-                assert!(
-                    instruction_length <= VM_COMPILER_MAXIMUM_INSTRUCTION_LENGTH as usize,
-                    "maximum instruction length of {} exceeded with {} bytes for instruction: {}",
-                    VM_COMPILER_MAXIMUM_INSTRUCTION_LENGTH,
-                    instruction_length,
-                    instruction
-                );
+        if self.gas_metering.is_some() {
+            log::trace!("Finalizing block costs...");
+            assert_eq!(gas_cost_for_basic_block.len(), self.nth_basic_block_to_machine_code_offset.len());
+            let nth_basic_block_to_machine_code_offset = core::mem::take(&mut self.nth_basic_block_to_machine_code_offset);
+            for (offset, &cost) in nth_basic_block_to_machine_code_offset.into_iter().zip(gas_cost_for_basic_block.iter()) {
+                self.emit_weight(offset, cost);
             }
         }
 
-        let epilogue_start = self.asm.len();
-        nth_instruction_to_code_offset_map.push(epilogue_start as u32);
-
         log::trace!("Emitting trampolines");
-
-        // If the code abruptly ends make sure we trap.
-        self.trap();
 
         if self.debug_trace_execution {
             self.emit_trace_trampoline();
@@ -226,11 +210,12 @@ impl<'a> Compiler<'a> {
 
         let code = self.asm.finalize();
         Ok(CompilationResult {
-            code,
-            jump_table: &self.jump_table,
-            export_trampolines: &self.export_trampolines,
+            code: code.into(),
+            jump_table: self.jump_table,
+            export_trampolines: self.export_trampolines,
             sysreturn_address,
-            nth_instruction_to_code_offset_map,
+            nth_instruction_to_code_offset_map: self.nth_instruction_to_code_offset_map,
+            init: self.init,
         })
     }
 
@@ -246,6 +231,9 @@ impl<'a> Compiler<'a> {
                 Some(label) => label,
                 None => {
                     let label = self.asm.forward_declare_label();
+                    if nth_basic_block as usize >= self.nth_basic_block_to_label_pending.len() {
+                        self.nth_basic_block_to_label_pending.resize(nth_basic_block as usize + 1, None);
+                    }
                     self.nth_basic_block_to_label_pending[nth_basic_block as usize] = Some(label);
                     self.pending_label_count += 1;
                     label
@@ -271,7 +259,7 @@ impl<'a> Compiler<'a> {
         let nth_basic_block = self.nth_basic_block_to_label.len();
         log::trace!("Starting new basic block: @{nth_basic_block:x}");
 
-        let label = if let Some(label) = self.nth_basic_block_to_label_pending[nth_basic_block].take() {
+        let label = if let Some(label) = self.nth_basic_block_to_label_pending.get_mut(nth_basic_block).and_then(|value| value.take()) {
             self.pending_label_count -= 1;
             label
         } else {
@@ -282,11 +270,117 @@ impl<'a> Compiler<'a> {
         self.nth_basic_block_to_label.push(label);
 
         if let Some(gas_metering) = self.gas_metering {
-            let cost = self.gas_cost_for_basic_block[nth_basic_block];
-            if cost > 0 {
-                self.emit_gas_metering(gas_metering, cost);
+            let offset = self.asm.len();
+            self.nth_basic_block_to_machine_code_offset.push(offset);
+            self.emit_gas_metering_stub(gas_metering);
+        }
+    }
+}
+
+impl<'a> VisitorWrapper<'a, Compiler<'a>> {
+    fn current_instruction(&self) -> Instruction {
+        Instruction::deserialize(&self.common.code[self.common.current_instruction_offset..]).expect("failed to deserialize instruction").1
+    }
+
+    #[cold]
+    fn panic_on_too_long_instruction(&self, instruction_length: usize) -> ! {
+        panic!(
+            "maximum instruction length of {} exceeded with {} bytes for instruction: {}",
+            VM_COMPILER_MAXIMUM_INSTRUCTION_LENGTH,
+            instruction_length,
+            self.current_instruction(),
+        );
+    }
+
+    #[cold]
+    fn trace_compiled_instruction(&self) {
+        log::trace!("Compiling {}/{}: {}", self.common.nth_instruction + 1, self.common.instruction_count, self.current_instruction());
+    }
+}
+
+impl<'a> crate::api::BackendVisitor for VisitorWrapper<'a, Compiler<'a>> {
+    fn before_instruction(&mut self) {
+        let initial_length = self.visitor.asm.len();
+        self.nth_instruction_to_code_offset_map.push(initial_length as u32);
+
+        if log::log_enabled!(log::Level::Trace) {
+            self.trace_compiled_instruction();
+        }
+
+        if self.debug_trace_execution {
+            self.visitor.trace_execution(self.common.nth_instruction);
+        }
+
+        self.is_last_instruction = self.common.is_last_instruction();
+    }
+
+    fn after_instruction(&mut self) {
+        if !self.debug_trace_execution {
+            let offset = *self.nth_instruction_to_code_offset_map.last().unwrap() as usize;
+            let instruction_length = self.asm.len() - offset;
+            if instruction_length > VM_COMPILER_MAXIMUM_INSTRUCTION_LENGTH as usize {
+                self.panic_on_too_long_instruction(instruction_length)
             }
         }
+    }
+}
+
+impl<S> crate::api::BackendModule for CompiledModule<S> where S: Sandbox {
+    type BackendVisitor<'a> = Compiler<'a>;
+    type Aux = S::AddressSpace;
+
+    fn create_visitor<'a>(
+        config: &'a ModuleConfig,
+        exports: &'a [ProgramExport],
+        basic_block_by_jump_table_index: &'a [u32],
+        jump_table_index_by_basic_block: &'a HashMap<u32, u32>,
+        init: GuestProgramInit<'a>,
+        instruction_count: usize,
+        basic_block_count: usize,
+        debug_trace_execution: bool,
+    ) -> Result<(Self::BackendVisitor<'a>, Self::Aux), Error> {
+        crate::sandbox::assert_native_page_size();
+
+        let address_space = S::reserve_address_space().map_err(Error::from_display)?;
+        let native_code_address = crate::sandbox::SandboxAddressSpace::native_code_address(&address_space);
+        let program_assembler = Compiler::new(
+            config,
+            exports,
+            basic_block_by_jump_table_index,
+            jump_table_index_by_basic_block,
+            S::KIND,
+            S::address_table(),
+            S::vmctx_regs_offset(),
+            S::vmctx_gas_offset(),
+            debug_trace_execution,
+            native_code_address,
+            instruction_count,
+            basic_block_count,
+            init,
+        );
+
+        Ok((program_assembler, address_space))
+    }
+
+    fn finish_compilation<'a>(wrapper: VisitorWrapper<'a, Self::BackendVisitor<'a>>, address_space: Self::Aux) -> Result<(crate::api::Common<'a>, Self), Error> {
+        let gas_metering = wrapper.visitor.gas_metering;
+        let result = wrapper.visitor.finalize(&wrapper.common.gas_cost_for_basic_block)?;
+
+        let init = SandboxProgramInit::new(result.init)
+            .with_code(&result.code)
+            .with_jump_table(&result.jump_table)
+            .with_sysreturn_address(result.sysreturn_address);
+
+        let sandbox_program = S::prepare_program(init, address_space, gas_metering).map_err(Error::from_display)?;
+        let export_trampolines = result.export_trampolines.to_owned();
+
+        let module = CompiledModule {
+            sandbox_program,
+            export_trampolines,
+            nth_instruction_to_code_offset_map: result.nth_instruction_to_code_offset_map,
+        };
+
+        Ok((wrapper.common, module))
     }
 }
 
@@ -297,56 +391,6 @@ pub(crate) struct CompiledModule<S> where S: Sandbox {
 }
 
 impl<S> CompiledModule<S> where S: Sandbox {
-    #[allow(clippy::too_many_arguments)]
-    pub fn new(
-        config: &ModuleConfig,
-        instructions: &[RawInstruction],
-        exports: &[ProgramExport],
-        basic_block_by_jump_table_index: &[u32],
-        jump_table_index_by_basic_block: &HashMap<u32, u32>,
-        gas_cost_for_basic_block: &[u32],
-        init: GuestProgramInit,
-        debug_trace_execution: bool,
-        jump_count: usize,
-        basic_block_count: usize,
-    ) -> Result<Self, Error> {
-        crate::sandbox::assert_native_page_size();
-
-        let address_space = S::reserve_address_space().map_err(Error::from_display)?;
-        let native_code_address = crate::sandbox::SandboxAddressSpace::native_code_address(&address_space);
-        let mut program_assembler = Compiler::new(
-            config,
-            instructions,
-            exports,
-            basic_block_by_jump_table_index,
-            jump_table_index_by_basic_block,
-            gas_cost_for_basic_block,
-            S::KIND,
-            S::address_table(),
-            S::vmctx_regs_offset(),
-            S::vmctx_gas_offset(),
-            debug_trace_execution,
-            native_code_address,
-            jump_count,
-            basic_block_count,
-        );
-
-        let result = program_assembler.finalize()?;
-        let init = SandboxProgramInit::new(init)
-            .with_code(result.code)
-            .with_jump_table(result.jump_table)
-            .with_sysreturn_address(result.sysreturn_address);
-
-        let sandbox_program = S::prepare_program(init, address_space, config.gas_metering).map_err(Error::from_display)?;
-        let export_trampolines = result.export_trampolines.to_owned();
-
-        Ok(CompiledModule {
-            sandbox_program,
-            export_trampolines,
-            nth_instruction_to_code_offset_map: result.nth_instruction_to_code_offset_map,
-        })
-    }
-
     pub fn machine_code(&self) -> Cow<[u8]> {
         self.sandbox_program.machine_code()
     }

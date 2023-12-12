@@ -4,24 +4,26 @@ use core::mem::MaybeUninit;
 use polkavm_common::abi::{VM_ADDR_RETURN_TO_HOST, VM_CODE_ADDRESS_ALIGNMENT};
 use polkavm_common::error::Trap;
 use polkavm_common::init::GuestProgramInit;
-use polkavm_common::program::{InstructionVisitor, Reg};
+use polkavm_common::program::{Instruction, InstructionVisitor, Reg};
 use polkavm_common::utils::{byte_slice_init, Access, AsUninitSliceMut, Gas};
 
 type ExecutionError<E = core::convert::Infallible> = polkavm_common::error::ExecutionError<E>;
 
 pub(crate) struct InterpretedModule {
+    pub(crate) instructions: Vec<Instruction>,
     ro_data: Vec<u8>,
     rw_data: Vec<u8>,
     gas_cost_for_basic_block: Vec<u32>,
 }
 
 impl InterpretedModule {
-    pub fn new(init: GuestProgramInit, gas_cost_for_basic_block: Vec<u32>) -> Result<Self, Error> {
+    pub fn new(init: GuestProgramInit, gas_cost_for_basic_block: Vec<u32>, instructions: Vec<Instruction>) -> Result<Self, Error> {
         let memory_config = init.memory_config().map_err(Error::from_static_str)?;
         let mut ro_data: Vec<_> = init.ro_data().into();
         ro_data.resize(memory_config.ro_data_size() as usize, 0);
 
         Ok(InterpretedModule {
+            instructions,
             ro_data,
             rw_data: init.rw_data().into(),
             gas_cost_for_basic_block,

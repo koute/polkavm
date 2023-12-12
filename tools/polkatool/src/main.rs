@@ -305,7 +305,7 @@ fn disassemble_into(
     let mut jump_target_counter = 0;
     let mut pending_label = true;
     for (nth_instruction, instruction) in instructions.iter().enumerate() {
-        let instruction_s = if instruction.op() == polkavm_common::program::Opcode::fallthrough {
+        let instruction_s = if instruction.opcode() == polkavm_common::program::Opcode::fallthrough {
             format_jump_target(jump_target_counter + 1)
         } else {
             instruction.to_string()
@@ -384,8 +384,8 @@ fn disassemble_into(
 
         if matches!(format, DisassemblyFormat::DiffFriendly) {
             let mut string = instruction_s;
-            if instruction.op() == polkavm_common::program::Opcode::add_imm && instruction.reg2() == polkavm_common::program::Reg::Zero {
-                string = format!("{} = _", instruction.reg1());
+            if let polkavm_common::program::Instruction::add_imm(dst, polkavm_common::program::Reg::Zero, _) = instruction {
+                string = format!("{} = _", dst);
             }
 
             if let Some(index) = string.find('@') {
@@ -429,7 +429,7 @@ fn disassemble_into(
             }
         }
 
-        match instruction.op() {
+        match instruction.opcode() {
             polkavm_common::program::Opcode::fallthrough
             | polkavm_common::program::Opcode::jump_and_link_register
             | polkavm_common::program::Opcode::trap
@@ -439,7 +439,7 @@ fn disassemble_into(
             | polkavm_common::program::Opcode::branch_greater_or_equal_signed
             | polkavm_common::program::Opcode::branch_eq
             | polkavm_common::program::Opcode::branch_not_eq => {
-                if instruction.op() != polkavm_common::program::Opcode::fallthrough && nth_instruction + 1 != instructions.len() {
+                if instruction.opcode() != polkavm_common::program::Opcode::fallthrough && nth_instruction + 1 != instructions.len() {
                     pending_label = true;
                 }
                 jump_target_counter += 1;

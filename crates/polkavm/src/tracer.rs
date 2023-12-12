@@ -172,7 +172,7 @@ impl Tracer {
             return;
         }
 
-        let Some(blob) = self.module.blob() else { return };
+        let blob = self.module.blob();
         let mut line_program = match blob.get_debug_line_program_at(program_counter) {
             Err(error) => {
                 log::warn!("Failed to get line program for instruction #{program_counter}: {error}");
@@ -294,7 +294,7 @@ impl Tracer {
         self.program_counter_history_position = (self.program_counter_history_position + 1) % self.program_counter_history.len();
 
         let instruction = self.module.instructions()[program_counter as usize];
-        if matches!(instruction.op(), Opcode::trap) {
+        if matches!(instruction.opcode(), Opcode::trap) {
             return Ok(());
         }
 
