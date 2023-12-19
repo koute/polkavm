@@ -238,7 +238,7 @@ macro_rules! define_opcodes {
         [$($name_with_regs3:ident = $value_with_regs3:expr,)+]
         [$($name_with_regs2_imm:ident = $value_with_regs2_imm:expr,)+]
     ) => {
-        pub trait ParsingVisitor<E>: InstructionVisitor<ReturnTy = Result<(), E>> /*where E: From<ProgramParseError>,*/ {
+        pub trait ParsingVisitor<E>: InstructionVisitor<ReturnTy = Result<(), E>> {
             fn on_pre_visit(&mut self, _offset: usize, _opcode: u8) -> Self::ReturnTy {
                 Ok(())
             }
