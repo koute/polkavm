@@ -3212,7 +3212,10 @@ impl ReachabilityGraph {
 
     fn is_code_reachable(&self, block_target: BlockTarget) -> bool {
         if let Some(reachability) = self.for_code.get(&block_target) {
-            assert!(!reachability.is_unreachable());
+            assert!(
+                !reachability.is_unreachable(),
+                "Block {block_target:?} is unreachable and yet it wasn't removed from the graph!"
+            );
             true
         } else {
             false
