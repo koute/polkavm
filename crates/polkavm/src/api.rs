@@ -17,7 +17,7 @@ use polkavm_common::utils::{Access, AsUninitSliceMut, Gas};
 
 use crate::caller::{Caller, CallerRaw};
 use crate::config::{BackendKind, Config, GasMeteringKind, ModuleConfig, SandboxKind};
-use crate::error::{bail, Error, ExecutionError};
+use crate::error::{bail, bail_static, Error, ExecutionError};
 use crate::interpreter::{InterpretedAccess, InterpretedInstance, InterpretedModule};
 use crate::tracer::Tracer;
 
@@ -335,7 +335,7 @@ struct ModulePrivate {
     export_index_by_name: HashMap<String, usize>,
 
     instruction_by_basic_block: Vec<u32>,
-    jump_table_index_by_basic_block: HashMap<u32, u32>,
+    jump_table_index_by_basic_block: Vec<u32>,
     basic_block_by_jump_table_index: Vec<u32>,
 
     blob: ProgramBlob<'static>,
@@ -358,7 +358,7 @@ pub(crate) trait BackendModule: Sized {
         config: &'a ModuleConfig,
         exports: &'a [ProgramExport],
         basic_block_by_jump_table_index: &'a [u32],
-        jump_table_index_by_basic_block: &'a HashMap<u32, u32>,
+        jump_table_index_by_basic_block: &'a [u32],
         init: GuestProgramInit<'a>,
         instruction_count: usize,
         basic_block_count: usize,
@@ -384,7 +384,7 @@ pub(crate) struct Common<'a> {
     pub(crate) code: &'a [u8],
     pub(crate) config: &'a ModuleConfig,
     pub(crate) imports: &'a BTreeMap<u32, ProgramImport<'a>>,
-    pub(crate) jump_table_index_by_basic_block: &'a HashMap<u32, u32>,
+    pub(crate) jump_table_index_by_basic_block: &'a Vec<u32>,
     pub(crate) instruction_by_basic_block: Vec<u32>,
     pub(crate) gas_cost_for_basic_block: Vec<u32>,
     pub(crate) maximum_seen_jump_target: u32,
@@ -452,7 +452,7 @@ where
         }
 
         if self.instruction_by_basic_block.len() > self.basic_block_count {
-            bail!("program contains an invalid basic block count");
+            bail_static!("program contains an invalid basic block count");
         }
 
         self.block_in_progress = false;
@@ -473,7 +473,7 @@ impl<'a, T> polkavm_common::program::ParsingVisitor<Error> for CommonVisitor<'a,
 where
     VisitorWrapper<'a, T>: BackendVisitor,
 {
-    #[inline]
+    #[cfg_attr(not(debug_assertions), inline)]
     fn on_pre_visit(&mut self, offset: usize, _opcode: u8) -> Self::ReturnTy {
         if self.config.gas_metering.is_some() {
             // TODO: Come up with a better cost model.
@@ -485,7 +485,7 @@ where
         Ok(())
     }
 
-    #[inline]
+    #[cfg_attr(not(debug_assertions), inline)]
     fn on_post_visit(&mut self) -> Self::ReturnTy {
         self.0.after_instruction();
         self.nth_instruction += 1;
@@ -499,6 +499,7 @@ where
 {
     type ReturnTy = Result<(), Error>;
 
+    #[inline(always)]
     fn trap(&mut self) -> Self::ReturnTy {
         self.start_new_basic_block()?;
         self.0.before_instruction();
@@ -506,6 +507,7 @@ where
         Ok(())
     }
 
+    #[inline(always)]
     fn fallthrough(&mut self) -> Self::ReturnTy {
         self.start_new_basic_block()?;
         self.0.before_instruction();
@@ -513,9 +515,15 @@ where
         Ok(())
     }
 
+    #[inline(always)]
     fn ecalli(&mut self, imm: u32) -> Self::ReturnTy {
         if self.imports.get(&imm).is_none() {
-            bail!("found an unrecognized ecall number: {imm:}");
+            #[cold]
+            fn error_unrecognized_ecall(imm: u32) -> Error {
+                Error::from(format!("found an unrecognized ecall number: {imm}"))
+            }
+
+            return Err(error_unrecognized_ecall(imm));
         }
 
         self.0.before_instruction();
@@ -523,255 +531,560 @@ where
         Ok(())
     }
 
+    #[inline(always)]
     fn set_less_than_unsigned(&mut self, d: Reg, s1: Reg, s2: Reg) -> Self::ReturnTy {
         self.0.before_instruction();
         self.0.set_less_than_unsigned(d, s1, s2);
         Ok(())
     }
 
+    #[inline(always)]
     fn set_less_than_signed(&mut self, d: Reg, s1: Reg, s2: Reg) -> Self::ReturnTy {
         self.0.before_instruction();
         self.0.set_less_than_signed(d, s1, s2);
         Ok(())
     }
 
+    #[inline(always)]
     fn shift_logical_right(&mut self, d: Reg, s1: Reg, s2: Reg) -> Self::ReturnTy {
         self.0.before_instruction();
         self.0.shift_logical_right(d, s1, s2);
         Ok(())
     }
 
+    #[inline(always)]
     fn shift_arithmetic_right(&mut self, d: Reg, s1: Reg, s2: Reg) -> Self::ReturnTy {
         self.0.before_instruction();
         self.0.shift_arithmetic_right(d, s1, s2);
         Ok(())
     }
 
+    #[inline(always)]
     fn shift_logical_left(&mut self, d: Reg, s1: Reg, s2: Reg) -> Self::ReturnTy {
         self.0.before_instruction();
         self.0.shift_logical_left(d, s1, s2);
         Ok(())
     }
 
+    #[inline(always)]
     fn xor(&mut self, d: Reg, s1: Reg, s2: Reg) -> Self::ReturnTy {
         self.0.before_instruction();
         self.0.xor(d, s1, s2);
         Ok(())
     }
 
+    #[inline(always)]
     fn and(&mut self, d: Reg, s1: Reg, s2: Reg) -> Self::ReturnTy {
         self.0.before_instruction();
         self.0.and(d, s1, s2);
         Ok(())
     }
 
+    #[inline(always)]
     fn or(&mut self, d: Reg, s1: Reg, s2: Reg) -> Self::ReturnTy {
         self.0.before_instruction();
         self.0.or(d, s1, s2);
         Ok(())
     }
 
+    #[inline(always)]
     fn add(&mut self, d: Reg, s1: Reg, s2: Reg) -> Self::ReturnTy {
         self.0.before_instruction();
         self.0.add(d, s1, s2);
         Ok(())
     }
 
+    #[inline(always)]
     fn sub(&mut self, d: Reg, s1: Reg, s2: Reg) -> Self::ReturnTy {
         self.0.before_instruction();
         self.0.sub(d, s1, s2);
         Ok(())
     }
 
+    #[inline(always)]
     fn mul(&mut self, d: Reg, s1: Reg, s2: Reg) -> Self::ReturnTy {
         self.0.before_instruction();
         self.0.mul(d, s1, s2);
         Ok(())
     }
 
+    #[inline(always)]
     fn mul_upper_signed_signed(&mut self, d: Reg, s1: Reg, s2: Reg) -> Self::ReturnTy {
         self.0.before_instruction();
         self.0.mul_upper_signed_signed(d, s1, s2);
         Ok(())
     }
 
+    #[inline(always)]
     fn mul_upper_unsigned_unsigned(&mut self, d: Reg, s1: Reg, s2: Reg) -> Self::ReturnTy {
         self.0.before_instruction();
         self.0.mul_upper_unsigned_unsigned(d, s1, s2);
         Ok(())
     }
 
+    #[inline(always)]
     fn mul_upper_signed_unsigned(&mut self, d: Reg, s1: Reg, s2: Reg) -> Self::ReturnTy {
         self.0.before_instruction();
         self.0.mul_upper_signed_unsigned(d, s1, s2);
         Ok(())
     }
 
+    #[inline(always)]
     fn div_unsigned(&mut self, d: Reg, s1: Reg, s2: Reg) -> Self::ReturnTy {
         self.0.before_instruction();
         self.0.div_unsigned(d, s1, s2);
         Ok(())
     }
 
+    #[inline(always)]
     fn div_signed(&mut self, d: Reg, s1: Reg, s2: Reg) -> Self::ReturnTy {
         self.0.before_instruction();
         self.0.div_signed(d, s1, s2);
         Ok(())
     }
 
+    #[inline(always)]
     fn rem_unsigned(&mut self, d: Reg, s1: Reg, s2: Reg) -> Self::ReturnTy {
         self.0.before_instruction();
         self.0.rem_unsigned(d, s1, s2);
         Ok(())
     }
 
+    #[inline(always)]
     fn rem_signed(&mut self, d: Reg, s1: Reg, s2: Reg) -> Self::ReturnTy {
         self.0.before_instruction();
         self.0.rem_signed(d, s1, s2);
         Ok(())
     }
 
-    fn set_less_than_unsigned_imm(&mut self, d: Reg, s: Reg, imm: u32) -> Self::ReturnTy {
+    #[inline(always)]
+    fn mul_imm(&mut self, d: Reg, s1: Reg, s2: u32) -> Self::ReturnTy {
         self.0.before_instruction();
-        self.0.set_less_than_unsigned_imm(d, s, imm);
+        self.0.mul_imm(d, s1, s2);
         Ok(())
     }
 
-    fn set_less_than_signed_imm(&mut self, d: Reg, s: Reg, imm: u32) -> Self::ReturnTy {
+    #[inline(always)]
+    fn mul_upper_signed_signed_imm(&mut self, d: Reg, s1: Reg, s2: u32) -> Self::ReturnTy {
         self.0.before_instruction();
-        self.0.set_less_than_signed_imm(d, s, imm);
+        self.0.mul_upper_signed_signed_imm(d, s1, s2);
         Ok(())
     }
 
-    fn shift_logical_right_imm(&mut self, d: Reg, s: Reg, imm: u32) -> Self::ReturnTy {
+    #[inline(always)]
+    fn mul_upper_unsigned_unsigned_imm(&mut self, d: Reg, s1: Reg, s2: u32) -> Self::ReturnTy {
         self.0.before_instruction();
-        self.0.shift_logical_right_imm(d, s, imm);
+        self.0.mul_upper_unsigned_unsigned_imm(d, s1, s2);
         Ok(())
     }
 
-    fn shift_arithmetic_right_imm(&mut self, d: Reg, s: Reg, imm: u32) -> Self::ReturnTy {
+    #[inline(always)]
+    fn set_less_than_unsigned_imm(&mut self, d: Reg, s1: Reg, s2: u32) -> Self::ReturnTy {
         self.0.before_instruction();
-        self.0.shift_arithmetic_right_imm(d, s, imm);
+        self.0.set_less_than_unsigned_imm(d, s1, s2);
         Ok(())
     }
 
-    fn shift_logical_left_imm(&mut self, d: Reg, s: Reg, imm: u32) -> Self::ReturnTy {
+    #[inline(always)]
+    fn set_less_than_signed_imm(&mut self, d: Reg, s1: Reg, s2: u32) -> Self::ReturnTy {
         self.0.before_instruction();
-        self.0.shift_logical_left_imm(d, s, imm);
+        self.0.set_less_than_signed_imm(d, s1, s2);
         Ok(())
     }
 
+    #[inline(always)]
+    fn set_greater_than_unsigned_imm(&mut self, d: Reg, s1: Reg, s2: u32) -> Self::ReturnTy {
+        self.0.before_instruction();
+        self.0.set_greater_than_unsigned_imm(d, s1, s2);
+        Ok(())
+    }
+
+    #[inline(always)]
+    fn set_greater_than_signed_imm(&mut self, d: Reg, s1: Reg, s2: u32) -> Self::ReturnTy {
+        self.0.before_instruction();
+        self.0.set_greater_than_signed_imm(d, s1, s2);
+        Ok(())
+    }
+
+    #[inline(always)]
+    fn shift_logical_right_imm(&mut self, d: Reg, s1: Reg, s2: u32) -> Self::ReturnTy {
+        self.0.before_instruction();
+        self.0.shift_logical_right_imm(d, s1, s2);
+        Ok(())
+    }
+
+    #[inline(always)]
+    fn shift_arithmetic_right_imm(&mut self, d: Reg, s1: Reg, s2: u32) -> Self::ReturnTy {
+        self.0.before_instruction();
+        self.0.shift_arithmetic_right_imm(d, s1, s2);
+        Ok(())
+    }
+
+    #[inline(always)]
+    fn shift_logical_left_imm(&mut self, d: Reg, s1: Reg, s2: u32) -> Self::ReturnTy {
+        self.0.before_instruction();
+        self.0.shift_logical_left_imm(d, s1, s2);
+        Ok(())
+    }
+
+    #[inline(always)]
+    fn shift_logical_right_imm_alt(&mut self, d: Reg, s2: Reg, s1: u32) -> Self::ReturnTy {
+        self.0.before_instruction();
+        self.0.shift_logical_right_imm_alt(d, s2, s1);
+        Ok(())
+    }
+
+    #[inline(always)]
+    fn shift_arithmetic_right_imm_alt(&mut self, d: Reg, s2: Reg, s1: u32) -> Self::ReturnTy {
+        self.0.before_instruction();
+        self.0.shift_arithmetic_right_imm_alt(d, s2, s1);
+        Ok(())
+    }
+
+    #[inline(always)]
+    fn shift_logical_left_imm_alt(&mut self, d: Reg, s2: Reg, s1: u32) -> Self::ReturnTy {
+        self.0.before_instruction();
+        self.0.shift_logical_left_imm_alt(d, s2, s1);
+        Ok(())
+    }
+
+    #[inline(always)]
     fn or_imm(&mut self, d: Reg, s: Reg, imm: u32) -> Self::ReturnTy {
         self.0.before_instruction();
         self.0.or_imm(d, s, imm);
         Ok(())
     }
 
+    #[inline(always)]
     fn and_imm(&mut self, d: Reg, s: Reg, imm: u32) -> Self::ReturnTy {
         self.0.before_instruction();
         self.0.and_imm(d, s, imm);
         Ok(())
     }
 
+    #[inline(always)]
     fn xor_imm(&mut self, d: Reg, s: Reg, imm: u32) -> Self::ReturnTy {
         self.0.before_instruction();
         self.0.xor_imm(d, s, imm);
         Ok(())
     }
 
+    #[inline(always)]
+    fn move_reg(&mut self, d: Reg, s: Reg) -> Self::ReturnTy {
+        self.0.before_instruction();
+        self.0.move_reg(d, s);
+        Ok(())
+    }
+
+    #[inline(always)]
     fn add_imm(&mut self, d: Reg, s: Reg, imm: u32) -> Self::ReturnTy {
         self.0.before_instruction();
         self.0.add_imm(d, s, imm);
         Ok(())
     }
 
-    fn store_u8(&mut self, src: Reg, base: Reg, offset: u32) -> Self::ReturnTy {
+    #[inline(always)]
+    fn negate_and_add_imm(&mut self, d: Reg, s1: Reg, s2: u32) -> Self::ReturnTy {
         self.0.before_instruction();
-        self.0.store_u8(src, base, offset);
+        self.0.negate_and_add_imm(d, s1, s2);
         Ok(())
     }
 
-    fn store_u16(&mut self, src: Reg, base: Reg, offset: u32) -> Self::ReturnTy {
+    #[inline(always)]
+    fn store_imm_indirect_u8(&mut self, base: Reg, offset: u32, value: u32) -> Self::ReturnTy {
         self.0.before_instruction();
-        self.0.store_u16(src, base, offset);
+        self.0.store_imm_indirect_u8(base, offset, value);
         Ok(())
     }
 
-    fn store_u32(&mut self, src: Reg, base: Reg, offset: u32) -> Self::ReturnTy {
+    #[inline(always)]
+    fn store_imm_indirect_u16(&mut self, base: Reg, offset: u32, value: u32) -> Self::ReturnTy {
         self.0.before_instruction();
-        self.0.store_u32(src, base, offset);
+        self.0.store_imm_indirect_u16(base, offset, value);
         Ok(())
     }
 
-    fn load_u8(&mut self, dst: Reg, base: Reg, offset: u32) -> Self::ReturnTy {
+    #[inline(always)]
+    fn store_imm_indirect_u32(&mut self, base: Reg, offset: u32, value: u32) -> Self::ReturnTy {
         self.0.before_instruction();
-        self.0.load_u8(dst, base, offset);
+        self.0.store_imm_indirect_u32(base, offset, value);
         Ok(())
     }
 
-    fn load_i8(&mut self, dst: Reg, base: Reg, offset: u32) -> Self::ReturnTy {
+    #[inline(always)]
+    fn store_indirect_u8(&mut self, src: Reg, base: Reg, offset: u32) -> Self::ReturnTy {
         self.0.before_instruction();
-        self.0.load_i8(dst, base, offset);
+        self.0.store_indirect_u8(src, base, offset);
         Ok(())
     }
 
-    fn load_u16(&mut self, dst: Reg, base: Reg, offset: u32) -> Self::ReturnTy {
+    #[inline(always)]
+    fn store_indirect_u16(&mut self, src: Reg, base: Reg, offset: u32) -> Self::ReturnTy {
         self.0.before_instruction();
-        self.0.load_u16(dst, base, offset);
+        self.0.store_indirect_u16(src, base, offset);
         Ok(())
     }
 
-    fn load_i16(&mut self, dst: Reg, base: Reg, offset: u32) -> Self::ReturnTy {
+    #[inline(always)]
+    fn store_indirect_u32(&mut self, src: Reg, base: Reg, offset: u32) -> Self::ReturnTy {
         self.0.before_instruction();
-        self.0.load_i16(dst, base, offset);
+        self.0.store_indirect_u32(src, base, offset);
         Ok(())
     }
 
-    fn load_u32(&mut self, dst: Reg, base: Reg, offset: u32) -> Self::ReturnTy {
+    #[inline(always)]
+    fn store_imm_u8(&mut self, value: u32, offset: u32) -> Self::ReturnTy {
         self.0.before_instruction();
-        self.0.load_u32(dst, base, offset);
+        self.0.store_imm_u8(value, offset);
         Ok(())
     }
 
+    #[inline(always)]
+    fn store_imm_u16(&mut self, value: u32, offset: u32) -> Self::ReturnTy {
+        self.0.before_instruction();
+        self.0.store_imm_u16(value, offset);
+        Ok(())
+    }
+
+    #[inline(always)]
+    fn store_imm_u32(&mut self, value: u32, offset: u32) -> Self::ReturnTy {
+        self.0.before_instruction();
+        self.0.store_imm_u32(value, offset);
+        Ok(())
+    }
+
+    #[inline(always)]
+    fn store_u8(&mut self, src: Reg, offset: u32) -> Self::ReturnTy {
+        self.0.before_instruction();
+        self.0.store_u8(src, offset);
+        Ok(())
+    }
+
+    #[inline(always)]
+    fn store_u16(&mut self, src: Reg, offset: u32) -> Self::ReturnTy {
+        self.0.before_instruction();
+        self.0.store_u16(src, offset);
+        Ok(())
+    }
+
+    #[inline(always)]
+    fn store_u32(&mut self, src: Reg, offset: u32) -> Self::ReturnTy {
+        self.0.before_instruction();
+        self.0.store_u32(src, offset);
+        Ok(())
+    }
+
+    #[inline(always)]
+    fn load_indirect_u8(&mut self, dst: Reg, base: Reg, offset: u32) -> Self::ReturnTy {
+        self.0.before_instruction();
+        self.0.load_indirect_u8(dst, base, offset);
+        Ok(())
+    }
+
+    #[inline(always)]
+    fn load_indirect_i8(&mut self, dst: Reg, base: Reg, offset: u32) -> Self::ReturnTy {
+        self.0.before_instruction();
+        self.0.load_indirect_i8(dst, base, offset);
+        Ok(())
+    }
+
+    #[inline(always)]
+    fn load_indirect_u16(&mut self, dst: Reg, base: Reg, offset: u32) -> Self::ReturnTy {
+        self.0.before_instruction();
+        self.0.load_indirect_u16(dst, base, offset);
+        Ok(())
+    }
+
+    #[inline(always)]
+    fn load_indirect_i16(&mut self, dst: Reg, base: Reg, offset: u32) -> Self::ReturnTy {
+        self.0.before_instruction();
+        self.0.load_indirect_i16(dst, base, offset);
+        Ok(())
+    }
+
+    #[inline(always)]
+    fn load_indirect_u32(&mut self, dst: Reg, base: Reg, offset: u32) -> Self::ReturnTy {
+        self.0.before_instruction();
+        self.0.load_indirect_u32(dst, base, offset);
+        Ok(())
+    }
+
+    #[inline(always)]
+    fn load_u8(&mut self, dst: Reg, offset: u32) -> Self::ReturnTy {
+        self.0.before_instruction();
+        self.0.load_u8(dst, offset);
+        Ok(())
+    }
+
+    #[inline(always)]
+    fn load_i8(&mut self, dst: Reg, offset: u32) -> Self::ReturnTy {
+        self.0.before_instruction();
+        self.0.load_i8(dst, offset);
+        Ok(())
+    }
+
+    #[inline(always)]
+    fn load_u16(&mut self, dst: Reg, offset: u32) -> Self::ReturnTy {
+        self.0.before_instruction();
+        self.0.load_u16(dst, offset);
+        Ok(())
+    }
+
+    #[inline(always)]
+    fn load_i16(&mut self, dst: Reg, offset: u32) -> Self::ReturnTy {
+        self.0.before_instruction();
+        self.0.load_i16(dst, offset);
+        Ok(())
+    }
+
+    #[inline(always)]
+    fn load_u32(&mut self, dst: Reg, offset: u32) -> Self::ReturnTy {
+        self.0.before_instruction();
+        self.0.load_u32(dst, offset);
+        Ok(())
+    }
+
+    #[inline(always)]
     fn branch_less_unsigned(&mut self, s1: Reg, s2: Reg, imm: u32) -> Self::ReturnTy {
         self.branch(imm, move |backend| backend.branch_less_unsigned(s1, s2, imm))
     }
 
+    #[inline(always)]
     fn branch_less_signed(&mut self, s1: Reg, s2: Reg, imm: u32) -> Self::ReturnTy {
         self.branch(imm, move |backend| backend.branch_less_signed(s1, s2, imm))
     }
 
+    #[inline(always)]
     fn branch_greater_or_equal_unsigned(&mut self, s1: Reg, s2: Reg, imm: u32) -> Self::ReturnTy {
         self.branch(imm, move |backend| backend.branch_greater_or_equal_unsigned(s1, s2, imm))
     }
 
+    #[inline(always)]
     fn branch_greater_or_equal_signed(&mut self, s1: Reg, s2: Reg, imm: u32) -> Self::ReturnTy {
         self.branch(imm, move |backend| backend.branch_greater_or_equal_signed(s1, s2, imm))
     }
 
+    #[inline(always)]
     fn branch_eq(&mut self, s1: Reg, s2: Reg, imm: u32) -> Self::ReturnTy {
         self.branch(imm, move |backend| backend.branch_eq(s1, s2, imm))
     }
 
+    #[inline(always)]
     fn branch_not_eq(&mut self, s1: Reg, s2: Reg, imm: u32) -> Self::ReturnTy {
         self.branch(imm, move |backend| backend.branch_not_eq(s1, s2, imm))
     }
 
-    fn jump_and_link_register(&mut self, ra: Reg, base: Reg, offset: u32) -> Self::ReturnTy {
-        if ra != Reg::Zero {
-            let return_basic_block = self.instruction_by_basic_block.len() as u32;
-            if !self.jump_table_index_by_basic_block.contains_key(&return_basic_block) {
-                bail!("found a call instruction where the next basic block is not part of the jump table");
-            }
+    #[inline(always)]
+    fn branch_eq_imm(&mut self, s1: Reg, s2: u32, imm: u32) -> Self::ReturnTy {
+        self.branch(imm, move |backend| backend.branch_eq_imm(s1, s2, imm))
+    }
+
+    #[inline(always)]
+    fn branch_not_eq_imm(&mut self, s1: Reg, s2: u32, imm: u32) -> Self::ReturnTy {
+        self.branch(imm, move |backend| backend.branch_not_eq_imm(s1, s2, imm))
+    }
+
+    #[inline(always)]
+    fn branch_less_unsigned_imm(&mut self, s1: Reg, s2: u32, imm: u32) -> Self::ReturnTy {
+        self.branch(imm, move |backend| backend.branch_less_unsigned_imm(s1, s2, imm))
+    }
+
+    #[inline(always)]
+    fn branch_less_signed_imm(&mut self, s1: Reg, s2: u32, imm: u32) -> Self::ReturnTy {
+        self.branch(imm, move |backend| backend.branch_less_signed_imm(s1, s2, imm))
+    }
+
+    #[inline(always)]
+    fn branch_greater_or_equal_unsigned_imm(&mut self, s1: Reg, s2: u32, imm: u32) -> Self::ReturnTy {
+        self.branch(imm, move |backend| backend.branch_greater_or_equal_unsigned_imm(s1, s2, imm))
+    }
+
+    #[inline(always)]
+    fn branch_greater_or_equal_signed_imm(&mut self, s1: Reg, s2: u32, imm: u32) -> Self::ReturnTy {
+        self.branch(imm, move |backend| backend.branch_greater_or_equal_signed_imm(s1, s2, imm))
+    }
+
+    #[inline(always)]
+    fn branch_less_or_equal_unsigned_imm(&mut self, s1: Reg, s2: u32, imm: u32) -> Self::ReturnTy {
+        self.branch(imm, move |backend| backend.branch_less_or_equal_unsigned_imm(s1, s2, imm))
+    }
+
+    #[inline(always)]
+    fn branch_less_or_equal_signed_imm(&mut self, s1: Reg, s2: u32, imm: u32) -> Self::ReturnTy {
+        self.branch(imm, move |backend| backend.branch_less_or_equal_signed_imm(s1, s2, imm))
+    }
+
+    #[inline(always)]
+    fn branch_greater_unsigned_imm(&mut self, s1: Reg, s2: u32, imm: u32) -> Self::ReturnTy {
+        self.branch(imm, move |backend| backend.branch_greater_unsigned_imm(s1, s2, imm))
+    }
+
+    #[inline(always)]
+    fn branch_greater_signed_imm(&mut self, s1: Reg, s2: u32, imm: u32) -> Self::ReturnTy {
+        self.branch(imm, move |backend| backend.branch_greater_signed_imm(s1, s2, imm))
+    }
+
+    #[inline(always)]
+    fn load_imm(&mut self, dst: Reg, value: u32) -> Self::ReturnTy {
+        self.0.before_instruction();
+        self.0.load_imm(dst, value);
+        Ok(())
+    }
+
+    #[inline(always)]
+    fn call(&mut self, ra: Reg, target: u32) -> Self::ReturnTy {
+        let return_basic_block = self.instruction_by_basic_block.len() as u32;
+        if self
+            .jump_table_index_by_basic_block
+            .get(return_basic_block as usize)
+            .copied()
+            .unwrap_or(0)
+            == 0
+        {
+            bail_static!("found a call instruction where the next basic block is not part of the jump table");
         }
 
-        if base == Reg::Zero {
-            self.maximum_seen_jump_target = core::cmp::max(self.maximum_seen_jump_target, offset);
+        self.maximum_seen_jump_target = core::cmp::max(self.maximum_seen_jump_target, target);
+
+        self.start_new_basic_block()?;
+        self.0.before_instruction();
+        self.0.call(ra, target);
+        Ok(())
+    }
+
+    #[inline(always)]
+    fn call_indirect(&mut self, ra: Reg, base: Reg, offset: u32) -> Self::ReturnTy {
+        let return_basic_block = self.instruction_by_basic_block.len() as u32;
+        if self
+            .jump_table_index_by_basic_block
+            .get(return_basic_block as usize)
+            .copied()
+            .unwrap_or(0)
+            == 0
+        {
+            bail_static!("found a call instruction where the next basic block is not part of the jump table");
         }
 
         self.start_new_basic_block()?;
         self.0.before_instruction();
-        self.0.jump_and_link_register(ra, base, offset);
+        self.0.call_indirect(ra, base, offset);
+        Ok(())
+    }
+
+    #[inline(always)]
+    fn jump(&mut self, target: u32) -> Self::ReturnTy {
+        self.maximum_seen_jump_target = core::cmp::max(self.maximum_seen_jump_target, target);
+        self.start_new_basic_block()?;
+        self.0.before_instruction();
+        self.0.jump(target);
+        Ok(())
+    }
+
+    #[inline(always)]
+    fn jump_indirect(&mut self, base: Reg, offset: u32) -> Self::ReturnTy {
+        self.start_new_basic_block()?;
+        self.0.before_instruction();
+        self.0.jump_indirect(base, offset);
         Ok(())
     }
 }
@@ -806,7 +1119,17 @@ impl Module {
     }
 
     pub(crate) fn jump_table_index_by_basic_block(&self, nth_basic_block: u32) -> Option<u32> {
-        self.0.jump_table_index_by_basic_block.get(&nth_basic_block).copied()
+        let index = self
+            .0
+            .jump_table_index_by_basic_block
+            .get(nth_basic_block as usize)
+            .copied()
+            .unwrap_or(0);
+        if index == 0 {
+            None
+        } else {
+            Some(index)
+        }
     }
 
     pub(crate) fn basic_block_by_jump_table_index(&self, jump_table_index: u32) -> Option<u32> {
@@ -870,6 +1193,8 @@ impl Module {
         let (initial_maximum_seen_jump_target, basic_block_by_jump_table_index, jump_table_index_by_basic_block) = {
             log::trace!("Parsing jump table...");
             let mut basic_block_by_jump_table_index = Vec::with_capacity(blob.jump_table_upper_bound() + 1);
+            let mut jump_table_index_by_basic_block = Vec::new();
+            jump_table_index_by_basic_block.resize(blob.basic_block_count() as usize, 0);
 
             // The very first entry is always invalid.
             basic_block_by_jump_table_index.push(u32::MAX);
@@ -877,18 +1202,18 @@ impl Module {
             let mut maximum_seen_jump_target = 0;
             for nth_basic_block in blob.jump_table() {
                 let nth_basic_block = nth_basic_block.map_err(Error::from_display)?;
+
+                if let Some(slot) = jump_table_index_by_basic_block.get_mut(nth_basic_block as usize) {
+                    *slot = basic_block_by_jump_table_index.len() as u32;
+                } else {
+                    bail_static!("program contains an invalid basic block count");
+                }
+
                 maximum_seen_jump_target = core::cmp::max(maximum_seen_jump_target, nth_basic_block);
                 basic_block_by_jump_table_index.push(nth_basic_block);
             }
 
             basic_block_by_jump_table_index.shrink_to_fit();
-
-            let jump_table_index_by_basic_block: HashMap<_, _> = basic_block_by_jump_table_index
-                .iter()
-                .copied()
-                .enumerate()
-                .map(|(jump_table_index, nth_basic_block)| (nth_basic_block, jump_table_index as u32))
-                .collect();
 
             (
                 maximum_seen_jump_target,
@@ -951,7 +1276,7 @@ impl Module {
 
         #[allow(unused_macros)]
         macro_rules! compile_module {
-            ($sandbox_kind:ident, $module_kind:ident) => {{
+            ($sandbox_kind:ident, $module_kind:ident, $run:ident) => {{
                 let (visitor, aux) = CompiledModule::<$sandbox_kind>::create_visitor(
                     config,
                     &exports,
@@ -964,10 +1289,8 @@ impl Module {
                 )?;
 
                 let common = new_common!();
-                type VisitorTy<'a> = CommonVisitor<'a, crate::compiler::Compiler<'a>>;
-                let visitor: VisitorTy = CommonVisitor(VisitorWrapper { common, visitor });
-                let run = polkavm_common::program::prepare_visitor!(VisitorTy<'a>);
-                let (visitor, result) = run(blob, visitor);
+                let visitor = CommonVisitor(VisitorWrapper { common, visitor });
+                let (visitor, result) = $run(blob, visitor);
                 result?;
 
                 let (common, module) = CompiledModule::<$sandbox_kind>::finish_compilation(visitor.0, aux)?;
@@ -977,24 +1300,33 @@ impl Module {
 
         let compiled: Option<(Common, CompiledModuleKind)> = if_compiler_is_supported! {
             {
-                match engine.selected_sandbox {
-                    _ if engine.selected_backend != BackendKind::Compiler => None,
-                    Some(SandboxKind::Linux) => {
-                        #[cfg(target_os = "linux")]
-                        {
-                            compile_module!(SandboxLinux, Linux)
-                        }
+                if engine.selected_backend == BackendKind::Compiler {
+                    if let Some(selected_sandbox) = engine.selected_sandbox {
+                        type VisitorTy<'a> = CommonVisitor<'a, crate::compiler::Compiler<'a>>;
+                        let run = polkavm_common::program::prepare_visitor!(COMPILER_VISITOR, VisitorTy<'a>);
 
-                        #[cfg(not(target_os = "linux"))]
-                        {
-                            log::debug!("Selected sandbox unavailable!");
-                            None
+                        match selected_sandbox {
+                            SandboxKind::Linux => {
+                                #[cfg(target_os = "linux")]
+                                {
+                                    compile_module!(SandboxLinux, Linux, run)
+                                }
+
+                                #[cfg(not(target_os = "linux"))]
+                                {
+                                    log::debug!("Selected sandbox unavailable!");
+                                    None
+                                }
+                            },
+                            SandboxKind::Generic => {
+                                compile_module!(SandboxGeneric, Generic, run)
+                            },
                         }
-                    },
-                    Some(SandboxKind::Generic) => {
-                        compile_module!(SandboxGeneric, Generic)
-                    },
-                    None => None
+                    } else {
+                        None
+                    }
+                } else {
+                    None
                 }
             } else {{
                 None
@@ -1009,7 +1341,8 @@ impl Module {
                 common,
                 visitor: instructions,
             });
-            let run = polkavm_common::program::prepare_visitor!(VisitorTy<'a>);
+
+            let run = polkavm_common::program::prepare_visitor!(INTERPRETER_VISITOR, VisitorTy<'a>);
             let (visitor, result) = run(blob, visitor);
             result?;
 
@@ -2342,15 +2675,15 @@ impl<T> Instance<T> {
 pub struct ExecutionConfig {
     pub(crate) reset_memory_after_execution: bool,
     pub(crate) clear_program_after_execution: bool,
-    pub(crate) initial_regs: [u32; Reg::ALL_NON_ZERO.len()],
+    pub(crate) initial_regs: [u32; Reg::ALL.len()],
     pub(crate) gas: Option<Gas>,
 }
 
 impl Default for ExecutionConfig {
     fn default() -> Self {
-        let mut initial_regs = [0; Reg::ALL_NON_ZERO.len()];
-        initial_regs[Reg::SP as usize - 1] = VM_ADDR_USER_STACK_HIGH;
-        initial_regs[Reg::RA as usize - 1] = VM_ADDR_RETURN_TO_HOST;
+        let mut initial_regs = [0; Reg::ALL.len()];
+        initial_regs[Reg::SP as usize] = VM_ADDR_USER_STACK_HIGH;
+        initial_regs[Reg::RA as usize] = VM_ADDR_RETURN_TO_HOST;
 
         ExecutionConfig {
             reset_memory_after_execution: false,
@@ -2373,10 +2706,7 @@ impl ExecutionConfig {
     }
 
     pub fn set_reg(&mut self, reg: Reg, value: u32) -> &mut Self {
-        if !matches!(reg, Reg::Zero) {
-            self.initial_regs[reg as usize - 1] = value;
-        }
-
+        self.initial_regs[reg as usize] = value;
         self
     }
 
@@ -2497,7 +2827,7 @@ impl<T> Func<T> {
 
             let mut cb = |value: u32| {
                 assert!(input_count <= VM_MAXIMUM_EXTERN_ARG_COUNT);
-                config.initial_regs[Reg::A0 as usize + input_count - 1] = value;
+                config.initial_regs[Reg::A0 as usize + input_count] = value;
                 input_count += 1;
             };
 
@@ -2597,7 +2927,7 @@ where
         let mut input_count = 0;
         args._set(|value| {
             assert!(input_count <= VM_MAXIMUM_EXTERN_ARG_COUNT);
-            config.initial_regs[Reg::A0 as usize + input_count - 1] = value;
+            config.initial_regs[Reg::A0 as usize + input_count] = value;
             input_count += 1;
         });
 

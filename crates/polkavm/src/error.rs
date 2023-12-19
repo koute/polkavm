@@ -6,7 +6,14 @@ macro_rules! bail {
     }
 }
 
+macro_rules! bail_static {
+    ($arg:expr) => {
+        return Err(Error::from_static_str($arg))
+    };
+}
+
 pub(crate) use bail;
+pub(crate) use bail_static;
 
 #[derive(Debug)]
 enum ErrorKind {

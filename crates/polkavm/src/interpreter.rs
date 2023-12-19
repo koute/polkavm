@@ -1,9 +1,11 @@
 use crate::api::{BackendAccess, ExecutionConfig, MemoryAccessError, Module, OnHostcall};
 use crate::error::{bail, Error};
+use crate::utils::RegImm;
 use core::mem::MaybeUninit;
 use polkavm_common::abi::{VM_ADDR_RETURN_TO_HOST, VM_CODE_ADDRESS_ALIGNMENT};
 use polkavm_common::error::Trap;
 use polkavm_common::init::GuestProgramInit;
+use polkavm_common::operation::*;
 use polkavm_common::program::{Instruction, InstructionVisitor, Reg};
 use polkavm_common::utils::{byte_slice_init, Access, AsUninitSliceMut, Gas};
 
@@ -59,7 +61,7 @@ pub(crate) struct InterpretedInstance {
     module: Module,
     heap: Vec<u8>,
     stack: Vec<u8>,
-    regs: [u32; Reg::ALL_NON_ZERO.len() + 1],
+    regs: [u32; Reg::ALL.len()],
     nth_instruction: u32,
     nth_basic_block: u32,
     return_to_host: bool,
@@ -84,7 +86,7 @@ impl InterpretedInstance {
             heap,
             stack,
             module,
-            regs: [0; Reg::ALL_NON_ZERO.len() + 1],
+            regs: [0; Reg::ALL.len()],
             nth_instruction: VM_ADDR_RETURN_TO_HOST,
             nth_basic_block: 0,
             return_to_host: true,
@@ -173,7 +175,7 @@ impl InterpretedInstance {
             .expect("internal error: invalid export address");
 
         self.return_to_host = false;
-        self.regs[1..].copy_from_slice(&config.initial_regs);
+        self.regs.copy_from_slice(&config.initial_regs);
         self.nth_instruction = nth_instruction;
         self.nth_basic_block = nth_basic_block;
         if self.module.gas_metering().is_some() {
@@ -270,18 +272,10 @@ impl<'a> Access<'a> for InterpretedAccess<'a> {
     type Error = MemoryAccessError<&'static str>;
 
     fn get_reg(&self, reg: Reg) -> u32 {
-        if reg == Reg::Zero {
-            return 0;
-        }
-
         self.instance.regs[reg as usize]
     }
 
     fn set_reg(&mut self, reg: Reg, value: u32) {
-        if reg == Reg::Zero {
-            return;
-        }
-
         self.instance.regs[reg as usize] = value;
     }
 
@@ -340,11 +334,16 @@ struct Visitor<'a, 'b> {
 }
 
 impl<'a, 'b> Visitor<'a, 'b> {
-    fn set(&mut self, dst: Reg, value: u32) -> Result<(), ExecutionError> {
-        if dst == Reg::Zero {
-            return Ok(());
+    #[inline(always)]
+    fn get(&self, regimm: impl Into<RegImm>) -> u32 {
+        match regimm.into() {
+            RegImm::Reg(reg) => self.inner.regs[reg as usize],
+            RegImm::Imm(value) => value,
         }
+    }
 
+    #[inline(always)]
+    fn set(&mut self, dst: Reg, value: u32) -> Result<(), ExecutionError> {
         self.inner.regs[dst as usize] = value;
         log::trace!("{dst} = 0x{value:x}");
 
@@ -356,24 +355,30 @@ impl<'a, 'b> Visitor<'a, 'b> {
         }
     }
 
-    fn set3(&mut self, dst: Reg, s1: Reg, s2: Reg, callback: impl Fn(u32, u32) -> u32) -> Result<(), ExecutionError> {
-        let s1 = self.inner.regs[s1 as usize];
-        let s2 = self.inner.regs[s2 as usize];
+    #[inline(always)]
+    fn set3(
+        &mut self,
+        dst: Reg,
+        s1: impl Into<RegImm>,
+        s2: impl Into<RegImm>,
+        callback: impl Fn(u32, u32) -> u32,
+    ) -> Result<(), ExecutionError> {
+        let s1 = self.get(s1);
+        let s2 = self.get(s2);
         self.set(dst, callback(s1, s2))?;
         self.inner.nth_instruction += 1;
         Ok(())
     }
 
-    fn set2(&mut self, dst: Reg, src: Reg, callback: impl Fn(u32) -> u32) -> Result<(), ExecutionError> {
-        let src = self.inner.regs[src as usize];
-        self.set(dst, callback(src))?;
-        self.inner.nth_instruction += 1;
-        Ok(())
-    }
-
-    fn branch(&mut self, s1: Reg, s2: Reg, target: u32, callback: impl Fn(u32, u32) -> bool) -> Result<(), ExecutionError> {
-        let s1 = self.inner.regs[s1 as usize];
-        let s2 = self.inner.regs[s2 as usize];
+    fn branch(
+        &mut self,
+        s1: impl Into<RegImm>,
+        s2: impl Into<RegImm>,
+        target: u32,
+        callback: impl Fn(u32, u32) -> bool,
+    ) -> Result<(), ExecutionError> {
+        let s1 = self.get(s1);
+        let s2 = self.get(s2);
         if callback(s1, s2) {
             self.inner.nth_instruction = self
                 .inner
@@ -389,10 +394,10 @@ impl<'a, 'b> Visitor<'a, 'b> {
         self.inner.on_start_new_basic_block()
     }
 
-    fn load<T: LoadTy>(&mut self, dst: Reg, base: Reg, offset: u32) -> Result<(), ExecutionError> {
+    fn load<T: LoadTy>(&mut self, dst: Reg, base: Option<Reg>, offset: u32) -> Result<(), ExecutionError> {
         assert!(core::mem::size_of::<T>() >= 1);
 
-        let address = self.inner.regs[base as usize].wrapping_add(offset);
+        let address = base.map(|base| self.inner.regs[base as usize]).unwrap_or(0).wrapping_add(offset);
         let length = core::mem::size_of::<T>() as u32;
         let Some(slice) = self.inner.get_memory_slice(address, length) else {
             log::debug!(
@@ -414,11 +419,22 @@ impl<'a, 'b> Visitor<'a, 'b> {
         Ok(())
     }
 
-    fn store<T: StoreTy>(&mut self, src: Reg, base: Reg, offset: u32) -> Result<(), ExecutionError> {
+    fn store<T: StoreTy>(&mut self, src: impl Into<RegImm>, base: Option<Reg>, offset: u32) -> Result<(), ExecutionError> {
         assert!(core::mem::size_of::<T>() >= 1);
 
-        let value = self.inner.regs[src as usize];
-        let address = self.inner.regs[base as usize].wrapping_add(offset);
+        let address = base.map(|base| self.inner.regs[base as usize]).unwrap_or(0).wrapping_add(offset);
+        let value = match src.into() {
+            RegImm::Reg(src) => {
+                let value = self.inner.regs[src as usize];
+                log::trace!("{kind} [0x{address:x}] = {src} = 0x{value:x}", kind = std::any::type_name::<T>());
+                value
+            }
+            RegImm::Imm(value) => {
+                log::trace!("{kind} [0x{address:x}] = 0x{value:x}", kind = std::any::type_name::<T>());
+                value
+            }
+        };
+
         let length = core::mem::size_of::<T>() as u32;
         let Some(slice) = self.inner.get_memory_slice_mut(address, length) else {
             log::debug!(
@@ -432,8 +448,6 @@ impl<'a, 'b> Visitor<'a, 'b> {
             return Err(ExecutionError::Trap(Default::default()));
         };
 
-        log::trace!("{kind} [0x{address:x}] = {src} = 0x{value:x}", kind = std::any::type_name::<T>());
-
         let value = T::into_bytes(value);
         slice.copy_from_slice(value.as_ref());
 
@@ -443,6 +457,64 @@ impl<'a, 'b> Visitor<'a, 'b> {
 
         self.inner.nth_instruction += 1;
         Ok(())
+    }
+
+    fn get_return_address(&self) -> u32 {
+        self.inner
+            .module
+            .jump_table_index_by_basic_block(self.inner.nth_basic_block + 1)
+            .expect("internal error: couldn't fetch the jump table index for the return basic block")
+            * VM_CODE_ADDRESS_ALIGNMENT
+    }
+
+    fn set_return_address(&mut self, ra: Reg, return_address: u32) -> Result<(), ExecutionError> {
+        log::trace!(
+            "Setting a call's return address: {ra} = @dyn {:x} (@{:x})",
+            return_address / VM_CODE_ADDRESS_ALIGNMENT,
+            self.inner.nth_basic_block + 1
+        );
+
+        self.set(ra, return_address)
+    }
+
+    fn dynamic_jump(&mut self, call: Option<(Reg, u32)>, base: Reg, offset: u32) -> Result<(), ExecutionError> {
+        let target = self.inner.regs[base as usize].wrapping_add(offset);
+        if let Some((ra, return_address)) = call {
+            self.set(ra, return_address)?;
+        }
+
+        if target == VM_ADDR_RETURN_TO_HOST {
+            self.inner.return_to_host = true;
+            return Ok(());
+        }
+
+        if target == 0 {
+            return Err(ExecutionError::Trap(Default::default()));
+        }
+
+        if target % VM_CODE_ADDRESS_ALIGNMENT != 0 {
+            log::error!("Found a dynamic jump with a misaligned target: target = {target}");
+            return Err(ExecutionError::Trap(Default::default()));
+        }
+
+        let Some(nth_basic_block) = self
+            .inner
+            .module
+            .basic_block_by_jump_table_index(target / VM_CODE_ADDRESS_ALIGNMENT)
+        else {
+            return Err(ExecutionError::Trap(Default::default()));
+        };
+
+        let nth_instruction = self
+            .inner
+            .module
+            .instruction_by_basic_block(nth_basic_block)
+            .expect("internal error: couldn't fetch the instruction index for a dynamic jump");
+
+        log::trace!("Dynamic jump to: #{nth_instruction}: @{nth_basic_block:x}");
+        self.inner.nth_basic_block = nth_basic_block;
+        self.inner.nth_instruction = nth_instruction;
+        self.inner.on_start_new_basic_block()
     }
 }
 
@@ -506,46 +578,15 @@ impl StoreTy for u32 {
     }
 }
 
-fn divu(s1: u32, s2: u32) -> u32 {
-    if s2 == 0 {
-        u32::MAX
-    } else {
-        s1 / s2
-    }
-}
-
-fn remu(s1: u32, s2: u32) -> u32 {
-    if s2 == 0 {
-        s1
-    } else {
-        s1 % s2
-    }
-}
-
-fn div(s1: i32, s2: i32) -> i32 {
-    if s2 == 0 {
-        -1
-    } else if s1 == i32::MIN && s2 == -1 {
-        s1
-    } else {
-        s1 / s2
-    }
-}
-
-fn rem(s1: i32, s2: i32) -> i32 {
-    if s2 == 0 {
-        s1
-    } else if s1 == i32::MIN && s2 == -1 {
-        0
-    } else {
-        s1 % s2
-    }
-}
-
 impl<'a, 'b> InstructionVisitor for Visitor<'a, 'b> {
     type ReturnTy = Result<(), ExecutionError>;
 
     fn trap(&mut self) -> Self::ReturnTy {
+        log::debug!(
+            "Trap at instruction {} in block @{:x}",
+            self.inner.nth_instruction,
+            self.inner.nth_basic_block
+        );
         Err(ExecutionError::Trap(Default::default()))
     }
 
@@ -581,7 +622,7 @@ impl<'a, 'b> InstructionVisitor for Visitor<'a, 'b> {
     }
 
     fn shift_arithmetic_right(&mut self, d: Reg, s1: Reg, s2: Reg) -> Self::ReturnTy {
-        self.set3(d, s1, s2, |s1, s2| ((s1 as i32) >> s2) as u32)
+        self.set3(d, s1, s2, |s1, s2| ((s1 as i32).wrapping_shr(s2)) as u32)
     }
 
     fn shift_logical_left(&mut self, d: Reg, s1: Reg, s2: Reg) -> Self::ReturnTy {
@@ -608,39 +649,36 @@ impl<'a, 'b> InstructionVisitor for Visitor<'a, 'b> {
         self.set3(d, s1, s2, |s1, s2| s1.wrapping_sub(s2))
     }
 
+    fn negate_and_add_imm(&mut self, d: Reg, s1: Reg, s2: u32) -> Self::ReturnTy {
+        self.set3(d, s1, s2, |s1, s2| s2.wrapping_sub(s1))
+    }
+
     fn mul(&mut self, d: Reg, s1: Reg, s2: Reg) -> Self::ReturnTy {
         self.set3(d, s1, s2, |s1, s2| s1.wrapping_mul(s2))
     }
 
-    fn mul_upper_signed_signed(&mut self, d: Reg, s1: Reg, s2: Reg) -> Self::ReturnTy {
-        self.set3(d, s1, s2, |s1, s2| {
-            let s1: i32 = s1 as i32;
-            let s2: i32 = s2 as i32;
-            let s1: i64 = s1 as i64;
-            let s2: i64 = s2 as i64;
-            ((s1 * s2) >> 32) as u64 as u32
-        })
+    fn mul_imm(&mut self, d: Reg, s1: Reg, s2: u32) -> Self::ReturnTy {
+        self.set3(d, s1, s2, |s1, s2| s1.wrapping_mul(s2))
     }
 
-    #[allow(clippy::unnecessary_cast)]
+    fn mul_upper_signed_signed(&mut self, d: Reg, s1: Reg, s2: Reg) -> Self::ReturnTy {
+        self.set3(d, s1, s2, |s1, s2| mulh(s1 as i32, s2 as i32) as u32)
+    }
+
+    fn mul_upper_signed_signed_imm(&mut self, d: Reg, s1: Reg, s2: u32) -> Self::ReturnTy {
+        self.set3(d, s1, s2, |s1, s2| mulh(s1 as i32, s2 as i32) as u32)
+    }
+
     fn mul_upper_unsigned_unsigned(&mut self, d: Reg, s1: Reg, s2: Reg) -> Self::ReturnTy {
-        self.set3(d, s1, s2, |s1, s2| {
-            let s1: u32 = s1;
-            let s2: u32 = s2;
-            let s1: u64 = s1 as u64;
-            let s2: u64 = s2 as u64;
-            ((s1 * s2) >> 32) as u64 as u32
-        })
+        self.set3(d, s1, s2, mulhu)
+    }
+
+    fn mul_upper_unsigned_unsigned_imm(&mut self, d: Reg, s1: Reg, s2: u32) -> Self::ReturnTy {
+        self.set3(d, s1, s2, mulhu)
     }
 
     fn mul_upper_signed_unsigned(&mut self, d: Reg, s1: Reg, s2: Reg) -> Self::ReturnTy {
-        self.set3(d, s1, s2, |s1, s2| {
-            let s1: i32 = s1 as i32;
-            let s2: u32 = s2;
-            let s1: i64 = s1 as i64;
-            let s2: i64 = s2 as u64 as i64;
-            ((s1 * s2) >> 32) as u64 as u32
-        })
+        self.set3(d, s1, s2, |s1, s2| mulhsu(s1 as i32, s2) as u32)
     }
 
     fn div_unsigned(&mut self, d: Reg, s1: Reg, s2: Reg) -> Self::ReturnTy {
@@ -659,75 +697,168 @@ impl<'a, 'b> InstructionVisitor for Visitor<'a, 'b> {
         self.set3(d, s1, s2, |s1, s2| rem(s1 as i32, s2 as i32) as u32)
     }
 
-    fn set_less_than_unsigned_imm(&mut self, d: Reg, s: Reg, i: u32) -> Self::ReturnTy {
-        self.set2(d, s, |s| (s < i) as u32)
+    fn set_less_than_unsigned_imm(&mut self, d: Reg, s1: Reg, s2: u32) -> Self::ReturnTy {
+        self.set3(d, s1, s2, |s1, s2| (s1 < s2) as u32)
     }
 
-    fn set_less_than_signed_imm(&mut self, d: Reg, s: Reg, i: u32) -> Self::ReturnTy {
-        self.set2(d, s, |s| ((s as i32) < (i as i32)) as u32)
+    fn set_greater_than_unsigned_imm(&mut self, d: Reg, s1: Reg, s2: u32) -> Self::ReturnTy {
+        self.set3(d, s1, s2, |s1, s2| (s1 > s2) as u32)
     }
 
-    fn shift_logical_right_imm(&mut self, d: Reg, s: Reg, i: u32) -> Self::ReturnTy {
-        self.set2(d, s, |s| s.wrapping_shr(i))
+    fn set_less_than_signed_imm(&mut self, d: Reg, s1: Reg, s2: u32) -> Self::ReturnTy {
+        self.set3(d, s1, s2, |s1, s2| ((s1 as i32) < (s2 as i32)) as u32)
     }
 
-    fn shift_arithmetic_right_imm(&mut self, d: Reg, s: Reg, i: u32) -> Self::ReturnTy {
-        self.set2(d, s, |s| ((s as i32) >> i) as u32)
+    fn set_greater_than_signed_imm(&mut self, d: Reg, s1: Reg, s2: u32) -> Self::ReturnTy {
+        self.set3(d, s1, s2, |s1, s2| ((s1 as i32) > (s2 as i32)) as u32)
     }
 
-    fn shift_logical_left_imm(&mut self, d: Reg, s: Reg, i: u32) -> Self::ReturnTy {
-        self.set2(d, s, |s| s.wrapping_shl(i))
+    fn shift_logical_right_imm(&mut self, d: Reg, s1: Reg, s2: u32) -> Self::ReturnTy {
+        self.set3(d, s1, s2, |s1, s2| s1.wrapping_shr(s2))
     }
 
-    fn or_imm(&mut self, d: Reg, s: Reg, i: u32) -> Self::ReturnTy {
-        self.set2(d, s, |s| s | i)
+    fn shift_logical_right_imm_alt(&mut self, d: Reg, s2: Reg, s1: u32) -> Self::ReturnTy {
+        self.set3(d, s1, s2, |s1, s2| s1.wrapping_shr(s2))
     }
 
-    fn and_imm(&mut self, d: Reg, s: Reg, i: u32) -> Self::ReturnTy {
-        self.set2(d, s, |s| s & i)
+    fn shift_arithmetic_right_imm(&mut self, d: Reg, s1: Reg, s2: u32) -> Self::ReturnTy {
+        self.set3(d, s1, s2, |s1, s2| ((s1 as i32) >> s2) as u32)
     }
 
-    fn xor_imm(&mut self, d: Reg, s: Reg, i: u32) -> Self::ReturnTy {
-        self.set2(d, s, |s| s ^ i)
+    fn shift_arithmetic_right_imm_alt(&mut self, d: Reg, s2: Reg, s1: u32) -> Self::ReturnTy {
+        self.set3(d, s1, s2, |s1, s2| ((s1 as i32) >> s2) as u32)
     }
 
-    fn add_imm(&mut self, d: Reg, s: Reg, i: u32) -> Self::ReturnTy {
-        self.set2(d, s, |s| s.wrapping_add(i))
+    fn shift_logical_left_imm(&mut self, d: Reg, s1: Reg, s2: u32) -> Self::ReturnTy {
+        self.set3(d, s1, s2, |s1, s2| s1.wrapping_shl(s2))
     }
 
-    fn store_u8(&mut self, src: Reg, base: Reg, offset: u32) -> Self::ReturnTy {
-        self.store::<u8>(src, base, offset)
+    fn shift_logical_left_imm_alt(&mut self, d: Reg, s2: Reg, s1: u32) -> Self::ReturnTy {
+        self.set3(d, s1, s2, |s1, s2| s1.wrapping_shl(s2))
     }
 
-    fn store_u16(&mut self, src: Reg, base: Reg, offset: u32) -> Self::ReturnTy {
-        self.store::<u16>(src, base, offset)
+    fn or_imm(&mut self, d: Reg, s1: Reg, s2: u32) -> Self::ReturnTy {
+        self.set3(d, s1, s2, |s1, s2| s1 | s2)
     }
 
-    fn store_u32(&mut self, src: Reg, base: Reg, offset: u32) -> Self::ReturnTy {
-        self.store::<u32>(src, base, offset)
+    fn and_imm(&mut self, d: Reg, s1: Reg, s2: u32) -> Self::ReturnTy {
+        self.set3(d, s1, s2, |s1, s2| s1 & s2)
     }
 
-    fn load_u8(&mut self, dst: Reg, base: Reg, offset: u32) -> Self::ReturnTy {
-        self.load::<u8>(dst, base, offset)
+    fn xor_imm(&mut self, d: Reg, s1: Reg, s2: u32) -> Self::ReturnTy {
+        self.set3(d, s1, s2, |s1, s2| s1 ^ s2)
     }
 
-    fn load_i8(&mut self, dst: Reg, base: Reg, offset: u32) -> Self::ReturnTy {
-        self.load::<i8>(dst, base, offset)
+    fn load_imm(&mut self, dst: Reg, imm: u32) -> Self::ReturnTy {
+        self.set(dst, imm)?;
+        self.inner.nth_instruction += 1;
+        Ok(())
     }
 
-    fn load_u16(&mut self, dst: Reg, base: Reg, offset: u32) -> Self::ReturnTy {
-        self.load::<u16>(dst, base, offset)
+    fn move_reg(&mut self, d: Reg, s: Reg) -> Self::ReturnTy {
+        let imm = self.get(s);
+        self.set(d, imm)?;
+        self.inner.nth_instruction += 1;
+        Ok(())
     }
 
-    fn load_i16(&mut self, dst: Reg, base: Reg, offset: u32) -> Self::ReturnTy {
-        self.load::<i16>(dst, base, offset)
+    fn add_imm(&mut self, d: Reg, s1: Reg, s2: u32) -> Self::ReturnTy {
+        self.set3(d, s1, s2, |s1, s2| s1.wrapping_add(s2))
     }
 
-    fn load_u32(&mut self, dst: Reg, base: Reg, offset: u32) -> Self::ReturnTy {
-        self.load::<u32>(dst, base, offset)
+    fn store_imm_u8(&mut self, value: u32, offset: u32) -> Self::ReturnTy {
+        self.store::<u8>(value, None, offset)
+    }
+
+    fn store_imm_u16(&mut self, value: u32, offset: u32) -> Self::ReturnTy {
+        self.store::<u16>(value, None, offset)
+    }
+
+    fn store_imm_u32(&mut self, value: u32, offset: u32) -> Self::ReturnTy {
+        self.store::<u32>(value, None, offset)
+    }
+
+    fn store_imm_indirect_u8(&mut self, base: Reg, offset: u32, value: u32) -> Self::ReturnTy {
+        self.store::<u8>(value, Some(base), offset)
+    }
+
+    fn store_imm_indirect_u16(&mut self, base: Reg, offset: u32, value: u32) -> Self::ReturnTy {
+        self.store::<u16>(value, Some(base), offset)
+    }
+
+    fn store_imm_indirect_u32(&mut self, base: Reg, offset: u32, value: u32) -> Self::ReturnTy {
+        self.store::<u32>(value, Some(base), offset)
+    }
+
+    fn store_indirect_u8(&mut self, src: Reg, base: Reg, offset: u32) -> Self::ReturnTy {
+        self.store::<u8>(src, Some(base), offset)
+    }
+
+    fn store_indirect_u16(&mut self, src: Reg, base: Reg, offset: u32) -> Self::ReturnTy {
+        self.store::<u16>(src, Some(base), offset)
+    }
+
+    fn store_indirect_u32(&mut self, src: Reg, base: Reg, offset: u32) -> Self::ReturnTy {
+        self.store::<u32>(src, Some(base), offset)
+    }
+
+    fn store_u8(&mut self, src: Reg, offset: u32) -> Self::ReturnTy {
+        self.store::<u8>(src, None, offset)
+    }
+
+    fn store_u16(&mut self, src: Reg, offset: u32) -> Self::ReturnTy {
+        self.store::<u16>(src, None, offset)
+    }
+
+    fn store_u32(&mut self, src: Reg, offset: u32) -> Self::ReturnTy {
+        self.store::<u32>(src, None, offset)
+    }
+
+    fn load_u8(&mut self, dst: Reg, offset: u32) -> Self::ReturnTy {
+        self.load::<u8>(dst, None, offset)
+    }
+
+    fn load_i8(&mut self, dst: Reg, offset: u32) -> Self::ReturnTy {
+        self.load::<i8>(dst, None, offset)
+    }
+
+    fn load_u16(&mut self, dst: Reg, offset: u32) -> Self::ReturnTy {
+        self.load::<u16>(dst, None, offset)
+    }
+
+    fn load_i16(&mut self, dst: Reg, offset: u32) -> Self::ReturnTy {
+        self.load::<i16>(dst, None, offset)
+    }
+
+    fn load_u32(&mut self, dst: Reg, offset: u32) -> Self::ReturnTy {
+        self.load::<u32>(dst, None, offset)
+    }
+
+    fn load_indirect_u8(&mut self, dst: Reg, base: Reg, offset: u32) -> Self::ReturnTy {
+        self.load::<u8>(dst, Some(base), offset)
+    }
+
+    fn load_indirect_i8(&mut self, dst: Reg, base: Reg, offset: u32) -> Self::ReturnTy {
+        self.load::<i8>(dst, Some(base), offset)
+    }
+
+    fn load_indirect_u16(&mut self, dst: Reg, base: Reg, offset: u32) -> Self::ReturnTy {
+        self.load::<u16>(dst, Some(base), offset)
+    }
+
+    fn load_indirect_i16(&mut self, dst: Reg, base: Reg, offset: u32) -> Self::ReturnTy {
+        self.load::<i16>(dst, Some(base), offset)
+    }
+
+    fn load_indirect_u32(&mut self, dst: Reg, base: Reg, offset: u32) -> Self::ReturnTy {
+        self.load::<u32>(dst, Some(base), offset)
     }
 
     fn branch_less_unsigned(&mut self, s1: Reg, s2: Reg, i: u32) -> Self::ReturnTy {
+        self.branch(s1, s2, i, |s1, s2| s1 < s2)
+    }
+
+    fn branch_less_unsigned_imm(&mut self, s1: Reg, s2: u32, i: u32) -> Self::ReturnTy {
         self.branch(s1, s2, i, |s1, s2| s1 < s2)
     }
 
@@ -735,15 +866,15 @@ impl<'a, 'b> InstructionVisitor for Visitor<'a, 'b> {
         self.branch(s1, s2, i, |s1, s2| (s1 as i32) < (s2 as i32))
     }
 
-    fn branch_greater_or_equal_unsigned(&mut self, s1: Reg, s2: Reg, i: u32) -> Self::ReturnTy {
-        self.branch(s1, s2, i, |s1, s2| s1 >= s2)
-    }
-
-    fn branch_greater_or_equal_signed(&mut self, s1: Reg, s2: Reg, i: u32) -> Self::ReturnTy {
-        self.branch(s1, s2, i, |s1, s2| (s1 as i32) >= (s2 as i32))
+    fn branch_less_signed_imm(&mut self, s1: Reg, s2: u32, i: u32) -> Self::ReturnTy {
+        self.branch(s1, s2, i, |s1, s2| (s1 as i32) < (s2 as i32))
     }
 
     fn branch_eq(&mut self, s1: Reg, s2: Reg, i: u32) -> Self::ReturnTy {
+        self.branch(s1, s2, i, |s1, s2| s1 == s2)
+    }
+
+    fn branch_eq_imm(&mut self, s1: Reg, s2: u32, i: u32) -> Self::ReturnTy {
         self.branch(s1, s2, i, |s1, s2| s1 == s2)
     }
 
@@ -751,101 +882,67 @@ impl<'a, 'b> InstructionVisitor for Visitor<'a, 'b> {
         self.branch(s1, s2, i, |s1, s2| s1 != s2)
     }
 
-    fn jump_and_link_register(&mut self, ra: Reg, base: Reg, offset: u32) -> Self::ReturnTy {
-        let return_address = if ra != Reg::Zero {
-            Some(
-                self.inner
-                    .module
-                    .jump_table_index_by_basic_block(self.inner.nth_basic_block + 1)
-                    .expect("internal error: couldn't fetch the jump table index for the return basic block")
-                    * VM_CODE_ADDRESS_ALIGNMENT,
-            )
-        } else {
-            None
-        };
+    fn branch_not_eq_imm(&mut self, s1: Reg, s2: u32, i: u32) -> Self::ReturnTy {
+        self.branch(s1, s2, i, |s1, s2| s1 != s2)
+    }
 
-        if let Some(return_address) = return_address {
-            log::trace!(
-                "Setting a call's return address: {ra} = @dyn {:x} (@{:x})",
-                return_address / VM_CODE_ADDRESS_ALIGNMENT,
-                self.inner.nth_basic_block + 1
-            );
-        }
+    fn branch_greater_or_equal_unsigned(&mut self, s1: Reg, s2: Reg, i: u32) -> Self::ReturnTy {
+        self.branch(s1, s2, i, |s1, s2| s1 >= s2)
+    }
 
-        if base == Reg::Zero {
-            // A static jump.
-            if let Some(return_address) = return_address {
-                self.set(ra, return_address)?;
-            }
+    fn branch_greater_or_equal_unsigned_imm(&mut self, s1: Reg, s2: u32, i: u32) -> Self::ReturnTy {
+        self.branch(s1, s2, i, |s1, s2| s1 >= s2)
+    }
 
-            let nth_instruction = self
-                .inner
-                .module
-                .instruction_by_basic_block(offset)
-                .expect("internal error: couldn't fetch the instruction index for a jump");
+    fn branch_greater_or_equal_signed(&mut self, s1: Reg, s2: Reg, i: u32) -> Self::ReturnTy {
+        self.branch(s1, s2, i, |s1, s2| (s1 as i32) >= (s2 as i32))
+    }
 
-            log::trace!("Static jump to: #{nth_instruction}: @{offset:x}");
-            self.inner.nth_basic_block = offset;
-            self.inner.nth_instruction = nth_instruction;
-        } else {
-            // A dynamic jump.
-            let target = self.inner.regs[base as usize].wrapping_add(offset);
-            if let Some(return_address) = return_address {
-                self.set(ra, return_address)?;
-            }
+    fn branch_greater_or_equal_signed_imm(&mut self, s1: Reg, s2: u32, i: u32) -> Self::ReturnTy {
+        self.branch(s1, s2, i, |s1, s2| (s1 as i32) >= (s2 as i32))
+    }
 
-            if target == VM_ADDR_RETURN_TO_HOST {
-                self.inner.return_to_host = true;
-                return Ok(());
-            }
+    fn branch_less_or_equal_unsigned_imm(&mut self, s1: Reg, s2: u32, i: u32) -> Self::ReturnTy {
+        self.branch(s1, s2, i, |s1, s2| s1 <= s2)
+    }
 
-            if target == 0 {
-                return Err(ExecutionError::Trap(Default::default()));
-            }
+    fn branch_less_or_equal_signed_imm(&mut self, s1: Reg, s2: u32, i: u32) -> Self::ReturnTy {
+        self.branch(s1, s2, i, |s1, s2| (s1 as i32) <= (s2 as i32))
+    }
 
-            if target % VM_CODE_ADDRESS_ALIGNMENT != 0 {
-                log::error!("Found a dynamic jump with a misaligned target: target = {target}");
-                return Err(ExecutionError::Trap(Default::default()));
-            }
+    fn branch_greater_unsigned_imm(&mut self, s1: Reg, s2: u32, i: u32) -> Self::ReturnTy {
+        self.branch(s1, s2, i, |s1, s2| s1 > s2)
+    }
 
-            let Some(nth_basic_block) = self
-                .inner
-                .module
-                .basic_block_by_jump_table_index(target / VM_CODE_ADDRESS_ALIGNMENT)
-            else {
-                return Err(ExecutionError::Trap(Default::default()));
-            };
+    fn branch_greater_signed_imm(&mut self, s1: Reg, s2: u32, i: u32) -> Self::ReturnTy {
+        self.branch(s1, s2, i, |s1, s2| (s1 as i32) > (s2 as i32))
+    }
 
-            let nth_instruction = self
-                .inner
-                .module
-                .instruction_by_basic_block(nth_basic_block)
-                .expect("internal error: couldn't fetch the instruction index for a dynamic jump");
+    fn jump(&mut self, target: u32) -> Self::ReturnTy {
+        let nth_instruction = self
+            .inner
+            .module
+            .instruction_by_basic_block(target)
+            .expect("internal error: couldn't fetch the instruction index for a jump");
 
-            log::trace!("Dynamic jump to: #{nth_instruction}: @{nth_basic_block:x}");
-            self.inner.nth_basic_block = nth_basic_block;
-            self.inner.nth_instruction = nth_instruction;
-        }
-
+        log::trace!("Static jump to: #{nth_instruction}: @{target:x}");
+        self.inner.nth_basic_block = target;
+        self.inner.nth_instruction = nth_instruction;
         self.inner.on_start_new_basic_block()
     }
-}
 
-#[test]
-fn test_div_rem() {
-    assert_eq!(divu(10, 2), 5);
-    assert_eq!(divu(10, 0), u32::MAX);
+    fn jump_indirect(&mut self, base: Reg, offset: u32) -> Self::ReturnTy {
+        self.dynamic_jump(None, base, offset)
+    }
 
-    assert_eq!(div(10, 2), 5);
-    assert_eq!(div(10, 0), -1);
-    assert_eq!(div(i32::MIN, -1), i32::MIN);
+    fn call(&mut self, ra: Reg, target: u32) -> Self::ReturnTy {
+        let return_address = self.get_return_address();
+        self.set_return_address(ra, return_address)?;
+        self.jump(target)
+    }
 
-    assert_eq!(remu(10, 9), 1);
-    assert_eq!(remu(10, 5), 0);
-    assert_eq!(remu(10, 0), 10);
-
-    assert_eq!(rem(10, 9), 1);
-    assert_eq!(rem(10, 5), 0);
-    assert_eq!(rem(10, 0), 10);
-    assert_eq!(rem(i32::MIN, -1), 0);
+    fn call_indirect(&mut self, ra: Reg, base: Reg, offset: u32) -> Self::ReturnTy {
+        let return_address = self.get_return_address();
+        self.dynamic_jump(Some((ra, return_address)), base, offset)
+    }
 }

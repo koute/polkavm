@@ -3,7 +3,7 @@ use polkavm_assembler::amd64::inst::*;
 use polkavm_assembler::amd64::RegIndex as NativeReg;
 use polkavm_assembler::amd64::RegIndex::*;
 use polkavm_assembler::amd64::Reg::rsp;
-use polkavm_assembler::amd64::{Condition, LoadKind, RegSize, Size, ImmKind, MemOp};
+use polkavm_assembler::amd64::{Condition, LoadKind, RegSize, Size, MemOp};
 use polkavm_assembler::Label;
 
 use polkavm_common::program::{InstructionVisitor, Reg};
@@ -13,8 +13,7 @@ use polkavm_common::zygote::VM_ADDR_VMCTX;
 use crate::api::VisitorWrapper;
 use crate::config::GasMeteringKind;
 use crate::compiler::{Compiler, SandboxKind};
-
-use Reg::Zero as Z;
+use crate::utils::RegImm;
 
 const TMP_REG: NativeReg = rcx;
 
@@ -28,7 +27,6 @@ const fn conv_reg_const(reg: Reg) -> NativeReg {
     // NOTE: This is sorted roughly in the order of which registers are more commonly used.
     // We try to assign registers which result in more compact code to the more common RISC-V registers.
     match reg {
-        Reg::Zero => unreachable!(),
         Reg::A0 => rdi,
         Reg::A1 => rsi,
         Reg::SP => rax,
@@ -45,12 +43,12 @@ const fn conv_reg_const(reg: Reg) -> NativeReg {
     }
 }
 
-static REG_MAP: [NativeReg; Reg::ALL_NON_ZERO.len()] = {
-    let mut output = [NativeReg::rcx; Reg::ALL_NON_ZERO.len()];
+static REG_MAP: [NativeReg; Reg::ALL.len()] = {
+    let mut output = [NativeReg::rcx; Reg::ALL.len()];
     let mut index = 0;
-    while index < Reg::ALL_NON_ZERO.len() {
-        assert!(Reg::ALL_NON_ZERO[index] as usize - 1 == index);
-        output[index] = conv_reg_const(Reg::ALL_NON_ZERO[index]);
+    while index < Reg::ALL.len() {
+        assert!(Reg::ALL[index] as usize == index);
+        output[index] = conv_reg_const(Reg::ALL[index]);
         index += 1;
     }
     output
@@ -58,16 +56,12 @@ static REG_MAP: [NativeReg; Reg::ALL_NON_ZERO.len()] = {
 
 #[inline]
 fn conv_reg(reg: Reg) -> NativeReg {
-    if reg == Reg::Zero {
-        unreachable!();
-    }
-
-    REG_MAP[reg as usize - 1]
+    REG_MAP[reg as usize]
 }
 
 #[test]
 fn test_conv_reg() {
-    for reg in Reg::ALL_NON_ZERO {
+    for reg in Reg::ALL {
         assert_eq!(conv_reg(reg), conv_reg_const(reg));
     }
 }
@@ -90,17 +84,17 @@ macro_rules! with_sandbox_kind {
 }
 
 macro_rules! load_store_operand {
-    ($self:expr, $base:expr, $offset:expr, |$op:ident| $body:expr) => {
+    ($self:ident, $base:ident, $offset:expr, |$op:ident| $body:expr) => {
         with_sandbox_kind!($self.sandbox_kind, |sandbox_kind| {
             match sandbox_kind {
                 SandboxKind::Linux => {
-                    if $base == Reg::Zero {
-                        // [address] = ..
-                        let $op = abs(RegSize::R32, $offset as i32);
-                        $body
-                    } else {
+                    if let Some($base) = $base {
                         // [address + offset]
                         let $op = reg_indirect(RegSize::R32, conv_reg($base) + $offset as i32);
+                        $body
+                    } else {
+                        // [address] = ..
+                        let $op = abs(RegSize::R32, $offset as i32);
                         $body
                     }
                 },
@@ -108,27 +102,27 @@ macro_rules! load_store_operand {
                     match ($base, $offset) {
                         // [address] = ..
                         // (address is in the lower 2GB of the address space)
-                        (Z, _) if $offset as i32 >= 0 => {
+                        (None, _) if $offset as i32 >= 0 => {
                             let $op = reg_indirect(RegSize::R64, GENERIC_SANDBOX_MEMORY_REG + $offset as i32);
                             $body
                         },
 
                         // [address] = ..
-                        (Z, _) => {
+                        (None, _) => {
                             $self.push(mov_imm(TMP_REG, imm32($offset)));
                             let $op = base_index(RegSize::R64, GENERIC_SANDBOX_MEMORY_REG, TMP_REG);
                             $body
                         },
 
                         // [base] = ..
-                        (_, 0) => {
+                        (Some($base), 0) => {
                             // NOTE: This assumes that `base` has its upper 32-bits clear.
                             let $op = base_index(RegSize::R64, GENERIC_SANDBOX_MEMORY_REG, conv_reg($base));
                             $body
                         },
 
                         // [base + offset] = ..
-                        (_, _) => {
+                        (Some($base), _) => {
                             $self.push(lea(RegSize::R32, TMP_REG, reg_indirect(RegSize::R32, conv_reg($base) + $offset as i32)));
                             let $op = base_index(RegSize::R64, GENERIC_SANDBOX_MEMORY_REG, TMP_REG);
                             $body
@@ -156,75 +150,52 @@ enum ShiftKind {
     ArithmeticRight,
 }
 
-#[inline(always)]
-fn zero_imm_from_size(kind: Size) -> ImmKind {
-    match kind {
-        Size::U8 => imm8(0),
-        Size::U16 => imm16(0),
-        Size::U32 => imm32(0),
-        Size::U64 => imm64(0),
-    }
-}
-
 impl<'a> Compiler<'a> {
     pub const PADDING_BYTE: u8 = 0x90; // NOP
 
-    #[inline]
+    #[cfg_attr(not(debug_assertions), inline(always))]
     fn reg_size(&self) -> RegSize {
         RegSize::R32
     }
 
-    fn imm_zero(&self) -> ImmKind {
-        match self.reg_size() {
-            RegSize::R32 => imm32(0),
-            RegSize::R64 => imm64(0)
-        }
+    #[cfg_attr(not(debug_assertions), inline(always))]
+    fn load_immediate(&mut self, dst: Reg, value: u32) {
+        self.push(mov_imm(conv_reg(dst), imm32(value)));
     }
 
-    fn nop(&mut self) {
-        self.push(nop());
-    }
-
-    fn load_imm(&mut self, reg: Reg, imm: u32) {
-        self.push(mov_imm(conv_reg(reg), imm32(imm)));
-    }
-
-    #[inline(always)]
-    fn store(&mut self, src: Reg, base: Reg, offset: u32, kind: Size) {
+    #[cfg_attr(not(debug_assertions), inline(always))]
+    fn store(&mut self, src: impl Into<RegImm>, base: Option<Reg>, offset: u32, kind: Size) {
+        let src = src.into();
         load_store_operand!(self, base, offset, |dst| {
-            if src != Reg::Zero {
-                self.push(store(kind, dst, conv_reg(src)));
-            } else {
-                self.push(mov_imm(dst, zero_imm_from_size(kind)));
+            match src {
+                RegImm::Reg(src) => self.push(store(kind, dst, conv_reg(src))),
+                RegImm::Imm(value) => {
+                    match kind {
+                        Size::U8 => self.push(mov_imm(dst, imm8(value as u8))),
+                        Size::U16 => self.push(mov_imm(dst, imm16(value as u16))),
+                        Size::U32 => self.push(mov_imm(dst, imm32(value))),
+                        Size::U64 => unreachable!(),
+                    }
+                },
             }
         });
     }
 
-    #[inline(always)]
-    fn load(&mut self, dst: Reg, base: Reg, offset: u32, kind: LoadKind) {
+    #[cfg_attr(not(debug_assertions), inline(always))]
+    fn load(&mut self, dst: Reg, base: Option<Reg>, offset: u32, kind: LoadKind) {
         load_store_operand!(self, base, offset, |src| {
-            if dst != Reg::Zero {
-                self.push(load(kind, conv_reg(dst), src));
-            } else {
-                self.push(load(kind, TMP_REG, src));
-            }
+            self.push(load(kind, conv_reg(dst), src));
         });
     }
 
+    #[cfg_attr(not(debug_assertions), inline(always))]
     fn clear_reg(&mut self, reg: Reg) {
-        if reg == Reg::Zero {
-            return;
-        }
-
         let reg = conv_reg(reg);
         self.push(xor((RegSize::R32, reg, reg)));
     }
 
+    #[cfg_attr(not(debug_assertions), inline(always))]
     fn fill_with_ones(&mut self, reg: Reg) {
-        if reg == Reg::Zero {
-            return;
-        }
-
         match self.reg_size() {
             RegSize::R32 => {
                 self.push(mov_imm(conv_reg(reg), imm32(0xffffffff)));
@@ -236,138 +207,100 @@ impl<'a> Compiler<'a> {
         }
     }
 
-    fn set_less_than(&mut self, d: Reg, s1: Reg, s2: Reg, kind: Signedness) {
-        match (d, s1, s2) {
-            // 0 = s1 < s2
-            (Z, _, _) => self.nop(),
-            // d = s1 < s1
-            (_, _, _) if s1 == s2 => self.clear_reg(d),
-            // d = 0 < s2
-            (_, Z, _) => match kind {
-                Signedness::Signed => {
-                    self.push(cmp((conv_reg(s2), self.imm_zero())));
-                    self.push(setcc(Condition::Greater, conv_reg(d)));
-                    self.push(and((conv_reg(d), imm32(1))));
-                }
-                Signedness::Unsigned => {
-                    self.push(test((self.reg_size(), conv_reg(s2), conv_reg(s2))));
-                    self.push(setcc(Condition::NotEqual, conv_reg(d)));
-                    self.push(and((conv_reg(d), imm32(1))));
-                }
-            },
-            // d = s1 < 0
-            (_, _, Z) => {
-                self.set_less_than_imm(d, s1, 0, kind);
-            }
-            // d = s1 < s2
-            _ => {
-                self.push(cmp((self.reg_size(), conv_reg(s1), conv_reg(s2))));
-                let condition = match kind {
-                    Signedness::Signed => Condition::Less,
-                    Signedness::Unsigned => Condition::Below,
-                };
-                self.push(setcc(condition, conv_reg(d)));
-                self.push(and((conv_reg(d), imm32(1))));
-            }
+    #[cfg_attr(not(debug_assertions), inline(always))]
+    fn compare_reg_reg(&mut self, d: Reg, s1: Reg, s2: Reg, condition: Condition) {
+        if d == s1 || d == s2 {
+            self.push(cmp((self.reg_size(), conv_reg(s1), conv_reg(s2))));
+            self.push(setcc(condition, conv_reg(d)));
+            self.push(and((conv_reg(d), imm32(1))));
+        } else {
+            self.clear_reg(d);
+            self.push(cmp((self.reg_size(), conv_reg(s1), conv_reg(s2))));
+            self.push(setcc(condition, conv_reg(d)));
         }
     }
 
-    fn set_less_than_imm(&mut self, d: Reg, s: Reg, imm: u32, kind: Signedness) {
-        match (d, s, imm) {
-            // 0 = s < imm
-            (Z, _, _) => self.nop(),
-            // d = 0 < imm
-            (_, Z, _) => {
-                #[allow(clippy::unnecessary_cast)]
-                let value = match kind {
-                    Signedness::Signed => 0 < (imm as i32),
-                    Signedness::Unsigned => 0 < (imm as u32),
-                };
-                self.load_imm(d, value as u32);
-            }
-            // d = s < 0
-            (_, _, 0) if matches!(kind, Signedness::Unsigned) => {
-                self.clear_reg(d);
-            }
-            // d = s < imm
-            _ => {
-                let condition = match kind {
-                    Signedness::Signed => Condition::Less,
-                    Signedness::Unsigned => Condition::Below,
-                };
+    #[cfg_attr(not(debug_assertions), inline(always))]
+    fn compare_reg_imm(&mut self, d: Reg, s1: Reg, s2: u32, condition: Condition) {
+        if d != s1 {
+            self.clear_reg(d);
+        }
 
-                match self.reg_size() {
-                    RegSize::R32 => {
-                        self.push(cmp((conv_reg(s), imm32(imm))));
-                    },
-                    RegSize::R64 => {
-                        self.push(cmp((conv_reg(s), imm64(imm as i32))));
-                    }
+        if condition == Condition::Below && s2 == 1 {
+            // d = s1 <u 1  =>  d = s1 == 0
+            self.push(test((self.reg_size(), conv_reg(s1), conv_reg(s1))));
+            self.push(setcc(Condition::Equal, conv_reg(d)));
+        } else if condition == Condition::Above && s2 == 0 {
+            // d = s1 >u 0  =>  d = s1 != 0
+            self.push(test((self.reg_size(), conv_reg(s1), conv_reg(s1))));
+            self.push(setcc(Condition::NotEqual, conv_reg(d)));
+        } else {
+            match self.reg_size() {
+                RegSize::R32 => {
+                    self.push(cmp((conv_reg(s1), imm32(s2))));
+                },
+                RegSize::R64 => {
+                    self.push(cmp((conv_reg(s1), imm64(s2 as i32))));
                 }
-
-                self.push(setcc(condition, conv_reg(d)));
-                self.push(and((conv_reg(d), imm32(1))));
             }
+            self.push(setcc(condition, conv_reg(d)));
+        }
+
+        if d == s1 {
+            self.push(and((conv_reg(d), imm32(1))));
         }
     }
 
-    fn shift_imm(&mut self, d: Reg, s: Reg, imm: u32, kind: ShiftKind) {
-        match (d, s) {
-            // 0 = s << imm
-            (Z, _) => self.nop(),
-            // d = 0 << imm
-            (_, Z) => self.clear_reg(d),
+    #[cfg_attr(not(debug_assertions), inline(always))]
+    fn shift_imm(&mut self, d: Reg, s1: Reg, s2: u32, kind: ShiftKind) {
+        if s2 >= 32 {
             // d = s << 32+
-            (_, _) if imm >= 32 => self.clear_reg(d),
-            // d = d << imm
-            (_, _) if d == s => match kind {
-                ShiftKind::LogicalLeft => self.push(shl_imm(self.reg_size(), conv_reg(d), imm as u8)),
-                ShiftKind::LogicalRight => self.push(shr_imm(self.reg_size(), conv_reg(d), imm as u8)),
-                ShiftKind::ArithmeticRight => self.push(sar_imm(self.reg_size(), conv_reg(d), imm as u8)),
-            },
-            // d = s << imm
-            (_, _) => {
-                self.mov(d, s);
-                match kind {
-                    ShiftKind::LogicalLeft => self.push(shl_imm(self.reg_size(), conv_reg(d), imm as u8)),
-                    ShiftKind::LogicalRight => self.push(shr_imm(self.reg_size(), conv_reg(d), imm as u8)),
-                    ShiftKind::ArithmeticRight => self.push(sar_imm(self.reg_size(), conv_reg(d), imm as u8)),
-                }
-            }
+            self.clear_reg(d);
+            return;
+        }
+
+        if d != s1 {
+            self.mov(d, s1);
+        }
+
+        // d = d << s2
+        match kind {
+            ShiftKind::LogicalLeft => self.push(shl_imm(self.reg_size(), conv_reg(d), s2 as u8)),
+            ShiftKind::LogicalRight => self.push(shr_imm(self.reg_size(), conv_reg(d), s2 as u8)),
+            ShiftKind::ArithmeticRight => self.push(sar_imm(self.reg_size(), conv_reg(d), s2 as u8)),
         }
     }
 
-    fn shift(&mut self, d: Reg, s1: Reg, s2: Reg, kind: ShiftKind) {
-        match (d, s1, s2) {
-            // 0 = s1 << s2
-            (Z, _, _) => self.nop(),
-            // d = 0 << s2
-            (_, Z, _) => self.clear_reg(d),
-            // d = d << 0
-            (_, _, Z) if d == s1 => self.nop(),
-            // d = s1 << 0
-            (_, _, Z) => self.mov(d, s1),
-            // d = s1 << s2
-            (_, _, _) => {
-                // TODO: Consider using shlx/shrx/sarx when BMI2 is available.
-                self.push(mov(self.reg_size(), rcx, conv_reg(s2)));
+    #[cfg_attr(not(debug_assertions), inline(always))]
+    fn shift(&mut self, d: Reg, s1: impl Into<RegImm>, s2: Reg, kind: ShiftKind) {
+        // TODO: Consider using shlx/shrx/sarx when BMI2 is available.
+        self.push(mov(self.reg_size(), rcx, conv_reg(s2)));
+
+        match s1.into() {
+            RegImm::Reg(s1) => {
                 if s1 != d {
                     self.mov(d, s1);
                 }
-                match kind {
-                    ShiftKind::LogicalLeft => self.push(shl_cl(self.reg_size(), conv_reg(d))),
-                    ShiftKind::LogicalRight => self.push(shr_cl(self.reg_size(), conv_reg(d))),
-                    ShiftKind::ArithmeticRight => self.push(sar_cl(self.reg_size(), conv_reg(d))),
-                }
+            },
+            RegImm::Imm(s1) => {
+                self.load_immediate(d, s1);
             }
+        }
+
+        // d = d << s2
+        match kind {
+            ShiftKind::LogicalLeft => self.push(shl_cl(self.reg_size(), conv_reg(d))),
+            ShiftKind::LogicalRight => self.push(shr_cl(self.reg_size(), conv_reg(d))),
+            ShiftKind::ArithmeticRight => self.push(sar_cl(self.reg_size(), conv_reg(d))),
         }
     }
 
+    #[cfg_attr(not(debug_assertions), inline(always))]
     fn mov(&mut self, dst: Reg, src: Reg) {
         self.push(mov(self.reg_size(), conv_reg(dst), conv_reg(src)))
     }
 
-    #[inline(always)]
+    #[cfg_attr(not(debug_assertions), inline(always))]
     fn calculate_label_offset(&self, rel8_len: usize, rel32_len: usize, offset: isize) -> Result<i8, i32> {
         let offset_near = offset - (self.asm.len() as isize + rel8_len as isize);
         if offset_near <= i8::MAX as isize && offset_near >= i8::MIN as isize {
@@ -378,6 +311,7 @@ impl<'a> Compiler<'a> {
         }
     }
 
+    #[cfg_attr(not(debug_assertions), inline(always))]
     fn jump_to_label(&mut self, label: Label) {
         if let Some(offset) = self.asm.get_label_origin_offset(label) {
             let offset = self.calculate_label_offset(
@@ -395,50 +329,14 @@ impl<'a> Compiler<'a> {
         }
     }
 
-    fn branch(&mut self, s1: Reg, s2: Reg, imm: u32, mut condition: Condition) {
-        match (s1, s2) {
-            (Z, Z) => {
-                let should_jump = match condition {
-                    Condition::Equal => true,
-                    Condition::NotEqual => false,
-                    Condition::Below => false,
-                    Condition::AboveOrEqual => true,
-                    Condition::Less => false,
-                    Condition::GreaterOrEqual => true,
-                    _ => unreachable!(),
-                };
-
-                if should_jump {
-                    let label = self.get_or_forward_declare_label(imm);
-                    self.jump_to_label(label);
-                } else {
-                    self.nop();
-                }
-
-                self.start_new_basic_block();
-                return;
-            }
-            (_, Z) => {
-                self.push(cmp((conv_reg(s1), self.imm_zero())));
-            }
-            (Z, _) => {
-                self.push(cmp((conv_reg(s2), self.imm_zero())));
-                condition = match condition {
-                    Condition::Equal => Condition::Equal,
-                    Condition::NotEqual => Condition::NotEqual,
-                    Condition::Below => Condition::Above,
-                    Condition::AboveOrEqual => Condition::BelowOrEqual,
-                    Condition::Less => Condition::Greater,
-                    Condition::GreaterOrEqual => Condition::LessOrEqual,
-                    _ => unreachable!(),
-                };
-            }
-            (_, _) => {
-                self.push(cmp((self.reg_size(), conv_reg(s1), conv_reg(s2))));
-            }
+    #[cfg_attr(not(debug_assertions), inline(always))]
+    fn branch(&mut self, s1: Reg, s2: impl Into<RegImm>, target: u32, condition: Condition) {
+        match s2.into() {
+            RegImm::Reg(s2) => self.push(cmp((self.reg_size(), conv_reg(s1), conv_reg(s2)))),
+            RegImm::Imm(s2) => self.push(cmp((conv_reg(s1), imm32(s2)))),
         }
 
-        let label = self.get_or_forward_declare_label(imm);
+        let label = self.get_or_forward_declare_label(target);
         if let Some(offset) = self.asm.get_label_origin_offset(label) {
             let offset = self.calculate_label_offset(
                 jcc_rel8(condition, i8::MAX).len(),
@@ -450,7 +348,6 @@ impl<'a> Compiler<'a> {
                 Ok(offset) => self.push(jcc_rel8(condition, offset)),
                 Err(offset) => self.push(jcc_rel32(condition, offset))
             }
-
         } else {
             self.push(jcc_label32(condition, label));
         }
@@ -462,111 +359,91 @@ impl<'a> Compiler<'a> {
         // Unlike most other architectures RISC-V doesn't trap on division by zero
         // nor on division with overflow, and has well defined results in such cases.
 
-        match (d, s1, s2) {
-            // 0 = s1 / s2
-            (Z, _, _) => self.nop(),
-            // d = s1 / 0
-            (_, _, Z) => match div_rem {
-                DivRem::Div => self.fill_with_ones(d),
-                DivRem::Rem if d == s1 => self.nop(),
-                DivRem::Rem => self.mov(d, s1),
-            },
-            // d = 0 / s2
-            (_, Z, _) => {
-                todo!();
-            }
-            // d = s1 / s2
-            _ => {
-                let label_divisor_is_zero = self.asm.forward_declare_label();
-                let label_next = self.asm.forward_declare_label();
+        let label_divisor_is_zero = self.asm.forward_declare_label();
+        let label_next = self.asm.forward_declare_label();
 
-                self.push(test((self.reg_size(), conv_reg(s2), conv_reg(s2))));
-                self.push(jcc_label8(Condition::Equal, label_divisor_is_zero));
+        self.push(test((self.reg_size(), conv_reg(s2), conv_reg(s2))));
+        self.push(jcc_label8(Condition::Equal, label_divisor_is_zero));
 
-                if matches!(kind, Signedness::Signed) {
-                    let label_normal = self.asm.forward_declare_label();
-                    match self.reg_size() {
-                        RegSize::R32 => {
-                            self.push(cmp((conv_reg(s1), imm32(i32::MIN as u32))));
-                            self.push(jcc_label8(Condition::NotEqual, label_normal));
-                            self.push(cmp((conv_reg(s2), imm32(-1_i32 as u32))));
-                            self.push(jcc_label8(Condition::NotEqual, label_normal));
-                            match div_rem {
-                                DivRem::Div => self.mov(d, s1),
-                                DivRem::Rem => self.clear_reg(d),
-                            }
-                            self.push(jmp_label8(label_next));
-                        }
-                        RegSize::R64 => todo!(),
-                    }
-
-                    self.define_label(label_normal);
-                }
-
-                if s1 == Reg::Zero {
-                    self.clear_reg(d);
-                } else {
-                    // The division instruction always accepts the dividend and returns the result in rdx:rax.
-                    // This isn't great because we're using these registers for the VM's registers, so we need
-                    // to do all of this in such a way that those won't be accidentally overwritten.
-
-                    const _: () = {
-                        assert!(TMP_REG as u32 != rdx as u32);
-                        assert!(TMP_REG as u32 != rax as u32);
-                    };
-
-                    // Push the registers that will be clobbered.
-                    self.push(push(rdx));
-                    self.push(push(rax));
-
-                    // Push the operands.
-                    self.push(push(conv_reg(s1)));
-                    self.push(push(conv_reg(s2)));
-
-                    // Pop the divisor.
-                    self.push(pop(TMP_REG));
-
-                    // Pop the dividend.
-                    self.push(xor((RegSize::R32, rdx, rdx)));
-                    self.push(pop(rax));
-
-                    match kind {
-                        Signedness::Unsigned => self.push(div(self.reg_size(), TMP_REG)),
-                        Signedness::Signed => {
-                            self.push(cdq());
-                            self.push(idiv(self.reg_size(), TMP_REG))
-                        }
-                    }
-
-                    // Move the result to the temporary register.
+        if matches!(kind, Signedness::Signed) {
+            let label_normal = self.asm.forward_declare_label();
+            match self.reg_size() {
+                RegSize::R32 => {
+                    self.push(cmp((conv_reg(s1), imm32(i32::MIN as u32))));
+                    self.push(jcc_label8(Condition::NotEqual, label_normal));
+                    self.push(cmp((conv_reg(s2), imm32(-1_i32 as u32))));
+                    self.push(jcc_label8(Condition::NotEqual, label_normal));
                     match div_rem {
-                        DivRem::Div => self.push(mov(self.reg_size(), TMP_REG, rax)),
-                        DivRem::Rem => self.push(mov(self.reg_size(), TMP_REG, rdx)),
+                        DivRem::Div => self.mov(d, s1),
+                        DivRem::Rem => self.clear_reg(d),
                     }
-
-                    // Restore the original registers.
-                    self.push(pop(rax));
-                    self.push(pop(rdx));
-
-                    // Move the output into the destination registers.
-                    self.push(mov(self.reg_size(), conv_reg(d), TMP_REG));
+                    self.push(jmp_label8(label_next));
                 }
+                RegSize::R64 => todo!(),
+            }
 
-                // Go to the next instruction.
-                self.push(jmp_label8(label_next));
+            self.define_label(label_normal);
+        }
 
-                self.define_label(label_divisor_is_zero);
-                match div_rem {
-                    DivRem::Div => self.fill_with_ones(d),
-                    DivRem::Rem if d == s1 => {}
-                    DivRem::Rem => self.mov(d, s1),
-                }
+        // The division instruction always accepts the dividend and returns the result in rdx:rax.
+        // This isn't great because we're using these registers for the VM's registers, so we need
+        // to do all of this in such a way that those won't be accidentally overwritten.
 
-                self.define_label(label_next);
+        const _: () = {
+            assert!(TMP_REG as u32 != rdx as u32);
+            assert!(TMP_REG as u32 != rax as u32);
+        };
+
+        // Push the registers that will be clobbered.
+        self.push(push(rdx));
+        self.push(push(rax));
+
+        // Push the operands.
+        self.push(push(conv_reg(s1)));
+        self.push(push(conv_reg(s2)));
+
+        // Pop the divisor.
+        self.push(pop(TMP_REG));
+
+        // Pop the dividend.
+        self.push(xor((RegSize::R32, rdx, rdx)));
+        self.push(pop(rax));
+
+        match kind {
+            Signedness::Unsigned => self.push(div(self.reg_size(), TMP_REG)),
+            Signedness::Signed => {
+                self.push(cdq());
+                self.push(idiv(self.reg_size(), TMP_REG))
             }
         }
+
+        // Move the result to the temporary register.
+        match div_rem {
+            DivRem::Div => self.push(mov(self.reg_size(), TMP_REG, rax)),
+            DivRem::Rem => self.push(mov(self.reg_size(), TMP_REG, rdx)),
+        }
+
+        // Restore the original registers.
+        self.push(pop(rax));
+        self.push(pop(rdx));
+
+        // Move the output into the destination registers.
+        self.push(mov(self.reg_size(), conv_reg(d), TMP_REG));
+
+        // Go to the next instruction.
+        self.push(jmp_label8(label_next));
+
+        self.define_label(label_divisor_is_zero);
+        match div_rem {
+            DivRem::Div => self.fill_with_ones(d),
+            DivRem::Rem if d == s1 => {}
+            DivRem::Rem => self.mov(d, s1),
+        }
+
+        self.define_label(label_next);
     }
 
+    #[cfg_attr(not(debug_assertions), inline(always))]
     fn vmctx_field(&self, offset: usize) -> MemOp {
         match self.sandbox_kind {
             SandboxKind::Linux => {
@@ -590,14 +467,14 @@ impl<'a> Compiler<'a> {
 
     fn save_registers_to_vmctx(&mut self) {
         let regs_base = self.load_vmctx_field_address(self.vmctx_regs_offset);
-        for (nth, reg) in Reg::ALL_NON_ZERO.iter().copied().enumerate() {
+        for (nth, reg) in Reg::ALL.iter().copied().enumerate() {
             self.push(store(Size::U32, reg_indirect(RegSize::R64, regs_base + nth as i32 * 4), conv_reg(reg)));
         }
     }
 
     fn restore_registers_from_vmctx(&mut self) {
         let regs_base = self.load_vmctx_field_address(self.vmctx_regs_offset);
-        for (nth, reg) in Reg::ALL_NON_ZERO.iter().copied().enumerate() {
+        for (nth, reg) in Reg::ALL.iter().copied().enumerate() {
             self.push(load(LoadKind::U32, conv_reg(reg), reg_indirect(RegSize::R64, regs_base + nth as i32 * 4)));
         }
     }
@@ -692,62 +569,147 @@ impl<'a> Compiler<'a> {
         let xs = cost.to_le_bytes();
         self.asm.code_mut()[offset + length - 4..offset + length].copy_from_slice(&xs);
     }
+
+    #[cfg_attr(not(debug_assertions), inline(always))]
+    fn get_return_address(&self) -> u32 {
+        let index = self.jump_table_index_by_basic_block.get(self.next_basic_block() as usize).copied().unwrap_or(0);
+        if index == 0 {
+            panic!("internal error: couldn't fetch the jump table index for the return basic block");
+        }
+
+        index * VM_CODE_ADDRESS_ALIGNMENT
+    }
+
+    fn indirect_jump_or_call(&mut self, ra: Option<Reg>, base: Reg, offset: u32) {
+        let return_address = ra.map(|ra| (ra, self.get_return_address()));
+        match self.sandbox_kind {
+            SandboxKind::Linux => {
+                use polkavm_assembler::amd64::{SegReg, Scale};
+
+                let target = if offset != 0 || ra == Some(base) {
+                    self.push(lea(RegSize::R32, TMP_REG, reg_indirect(RegSize::R32, conv_reg(base) + offset as i32)));
+                    TMP_REG
+                } else {
+                    conv_reg(base)
+                };
+
+                if let Some((return_register, return_address)) = return_address {
+                    self.load_immediate(return_register, return_address);
+                }
+
+                self.asm.push(jmp(MemOp::IndexScaleOffset(Some(SegReg::gs), RegSize::R64, target, Scale::x8, 0)));
+            },
+            SandboxKind::Generic => {
+                // TODO: This also could be more efficient.
+                self.push(lea_rip_label(TMP_REG, self.jump_table_label));
+                self.push(push(conv_reg(base)));
+                self.push(shl_imm(RegSize::R64, conv_reg(base), 3));
+                if offset > 0 {
+                    let offset = offset.wrapping_mul(8);
+                    self.push(add((conv_reg(base), imm32(offset))));
+                }
+                self.push(add((RegSize::R64, TMP_REG, conv_reg(base))));
+                self.push(pop(conv_reg(base)));
+                self.push(load(LoadKind::U64, TMP_REG, reg_indirect(RegSize::R64, TMP_REG)));
+
+                if let Some((return_register, return_address)) = return_address {
+                    self.load_immediate(return_register, return_address);
+                }
+
+                self.push(jmp(TMP_REG));
+            }
+        }
+
+        self.start_new_basic_block();
+    }
 }
 
 impl<'a> InstructionVisitor for VisitorWrapper<'a, Compiler<'a>> {
     type ReturnTy = ();
 
+    #[inline(always)]
     fn trap(&mut self) -> Self::ReturnTy {
         let trap_label = self.trap_label;
         self.push(jmp_label32(trap_label));
         self.start_new_basic_block();
     }
 
+    #[inline(always)]
     fn fallthrough(&mut self) -> Self::ReturnTy {
         self.start_new_basic_block();
     }
 
+    #[inline(always)]
     fn ecalli(&mut self, imm: u32) -> Self::ReturnTy {
         let ecall_label = self.ecall_label;
         self.push(mov_imm(TMP_REG, imm32(imm)));
         self.push(call_label32(ecall_label));
     }
 
-    fn set_less_than_unsigned(&mut self, dst: Reg, s1: Reg, s2: Reg) -> Self::ReturnTy {
-        self.set_less_than(dst, s1, s2, Signedness::Unsigned);
+    #[inline(always)]
+    fn set_less_than_unsigned(&mut self, d: Reg, s1: Reg, s2: Reg) -> Self::ReturnTy {
+        self.compare_reg_reg(d, s1, s2, Condition::Below);
     }
 
-    fn set_less_than_signed(&mut self, dst: Reg, s1: Reg, s2: Reg) -> Self::ReturnTy {
-        self.set_less_than(dst, s1, s2, Signedness::Signed);
+    #[inline(always)]
+    fn set_less_than_unsigned_imm(&mut self, d: Reg, s1: Reg, s2: u32) -> Self::ReturnTy {
+        self.compare_reg_imm(d, s1, s2, Condition::Below);
     }
 
+    #[inline(always)]
+    fn set_greater_than_unsigned_imm(&mut self, d: Reg, s1: Reg, s2: u32) -> Self::ReturnTy {
+        self.compare_reg_imm(d, s1, s2, Condition::Above);
+    }
+
+    #[inline(always)]
+    fn set_less_than_signed(&mut self, d: Reg, s1: Reg, s2: Reg) -> Self::ReturnTy {
+        self.compare_reg_reg(d, s1, s2, Condition::Less);
+    }
+
+    #[inline(always)]
+    fn set_less_than_signed_imm(&mut self, d: Reg, s1: Reg, s2: u32) -> Self::ReturnTy {
+        self.compare_reg_imm(d, s1, s2, Condition::Less);
+    }
+
+    #[inline(always)]
+    fn set_greater_than_signed_imm(&mut self, d: Reg, s1: Reg, s2: u32) -> Self::ReturnTy {
+        self.compare_reg_imm(d, s1, s2, Condition::Greater);
+    }
+
+    #[inline(always)]
     fn shift_logical_right(&mut self, d: Reg, s1: Reg, s2: Reg) -> Self::ReturnTy {
         self.shift(d, s1, s2, ShiftKind::LogicalRight);
     }
 
+    #[inline(always)]
     fn shift_arithmetic_right(&mut self, d: Reg, s1: Reg, s2: Reg) -> Self::ReturnTy {
         self.shift(d, s1, s2, ShiftKind::ArithmeticRight);
     }
 
+    #[inline(always)]
     fn shift_logical_left(&mut self, d: Reg, s1: Reg, s2: Reg) -> Self::ReturnTy {
         self.shift(d, s1, s2, ShiftKind::LogicalLeft);
     }
 
+    #[inline(always)]
+    fn shift_logical_right_imm_alt(&mut self, d: Reg, s2: Reg, s1: u32) -> Self::ReturnTy {
+        self.shift(d, s1, s2, ShiftKind::LogicalRight);
+    }
+
+    #[inline(always)]
+    fn shift_arithmetic_right_imm_alt(&mut self, d: Reg, s2: Reg, s1: u32) -> Self::ReturnTy  {
+        self.shift(d, s1, s2, ShiftKind::ArithmeticRight);
+    }
+
+    #[inline(always)]
+    fn shift_logical_left_imm_alt(&mut self, d: Reg, s2: Reg, s1: u32) -> Self::ReturnTy  {
+        self.shift(d, s1, s2, ShiftKind::LogicalLeft);
+    }
+
+    #[inline(always)]
     fn xor(&mut self, d: Reg, s1: Reg, s2: Reg) -> Self::ReturnTy {
         let reg_size = self.reg_size();
         match (d, s1, s2) {
-            // 0 = s1 ^ s2
-            (Z, _, _) => self.nop(),
-            // d = s ^ s
-            (_, _, _) if s1 == s2 => self.clear_reg(d),
-            // d = 0 ^ d
-            (_, Z, _) if d == s2 => self.nop(),
-            // d = 0 ^ s2
-            (_, Z, _) => self.mov(d, s2),
-            // d = d ^ 0
-            (_, _, Z) if d == s1 => self.nop(),
-            // d = s1 ^ 0
-            (_, _, Z) => self.mov(d, s1),
             // d = d ^ s2
             (_, _, _) if d == s1 => self.push(xor((reg_size, conv_reg(d), conv_reg(s2)))),
             // d = s1 ^ d
@@ -760,19 +722,10 @@ impl<'a> InstructionVisitor for VisitorWrapper<'a, Compiler<'a>> {
         }
     }
 
+    #[inline(always)]
     fn and(&mut self, d: Reg, s1: Reg, s2: Reg) -> Self::ReturnTy {
         let reg_size = self.reg_size();
         match (d, s1, s2) {
-            // 0 = s1 & s2
-            (Z, _, _) => self.nop(),
-            // d = 0 & s2
-            (_, Z, _) => self.clear_reg(d),
-            // d = s1 & 0
-            (_, _, Z) => self.clear_reg(d),
-            // d = d & d
-            (_, _, _) if d == s1 && d == s2 => self.nop(),
-            // d = s & s
-            (_, _, _) if s1 == s2 => self.mov(d, s1),
             // d = d & s2
             (_, _, _) if d == s1 => self.push(and((reg_size, conv_reg(d), conv_reg(s2)))),
             // d = s1 & d
@@ -785,25 +738,10 @@ impl<'a> InstructionVisitor for VisitorWrapper<'a, Compiler<'a>> {
         }
     }
 
+    #[inline(always)]
     fn or(&mut self, d: Reg, s1: Reg, s2: Reg) -> Self::ReturnTy {
         let reg_size = self.reg_size();
         match (d, s1, s2) {
-            // 0 = s1 | s2
-            (Z, _, _) => self.nop(),
-            // d = 0 | 0
-            (_, Z, Z) => self.clear_reg(d),
-            // d = 0 | d
-            (_, Z, _) if d == s2 => self.nop(),
-            // d = 0 | s2
-            (_, Z, _) => self.mov(d, s2),
-            // d = d | 0
-            (_, _, Z) if d == s1 => self.nop(),
-            // d = s1 | 0
-            (_, _, Z) => self.mov(d, s1),
-            // d = d | d
-            (_, _, _) if d == s1 && d == s2 => self.nop(),
-            // d = s | s
-            (_, _, _) if s1 == s2 => self.mov(d, s1),
             // d = d | s2
             (_, _, _) if d == s1 => self.push(or((reg_size, conv_reg(d), conv_reg(s2)))),
             // d = s1 | d
@@ -816,21 +754,10 @@ impl<'a> InstructionVisitor for VisitorWrapper<'a, Compiler<'a>> {
         }
     }
 
+    #[inline(always)]
     fn add(&mut self, d: Reg, s1: Reg, s2: Reg) -> Self::ReturnTy {
         let reg_size = self.reg_size();
         match (d, s1, s2) {
-            // 0 = s1 + s2
-            (Z, _, _) => self.nop(),
-            // d = 0 + 0
-            (_, Z, Z) => self.clear_reg(d),
-            // d = 0 + d
-            (_, Z, _) if d == s2 => self.nop(),
-            // d = 0 + s2
-            (_, Z, _) => self.mov(d, s2),
-            // d = d + 0
-            (_, _, Z) if d == s1 => self.nop(),
-            // d = s1 + 0
-            (_, _, Z) => self.mov(d, s1),
             // d = d + s2
             (_, _, _) if d == s1 => self.push(add((reg_size, conv_reg(d), conv_reg(s2)))),
             // d = s1 + d
@@ -845,26 +772,10 @@ impl<'a> InstructionVisitor for VisitorWrapper<'a, Compiler<'a>> {
         }
     }
 
+    #[inline(always)]
     fn sub(&mut self, d: Reg, s1: Reg, s2: Reg) -> Self::ReturnTy {
         let reg_size = self.reg_size();
         match (d, s1, s2) {
-            // 0 = s1 - s2
-            (Z, _, _) => self.nop(),
-            // d = s - s
-            (_, _, _) if s1 == s2 => self.clear_reg(d),
-            // d = 0 - d
-            (_, Z, _) if d == s2 => self.push(neg(reg_size, conv_reg(d))),
-            // d = 0 - s2
-            (_, Z, _) => {
-                self.mov(d, s2);
-                self.push(neg(reg_size, conv_reg(d)));
-            }
-            // d = d - 0
-            (_, _, Z) if d == s1 => self.nop(),
-            // d = s1 - 0
-            (_, _, Z) => self.mov(d, s1),
-            // d = d - d
-            (_, _, _) if d == s1 && d == s2 => self.clear_reg(d),
             // d = d - s2
             (_, _, _) if d == s1 => self.push(sub((reg_size, conv_reg(d), conv_reg(s2)))),
             // d = s1 - d
@@ -880,72 +791,93 @@ impl<'a> InstructionVisitor for VisitorWrapper<'a, Compiler<'a>> {
         }
     }
 
+    #[inline(always)]
+    fn negate_and_add_imm(&mut self, d: Reg, s1: Reg, s2: u32) -> Self::ReturnTy {
+        if d == s1 {
+            // d = -d + s2
+            self.push(neg(RegSize::R32, conv_reg(d)));
+            if s2 != 0 {
+                self.push(add((conv_reg(d), imm32(s2))));
+            }
+        } else {
+            // d = -s1 + s2  =>  d = s2 - s1
+            if s2 == 0 {
+                self.mov(d, s1);
+                self.push(neg(RegSize::R32, conv_reg(d)));
+            } else {
+                self.push(mov_imm(conv_reg(d), imm32(s2)));
+                self.push(sub((RegSize::R32, conv_reg(d), conv_reg(s1))));
+            }
+        }
+    }
+
+    #[inline(always)]
     fn mul(&mut self, d: Reg, s1: Reg, s2: Reg) -> Self::ReturnTy {
         let reg_size = self.reg_size();
-        match (d, s1, s2) {
-            // 0 = s1 * s2
-            (Z, _, _) => self.nop(),
-            // d = 0 * s2
-            (_, Z, _) => self.clear_reg(d),
-            // d = s1 * 0
-            (_, _, Z) => self.clear_reg(d),
+        if d == s1 {
             // d = d * s2
-            (_, _, _) if d == s1 => self.push(imul(reg_size, conv_reg(d), conv_reg(s2))),
+            self.push(imul(reg_size, conv_reg(d), conv_reg(s2)))
+        } else if d == s2 {
             // d = s1 * d
-            (_, _, _) if d == s2 => self.push(imul(reg_size, conv_reg(d), conv_reg(s1))),
+            self.push(imul(reg_size, conv_reg(d), conv_reg(s1)))
+        } else {
             // d = s1 * s2
-            _ => {
-                self.mov(d, s1);
-                self.push(imul(reg_size, conv_reg(d), conv_reg(s2)));
-            }
+            self.mov(d, s1);
+            self.push(imul(reg_size, conv_reg(d), conv_reg(s2)));
         }
     }
 
+    #[inline(always)]
+    fn mul_imm(&mut self, d: Reg, s1: Reg, s2: u32) -> Self::ReturnTy {
+        self.push(imul_imm(RegSize::R32, conv_reg(d), conv_reg(s1), s2 as i32));
+    }
+
+    #[inline(always)]
     fn mul_upper_signed_signed(&mut self, d: Reg, s1: Reg, s2: Reg) -> Self::ReturnTy {
-        match (d, s1, s2) {
-            // 0 = s1 * s2
-            (Z, _, _) => self.nop(),
-            // d = 0 * s2
-            (_, Z, _) => self.clear_reg(d),
-            // d = s1 * 0
-            (_, _, Z) => self.clear_reg(d),
-            // d = s1 * s2
-            _ => {
-                self.push(movsxd_32_to_64(TMP_REG, conv_reg(s2)));
-                self.push(movsxd_32_to_64(conv_reg(d), conv_reg(s1)));
-                self.push(imul(RegSize::R64, conv_reg(d), TMP_REG));
-                self.push(shr_imm(RegSize::R64, conv_reg(d), 32));
-            }
-        }
+        self.push(movsxd_32_to_64(TMP_REG, conv_reg(s2)));
+        self.push(movsxd_32_to_64(conv_reg(d), conv_reg(s1)));
+        self.push(imul(RegSize::R64, conv_reg(d), TMP_REG));
+        self.push(shr_imm(RegSize::R64, conv_reg(d), 32));
     }
 
+    #[inline(always)]
+    fn mul_upper_signed_signed_imm(&mut self, d: Reg, s1: Reg, s2: u32) -> Self::ReturnTy {
+        self.push(mov_imm(TMP_REG, imm64(s2 as i32)));
+        self.push(movsxd_32_to_64(conv_reg(d), conv_reg(s1)));
+        self.push(imul(RegSize::R64, conv_reg(d), TMP_REG));
+        self.push(shr_imm(RegSize::R64, conv_reg(d), 32));
+    }
+
+    #[inline(always)]
     fn mul_upper_unsigned_unsigned(&mut self, d: Reg, s1: Reg, s2: Reg) -> Self::ReturnTy {
-        match (d, s1, s2) {
-            // 0 = s1 * s2
-            (Z, _, _) => self.nop(),
-            // d = 0 * s2
-            (_, Z, _) => self.clear_reg(d),
-            // d = s1 * 0
-            (_, _, Z) => self.clear_reg(d),
+        if d == s1 {
             // d = d * s2
-            (_, _, _) if d == s1 => {
-                self.push(imul(RegSize::R64, conv_reg(d), conv_reg(s2)));
-                self.push(shr_imm(RegSize::R64, conv_reg(d), 32));
-            }
+            self.push(imul(RegSize::R64, conv_reg(d), conv_reg(s2)));
+            self.push(shr_imm(RegSize::R64, conv_reg(d), 32));
+        } else if d == s2 {
             // d = s1 * d
-            (_, _, _) if d == s2 => {
-                self.push(imul(RegSize::R64, conv_reg(d), conv_reg(s1)));
-                self.push(shr_imm(RegSize::R64, conv_reg(d), 32));
-            }
+            self.push(imul(RegSize::R64, conv_reg(d), conv_reg(s1)));
+            self.push(shr_imm(RegSize::R64, conv_reg(d), 32));
+        } else {
             // d = s1 * s2
-            _ => {
-                self.push(mov(RegSize::R32, conv_reg(d), conv_reg(s1)));
-                self.push(imul(RegSize::R64, conv_reg(d), conv_reg(s2)));
-                self.push(shr_imm(RegSize::R64, conv_reg(d), 32));
-            }
+            self.push(mov(RegSize::R32, conv_reg(d), conv_reg(s1)));
+            self.push(imul(RegSize::R64, conv_reg(d), conv_reg(s2)));
+            self.push(shr_imm(RegSize::R64, conv_reg(d), 32));
         }
     }
 
+    #[inline(always)]
+    fn mul_upper_unsigned_unsigned_imm(&mut self, d: Reg, s1: Reg, s2: u32) -> Self::ReturnTy {
+        self.push(mov_imm(TMP_REG, imm32(s2)));
+        if d != s1 {
+            self.push(mov(RegSize::R32, conv_reg(d), conv_reg(s1)));
+        }
+
+        self.push(imul(RegSize::R64, conv_reg(d), TMP_REG));
+        self.push(shr_imm(RegSize::R64, conv_reg(d), 32));
+    }
+
+    #[inline(always)]
     fn mul_upper_signed_unsigned(&mut self, d: Reg, s1: Reg, s2: Reg) -> Self::ReturnTy {
         // This instruction is equivalent to:
         //   let s1: i32;
@@ -959,258 +891,332 @@ impl<'a> InstructionVisitor for VisitorWrapper<'a, Compiler<'a>> {
         //   2) zero-extend the s2 to 64-bits,
         //   3) multiply,
         //   4) return the upper 32-bits.
-        match (d, s1, s2) {
-            // 0 = s1 * s2
-            (Z, _, _) => self.nop(),
-            // d = 0 * s2
-            (_, Z, _) => self.clear_reg(d),
-            // d = s1 * 0
-            (_, _, Z) => self.clear_reg(d),
+
+        if d == s2 {
             // d = s1 * d
-            (_, _, _) if d == s2 => {
-                self.push(mov(RegSize::R32, TMP_REG, conv_reg(s2)));
-                self.push(movsxd_32_to_64(conv_reg(d), conv_reg(s1)));
-                self.push(imul(RegSize::R64, conv_reg(d), TMP_REG));
-                self.push(shr_imm(RegSize::R64, conv_reg(d), 32));
-            }
+            self.push(mov(RegSize::R32, TMP_REG, conv_reg(s2)));
+            self.push(movsxd_32_to_64(conv_reg(d), conv_reg(s1)));
+            self.push(imul(RegSize::R64, conv_reg(d), TMP_REG));
+            self.push(shr_imm(RegSize::R64, conv_reg(d), 32));
+        } else {
             // d = s1 * s2
-            _ => {
-                self.push(movsxd_32_to_64(conv_reg(d), conv_reg(s1)));
-                self.push(imul(RegSize::R64, conv_reg(d), conv_reg(s2)));
-                self.push(shr_imm(RegSize::R64, conv_reg(d), 32));
-            }
+            self.push(movsxd_32_to_64(conv_reg(d), conv_reg(s1)));
+            self.push(imul(RegSize::R64, conv_reg(d), conv_reg(s2)));
+            self.push(shr_imm(RegSize::R64, conv_reg(d), 32));
         }
     }
 
+    #[inline(always)]
     fn div_unsigned(&mut self, d: Reg, s1: Reg, s2: Reg) -> Self::ReturnTy {
         self.div_rem(d, s1, s2, DivRem::Div, Signedness::Unsigned);
     }
 
+    #[inline(always)]
     fn div_signed(&mut self, d: Reg, s1: Reg, s2: Reg) -> Self::ReturnTy {
         self.div_rem(d, s1, s2, DivRem::Div, Signedness::Signed);
     }
 
+    #[inline(always)]
     fn rem_unsigned(&mut self, d: Reg, s1: Reg, s2: Reg) -> Self::ReturnTy {
         self.div_rem(d, s1, s2, DivRem::Rem, Signedness::Unsigned);
     }
 
+    #[inline(always)]
     fn rem_signed(&mut self, d: Reg, s1: Reg, s2: Reg) -> Self::ReturnTy {
         self.div_rem(d, s1, s2, DivRem::Rem, Signedness::Signed);
     }
 
-    fn set_less_than_unsigned_imm(&mut self, dst: Reg, src: Reg, imm: u32) -> Self::ReturnTy {
-        self.set_less_than_imm(dst, src, imm, Signedness::Unsigned);
+    #[inline(always)]
+    fn shift_logical_right_imm(&mut self, d: Reg, s1: Reg, s2: u32) -> Self::ReturnTy {
+        self.shift_imm(d, s1, s2, ShiftKind::LogicalRight);
     }
 
-    fn set_less_than_signed_imm(&mut self, dst: Reg, src: Reg, imm: u32) -> Self::ReturnTy {
-        self.set_less_than_imm(dst, src, imm, Signedness::Signed);
+    #[inline(always)]
+    fn shift_arithmetic_right_imm(&mut self, d: Reg, s1: Reg, s2: u32) -> Self::ReturnTy {
+        self.shift_imm(d, s1, s2, ShiftKind::ArithmeticRight);
     }
 
-    fn shift_logical_right_imm(&mut self, d: Reg, s: Reg, imm: u32) -> Self::ReturnTy {
-        self.shift_imm(d, s, imm, ShiftKind::LogicalRight);
+    #[inline(always)]
+    fn shift_logical_left_imm(&mut self, d: Reg, s1: Reg, s2: u32) -> Self::ReturnTy {
+        self.shift_imm(d, s1, s2, ShiftKind::LogicalLeft);
     }
 
-    fn shift_arithmetic_right_imm(&mut self, d: Reg, s: Reg, imm: u32) -> Self::ReturnTy {
-        self.shift_imm(d, s, imm, ShiftKind::ArithmeticRight);
-    }
-
-    fn shift_logical_left_imm(&mut self, d: Reg, s: Reg, imm: u32) -> Self::ReturnTy {
-        self.shift_imm(d, s, imm, ShiftKind::LogicalLeft);
-    }
-
-    fn or_imm(&mut self, d: Reg, s: Reg, imm: u32) -> Self::ReturnTy {
-        match (d, s, imm) {
-            // 0 = s | imm
-            (Z, _, _) => self.nop(),
-            // d = 0 | imm
-            (_, Z, _) => self.load_imm(d, imm),
-            // d = d | imm
-            (_, _, _) if d == s => self.push(or((conv_reg(d), imm32(imm)))),
-            // d = s | imm
-            (_, _, _) => {
-                self.mov(d, s);
-                self.push(or((conv_reg(d), imm32(imm))));
-            }
+    #[inline(always)]
+    fn or_imm(&mut self, d: Reg, s1: Reg, s2: u32) -> Self::ReturnTy {
+        if d != s1 {
+            self.mov(d, s1);
         }
+
+        // d = s1 | s2
+        self.push(or((conv_reg(d), imm32(s2))));
     }
 
-    fn and_imm(&mut self, d: Reg, s: Reg, imm: u32) -> Self::ReturnTy {
-        match (d, s, imm) {
-            // 0 = s & imm
-            (Z, _, _) => self.nop(),
-            // d = 0 & imm
-            (_, Z, _) => self.clear_reg(d),
-            // d = d & imm
-            (_, _, _) if d == s => self.push(and((conv_reg(d), imm32(imm)))),
-            // d = s & imm
-            (_, _, _) => {
-                self.mov(d, s);
-                self.push(and((conv_reg(d), imm32(imm))));
-            }
+    #[inline(always)]
+    fn and_imm(&mut self, d: Reg, s1: Reg, s2: u32) -> Self::ReturnTy {
+        if d != s1 {
+            self.mov(d, s1);
         }
+
+        // d = s1 & s2
+        self.push(and((conv_reg(d), imm32(s2))));
     }
 
-    fn xor_imm(&mut self, d: Reg, s: Reg, imm: u32) -> Self::ReturnTy {
+    #[inline(always)]
+    fn xor_imm(&mut self, d: Reg, s1: Reg, s2: u32) -> Self::ReturnTy {
         let reg_size = self.reg_size();
-        match (d, s, imm) {
-            // 0 = s ^ imm
-            (Z, _, _) => self.nop(),
-            // d = 0 ^ imm
-            (_, Z, _) => self.load_imm(d, imm),
-            // d = d ^ 0xfffffff
-            (_, _, _) if d == s && imm == !0 => self.push(not(reg_size, conv_reg(d))),
-            // d = s ^ 0xfffffff
-            (_, _, _) if imm == !0 => {
-                self.mov(d, s);
-                self.push(not(reg_size, conv_reg(d)))
-            }
-            // d = d ^ imm
-            (_, _, _) if d == s => self.push(xor((conv_reg(d), imm32(imm)))),
-            // d = s ^ imm
-            (_, _, _) => {
-                self.mov(d, s);
-                self.push(xor((conv_reg(d), imm32(imm))));
-            }
+        if d != s1 {
+            self.mov(d, s1);
+        }
+
+        if s2 != !0 {
+            // d = s1 ^ s2
+            self.push(xor((conv_reg(d), imm32(s2))));
+        } else {
+            // d = s1 ^ 0xfffffff
+            self.push(not(reg_size, conv_reg(d)));
         }
     }
 
-    fn add_imm(&mut self, d: Reg, s: Reg, imm: u32) -> Self::ReturnTy {
+    #[inline(always)]
+    fn load_imm(&mut self, dst: Reg, s2: u32) -> Self::ReturnTy {
+        self.load_immediate(dst, s2);
+    }
+
+    #[inline(always)]
+    fn move_reg(&mut self, d: Reg, s: Reg) -> Self::ReturnTy {
+        self.mov(d, s);
+    }
+
+    #[inline(always)]
+    fn add_imm(&mut self, d: Reg, s1: Reg, s2: u32) -> Self::ReturnTy {
         let reg_size = self.reg_size();
-        match (d, s, imm) {
-            // 0 = s + imm
-            (Z, _, _) => self.nop(),
-            // d = 0 + imm
-            (_, Z, _) => self.load_imm(d, imm),
-            // d = s + 0
-            (_, _, 0) => self.mov(d, s),
+        let d = conv_reg(d);
+        let s1 = conv_reg(s1);
+        match (d, s1, s2) {
             // d = d + 1
-            (_, _, 1) if d == s => self.push(inc(reg_size, conv_reg(d))),
-            // d = d + imm
-            (_, _, _) if d == s => self.push(add((conv_reg(d), imm32(imm)))),
-            // d = s + imm
+            (_, _, 1) if d == s1 => self.push(inc(reg_size, d)),
+            // d = d + s2
+            (_, _, _) if d == s1 => self.push(add((d, imm32(s2)))),
+            // d = s1 + s2
             (_, _, _) => {
-                self.push(lea(reg_size, conv_reg(d), reg_indirect(reg_size, conv_reg(s) + imm as i32)));
+                self.push(lea(reg_size, d, reg_indirect(reg_size, s1 + s2 as i32)));
             }
         }
     }
 
-    fn store_u8(&mut self, src: Reg, base: Reg, offset: u32) -> Self::ReturnTy {
-        self.store(src, base, offset, Size::U8);
+    #[inline(always)]
+    fn store_u8(&mut self, src: Reg, offset: u32) -> Self::ReturnTy {
+        self.store(src, None, offset, Size::U8);
     }
 
-    fn store_u16(&mut self, src: Reg, base: Reg, offset: u32) -> Self::ReturnTy {
-        self.store(src, base, offset, Size::U16);
+    #[inline(always)]
+    fn store_u16(&mut self, src: Reg, offset: u32) -> Self::ReturnTy {
+        self.store(src, None, offset, Size::U16);
     }
 
-    fn store_u32(&mut self, src: Reg, base: Reg, offset: u32) -> Self::ReturnTy {
-        self.store(src, base, offset, Size::U32);
+    #[inline(always)]
+    fn store_u32(&mut self, src: Reg, offset: u32) -> Self::ReturnTy {
+        self.store(src, None, offset, Size::U32);
     }
 
-    fn load_u8(&mut self, dst: Reg, base: Reg, offset: u32) -> Self::ReturnTy {
-        self.load(dst, base, offset, LoadKind::U8);
+    #[inline(always)]
+    fn store_indirect_u8(&mut self, src: Reg, base: Reg, offset: u32) -> Self::ReturnTy {
+        self.store(src, Some(base), offset, Size::U8);
     }
 
-    fn load_i8(&mut self, dst: Reg, base: Reg, offset: u32) -> Self::ReturnTy {
-        self.load(dst, base, offset, LoadKind::I8);
+    #[inline(always)]
+    fn store_indirect_u16(&mut self, src: Reg, base: Reg, offset: u32) -> Self::ReturnTy {
+        self.store(src, Some(base), offset, Size::U16);
     }
 
-    fn load_u16(&mut self, dst: Reg, base: Reg, offset: u32) -> Self::ReturnTy {
-        self.load(dst, base, offset, LoadKind::U16);
+    #[inline(always)]
+    fn store_indirect_u32(&mut self, src: Reg, base: Reg, offset: u32) -> Self::ReturnTy {
+        self.store(src, Some(base), offset, Size::U32);
     }
 
-    fn load_i16(&mut self, dst: Reg, base: Reg, offset: u32) -> Self::ReturnTy {
-        self.load(dst, base, offset, LoadKind::I16);
+    #[inline(always)]
+    fn store_imm_indirect_u8(&mut self, base: Reg, offset: u32, value: u32) -> Self::ReturnTy {
+        self.store(value, Some(base), offset, Size::U8);
     }
 
-    fn load_u32(&mut self, dst: Reg, base: Reg, offset: u32) -> Self::ReturnTy {
-        self.load(dst, base, offset, LoadKind::U32);
+    #[inline(always)]
+    fn store_imm_indirect_u16(&mut self, base: Reg, offset: u32, value: u32) -> Self::ReturnTy {
+        self.store(value, Some(base), offset, Size::U16);
     }
 
-    fn branch_less_unsigned(&mut self, s1: Reg, s2: Reg, imm: u32) -> Self::ReturnTy {
-        self.branch(s1, s2, imm, Condition::Below);
+    #[inline(always)]
+    fn store_imm_indirect_u32(&mut self, base: Reg, offset: u32, value: u32) -> Self::ReturnTy {
+        self.store(value, Some(base), offset, Size::U32);
     }
 
-    fn branch_less_signed(&mut self, s1: Reg, s2: Reg, imm: u32) -> Self::ReturnTy {
-        self.branch(s1, s2, imm, Condition::Less);
+    #[inline(always)]
+    fn store_imm_u8(&mut self, value: u32, offset: u32) -> Self::ReturnTy {
+        self.store(value, None, offset, Size::U8);
     }
 
-    fn branch_greater_or_equal_unsigned(&mut self, s1: Reg, s2: Reg, imm: u32) -> Self::ReturnTy {
-        self.branch(s1, s2, imm, Condition::AboveOrEqual);
+    #[inline(always)]
+    fn store_imm_u16(&mut self, value: u32, offset: u32) -> Self::ReturnTy {
+        self.store(value, None, offset, Size::U16);
     }
 
-    fn branch_greater_or_equal_signed(&mut self, s1: Reg, s2: Reg, imm: u32) -> Self::ReturnTy {
-        self.branch(s1, s2, imm, Condition::GreaterOrEqual);
+    #[inline(always)]
+    fn store_imm_u32(&mut self, value: u32, offset: u32) -> Self::ReturnTy {
+        self.store(value, None, offset, Size::U32);
     }
 
-    fn branch_eq(&mut self, s1: Reg, s2: Reg, imm: u32) -> Self::ReturnTy {
-        self.branch(s1, s2, imm, Condition::Equal);
+    #[inline(always)]
+    fn load_indirect_u8(&mut self, dst: Reg, base: Reg, offset: u32) -> Self::ReturnTy {
+        self.load(dst, Some(base), offset, LoadKind::U8);
     }
 
-    fn branch_not_eq(&mut self, s1: Reg, s2: Reg, imm: u32) -> Self::ReturnTy {
-        self.branch(s1, s2, imm, Condition::NotEqual);
+    #[inline(always)]
+    fn load_indirect_i8(&mut self, dst: Reg, base: Reg, offset: u32) -> Self::ReturnTy {
+        self.load(dst, Some(base), offset, LoadKind::I8);
     }
 
-    fn jump_and_link_register(&mut self, ra: Reg, base: Reg, offset: u32) -> Self::ReturnTy {
-        let return_address = if ra != Reg::Zero {
-            let index = self.jump_table_index_by_basic_block.get(&self.next_basic_block())
-                .copied()
-                .expect("internal error: couldn't fetch the jump table index for the return basic block");
+    #[inline(always)]
+    fn load_indirect_u16(&mut self, dst: Reg, base: Reg, offset: u32) -> Self::ReturnTy {
+        self.load(dst, Some(base), offset, LoadKind::U16);
+    }
 
-            Some(index * VM_CODE_ADDRESS_ALIGNMENT)
-        } else {
-            None
-        };
+    #[inline(always)]
+    fn load_indirect_i16(&mut self, dst: Reg, base: Reg, offset: u32) -> Self::ReturnTy {
+        self.load(dst, Some(base), offset, LoadKind::I16);
+    }
 
-        if base == Reg::Zero {
-            // A static jump.
-            let label = self.get_or_forward_declare_label(offset);
-            if let Some(return_address) = return_address {
-                self.load_imm(ra, return_address);
-            }
+    #[inline(always)]
+    fn load_indirect_u32(&mut self, dst: Reg, base: Reg, offset: u32) -> Self::ReturnTy {
+        self.load(dst, Some(base), offset, LoadKind::U32);
+    }
 
-            self.jump_to_label(label);
-        } else {
-            // A dynamic jump.
-            match self.sandbox_kind {
-                SandboxKind::Linux => {
-                    use polkavm_assembler::amd64::{SegReg, Scale};
+    #[inline(always)]
+    fn load_u8(&mut self, dst: Reg, offset: u32) -> Self::ReturnTy {
+        self.load(dst, None, offset, LoadKind::U8);
+    }
 
-                    let target = if offset != 0 || ra == base {
-                        self.push(lea(RegSize::R32, TMP_REG, reg_indirect(RegSize::R32, conv_reg(base) + offset as i32)));
-                        TMP_REG
-                    } else {
-                        conv_reg(base)
-                    };
+    #[inline(always)]
+    fn load_i8(&mut self, dst: Reg, offset: u32) -> Self::ReturnTy {
+        self.load(dst, None, offset, LoadKind::I8);
+    }
 
-                    if let Some(return_address) = return_address {
-                        self.load_imm(ra, return_address);
-                    }
+    #[inline(always)]
+    fn load_u16(&mut self, dst: Reg, offset: u32) -> Self::ReturnTy {
+        self.load(dst, None, offset, LoadKind::U16);
+    }
 
-                    self.asm.push(jmp(MemOp::IndexScaleOffset(Some(SegReg::gs), RegSize::R64, target, Scale::x8, 0)));
-                },
-                SandboxKind::Generic => {
-                    // // TODO: This also could be more efficient.
-                    let jump_table_label = self.jump_table_label;
-                    self.push(lea_rip_label(TMP_REG, jump_table_label));
-                    self.push(push(conv_reg(base)));
-                    self.push(shl_imm(RegSize::R64, conv_reg(base), 3));
-                    if offset > 0 {
-                        let offset = offset.wrapping_mul(8);
-                        self.push(add((conv_reg(base), imm32(offset))));
-                    }
-                    self.push(add((RegSize::R64, TMP_REG, conv_reg(base))));
-                    self.push(pop(conv_reg(base)));
-                    self.push(load(LoadKind::U64, TMP_REG, reg_indirect(RegSize::R64, TMP_REG)));
+    #[inline(always)]
+    fn load_i16(&mut self, dst: Reg, offset: u32) -> Self::ReturnTy {
+        self.load(dst, None, offset, LoadKind::I16);
+    }
 
-                    if let Some(return_address) = return_address {
-                        self.load_imm(ra, return_address);
-                    }
+    #[inline(always)]
+    fn load_u32(&mut self, dst: Reg, offset: u32) -> Self::ReturnTy {
+        self.load(dst, None, offset, LoadKind::U32);
+    }
 
-                    self.push(jmp(TMP_REG));
-                }
-            }
-        }
+    #[inline(always)]
+    fn branch_less_unsigned(&mut self, s1: Reg, s2: Reg, target: u32) -> Self::ReturnTy {
+        self.branch(s1, s2, target, Condition::Below);
+    }
 
+    #[inline(always)]
+    fn branch_less_signed(&mut self, s1: Reg, s2: Reg, target: u32) -> Self::ReturnTy {
+        self.branch(s1, s2, target, Condition::Less);
+    }
+
+    #[inline(always)]
+    fn branch_greater_or_equal_unsigned(&mut self, s1: Reg, s2: Reg, target: u32) -> Self::ReturnTy {
+        self.branch(s1, s2, target, Condition::AboveOrEqual);
+    }
+
+    #[inline(always)]
+    fn branch_greater_or_equal_signed(&mut self, s1: Reg, s2: Reg, target: u32) -> Self::ReturnTy {
+        self.branch(s1, s2, target, Condition::GreaterOrEqual);
+    }
+
+    #[inline(always)]
+    fn branch_eq(&mut self, s1: Reg, s2: Reg, target: u32) -> Self::ReturnTy {
+        self.branch(s1, s2, target, Condition::Equal);
+    }
+
+    #[inline(always)]
+    fn branch_not_eq(&mut self, s1: Reg, s2: Reg, target: u32) -> Self::ReturnTy {
+        self.branch(s1, s2, target, Condition::NotEqual);
+    }
+
+    #[inline(always)]
+    fn branch_eq_imm(&mut self, s1: Reg, s2: u32, target: u32) -> Self::ReturnTy {
+        self.branch(s1, s2, target, Condition::Equal);
+    }
+
+    #[inline(always)]
+    fn branch_not_eq_imm(&mut self, s1: Reg, s2: u32, target: u32) -> Self::ReturnTy {
+        self.branch(s1, s2, target, Condition::NotEqual);
+    }
+
+    #[inline(always)]
+    fn branch_less_unsigned_imm(&mut self, s1: Reg, s2: u32, target: u32) -> Self::ReturnTy {
+        self.branch(s1, s2, target, Condition::Below);
+    }
+
+    #[inline(always)]
+    fn branch_less_signed_imm(&mut self, s1: Reg, s2: u32, target: u32) -> Self::ReturnTy {
+        self.branch(s1, s2, target, Condition::Less);
+    }
+
+    #[inline(always)]
+    fn branch_greater_or_equal_unsigned_imm(&mut self, s1: Reg, s2: u32, target: u32) -> Self::ReturnTy {
+        self.branch(s1, s2, target, Condition::AboveOrEqual);
+    }
+
+    #[inline(always)]
+    fn branch_greater_or_equal_signed_imm(&mut self, s1: Reg, s2: u32, target: u32) -> Self::ReturnTy {
+        self.branch(s1, s2, target, Condition::GreaterOrEqual);
+    }
+
+    #[inline(always)]
+    fn branch_less_or_equal_unsigned_imm(&mut self, s1: Reg, s2: u32, target: u32) -> Self::ReturnTy {
+        self.branch(s1, s2, target, Condition::BelowOrEqual);
+    }
+
+    #[inline(always)]
+    fn branch_less_or_equal_signed_imm(&mut self, s1: Reg, s2: u32, target: u32) -> Self::ReturnTy {
+        self.branch(s1, s2, target, Condition::LessOrEqual);
+    }
+
+    #[inline(always)]
+    fn branch_greater_unsigned_imm(&mut self, s1: Reg, s2: u32, target: u32) -> Self::ReturnTy {
+        self.branch(s1, s2, target, Condition::Above);
+    }
+
+    #[inline(always)]
+    fn branch_greater_signed_imm(&mut self, s1: Reg, s2: u32, target: u32) -> Self::ReturnTy {
+        self.branch(s1, s2, target, Condition::Greater);
+    }
+
+    #[inline(always)]
+    fn jump(&mut self, target: u32) -> Self::ReturnTy {
+        let label = self.get_or_forward_declare_label(target);
+        self.jump_to_label(label);
         self.start_new_basic_block();
+    }
+
+    #[inline(always)]
+    fn call(&mut self, ra: Reg, target: u32) -> Self::ReturnTy {
+        let label = self.get_or_forward_declare_label(target);
+        let return_address = self.get_return_address();
+        self.load_immediate(ra, return_address);
+        self.jump_to_label(label);
+        self.start_new_basic_block();
+    }
+
+    #[inline(always)]
+    fn jump_indirect(&mut self, base: Reg, offset: u32) -> Self::ReturnTy {
+        self.indirect_jump_or_call(None, base, offset)
+    }
+
+    #[inline(always)]
+    fn call_indirect(&mut self, ra: Reg, base: Reg, offset: u32) -> Self::ReturnTy {
+        self.indirect_jump_or_call(Some(ra), base, offset)
     }
 }

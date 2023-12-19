@@ -94,8 +94,7 @@ fn basic_test_blob() -> ProgramBlob<'static> {
     builder.add_export(0, &FnMetadata::new("main", &[I32, I32], Some(I32)));
     builder.add_import(0, &FnMetadata::new("hostcall", &[], Some(I32)));
     builder.set_code(&[
-        asm::load_imm(T0, 0x12345678),
-        asm::store_u32(T0, Reg::Zero, VM_ADDR_USER_MEMORY),
+        asm::store_imm_u32(0x12345678, VM_ADDR_USER_MEMORY),
         asm::add(S0, A0, A1),
         asm::ecalli(0),
         asm::add(A0, A0, S0),

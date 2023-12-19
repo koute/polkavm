@@ -64,20 +64,8 @@ impl ProgramBlobBuilder {
             self.code.extend_from_slice(&buffer[..length]);
             self.instruction_count += 1;
 
-            use crate::program::Opcode as O;
-            match instruction.opcode() {
-                O::trap
-                | O::fallthrough
-                | O::jump_and_link_register
-                | O::branch_less_unsigned
-                | O::branch_less_signed
-                | O::branch_greater_or_equal_unsigned
-                | O::branch_greater_or_equal_signed
-                | O::branch_eq
-                | O::branch_not_eq => {
-                    self.basic_block_count += 1;
-                }
-                _ => {}
+            if instruction.opcode().starts_new_basic_block() {
+                self.basic_block_count += 1;
             }
         }
     }

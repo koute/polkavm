@@ -248,7 +248,7 @@ impl<T> core::ops::DerefMut for CacheAligned<T> {
     }
 }
 
-const REG_COUNT: usize = crate::program::Reg::ALL_NON_ZERO.len();
+const REG_COUNT: usize = crate::program::Reg::ALL.len();
 
 #[repr(C)]
 pub struct VmCtxSyscall {

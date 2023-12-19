@@ -24,7 +24,7 @@ pub(crate) struct Compiler<'a> {
     asm: Assembler,
     exports: &'a [ProgramExport<'a>],
     basic_block_by_jump_table_index: &'a [u32],
-    jump_table_index_by_basic_block: &'a HashMap<u32, u32>,
+    jump_table_index_by_basic_block: &'a [u32],
     nth_basic_block_to_label: Vec<Label>,
     nth_basic_block_to_label_pending: Vec<Option<Label>>,
     nth_basic_block_to_machine_code_offset: Vec<usize>,
@@ -63,7 +63,7 @@ impl<'a> Compiler<'a> {
         config: &ModuleConfig,
         exports: &'a [ProgramExport<'a>],
         basic_block_by_jump_table_index: &'a [u32],
-        jump_table_index_by_basic_block: &'a HashMap<u32, u32>,
+        jump_table_index_by_basic_block: &'a [u32],
         sandbox_kind: SandboxKind,
         address_table: AddressTable,
         vmctx_regs_offset: usize,
@@ -247,6 +247,7 @@ impl<'a> Compiler<'a> {
         self.asm.define_label(label);
     }
 
+    #[inline(always)]
     fn next_basic_block(&self) -> u32 {
         self.nth_basic_block_to_label.len() as u32
     }
@@ -299,6 +300,7 @@ impl<'a> VisitorWrapper<'a, Compiler<'a>> {
 }
 
 impl<'a> crate::api::BackendVisitor for VisitorWrapper<'a, Compiler<'a>> {
+    #[inline(always)]
     fn before_instruction(&mut self) {
         let initial_length = self.visitor.asm.len();
         self.nth_instruction_to_code_offset_map.push(initial_length as u32);
@@ -312,6 +314,7 @@ impl<'a> crate::api::BackendVisitor for VisitorWrapper<'a, Compiler<'a>> {
         }
 
         self.is_last_instruction = self.common.is_last_instruction();
+        self.asm.reserve::<8>();
     }
 
     fn after_instruction(&mut self) {
@@ -333,7 +336,7 @@ impl<S> crate::api::BackendModule for CompiledModule<S> where S: Sandbox {
         config: &'a ModuleConfig,
         exports: &'a [ProgramExport],
         basic_block_by_jump_table_index: &'a [u32],
-        jump_table_index_by_basic_block: &'a HashMap<u32, u32>,
+        jump_table_index_by_basic_block: &'a [u32],
         init: GuestProgramInit<'a>,
         instruction_count: usize,
         basic_block_count: usize,
