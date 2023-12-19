@@ -435,7 +435,7 @@ fn disassemble_into(
 
         if matches!(format, DisassemblyFormat::DiffFriendly) {
             let mut string = instruction_s;
-            if let polkavm_common::program::Instruction::add_imm(dst, polkavm_common::program::Reg::Zero, _) = instruction {
+            if let polkavm_common::program::Instruction::load_imm(dst, _) = instruction {
                 string = format!("{} = _", dst);
             }
 
@@ -480,22 +480,11 @@ fn disassemble_into(
             }
         }
 
-        match instruction.opcode() {
-            polkavm_common::program::Opcode::fallthrough
-            | polkavm_common::program::Opcode::jump_and_link_register
-            | polkavm_common::program::Opcode::trap
-            | polkavm_common::program::Opcode::branch_less_unsigned
-            | polkavm_common::program::Opcode::branch_less_signed
-            | polkavm_common::program::Opcode::branch_greater_or_equal_unsigned
-            | polkavm_common::program::Opcode::branch_greater_or_equal_signed
-            | polkavm_common::program::Opcode::branch_eq
-            | polkavm_common::program::Opcode::branch_not_eq => {
-                if instruction.opcode() != polkavm_common::program::Opcode::fallthrough && nth_instruction + 1 != instructions.len() {
-                    pending_label = true;
-                }
-                jump_target_counter += 1;
+        if instruction.opcode().starts_new_basic_block() {
+            if instruction.opcode() != polkavm_common::program::Opcode::fallthrough && nth_instruction + 1 != instructions.len() {
+                pending_label = true;
             }
-            _ => {}
+            jump_target_counter += 1;
         }
     }
 

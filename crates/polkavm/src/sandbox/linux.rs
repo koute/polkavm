@@ -1342,22 +1342,13 @@ impl<'a> Access<'a> for SandboxAccess<'a> {
     type Error = MemoryAccessError<linux_raw::Error>;
 
     fn get_reg(&self, reg: Reg) -> u32 {
-        if reg == Reg::Zero {
-            return 0;
-        }
-
         let regs = unsafe { &*self.sandbox.vmctx().regs().get() };
-
-        regs[reg as usize - 1]
+        regs[reg as usize]
     }
 
     fn set_reg(&mut self, reg: Reg, value: u32) {
-        if reg == Reg::Zero {
-            return;
-        }
-
         unsafe {
-            (*self.sandbox.vmctx().regs().get())[reg as usize - 1] = value;
+            (*self.sandbox.vmctx().regs().get())[reg as usize] = value;
         }
     }
 
@@ -1470,6 +1461,5 @@ impl<'a> Access<'a> for SandboxAccess<'a> {
         if self.sandbox.gas_metering.is_none() { return }
         let gas_remaining = unsafe { &mut *self.sandbox.vmctx().gas().get() };
         *gas_remaining = gas_remaining.checked_sub_unsigned(gas).unwrap_or(-1);
-
     }
 }

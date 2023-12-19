@@ -176,7 +176,7 @@ impl<'a, T> Default for ExecuteArgs<'a, T> where T: Sandbox {
 impl<'a, T> ExecuteArgs<'a, T> where T: Sandbox {
     #[inline]
     pub fn new() -> Self {
-        static EMPTY_REGS: &[u32; Reg::ALL_NON_ZERO.len()] = &[0; Reg::ALL_NON_ZERO.len()];
+        static EMPTY_REGS: &[u32; Reg::ALL.len()] = &[0; Reg::ALL.len()];
         ExecuteArgs {
             rpc_address: 0,
             rpc_flags: 0,
@@ -216,7 +216,7 @@ impl<'a, T> ExecuteArgs<'a, T> where T: Sandbox {
 
     #[inline]
     pub fn set_initial_regs(&mut self, regs: &'a [u32]) {
-        assert_eq!(regs.len(), Reg::ALL_NON_ZERO.len());
+        assert_eq!(regs.len(), Reg::ALL.len());
         self.initial_regs = regs;
     }
 

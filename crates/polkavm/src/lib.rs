@@ -46,6 +46,7 @@ mod config;
 mod interpreter;
 mod source_cache;
 mod tracer;
+mod utils;
 
 if_compiler_is_supported! {
     mod compiler;

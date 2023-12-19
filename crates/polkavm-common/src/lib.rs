@@ -22,6 +22,7 @@ pub mod abi;
 pub mod elf;
 pub mod error;
 pub mod init;
+pub mod operation;
 pub mod program;
 pub mod utils;
 pub mod varint;

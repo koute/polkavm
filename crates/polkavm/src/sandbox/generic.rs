@@ -417,7 +417,7 @@ unsafe fn trigger_trap(vmctx: &mut VmCtx) -> ! {
     sysreturn(vmctx);
 }
 
-const REG_COUNT: usize = polkavm_common::program::Reg::ALL_NON_ZERO.len();
+const REG_COUNT: usize = polkavm_common::program::Reg::ALL.len();
 
 #[repr(C)]
 struct VmCtx {
@@ -1076,21 +1076,13 @@ impl<'a> Access<'a> for SandboxAccess<'a> {
     type Error = MemoryAccessError<&'static str>;
 
     fn get_reg(&self, reg: Reg) -> u32 {
-        if reg == Reg::Zero {
-            return 0;
-        }
-
         assert!(!matches!(self.sandbox.poison, Poison::Poisoned), "sandbox has been poisoned");
-        self.sandbox.vmctx().regs[reg as usize - 1]
+        self.sandbox.vmctx().regs[reg as usize]
     }
 
     fn set_reg(&mut self, reg: Reg, value: u32) {
-        if reg == Reg::Zero {
-            return;
-        }
-
         assert!(!matches!(self.sandbox.poison, Poison::Poisoned), "sandbox has been poisoned");
-        self.sandbox.vmctx_mut().regs[reg as usize - 1] = value;
+        self.sandbox.vmctx_mut().regs[reg as usize] = value;
     }
 
     fn read_memory_into_slice<'slice, T>(&self, address: u32, buffer: &'slice mut T) -> Result<&'slice mut [u8], Self::Error>
