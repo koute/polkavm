@@ -15,39 +15,13 @@ pub(crate) fn read_varint(input: &[u8], first_byte: u8) -> Option<(usize, u32)> 
     let length = (!first_byte).leading_zeros();
     let upper_mask = 0b11111111_u32 >> length;
     let upper_bits = (upper_mask & (first_byte as u32)).wrapping_shl(length * 8);
-
-    macro_rules! read {
-        ($count:expr) => {{
-            if $count == 1 {
-                let lower_bits = *input.get(0)?;
-                upper_bits | lower_bits as u32
-            } else if $count == 2 {
-                let input = input.get(..2)?;
-                upper_bits | u16::from_le_bytes([input[0], input[1]]) as u32
-            } else if $count == 4 {
-                let input = input.get(..4)?;
-                upper_bits | u32::from_le_bytes([input[0], input[1], input[2], input[3]])
-            } else {
-                let input = input.get(..$count)?;
-
-                let mut value: u32 = 0;
-                for n in 0..$count {
-                    value |= (input[n] as u32) << (n * 8);
-                }
-                value = value.to_le();
-                upper_bits | value
-            }
-        }};
-    }
-
-    let value = match length {
+    let input = input.get(..length as usize)?;
+    let value = match input.len() {
         0 => upper_bits,
-        1 => read!(1),
-        2 => read!(2),
-        3 => read!(3),
-        4 => read!(4),
-
-        // Only at most 32-bit values are supported.
+        1 => upper_bits | input[0] as u32,
+        2 => upper_bits | u16::from_le_bytes([input[0], input[1]]) as u32,
+        3 => upper_bits | u32::from_le_bytes([input[0], input[1], input[2], 0]),
+        4 => upper_bits | u32::from_le_bytes([input[0], input[1], input[2], input[3]]),
         _ => return None,
     };
 
