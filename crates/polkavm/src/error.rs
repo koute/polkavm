@@ -1,5 +1,4 @@
 use polkavm_common::program::ProgramParseError;
-use std::borrow::Cow;
 
 macro_rules! bail {
     ($($arg:expr),* $(,)?) => {
@@ -10,56 +9,65 @@ macro_rules! bail {
 pub(crate) use bail;
 
 #[derive(Debug)]
-pub struct Error {
-    message: Cow<'static, str>,
+enum ErrorKind {
+    Owned(String),
+    Static(&'static str),
+    ProgramParseError(ProgramParseError),
 }
 
+#[derive(Debug)]
+#[repr(transparent)]
+pub struct Error(ErrorKind);
+
 impl From<String> for Error {
+    #[cold]
     fn from(string: String) -> Self {
-        Error { message: string.into() }
+        Error(ErrorKind::Owned(string))
     }
 }
 
 impl From<ProgramParseError> for Error {
+    #[cold]
     fn from(error: ProgramParseError) -> Self {
-        Self::from_display(error)
+        Self(ErrorKind::ProgramParseError(error))
     }
 }
 
 impl Error {
+    #[cold]
     pub(crate) fn from_display(message: impl core::fmt::Display) -> Self {
-        Error {
-            message: Cow::Owned(message.to_string()),
-        }
+        Error(ErrorKind::Owned(message.to_string()))
     }
 
+    #[cold]
     pub(crate) fn from_static_str(message: &'static str) -> Self {
-        Error {
-            message: Cow::Borrowed(message),
-        }
+        Error(ErrorKind::Static(message))
     }
 
-    #[allow(dead_code)]
+    #[cold]
     pub(crate) fn context(self, message: impl core::fmt::Display) -> Self {
-        let message = match self.message {
-            Cow::Borrowed(prefix) => format!("{}: {}", prefix, message),
-            Cow::Owned(mut buffer) => {
+        let string = match self.0 {
+            ErrorKind::Owned(mut buffer) => {
                 use core::fmt::Write;
-
-                write!(&mut buffer, ": {}", message).unwrap();
+                let _ = write!(&mut buffer, ": {}", message);
                 buffer
             }
+            error => format!("{}: {}", Error(error), message),
         };
 
-        Error {
-            message: Cow::Owned(message),
-        }
+        Error(ErrorKind::Owned(string))
     }
 }
 
 impl core::fmt::Display for Error {
     fn fmt(&self, fmt: &mut core::fmt::Formatter) -> core::fmt::Result {
-        fmt.write_str(&self.message)
+        let message = match &self.0 {
+            ErrorKind::Owned(message) => message.as_str(),
+            ErrorKind::Static(message) => message,
+            ErrorKind::ProgramParseError(error) => return error.fmt(fmt),
+        };
+
+        fmt.write_str(message)
     }
 }
 
