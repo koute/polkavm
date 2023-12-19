@@ -116,28 +116,30 @@ impl Assembler {
         self.labels[label.0 as usize] = offset;
     }
 
+    #[inline(always)]
     fn add_fixup(
         &mut self,
-        bytes_len: usize,
+        instruction_offset: usize,
+        instruction_length: usize,
         InstFixup {
             target_label,
             fixup_offset,
             fixup_length,
         }: InstFixup,
     ) {
-        assert!((target_label.0 as usize) < self.labels.len());
-        assert!(
-            (fixup_offset as usize) < bytes_len,
+        debug_assert!((target_label.0 as usize) < self.labels.len());
+        debug_assert!(
+            (fixup_offset as usize) < instruction_length,
             "instruction is {} bytes long and yet its target fixup starts at {}",
-            bytes_len,
+            instruction_length,
             fixup_offset
         );
-        assert!((fixup_length as usize) < bytes_len);
-        assert!((fixup_offset as usize + fixup_length as usize) <= bytes_len);
+        debug_assert!((fixup_length as usize) < instruction_length);
+        debug_assert!((fixup_offset as usize + fixup_length as usize) <= instruction_length);
         self.fixups.push(Fixup {
             target_label,
-            instruction_offset: self.code.len(),
-            instruction_length: bytes_len as u8,
+            instruction_offset,
+            instruction_length: instruction_length as u8,
             fixup_offset,
             fixup_length,
         });
@@ -149,26 +151,31 @@ impl Assembler {
         self.guaranteed_capacity = INSTRUCTIONS;
     }
 
-    #[inline(always)]
+    #[cfg_attr(not(debug_assertions), inline(always))]
     pub fn push<T>(&mut self, instruction: Instruction<T>) -> &mut Self
     where
         T: core::fmt::Display,
     {
+        #[cfg(debug_assertions)]
         log::trace!("{:08x}: {}", self.origin + self.code.len() as u64, instruction);
-        if let Some(fixup) = instruction.fixup {
-            self.add_fixup(instruction.bytes.len(), fixup);
-        }
 
         if self.guaranteed_capacity == 0 {
             InstBuf::reserve::<1>(&mut self.code);
             self.guaranteed_capacity = 1;
         }
 
+        let instruction_offset = self.code.len();
+
         // SAFETY: We've reserved space for at least one instruction.
         unsafe {
             instruction.bytes.encode_into_vec_unsafe(&mut self.code);
         }
         self.guaranteed_capacity -= 1;
+
+        if let Some(fixup) = instruction.fixup {
+            self.add_fixup(instruction_offset, instruction.bytes.len(), fixup);
+        }
+
         self
     }
 
@@ -390,7 +397,6 @@ impl InstBuf {
         out
     }
 
-    #[inline]
     pub fn to_vec(self) -> Vec<u8> {
         let mut vec = Vec::with_capacity(MAXIMUM_INSTRUCTION_SIZE);
 

@@ -571,7 +571,7 @@ impl Inst {
         }
     }
 
-    #[inline(always)]
+    #[cfg_attr(not(debug_assertions), inline(always))]
     const fn mem(mut self, operand: MemOp) -> Self {
         match operand.simplify() {
             MemOp::BaseOffset(segment, reg_size, base, offset) => {
