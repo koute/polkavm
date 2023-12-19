@@ -1854,6 +1854,7 @@ fn perform_inlining(
     all_blocks: &mut [BasicBlock<AnyTarget, BlockTarget>],
     reachability_graph: &mut ReachabilityGraph,
     optimize_queue: Option<&mut VecSet<BlockTarget>>,
+    inline_history: &mut HashSet<(BlockTarget, BlockTarget)>,
     inline_threshold: usize,
     current: BlockTarget,
 ) -> bool {
@@ -1869,6 +1870,7 @@ fn perform_inlining(
         inner: BlockTarget,
     ) {
         log::trace!("Inlining {inner:?} into {outer:?}...");
+        log::trace!("  {outer:?} will now end with: {:?}", all_blocks[inner.index()].next.instruction);
 
         if let Some(ref mut optimize_queue) = optimize_queue {
             add_to_optimize_queue(all_blocks, reachability_graph, optimize_queue, outer);
@@ -1966,7 +1968,8 @@ fn perform_inlining(
 
     match all_blocks[current.index()].next.instruction {
         ControlInst::Jump { target } => {
-            if should_inline(all_blocks, reachability_graph, current, target, inline_threshold) {
+            if should_inline(all_blocks, reachability_graph, current, target, inline_threshold) && inline_history.insert((current, target))
+            {
                 inline(all_blocks, reachability_graph, optimize_queue, current, target);
                 return true;
             }
@@ -2831,6 +2834,7 @@ fn optimize_program(
 
     let opt_minimum_iteration_count = reachability_graph.reachable_block_count();
     let mut opt_iteration_count = 0;
+    let mut inline_history = HashSet::new(); // Necessary to prevent infinite loops.
     while let Some(current) = optimize_queue.pop_non_unique() {
         if !reachability_graph.is_code_reachable(current) {
             continue;
@@ -2842,6 +2846,7 @@ fn optimize_program(
             all_blocks,
             reachability_graph,
             Some(&mut optimize_queue),
+            &mut inline_history,
             config.inline_threshold,
             current,
         );
@@ -2872,6 +2877,7 @@ fn optimize_program(
     );
     garbage_collect_reachability(all_blocks, reachability_graph);
 
+    inline_history.clear();
     let mut opt_brute_force_iterations = 0;
     let mut modified = true;
     while modified {
@@ -2882,7 +2888,14 @@ fn optimize_program(
                 continue;
             }
 
-            modified |= perform_inlining(all_blocks, reachability_graph, None, config.inline_threshold, current);
+            modified |= perform_inlining(
+                all_blocks,
+                reachability_graph,
+                None,
+                &mut inline_history,
+                config.inline_threshold,
+                current,
+            );
             modified |= perform_dead_code_elimination(
                 config,
                 imports,
