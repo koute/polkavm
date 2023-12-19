@@ -3038,6 +3038,14 @@ fn merge_consecutive_fallthrough_blocks(
             }
 
             let referenced_by_data = core::mem::take(&mut current_reachability.referenced_by_data);
+            for section_index in &referenced_by_data {
+                if let Some(list) = reachability_graph.code_references_in_data_section.get_mut(section_index) {
+                    list.retain(|&target| target != current);
+                }
+            }
+
+            remove_code_if_globally_unreachable(all_blocks, reachability_graph, None, current);
+
             reachability_graph
                 .for_code
                 .get_mut(&next)
