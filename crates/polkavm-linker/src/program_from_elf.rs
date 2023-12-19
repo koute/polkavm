@@ -2666,6 +2666,10 @@ fn perform_constant_propagation(
 
         if modified_this_block {
             update_references(all_blocks, reachability_graph, optimize_queue.as_deref_mut(), current, references);
+            if !reachability_graph.is_code_reachable(current) {
+                break;
+            }
+
             if let Some(ref mut optimize_queue) = optimize_queue {
                 add_to_optimize_queue(all_blocks, reachability_graph, optimize_queue, current);
             }
