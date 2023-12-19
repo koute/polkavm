@@ -14,6 +14,7 @@ pub struct Assembler {
     code: Vec<u8>,
     labels: Vec<isize>,
     fixups: Vec<Fixup>,
+    guaranteed_capacity: usize,
 }
 
 #[allow(clippy::derivable_impls)]
@@ -54,6 +55,7 @@ impl Assembler {
             code: Vec::new(),
             labels: Vec::new(),
             fixups: Vec::new(),
+            guaranteed_capacity: 0,
         }
     }
 
@@ -142,6 +144,12 @@ impl Assembler {
     }
 
     #[inline(always)]
+    pub fn reserve<const INSTRUCTIONS: usize>(&mut self) {
+        InstBuf::reserve::<INSTRUCTIONS>(&mut self.code);
+        self.guaranteed_capacity = INSTRUCTIONS;
+    }
+
+    #[inline(always)]
     pub fn push<T>(&mut self, instruction: Instruction<T>) -> &mut Self
     where
         T: core::fmt::Display,
@@ -151,7 +159,16 @@ impl Assembler {
             self.add_fixup(instruction.bytes.len(), fixup);
         }
 
-        instruction.bytes.encode_into(&mut self.code);
+        if self.guaranteed_capacity == 0 {
+            InstBuf::reserve::<1>(&mut self.code);
+            self.guaranteed_capacity = 1;
+        }
+
+        // SAFETY: We've reserved space for at least one instruction.
+        unsafe {
+            instruction.bytes.encode_into_vec_unsafe(&mut self.code);
+        }
+        self.guaranteed_capacity -= 1;
         self
     }
 
@@ -275,6 +292,8 @@ pub struct InstFixup {
     pub(crate) fixup_length: u8,
 }
 
+const MAXIMUM_INSTRUCTION_SIZE: usize = 16;
+
 #[derive(Copy, Clone)]
 pub struct InstBuf {
     out_1: u64,
@@ -329,37 +348,38 @@ impl InstBuf {
         core::ptr::write_unaligned(output.add(8).cast::<u64>(), u64::from_le(self.out_2));
     }
 
-    #[cold]
-    fn reserve(output: &mut Vec<u8>) {
-        output.reserve(16);
-        assert!(output.spare_capacity_mut().len() >= 16);
+    #[inline]
+    unsafe fn encode_into_vec_unsafe(self, output: &mut Vec<u8>) {
+        debug_assert!(output.spare_capacity_mut().len() >= MAXIMUM_INSTRUCTION_SIZE);
+
+        self.encode_into_raw(output.spare_capacity_mut().as_mut_ptr().cast());
+        let new_length = output.len() + self.length;
+        output.set_len(new_length);
     }
 
-    #[inline]
-    pub fn encode_into(self, output: &mut Vec<u8>) {
-        // NOTE: This `if` actually matters and should not be removed, even though `reserve` would be a no-op anyway in such case.
-        if output.spare_capacity_mut().len() < 16 {
-            Self::reserve(output);
-            if output.spare_capacity_mut().len() < 16 {
+    #[cold]
+    #[inline(never)]
+    fn reserve_impl(output: &mut Vec<u8>, length: usize) {
+        output.reserve(length);
+    }
+
+    #[inline(always)]
+    fn reserve<const INSTRUCTIONS: usize>(output: &mut Vec<u8>) {
+        let count = INSTRUCTIONS.checked_mul(MAXIMUM_INSTRUCTION_SIZE).unwrap();
+        if output.spare_capacity_mut().len() < count {
+            Self::reserve_impl(output, count);
+            if output.spare_capacity_mut().len() < count {
                 // SAFETY: `reserve` made sure that we have this much capacity, so this is safe.
                 unsafe {
                     core::hint::unreachable_unchecked();
                 }
             }
         }
-
-        // SAFETY: We've made sure that there is at least 16 bytes of spare capacity,
-        //         and `encode_into_raw` can only write up to 16 bytes, so this is safe.
-        unsafe {
-            self.encode_into_raw(output.spare_capacity_mut().as_mut_ptr().cast());
-            let new_length = output.len() + self.length;
-            output.set_len(new_length);
-        }
     }
 
     #[inline]
     pub fn from_array<const N: usize>(array: [u8; N]) -> Self {
-        if N > 16 {
+        if N > MAXIMUM_INSTRUCTION_SIZE {
             panic!();
         }
 
@@ -372,8 +392,13 @@ impl InstBuf {
 
     #[inline]
     pub fn to_vec(self) -> Vec<u8> {
-        let mut vec = Vec::new();
-        self.encode_into(&mut vec);
+        let mut vec = Vec::with_capacity(MAXIMUM_INSTRUCTION_SIZE);
+
+        // SAFETY: We've reserved space for at least one instruction.
+        unsafe {
+            self.encode_into_vec_unsafe(&mut vec);
+        }
+
         vec
     }
 }
