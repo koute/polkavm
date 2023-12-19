@@ -3250,11 +3250,13 @@ struct Reachability {
     address_taken_in: BTreeSet<BlockTarget>,
     referenced_by_data: BTreeSet<SectionIndex>,
     always_reachable: bool,
+    always_dynamically_reachable: bool,
 }
 
 impl Reachability {
     fn is_only_reachable_from(&self, block_target: BlockTarget) -> bool {
         !self.always_reachable
+            && !self.always_dynamically_reachable
             && self.referenced_by_data.is_empty()
             && self.address_taken_in.is_empty()
             && self.reachable_from.len() == 1
@@ -3262,11 +3264,15 @@ impl Reachability {
     }
 
     fn is_unreachable(&self) -> bool {
-        self.reachable_from.is_empty() && self.address_taken_in.is_empty() && self.referenced_by_data.is_empty() && !self.always_reachable
+        self.reachable_from.is_empty()
+            && self.address_taken_in.is_empty()
+            && self.referenced_by_data.is_empty()
+            && !self.always_reachable
+            && !self.always_dynamically_reachable
     }
 
     fn is_dynamically_reachable(&self) -> bool {
-        !self.address_taken_in.is_empty() || !self.referenced_by_data.is_empty()
+        !self.address_taken_in.is_empty() || !self.referenced_by_data.is_empty() || self.always_dynamically_reachable
     }
 }
 
@@ -4939,19 +4945,17 @@ pub fn program_from_elf(config: Config, data: &[u8]) -> Result<ProgramBlob, Prog
     } else {
         reachability_graph = ReachabilityGraph::default();
         for current in (0..all_blocks.len()).map(BlockTarget::from_raw) {
-            reachability_graph
-                .for_code
-                .entry(current)
-                .or_insert_with(Default::default)
-                .always_reachable = true;
+            let reachability = reachability_graph.for_code.entry(current).or_insert_with(Default::default);
+
+            reachability.always_reachable = true;
+            reachability.always_dynamically_reachable = true;
         }
 
         for &section_index in sections_ro_data.iter().chain(sections_rw_data.iter()) {
-            reachability_graph
-                .for_data
-                .entry(section_index)
-                .or_insert_with(Default::default)
-                .always_reachable = true;
+            let reachability = reachability_graph.for_data.entry(section_index).or_insert_with(Default::default);
+
+            reachability.always_reachable = true;
+            reachability.always_dynamically_reachable = true;
         }
 
         used_blocks = (0..all_blocks.len()).map(BlockTarget::from_raw).collect();
