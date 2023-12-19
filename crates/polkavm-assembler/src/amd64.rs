@@ -1539,6 +1539,37 @@ pub mod inst {
             None,
             (fmt.write_fmt(core::format_args!("imul {}, {}", self.1.name_from(self.0), self.2.display_without_prefix(Size::from(self.0))))),
 
+        imul_imm(RegSize, Reg, RegMem, i32) =>
+            {
+                let value = self.3;
+                if value <= i8::MAX as i32 && value >= i8::MIN as i32 {
+                    Inst::new(0x6b).imm8(value as u8)
+                } else {
+                    Inst::new(0x69).imm32(value as u32)
+                }.rex_64b_if(matches!(self.0, RegSize::R64)).modrm_reg(self.1).regmem(self.2).encode()
+            },
+            None,
+            ({
+                struct DisplaySignExtend(RegSize, i32);
+                impl core::fmt::Display for DisplaySignExtend {
+                    fn fmt(&self, fmt: &mut core::fmt::Formatter) -> core::fmt::Result {
+                        let value = match self.0 {
+                            RegSize::R64 => self.1 as i64 as u64,
+                            RegSize::R32 => self.1 as u32 as u64,
+                        };
+
+                        fmt.write_fmt(core::format_args!("0x{:x}", value))
+                    }
+
+                }
+
+                if RegMem::Reg(self.1) == self.2 {
+                    fmt.write_fmt(core::format_args!("imul {}, {}", self.1.name_from(self.0), DisplaySignExtend(self.0, self.3)))
+                } else {
+                    fmt.write_fmt(core::format_args!("imul {}, {}, {}", self.1.name_from(self.0), self.2.display_without_prefix(Size::from(self.0)), DisplaySignExtend(self.0, self.3)))
+                }
+            }),
+
         // https://www.felixcloutier.com/x86/div
         div(RegSize, RegMem) =>
             Inst::new(0xf7).modrm_opext(0b110).rex_64b_if(matches!(self.0, RegSize::R64)).regmem(self.1).encode(),
@@ -2192,6 +2223,7 @@ mod tests {
         div,
         endbr64,
         idiv,
+        imul_imm,
         imul,
         inc,
         jcc_rel32,
