@@ -1,6 +1,10 @@
 use clap::Parser;
+use polkavm_common::program::{Opcode, ProgramBlob};
 use std::collections::HashMap;
-use std::{io::Write, path::PathBuf};
+use std::{
+    io::Write,
+    path::{Path, PathBuf},
+};
 
 #[derive(Copy, Clone, Debug, clap::ValueEnum)]
 enum DisassemblyFormat {
@@ -42,6 +46,12 @@ enum Args {
         /// The input file.
         input: PathBuf,
     },
+
+    /// Calculates various statistics for given program blobs.
+    Stats {
+        /// The input files.
+        inputs: Vec<PathBuf>,
+    },
 }
 
 macro_rules! bail {
@@ -62,6 +72,7 @@ fn main() {
             run_only_if_newer,
         } => main_link(input, output, strip, run_only_if_newer),
         Args::Disassemble { output, format, input } => main_disassemble(input, format, output),
+        Args::Stats { inputs } => main_stats(inputs),
     };
 
     if let Err(error) = result {
@@ -105,19 +116,59 @@ fn main_link(input: PathBuf, output: PathBuf, strip: bool, run_only_if_newer: bo
     Ok(())
 }
 
-fn main_disassemble(input: PathBuf, format: DisassemblyFormat, output: Option<PathBuf>) -> Result<(), String> {
-    let data = match std::fs::read(&input) {
+fn load_blob(input: &Path) -> Result<ProgramBlob<'static>, String> {
+    let data = match std::fs::read(input) {
         Ok(data) => data,
         Err(error) => {
             bail!("failed to read {input:?}: {error}");
         }
     };
+
     let blob = match polkavm_linker::ProgramBlob::parse(&data[..]) {
-        Ok(b) => b,
+        Ok(blob) => blob,
         Err(error) => {
             bail!("failed to parse {input:?}: {error}");
         }
     };
+
+    Ok(blob.into_owned())
+}
+
+fn main_stats(inputs: Vec<PathBuf>) -> Result<(), String> {
+    let mut map = HashMap::new();
+    for opcode in 0..=255 {
+        if let Some(opcode) = Opcode::from_u8(opcode) {
+            map.insert(opcode, 0);
+        }
+    }
+
+    for input in inputs {
+        let blob = load_blob(&input)?;
+        for instruction in blob.instructions() {
+            let instruction = match instruction {
+                Ok(instruction) => instruction,
+                Err(error) => {
+                    bail!("failed to parse instruction: {error}");
+                }
+            };
+
+            *map.get_mut(&instruction.opcode()).unwrap() += 1;
+        }
+    }
+
+    let mut list: Vec<_> = map.into_iter().collect();
+    list.sort_by_key(|(_, count)| core::cmp::Reverse(*count));
+
+    println!("Instruction distribution:");
+    for (opcode, count) in list {
+        println!("{opcode:>40}: {count}", opcode = format!("{:?}", opcode));
+    }
+
+    Ok(())
+}
+
+fn main_disassemble(input: PathBuf, format: DisassemblyFormat, output: Option<PathBuf>) -> Result<(), String> {
+    let blob = load_blob(&input)?;
 
     let native = if matches!(format, DisassemblyFormat::Native | DisassemblyFormat::GuestAndNative) {
         if !cfg!(target_arch = "x86_64") {
