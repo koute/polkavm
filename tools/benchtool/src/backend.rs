@@ -272,9 +272,9 @@ define_backends! {
     Wasm3 => backend_wasm3::Wasm3(),
 
     #[cfg(feature = "wasmi")]
-    Wasmi_StackMachine => backend_wasmi::Wasmi(wasmi::EngineBackend::StackMachine),
+    Wasmi_Eager => backend_wasmi::Wasmi(wasmi::CompilationMode::Eager),
     #[cfg(feature = "wasmi")]
-    Wasmi_RegisterMachine => backend_wasmi::Wasmi(wasmi::EngineBackend::RegisterMachine),
+    Wasmi_Lazy => backend_wasmi::Wasmi(wasmi::CompilationMode::Lazy),
 
     #[cfg(feature = "native")]
     Native => backend_native::Native()
@@ -297,8 +297,8 @@ impl BenchmarkKind {
             BenchmarkKind::WebAssembly => {
                 #[cfg(feature = "wasmi")]
                 {
-                    output.push(BackendKind::Wasmi_StackMachine);
-                    output.push(BackendKind::Wasmi_RegisterMachine);
+                    output.push(BackendKind::Wasmi_Eager);
+                    output.push(BackendKind::Wasmi_Lazy);
                 }
 
                 #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
