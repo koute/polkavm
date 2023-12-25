@@ -18,7 +18,7 @@ impl Backend for Wasmi {
     fn name(&self) -> &'static str {
         match self.0 {
             wasmi::CompilationMode::Eager => "wasmi_eager",
-            wasmi::CompilationMode::LazyTranslation => "wasmi_lazy_translation)",
+            wasmi::CompilationMode::LazyTranslation => "wasmi_lazy_translation",
             wasmi::CompilationMode::Lazy => "wasmi_lazy",
         }
     }
