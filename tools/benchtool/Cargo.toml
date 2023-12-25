@@ -16,7 +16,7 @@ libc = { workspace = true }
 libloading = { version = "0.8.1", optional = true }
 log = { workspace = true }
 object = { version = "0.32.1", default-features = false, features = ["std", "elf"], optional = true }
-wasmi = { git = "https://github.com/paritytech/wasmi.git", rev = "ea3a29ce66ca116489b7bbcec520c5415ace17b2", optional = true }
+wasmi = { version = "0.32.0-beta.2", optional = true }
 
 [target.'cfg(target_arch = "x86_64")'.dependencies]
 ckb-vm = { version = "0.24.6", features = ["asm"], optional = true }

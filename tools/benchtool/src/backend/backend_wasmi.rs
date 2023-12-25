@@ -1,7 +1,7 @@
 use super::backend_prelude::*;
 
 #[derive(Copy, Clone)]
-pub struct Wasmi(pub wasmi::EngineBackend);
+pub struct Wasmi(pub wasmi::CompilationMode);
 
 pub struct WasmiInstance {
     store: wasmi::Store<()>,
@@ -17,14 +17,15 @@ impl Backend for Wasmi {
 
     fn name(&self) -> &'static str {
         match self.0 {
-            wasmi::EngineBackend::StackMachine => "wasmi_stack",
-            wasmi::EngineBackend::RegisterMachine => "wasmi_register",
+            wasmi::CompilationMode::Eager => "wasmi_eager",
+            wasmi::CompilationMode::LazyTranslation => "wasmi_lazy_translation)",
+            wasmi::CompilationMode::Lazy => "wasmi_lazy",
         }
     }
 
     fn create(&self) -> Self::Engine {
         let mut config = wasmi::Config::default();
-        config.set_engine_backend(self.0);
+        config.compilation_mode(self.0);
         wasmi::Engine::new(&config)
     }
 
