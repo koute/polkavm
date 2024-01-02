@@ -537,6 +537,12 @@ unsafe fn child_main(zygote_memfd: Fd, child_socket: Fd, uid_map: &str, gid_map:
     fd.close()?;
     proc_self.close()?;
 
+    let fd_limit = if logging_pipe.is_some() {
+        4
+    } else {
+        3
+    };
+
     // This should never happen in practice, but can in theory if the user closes stdin or stderr manually.
     // TODO: Actually support this?
     for fd in [zygote_memfd.raw(), child_socket.raw()].into_iter().chain(logging_pipe.as_ref().map(|fd| fd.raw())) {
@@ -612,7 +618,8 @@ unsafe fn child_main(zygote_memfd: Fd, child_socket: Fd, uid_map: &str, gid_map:
             rlim_max: 16 * 1024,
         },
     )?;
-    linux_raw::sys_setrlimit(linux_raw::RLIMIT_NOFILE, &linux_raw::rlimit { rlim_cur: 2, rlim_max: 2 })?;
+
+    linux_raw::sys_setrlimit(linux_raw::RLIMIT_NOFILE, &linux_raw::rlimit { rlim_cur: fd_limit, rlim_max: fd_limit })?;
     linux_raw::sys_setrlimit(linux_raw::RLIMIT_NPROC, &linux_raw::rlimit { rlim_cur: 1, rlim_max: 1 })?;
     linux_raw::sys_setrlimit(linux_raw::RLIMIT_FSIZE, &linux_raw::rlimit { rlim_cur: 0, rlim_max: 0 })?;
     linux_raw::sys_setrlimit(linux_raw::RLIMIT_LOCKS, &linux_raw::rlimit { rlim_cur: 0, rlim_max: 0 })?;
@@ -800,6 +807,7 @@ unsafe fn set_message(vmctx: &VmCtx, message: core::fmt::Arguments) {
 }
 
 pub struct Sandbox {
+    _lifetime_pipe: Fd,
     vmctx_mmap: Mmap,
     child: ChildProcess,
     socket: Fd,
@@ -889,6 +897,7 @@ impl super::Sandbox for Sandbox {
         let zygote_memfd = prepare_zygote()?;
         let (vmctx_memfd, vmctx_mmap) = prepare_vmctx()?;
         let (socket, child_socket) = linux_raw::sys_socketpair(linux_raw::AF_UNIX, linux_raw::SOCK_SEQPACKET | linux_raw::SOCK_CLOEXEC, 0)?;
+        let (lifetime_pipe_host, lifetime_pipe_child) = linux_raw::sys_pipe2(linux_raw::O_CLOEXEC)?;
 
         let sandbox_flags = linux_raw::CLONE_NEWCGROUP as u64
             | linux_raw::CLONE_NEWIPC as u64
@@ -1067,6 +1076,9 @@ impl super::Sandbox for Sandbox {
             return Err(error);
         }
 
+        linux_raw::sendfd(socket.borrow(), lifetime_pipe_child.borrow())?;
+        lifetime_pipe_child.close()?;
+
         // Wait until the child process receives the vmctx memfd.
         wait_for_futex(vmctx, &mut child, VMCTX_FUTEX_BUSY, VMCTX_FUTEX_INIT)?;
 
@@ -1112,6 +1124,7 @@ impl super::Sandbox for Sandbox {
         wait_for_futex(vmctx, &mut child, VMCTX_FUTEX_BUSY, VMCTX_FUTEX_IDLE)?;
 
         Ok(Sandbox {
+            _lifetime_pipe: lifetime_pipe_host,
             vmctx_mmap,
             child,
             socket,

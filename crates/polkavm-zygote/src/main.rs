@@ -167,8 +167,8 @@ unsafe extern "C" fn entry_point(stack: *mut usize) -> ! {
 static IN_SIGNAL_HANDLER: AtomicBool = AtomicBool::new(false);
 static NATIVE_PAGE_SIZE: AtomicUsize = AtomicUsize::new(!0);
 
-unsafe extern "C" fn signal_handler(signal: i32, _info: &linux_raw::siginfo_t, context: &linux_raw::ucontext) {
-    if IN_SIGNAL_HANDLER.load(Ordering::Relaxed) {
+unsafe extern "C" fn signal_handler(signal: u32, _info: &linux_raw::siginfo_t, context: &linux_raw::ucontext) {
+    if IN_SIGNAL_HANDLER.load(Ordering::Relaxed) || signal == linux_raw::SIGIO {
         let _ = linux_raw::sys_exit(255);
     }
 
@@ -368,6 +368,22 @@ unsafe fn initialize(mut stack: *mut usize) -> linux_raw::Fd {
         .close()
         .unwrap_or_else(|error| abort_with_error("failed to close vmctx memfd", error));
 
+    let lifetime_pipe = linux_raw::recvfd(socket.borrow()).unwrap_or_else(|error| abort_with_error("failed to read lifetime pipe", error));
+
+    // Make sure we're killed when the parent process exits.
+    let pid = linux_raw::sys_getpid().unwrap_or_else(|error| abort_with_error("failed to get process PID", error)) as u32;
+    linux_raw::sys_fcntl(lifetime_pipe.borrow(), linux_raw::F_SETOWN, pid)
+        .unwrap_or_else(|error| abort_with_error("failed to fcntl(F_SETOWN) on the lifetime pipe", error));
+
+    linux_raw::sys_fcntl(
+        lifetime_pipe.borrow(),
+        linux_raw::F_SETFL,
+        linux_raw::O_NONBLOCK | linux_raw::O_ASYNC,
+    )
+    .unwrap_or_else(|error| abort_with_error("failed to fcntl(F_SETFL) on the lifetime pipe", error));
+
+    lifetime_pipe.leak();
+
     // Wait for the host to fill out vmctx.
     signal_host(VMCTX_FUTEX_INIT, SignalHostKind::Normal)
         .unwrap_or_else(|error| abort_with_error("failed to wait for the host process (init)", error));
@@ -458,6 +474,9 @@ unsafe fn initialize(mut stack: *mut usize) -> linux_raw::Fd {
 
     linux_raw::sys_rt_sigaction(linux_raw::SIGFPE, &sa, None)
         .unwrap_or_else(|error| abort_with_error("failed to set up a signal handler for SIGFPE", error));
+
+    linux_raw::sys_rt_sigaction(linux_raw::SIGIO, &sa, None)
+        .unwrap_or_else(|error| abort_with_error("failed to set up a signal handler for SIGIO", error));
 
     // Set up the sysreturn jump table.
     linux_raw::sys_mmap(
