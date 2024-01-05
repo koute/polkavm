@@ -5452,6 +5452,7 @@ pub fn program_from_elf(config: Config, data: &[u8]) -> Result<ProgramBlob, Prog
 
         for &section_index in &sections_code {
             let section = elf.section_by_index(section_index);
+            let initial_instruction_count = instructions.len();
             parse_code_section(
                 section,
                 &import_by_location,
@@ -5459,6 +5460,19 @@ pub fn program_from_elf(config: Config, data: &[u8]) -> Result<ProgramBlob, Prog
                 &mut instruction_overrides,
                 &mut instructions,
             )?;
+
+            if instructions.len() > initial_instruction_count {
+                // Sometimes a section ends with a `call`, which (considering sections can be reordered) would put
+                // the return address out of bounds of the section, so let's inject an `unimp` here to make sure this doesn't happen.
+                //
+                // If it ends up being unnecessary the optimizer will remove it anyway.
+                let last_source = instructions.last().unwrap().0;
+                let source = Source {
+                    section_index: last_source.section_index,
+                    offset_range: (last_source.offset_range.end..last_source.offset_range.end + 4).into(),
+                };
+                instructions.push((source, InstExt::Control(ControlInst::Unimplemented)));
+            }
         }
 
         if !instruction_overrides.is_empty() {
