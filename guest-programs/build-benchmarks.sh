@@ -64,7 +64,7 @@ function build_benchmark() {
 
     if [ "${RV32E_TOOLCHAIN:-}" != "" ]; then
         echo "> Building: '$1' (polkavm)"
-        RUSTFLAGS="-C target-feature=+lui-addi-fusion -C relocation-model=pie -C link-arg=--emit-relocs -C link-arg=-T.cargo/memory.ld $extra_flags" rustup run $RV32E_TOOLCHAIN cargo build -q --release --bin $1 -p $1
+        RUSTFLAGS="-C target-feature=+lui-addi-fusion -C relocation-model=pie -C link-arg=--emit-relocs -C link-arg=--export-dynamic-symbol=__polkavm_symbol_export_hack__* $extra_flags" rustup run $RV32E_TOOLCHAIN cargo build -q --release --bin $1 -p $1
         cd ..
         cargo run -q -p polkatool link --run-only-if-newer guest-programs/target/riscv32ema-unknown-none-elf/release/$1 -o guest-programs/target/riscv32ema-unknown-none-elf/release/$1.polkavm
         cd $current_dir
