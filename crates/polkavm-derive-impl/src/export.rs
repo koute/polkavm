@@ -91,5 +91,16 @@ pub fn polkavm_export(input: syn::ItemFn) -> Result<proc_macro2::TokenStream, sy
         #(#fn_attributes)*
         #[cfg_attr(any(target_arch = "riscv32", target_arch = "riscv64"), link_section = ".text.polkavm_export")]
         #vis extern "C" fn #ident(#args) #return_ty #body
+
+        // A dirty hack to remove the need for a linker script.
+        #(#cfg_attributes)*
+        #[cfg(any(target_arch = "riscv32", target_arch = "riscv64"))]
+        core::arch::global_asm!(
+            ".pushsection .text.polkavm_export,\"x\",@progbits\n",
+            ".global __polkavm_symbol_export_hack__{name}\n",
+            "__polkavm_symbol_export_hack__{name}:\n",
+            ".popsection\n",
+            name = sym #ident
+        );
     })
 }
