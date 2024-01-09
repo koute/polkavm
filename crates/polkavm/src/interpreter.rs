@@ -762,6 +762,14 @@ impl<'a, 'b> InstructionVisitor for Visitor<'a, 'b> {
         Ok(())
     }
 
+    fn cmov_if_zero(&mut self, d: Reg, s: Reg, c: Reg) -> Self::ReturnTy {
+        self.set3(d, s, c, |s, c| if c == 0 { s } else { 0 })
+    }
+
+    fn cmov_if_not_zero(&mut self, d: Reg, s: Reg, c: Reg) -> Self::ReturnTy {
+        self.set3(d, s, c, |s, c| if c != 0 { s } else { 0 })
+    }
+
     fn add_imm(&mut self, d: Reg, s1: Reg, s2: u32) -> Self::ReturnTy {
         self.set3(d, s1, s2, |s1, s2| s1.wrapping_add(s2))
     }

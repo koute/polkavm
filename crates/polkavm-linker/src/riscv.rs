@@ -229,6 +229,52 @@ pub enum Inst {
     },
     Ecall,
     Unimplemented,
+    LoadReserved {
+        acquire: bool,
+        release: bool,
+        dst: Reg,
+        src: Reg,
+    },
+    StoreConditional {
+        acquire: bool,
+        release: bool,
+        addr: Reg,
+        dst: Reg,
+        src: Reg,
+    },
+    Atomic {
+        acquire: bool,
+        release: bool,
+        kind: AtomicKind,
+        dst: Reg,
+        addr: Reg,
+        src: Reg,
+    },
+    Cmov {
+        kind: CmovKind,
+        dst: Reg,
+        src: Reg,
+        cond: Reg,
+    },
+}
+
+#[derive(Copy, Clone, PartialEq, Eq, Debug, Hash)]
+pub enum AtomicKind {
+    Swap = 0b00001,
+    Add = 0b00000,
+    And = 0b01100,
+    Or = 0b01000,
+    Xor = 0b00100,
+    MaxSigned = 0b10100,
+    MinSigned = 0b10000,
+    MaxUnsigned = 0b11100,
+    MinUnsigned = 0b11000,
+}
+
+#[derive(Copy, Clone, PartialEq, Eq, Debug, Hash)]
+pub enum CmovKind {
+    EqZero = 0b101,
+    NotEqZero = 0b111,
 }
 
 impl Reg {
@@ -441,6 +487,9 @@ impl Inst {
                 }),
             },
             0b0110011 => {
+                let dst = Reg::decode(op >> 7);
+                let src1 = Reg::decode(op >> 15);
+                let src2 = Reg::decode(op >> 20);
                 let kind = match op & 0b1111111_00000_00000_111_00000_0000000 {
                     0b0000000_00000_00000_000_00000_0000000 => RegRegKind::Add,
                     0b0100000_00000_00000_000_00000_0000000 => RegRegKind::Sub,
@@ -461,21 +510,80 @@ impl Inst {
                     0b0000001_00000_00000_101_00000_0000000 => RegRegKind::DivUnsigned,
                     0b0000001_00000_00000_110_00000_0000000 => RegRegKind::Rem,
                     0b0000001_00000_00000_111_00000_0000000 => RegRegKind::RemUnsigned,
+
+                    0b0000111_00000_00000_101_00000_0000000 => {
+                        return Some(Inst::Cmov {
+                            kind: CmovKind::EqZero,
+                            dst,
+                            src: src1,
+                            cond: src2,
+                        });
+                    }
+                    0b0000111_00000_00000_111_00000_0000000 => {
+                        return Some(Inst::Cmov {
+                            kind: CmovKind::NotEqZero,
+                            dst,
+                            src: src1,
+                            cond: src2,
+                        });
+                    }
+
                     _ => return None,
                 };
 
-                Some(Inst::RegReg {
-                    kind,
-                    dst: Reg::decode(op >> 7),
-                    src1: Reg::decode(op >> 15),
-                    src2: Reg::decode(op >> 20),
-                })
+                Some(Inst::RegReg { kind, dst, src1, src2 })
             }
             0b1110011 => {
                 if op == 0b000000000000_00000_000_00000_1110011 {
                     Some(Inst::Ecall)
                 } else {
                     None
+                }
+            }
+            0b0101111 if (op >> 12) & 0b111 == 0b010 => {
+                let dst = Reg::decode(op >> 7);
+                let src1 = Reg::decode(op >> 15);
+                let src2 = Reg::decode(op >> 20);
+                let kind = op >> 27;
+                let release = ((op >> 25) & 1) != 0;
+                let acquire = ((op >> 26) & 1) != 0;
+                match kind {
+                    0b00010 if src2 == Reg::Zero => Some(Inst::LoadReserved {
+                        acquire,
+                        release,
+                        dst,
+                        src: src1,
+                    }),
+                    0b00011 => Some(Inst::StoreConditional {
+                        acquire,
+                        release,
+                        addr: src1,
+                        dst,
+                        src: src2,
+                    }),
+                    _ => {
+                        let kind = match kind {
+                            0b00000 => AtomicKind::Add,
+                            0b00001 => AtomicKind::Swap,
+                            0b00100 => AtomicKind::Xor,
+                            0b01100 => AtomicKind::And,
+                            0b01000 => AtomicKind::Or,
+                            0b10000 => AtomicKind::MinSigned,
+                            0b10100 => AtomicKind::MaxSigned,
+                            0b11000 => AtomicKind::MinUnsigned,
+                            0b11100 => AtomicKind::MaxUnsigned,
+                            _ => return None,
+                        };
+
+                        Some(Inst::Atomic {
+                            acquire,
+                            release,
+                            kind,
+                            dst,
+                            addr: src1,
+                            src: src2,
+                        })
+                    }
                 }
             }
             _ => None,
@@ -577,6 +685,56 @@ impl Inst {
             ),
             Inst::Ecall => Some(0x00000073),
             Inst::Unimplemented => Some(0xc0001073),
+            Inst::LoadReserved {
+                acquire,
+                release,
+                dst,
+                src,
+            } => Some(
+                0b0101111
+                    | (0b010 << 12)
+                    | ((dst as u32) << 7)
+                    | ((src as u32) << 15)
+                    | ((release as u32) << 25)
+                    | ((acquire as u32) << 26)
+                    | (0b00010 << 27),
+            ),
+            Inst::StoreConditional {
+                acquire,
+                release,
+                addr,
+                dst,
+                src,
+            } => Some(
+                0b0101111
+                    | (0b010 << 12)
+                    | ((dst as u32) << 7)
+                    | ((addr as u32) << 15)
+                    | ((src as u32) << 20)
+                    | ((release as u32) << 25)
+                    | ((acquire as u32) << 26)
+                    | (0b00011 << 27),
+            ),
+            Inst::Atomic {
+                acquire,
+                release,
+                kind,
+                dst,
+                addr,
+                src,
+            } => Some(
+                0b0101111
+                    | (0b010 << 12)
+                    | ((dst as u32) << 7)
+                    | ((addr as u32) << 15)
+                    | ((src as u32) << 20)
+                    | ((release as u32) << 25)
+                    | ((acquire as u32) << 26)
+                    | ((kind as u32) << 27),
+            ),
+            Inst::Cmov { kind, dst, src, cond } => {
+                Some(0b0110011 | ((kind as u32) << 12) | ((dst as u32) << 7) | ((src as u32) << 15) | ((cond as u32) << 20) | (0b111 << 25))
+            }
         }
     }
 }
@@ -647,6 +805,29 @@ fn test_decode_multiply() {
             dst: Reg::A2,
             src1: Reg::S0,
             src2: Reg::S1,
+        }
+    );
+}
+
+#[test]
+fn test_decode_cmov() {
+    assert_eq!(
+        Inst::decode(0xec5f5b3).unwrap(),
+        Inst::Cmov {
+            kind: CmovKind::NotEqZero,
+            dst: Reg::A1,
+            src: Reg::A1,
+            cond: Reg::A2
+        }
+    );
+
+    assert_eq!(
+        Inst::decode(0xec55533).unwrap(),
+        Inst::Cmov {
+            kind: CmovKind::EqZero,
+            dst: Reg::A0,
+            src: Reg::A0,
+            cond: Reg::A2
         }
     );
 }
