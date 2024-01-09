@@ -355,6 +355,20 @@ impl<'a> Compiler<'a> {
         self.start_new_basic_block();
     }
 
+    #[cfg_attr(not(debug_assertions), inline(always))]
+    fn cmov(&mut self, d: Reg, s: Reg, c: Reg, condition: Condition) {
+        if d != c && d != s {
+            self.clear_reg(d);
+            self.push(test((self.reg_size(), conv_reg(c), conv_reg(c))));
+            self.push(cmov(condition, self.reg_size(), conv_reg(d), conv_reg(s)));
+        } else {
+            self.push(xor((RegSize::R32, TMP_REG, TMP_REG)));
+            self.push(test((self.reg_size(), conv_reg(c), conv_reg(c))));
+            self.push(cmov(condition, self.reg_size(), TMP_REG, conv_reg(s)));
+            self.push(mov(self.reg_size(), conv_reg(d), TMP_REG))
+        }
+    }
+
     fn div_rem(&mut self, d: Reg, s1: Reg, s2: Reg, div_rem: DivRem, kind: Signedness) {
         // Unlike most other architectures RISC-V doesn't trap on division by zero
         // nor on division with overflow, and has well defined results in such cases.
@@ -985,6 +999,16 @@ impl<'a> InstructionVisitor for VisitorWrapper<'a, Compiler<'a>> {
     #[inline(always)]
     fn move_reg(&mut self, d: Reg, s: Reg) -> Self::ReturnTy {
         self.mov(d, s);
+    }
+
+    #[inline(always)]
+    fn cmov_if_zero(&mut self, d: Reg, s: Reg, c: Reg) -> Self::ReturnTy {
+        self.cmov(d, s, c, Condition::Equal);
+    }
+
+    #[inline(always)]
+    fn cmov_if_not_zero(&mut self, d: Reg, s: Reg, c: Reg) -> Self::ReturnTy {
+        self.cmov(d, s, c, Condition::NotEqual);
     }
 
     #[inline(always)]

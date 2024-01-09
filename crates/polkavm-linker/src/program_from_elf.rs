@@ -1,6 +1,5 @@
 use polkavm_common::abi::{GuestMemoryConfig, VM_ADDR_USER_MEMORY, VM_CODE_ADDRESS_ALIGNMENT, VM_MAX_PAGE_SIZE, VM_PAGE_SIZE};
 use polkavm_common::elf::{FnMetadata, ImportMetadata, INSTRUCTION_ECALLI};
-use polkavm_common::program::Reg;
 use polkavm_common::program::{self, FrameKind, Instruction, LineProgramOp, ProgramBlob};
 use polkavm_common::utils::align_to_next_page_u64;
 use polkavm_common::varint;
@@ -14,7 +13,95 @@ use std::sync::Arc;
 use crate::dwarf::Location;
 use crate::elf::{Elf, Section, SectionIndex};
 use crate::riscv::Reg as RReg;
-use crate::riscv::{BranchKind, Inst, LoadKind, RegImmKind, StoreKind};
+use crate::riscv::{AtomicKind, BranchKind, CmovKind, Inst, LoadKind, RegImmKind, StoreKind};
+
+#[derive(Copy, Clone, PartialEq, Eq, Debug, Hash)]
+#[repr(u8)]
+enum Reg {
+    // The registers supported by the VM.
+    RA = 0,
+    SP = 1,
+    T0 = 2,
+    T1 = 3,
+    T2 = 4,
+    S0 = 5,
+    S1 = 6,
+    A0 = 7,
+    A1 = 8,
+    A2 = 9,
+    A3 = 10,
+    A4 = 11,
+    A5 = 12,
+
+    // Extra fake registers. These will be stripped away before the final codegen pass.
+    E0 = 13,
+    E1 = 14,
+    E2 = 15,
+}
+
+impl Reg {
+    pub const fn from_usize(value: usize) -> Option<Reg> {
+        match value {
+            0 => Some(Reg::RA),
+            1 => Some(Reg::SP),
+            2 => Some(Reg::T0),
+            3 => Some(Reg::T1),
+            4 => Some(Reg::T2),
+            5 => Some(Reg::S0),
+            6 => Some(Reg::S1),
+            7 => Some(Reg::A0),
+            8 => Some(Reg::A1),
+            9 => Some(Reg::A2),
+            10 => Some(Reg::A3),
+            11 => Some(Reg::A4),
+            12 => Some(Reg::A5),
+            13 => Some(Reg::E0),
+            14 => Some(Reg::E1),
+            15 => Some(Reg::E2),
+            _ => None,
+        }
+    }
+
+    pub const fn name(self) -> &'static str {
+        use Reg::*;
+        match self {
+            RA => "ra",
+            SP => "sp",
+            T0 => "t0",
+            T1 => "t1",
+            T2 => "t2",
+            S0 => "s0",
+            S1 => "s1",
+            A0 => "a0",
+            A1 => "a1",
+            A2 => "a2",
+            A3 => "a3",
+            A4 => "a4",
+            A5 => "a5",
+
+            E0 => "e0",
+            E1 => "e1",
+            E2 => "e2",
+        }
+    }
+
+    fn fake_register_index(self) -> Option<usize> {
+        match self {
+            Reg::E0 => Some(0),
+            Reg::E1 => Some(1),
+            Reg::E2 => Some(2),
+            _ => None,
+        }
+    }
+
+    const ALL: [Reg; 16] = {
+        use Reg::*;
+        [RA, SP, T0, T1, T2, S0, S1, A0, A1, A2, A3, A4, A5, E0, E1, E2]
+    };
+
+    const FAKE: [Reg; 3] = { [Reg::E0, Reg::E1, Reg::E2] };
+    const ARG_REGS: [Reg; 6] = [Reg::A0, Reg::A1, Reg::A2, Reg::A3, Reg::A4, Reg::A5];
+}
 
 #[derive(Debug)]
 pub enum ProgramFromElfErrorKind {
@@ -300,6 +387,15 @@ enum RegImm {
     Imm(u32),
 }
 
+impl RegImm {
+    fn map_register(self, mut map: impl FnMut(Reg) -> Reg) -> RegImm {
+        match self {
+            RegImm::Reg(reg) => RegImm::Reg(map(reg)),
+            RegImm::Imm(value) => RegImm::Imm(value),
+        }
+    }
+}
+
 impl From<Reg> for RegImm {
     fn from(reg: Reg) -> Self {
         RegImm::Reg(reg)
@@ -361,6 +457,12 @@ enum BasicInst<T> {
         src1: RegImm,
         src2: RegImm,
     },
+    Cmov {
+        kind: CmovKind,
+        dst: Reg,
+        src: Reg,
+        cond: Reg,
+    },
     Ecalli {
         syscall: u32,
     },
@@ -399,6 +501,7 @@ impl<T> BasicInst<T> {
             BasicInst::StoreIndirect { src, base, .. } => RegMask::from(src) | RegMask::from(base),
             BasicInst::RegReg { src1, src2, .. } => RegMask::from(src1) | RegMask::from(src2),
             BasicInst::AnyAny { src1, src2, .. } => RegMask::from(src1) | RegMask::from(src2),
+            BasicInst::Cmov { src, cond, .. } => RegMask::from(src) | RegMask::from(cond),
             BasicInst::Ecalli { syscall } => imports
                 .iter()
                 .find(|import| import.metadata.index.unwrap() == syscall)
@@ -416,6 +519,7 @@ impl<T> BasicInst<T> {
             | BasicInst::LoadAddressIndirect { dst, .. }
             | BasicInst::LoadIndirect { dst, .. }
             | BasicInst::RegReg { dst, .. }
+            | BasicInst::Cmov { dst, .. }
             | BasicInst::AnyAny { dst, .. } => RegMask::from(dst),
 
             BasicInst::Ecalli { syscall } => imports
@@ -435,8 +539,115 @@ impl<T> BasicInst<T> {
             | BasicInst::LoadAddress { .. }
             | BasicInst::LoadAddressIndirect { .. }
             | BasicInst::RegReg { .. }
+            | BasicInst::Cmov { .. }
             | BasicInst::AnyAny { .. } => false,
         }
+    }
+
+    fn map_register(self, mut map: impl FnMut(Reg, bool) -> Reg) -> Option<Self> {
+        // Note: ALWAYS map the inputs first; otherwise `regalloc2` might break!
+        match self {
+            BasicInst::LoadImmediate { dst, imm } => Some(BasicInst::LoadImmediate { dst: map(dst, true), imm }),
+            BasicInst::LoadAbsolute { kind, dst, target } => Some(BasicInst::LoadAbsolute {
+                kind,
+                dst: map(dst, true),
+                target,
+            }),
+            BasicInst::StoreAbsolute { kind, src, target } => Some(BasicInst::StoreAbsolute {
+                kind,
+                src: src.map_register(|reg| map(reg, false)),
+                target,
+            }),
+            BasicInst::LoadAddress { dst, target } => Some(BasicInst::LoadAddress {
+                dst: map(dst, true),
+                target,
+            }),
+            BasicInst::LoadAddressIndirect { dst, target } => Some(BasicInst::LoadAddressIndirect {
+                dst: map(dst, true),
+                target,
+            }),
+            BasicInst::LoadIndirect { kind, dst, base, offset } => Some(BasicInst::LoadIndirect {
+                kind,
+                base: map(base, false),
+                dst: map(dst, true),
+                offset,
+            }),
+            BasicInst::StoreIndirect { kind, src, base, offset } => Some(BasicInst::StoreIndirect {
+                kind,
+                src: src.map_register(|reg| map(reg, false)),
+                base: map(base, false),
+                offset,
+            }),
+            BasicInst::RegReg { kind, dst, src1, src2 } => Some(BasicInst::RegReg {
+                kind,
+                src1: map(src1, false),
+                src2: map(src2, false),
+                dst: map(dst, true),
+            }),
+            BasicInst::AnyAny { kind, dst, src1, src2 } => Some(BasicInst::AnyAny {
+                kind,
+                src1: src1.map_register(|reg| map(reg, false)),
+                src2: src2.map_register(|reg| map(reg, false)),
+                dst: map(dst, true),
+            }),
+            BasicInst::Cmov { kind, dst, src, cond } => Some(BasicInst::Cmov {
+                kind,
+                src: map(src, false),
+                cond: map(cond, false),
+                dst: map(dst, true),
+            }),
+            BasicInst::Ecalli { .. } => None,
+            BasicInst::Nop => Some(BasicInst::Nop),
+        }
+    }
+
+    fn operands(&self, imports: &[Import]) -> impl Iterator<Item = (Reg, bool)>
+    where
+        T: Clone,
+    {
+        let mut list = [None, None, None, None, None, None, None, None];
+        let mut length = 0;
+        // Abuse the `map_register` to avoid matching on everything again.
+        let is_special_instruction = self
+            .clone()
+            .map_register(|reg, is_dst| {
+                list[length] = Some((reg, is_dst));
+                length += 1;
+                reg
+            })
+            .is_none();
+
+        if is_special_instruction {
+            let BasicInst::Ecalli { syscall } = *self else { unreachable!() };
+            let import = imports
+                .iter()
+                .find(|import| import.metadata.index.unwrap() == syscall)
+                .expect("internal error: import not found");
+
+            for reg in import.src_mask() {
+                list[length] = Some((reg, false));
+                length += 1;
+            }
+
+            for reg in import.dst_mask() {
+                list[length] = Some((reg, true));
+                length += 1;
+            }
+        };
+
+        let mut seen_dst = false;
+        list.into_iter()
+            .take_while(|reg| reg.is_some())
+            .flatten()
+            .map(move |(reg, is_dst)| {
+                // Sanity check to make sure inputs always come before outputs, so that `regalloc2` doesn't break.
+                if seen_dst {
+                    assert!(is_dst);
+                }
+                seen_dst |= is_dst;
+
+                (reg, is_dst)
+            })
     }
 
     fn map_target<U, E>(self, map: impl Fn(T) -> Result<U, E>) -> Result<BasicInst<U>, E> {
@@ -450,6 +661,7 @@ impl<T> BasicInst<T> {
             BasicInst::StoreIndirect { kind, src, base, offset } => BasicInst::StoreIndirect { kind, src, base, offset },
             BasicInst::RegReg { kind, dst, src1, src2 } => BasicInst::RegReg { kind, dst, src1, src2 },
             BasicInst::AnyAny { kind, dst, src1, src2 } => BasicInst::AnyAny { kind, dst, src1, src2 },
+            BasicInst::Cmov { kind, dst, src, cond } => BasicInst::Cmov { kind, dst, src, cond },
             BasicInst::Ecalli { syscall } => BasicInst::Ecalli { syscall },
             BasicInst::Nop => BasicInst::Nop,
         })
@@ -468,6 +680,7 @@ impl<T> BasicInst<T> {
             | BasicInst::StoreIndirect { .. }
             | BasicInst::RegReg { .. }
             | BasicInst::AnyAny { .. }
+            | BasicInst::Cmov { .. }
             | BasicInst::Ecalli { .. } => (None, None),
         }
     }
@@ -1149,15 +1362,84 @@ fn get_relocation_target(elf: &Elf, relocation: &object::read::Relocation) -> Re
     }
 }
 
+enum MinMax {
+    MaxSigned,
+    MinSigned,
+    MaxUnsigned,
+    MinUnsigned,
+}
+
+fn emit_minmax(
+    kind: MinMax,
+    dst: Reg,
+    src1: Option<Reg>,
+    src2: Option<Reg>,
+    tmp: Reg,
+    mut emit: impl FnMut(InstExt<SectionTarget, SectionTarget>),
+) {
+    // This is supposed to emit something like this:
+    //   dst = src1 ? src2
+    //   tmp = (dst != 0) ? src1 : 0
+    //   dst = (dst == 0) ? src2 : 0
+    //   dst = dst | tmp
+
+    assert_ne!(dst, tmp);
+    assert_ne!(Some(dst), src1);
+    assert_ne!(Some(dst), src2);
+    assert_ne!(Some(tmp), src2);
+
+    let (cmp_src1, cmp_src2, cmp_kind) = match kind {
+        MinMax::MinUnsigned => (src1, src2, AnyAnyKind::SetLessThanUnsigned),
+        MinMax::MaxUnsigned => (src2, src1, AnyAnyKind::SetLessThanUnsigned),
+        MinMax::MinSigned => (src1, src2, AnyAnyKind::SetLessThanSigned),
+        MinMax::MaxSigned => (src2, src1, AnyAnyKind::SetLessThanSigned),
+    };
+
+    emit(InstExt::Basic(BasicInst::AnyAny {
+        kind: cmp_kind,
+        dst,
+        src1: cmp_src1.map(RegImm::Reg).unwrap_or(RegImm::Imm(0)),
+        src2: cmp_src2.map(RegImm::Reg).unwrap_or(RegImm::Imm(0)),
+    }));
+    if let Some(src1) = src1 {
+        emit(InstExt::Basic(BasicInst::Cmov {
+            kind: CmovKind::NotEqZero,
+            dst: tmp,
+            src: src1,
+            cond: dst,
+        }));
+    } else {
+        emit(InstExt::Basic(BasicInst::LoadImmediate { dst: tmp, imm: 0 }));
+    }
+    if let Some(src2) = src2 {
+        emit(InstExt::Basic(BasicInst::Cmov {
+            kind: CmovKind::EqZero,
+            dst,
+            src: src2,
+            cond: dst,
+        }));
+    } else {
+        emit(InstExt::Basic(BasicInst::LoadImmediate { dst, imm: 0 }));
+    }
+    emit(InstExt::Basic(BasicInst::AnyAny {
+        kind: AnyAnyKind::Or,
+        dst,
+        src1: dst.into(),
+        src2: tmp.into(),
+    }))
+}
+
 fn convert_instruction(
     section: &Section,
     current_location: SectionTarget,
     instruction: Inst,
-) -> Result<Option<InstExt<SectionTarget, SectionTarget>>, ProgramFromElfError> {
+    mut emit: impl FnMut(InstExt<SectionTarget, SectionTarget>),
+) -> Result<(), ProgramFromElfError> {
     match instruction {
         Inst::LoadUpperImmediate { dst, value } => {
-            let Some(dst) = cast_reg_non_zero(dst)? else { return Ok(None) };
-            Ok(Some(InstExt::Basic(BasicInst::LoadImmediate { dst, imm: value as i32 })))
+            let Some(dst) = cast_reg_non_zero(dst)? else { return Ok(()) };
+            emit(InstExt::Basic(BasicInst::LoadImmediate { dst, imm: value as i32 }));
+            Ok(())
         }
         Inst::JumpAndLink { dst, target } => {
             let target = SectionTarget {
@@ -1180,7 +1462,8 @@ fn convert_instruction(
                 ControlInst::Jump { target }
             };
 
-            Ok(Some(InstExt::Control(next)))
+            emit(InstExt::Control(next));
+            Ok(())
         }
         Inst::Branch { kind, src1, src2, target } => {
             let src1 = cast_reg_any(src1)?;
@@ -1196,13 +1479,14 @@ fn convert_instruction(
             }
 
             let target_false = current_location.add(4);
-            Ok(Some(InstExt::Control(ControlInst::Branch {
+            emit(InstExt::Control(ControlInst::Branch {
                 kind,
                 src1,
                 src2,
                 target_true,
                 target_false,
-            })))
+            }));
+            Ok(())
         }
         Inst::JumpAndLinkRegister { dst, base, value } => {
             let Some(base) = cast_reg_non_zero(base)? else {
@@ -1224,9 +1508,13 @@ fn convert_instruction(
                 }
             };
 
-            Ok(Some(InstExt::Control(next)))
+            emit(InstExt::Control(next));
+            Ok(())
         }
-        Inst::Unimplemented => Ok(Some(InstExt::Control(ControlInst::Unimplemented))),
+        Inst::Unimplemented => {
+            emit(InstExt::Control(ControlInst::Unimplemented));
+            Ok(())
+        }
         Inst::Load { kind, dst, base, offset } => {
             let Some(dst) = cast_reg_non_zero(dst)? else {
                 return Err(ProgramFromElfError::other("found a load with a zero register as the destination"));
@@ -1236,7 +1524,8 @@ fn convert_instruction(
                 return Err(ProgramFromElfError::other("found an unrelocated absolute load"));
             };
 
-            Ok(Some(InstExt::Basic(BasicInst::LoadIndirect { kind, dst, base, offset })))
+            emit(InstExt::Basic(BasicInst::LoadIndirect { kind, dst, base, offset }));
+            Ok(())
         }
         Inst::Store { kind, src, base, offset } => {
             let Some(base) = cast_reg_non_zero(base)? else {
@@ -1244,10 +1533,11 @@ fn convert_instruction(
             };
 
             let src = cast_reg_any(src)?;
-            Ok(Some(InstExt::Basic(BasicInst::StoreIndirect { kind, src, base, offset })))
+            emit(InstExt::Basic(BasicInst::StoreIndirect { kind, src, base, offset }));
+            Ok(())
         }
         Inst::RegImm { kind, dst, src, imm } => {
-            let Some(dst) = cast_reg_non_zero(dst)? else { return Ok(None) };
+            let Some(dst) = cast_reg_non_zero(dst)? else { return Ok(()) };
             let src = cast_reg_any(src)?;
             let kind = match kind {
                 RegImmKind::Add => AnyAnyKind::Add,
@@ -1261,15 +1551,16 @@ fn convert_instruction(
                 RegImmKind::ShiftArithmeticRight => AnyAnyKind::ShiftArithmeticRight,
             };
 
-            Ok(Some(InstExt::Basic(BasicInst::AnyAny {
+            emit(InstExt::Basic(BasicInst::AnyAny {
                 kind,
                 dst,
                 src1: src,
                 src2: (imm as u32).into(),
-            })))
+            }));
+            Ok(())
         }
         Inst::RegReg { kind, dst, src1, src2 } => {
-            let Some(dst) = cast_reg_non_zero(dst)? else { return Ok(None) };
+            let Some(dst) = cast_reg_non_zero(dst)? else { return Ok(()) };
 
             macro_rules! anyany {
                 ($kind:ident) => {
@@ -1324,7 +1615,8 @@ fn convert_instruction(
                 K::RemUnsigned => regreg!(RemUnsigned),
             };
 
-            Ok(Some(InstExt::Basic(instruction)))
+            emit(InstExt::Basic(instruction));
+            Ok(())
         }
         Inst::AddUpperImmediateToPc { .. } => Err(ProgramFromElfError::other(format!(
             "found an unrelocated auipc instruction at offset {} in section '{}'; is the program compiled with relocations?",
@@ -1334,6 +1626,167 @@ fn convert_instruction(
         Inst::Ecall => Err(ProgramFromElfError::other(
             "found a bare ecall instruction; those are not supported",
         )),
+        Inst::Cmov { kind, dst, src, cond, .. } => {
+            let Some(dst) = cast_reg_non_zero(dst)? else { return Ok(()) };
+            let Some(cond) = cast_reg_non_zero(cond)? else {
+                return Err(ProgramFromElfError::other(
+                    "found a conditional move with a zero register as the condition",
+                ));
+            };
+
+            if let Some(src) = cast_reg_non_zero(src)? {
+                emit(InstExt::Basic(BasicInst::Cmov { kind, dst, src, cond }));
+
+                Ok(())
+            } else {
+                todo!();
+            }
+        }
+        Inst::LoadReserved { dst, src, .. } => {
+            let Some(dst) = cast_reg_non_zero(dst)? else {
+                return Err(ProgramFromElfError::other(
+                    "found an atomic load with a zero register as the destination",
+                ));
+            };
+
+            let Some(src) = cast_reg_non_zero(src)? else {
+                return Err(ProgramFromElfError::other(
+                    "found an atomic load with a zero register as the source",
+                ));
+            };
+
+            emit(InstExt::Basic(BasicInst::LoadIndirect {
+                kind: LoadKind::U32,
+                dst,
+                base: src,
+                offset: 0,
+            }));
+
+            Ok(())
+        }
+        Inst::StoreConditional { src, addr, dst, .. } => {
+            let Some(addr) = cast_reg_non_zero(addr)? else {
+                return Err(ProgramFromElfError::other(
+                    "found an atomic store with a zero register as the address",
+                ));
+            };
+
+            let src = cast_reg_any(src)?;
+            emit(InstExt::Basic(BasicInst::StoreIndirect {
+                kind: StoreKind::U32,
+                src,
+                base: addr,
+                offset: 0,
+            }));
+
+            if let Some(dst) = cast_reg_non_zero(dst)? {
+                // The store always succeeds, so write zero here.
+                emit(InstExt::Basic(BasicInst::LoadImmediate { dst, imm: 0 }));
+            }
+
+            Ok(())
+        }
+        Inst::Atomic {
+            kind,
+            dst: old_value,
+            addr,
+            src: operand,
+            ..
+        } => {
+            let Some(addr) = cast_reg_non_zero(addr)? else {
+                return Err(ProgramFromElfError::other(
+                    "found an atomic operation with a zero register as the address",
+                ));
+            };
+
+            let operand = cast_reg_non_zero(operand)?;
+            let operand_regimm = operand.map(RegImm::Reg).unwrap_or(RegImm::Imm(0));
+            let (old_value, new_value, output) = match cast_reg_non_zero(old_value)? {
+                None => (Reg::E0, Reg::E0, None),
+                Some(old_value) if old_value == addr => (Reg::E0, Reg::E1, Some(old_value)),
+                Some(old_value) => (old_value, Reg::E0, None),
+            };
+
+            emit(InstExt::Basic(BasicInst::LoadIndirect {
+                kind: LoadKind::U32,
+                dst: old_value,
+                base: addr,
+                offset: 0,
+            }));
+
+            match kind {
+                AtomicKind::Swap => {
+                    emit(InstExt::Basic(BasicInst::AnyAny {
+                        kind: AnyAnyKind::Add,
+                        dst: new_value,
+                        src1: operand_regimm,
+                        src2: RegImm::Imm(0),
+                    }));
+                }
+                AtomicKind::Add => {
+                    emit(InstExt::Basic(BasicInst::AnyAny {
+                        kind: AnyAnyKind::Add,
+                        dst: new_value,
+                        src1: old_value.into(),
+                        src2: operand_regimm,
+                    }));
+                }
+                AtomicKind::And => {
+                    emit(InstExt::Basic(BasicInst::AnyAny {
+                        kind: AnyAnyKind::And,
+                        dst: new_value,
+                        src1: old_value.into(),
+                        src2: operand_regimm,
+                    }));
+                }
+                AtomicKind::Or => {
+                    emit(InstExt::Basic(BasicInst::AnyAny {
+                        kind: AnyAnyKind::Or,
+                        dst: new_value,
+                        src1: old_value.into(),
+                        src2: operand_regimm,
+                    }));
+                }
+                AtomicKind::Xor => {
+                    emit(InstExt::Basic(BasicInst::AnyAny {
+                        kind: AnyAnyKind::Xor,
+                        dst: new_value,
+                        src1: old_value.into(),
+                        src2: operand_regimm,
+                    }));
+                }
+                AtomicKind::MaxSigned => {
+                    emit_minmax(MinMax::MaxSigned, new_value, Some(old_value), operand, Reg::E2, &mut emit);
+                }
+                AtomicKind::MinSigned => {
+                    emit_minmax(MinMax::MinSigned, new_value, Some(old_value), operand, Reg::E2, &mut emit);
+                }
+                AtomicKind::MaxUnsigned => {
+                    emit_minmax(MinMax::MaxUnsigned, new_value, Some(old_value), operand, Reg::E2, &mut emit);
+                }
+                AtomicKind::MinUnsigned => {
+                    emit_minmax(MinMax::MinUnsigned, new_value, Some(old_value), operand, Reg::E2, &mut emit);
+                }
+            }
+
+            emit(InstExt::Basic(BasicInst::StoreIndirect {
+                kind: StoreKind::U32,
+                src: new_value.into(),
+                base: addr,
+                offset: 0,
+            }));
+
+            if let Some(output) = output {
+                emit(InstExt::Basic(BasicInst::AnyAny {
+                    kind: AnyAnyKind::Add,
+                    dst: output,
+                    src1: old_value.into(),
+                    src2: RegImm::Imm(0),
+                }));
+            }
+
+            Ok(())
+        }
     }
 }
 
@@ -1460,16 +1913,13 @@ fn parse_code_section(
             .into());
         };
 
-        let op = if let Some(inst) = instruction_overrides.remove(&current_location) {
-            inst
+        if let Some(inst) = instruction_overrides.remove(&current_location) {
+            output.push((source, inst));
         } else {
-            let Some(inst) = convert_instruction(section, current_location, original_inst)? else {
-                continue;
-            };
-            inst
-        };
-
-        output.push((source, op));
+            convert_instruction(section, current_location, original_inst, |inst| {
+                output.push((source, inst));
+            })?
+        }
     }
 
     Ok(())
@@ -1482,7 +1932,17 @@ fn split_code_into_basic_blocks(
     let mut blocks: Vec<BasicBlock<SectionTarget, SectionTarget>> = Vec::new();
     let mut current_block: Vec<(SourceStack, BasicInst<SectionTarget>)> = Vec::new();
     let mut block_start_opt = None;
+    let mut last_source_in_block = None;
     for (source, op) in instructions {
+        if let Some(last_source_in_block) = last_source_in_block {
+            // Handle the case where we've emitted multiple instructions from a single RISC-V instruction.
+            if source == last_source_in_block {
+                let InstExt::Basic(instruction) = op else { unreachable!() };
+                current_block.push((source.into(), instruction));
+                continue;
+            }
+        }
+
         assert!(source.offset_range.start < source.offset_range.end);
 
         let is_jump_target = jump_targets.contains(&source.begin());
@@ -1545,6 +2005,7 @@ fn split_code_into_basic_blocks(
 
         match op {
             InstExt::Control(instruction) => {
+                last_source_in_block = None;
                 block_start_opt = None;
 
                 let block_index = BlockTarget::from_raw(blocks.len());
@@ -1571,6 +2032,7 @@ fn split_code_into_basic_blocks(
                 }
             }
             InstExt::Basic(instruction) => {
+                last_source_in_block = Some(source);
                 current_block.push((source.into(), instruction));
             }
         }
@@ -3305,12 +3767,9 @@ fn optimize_program(
     );
 }
 
-fn add_missing_fallthrough_blocks(
-    all_blocks: &mut Vec<BasicBlock<AnyTarget, BlockTarget>>,
-    reachability_graph: &mut ReachabilityGraph,
-) -> Vec<BlockTarget> {
+fn collect_used_blocks(all_blocks: &[BasicBlock<AnyTarget, BlockTarget>], reachability_graph: &ReachabilityGraph) -> Vec<BlockTarget> {
     let mut used_blocks = Vec::new();
-    for block in &*all_blocks {
+    for block in all_blocks {
         if !reachability_graph.is_code_reachable(block.target) {
             continue;
         }
@@ -3318,6 +3777,14 @@ fn add_missing_fallthrough_blocks(
         used_blocks.push(block.target);
     }
 
+    used_blocks
+}
+
+fn add_missing_fallthrough_blocks(
+    all_blocks: &mut Vec<BasicBlock<AnyTarget, BlockTarget>>,
+    reachability_graph: &mut ReachabilityGraph,
+    used_blocks: Vec<BlockTarget>,
+) -> Vec<BlockTarget> {
     let mut new_used_blocks = Vec::new();
     let can_fallthrough_to_next_block = calculate_whether_can_fallthrough(all_blocks, &used_blocks);
     for current in used_blocks {
@@ -3461,6 +3928,330 @@ fn merge_consecutive_fallthrough_blocks(
     }
 
     used_blocks.retain(|current| !removed.contains(current));
+}
+
+fn spill_fake_registers(
+    section_regspill: SectionIndex,
+    all_blocks: &mut [BasicBlock<AnyTarget, BlockTarget>],
+    reachability_graph: &mut ReachabilityGraph,
+    imports: &[Import],
+    used_blocks: &[BlockTarget],
+    regspill_size: &mut usize,
+) {
+    struct RegAllocBlock<'a> {
+        instructions: &'a [Vec<regalloc2::Operand>],
+        num_vregs: usize,
+    }
+
+    impl<'a> regalloc2::Function for RegAllocBlock<'a> {
+        fn num_insts(&self) -> usize {
+            self.instructions.len()
+        }
+
+        fn num_blocks(&self) -> usize {
+            1
+        }
+
+        fn entry_block(&self) -> regalloc2::Block {
+            regalloc2::Block(0)
+        }
+
+        fn block_insns(&self, _block: regalloc2::Block) -> regalloc2::InstRange {
+            regalloc2::InstRange::forward(regalloc2::Inst(0), regalloc2::Inst(self.instructions.len() as u32))
+        }
+
+        fn block_succs(&self, _block: regalloc2::Block) -> &[regalloc2::Block] {
+            &[]
+        }
+
+        fn block_preds(&self, _block: regalloc2::Block) -> &[regalloc2::Block] {
+            &[]
+        }
+
+        fn block_params(&self, _block: regalloc2::Block) -> &[regalloc2::VReg] {
+            &[]
+        }
+
+        fn is_ret(&self, insn: regalloc2::Inst) -> bool {
+            insn.0 as usize + 1 == self.instructions.len()
+        }
+
+        fn is_branch(&self, _insn: regalloc2::Inst) -> bool {
+            false
+        }
+
+        fn branch_blockparams(&self, _block: regalloc2::Block, _insn: regalloc2::Inst, _succ_idx: usize) -> &[regalloc2::VReg] {
+            unimplemented!();
+        }
+
+        fn inst_operands(&self, insn: regalloc2::Inst) -> &[regalloc2::Operand] {
+            &self.instructions[insn.0 as usize]
+        }
+
+        fn inst_clobbers(&self, _insn: regalloc2::Inst) -> regalloc2::PRegSet {
+            regalloc2::PRegSet::empty()
+        }
+
+        fn num_vregs(&self) -> usize {
+            self.num_vregs
+        }
+
+        fn spillslot_size(&self, _regclass: regalloc2::RegClass) -> usize {
+            1
+        }
+    }
+
+    let fake_mask = RegMask::fake();
+    for current in used_blocks {
+        let block = &mut all_blocks[current.index()];
+        let Some(start_at) = block
+            .ops
+            .iter()
+            .position(|(_, instruction)| !((instruction.src_mask(imports) | instruction.dst_mask(imports)) & fake_mask).is_empty())
+        else {
+            continue;
+        };
+
+        let end_at = start_at
+            + block.ops[start_at..]
+                .iter()
+                .take_while(|(_, instruction)| !((instruction.src_mask(imports) | instruction.dst_mask(imports)) & fake_mask).is_empty())
+                .count();
+
+        // This block uses one or more "fake" registers which are not supported by the VM.
+        //
+        // So we have to spill those register into memory and modify the block in such a way
+        // that it only uses "real" registers natively supported by the VM.
+        //
+        // This is not going to be particularily pretty nor very fast at run time, but it is done only as the last restort.
+
+        let mut counter = 0;
+        let mut reg_to_value_index: [usize; Reg::ALL.len()] = Default::default();
+        let mut instructions = Vec::new();
+
+        let mut prologue = Vec::new();
+        for reg in RegMask::all() {
+            let value_index = counter;
+            counter += 1;
+            reg_to_value_index[reg as usize] = value_index;
+            prologue.push(regalloc2::Operand::new(
+                regalloc2::VReg::new(value_index, regalloc2::RegClass::Int),
+                regalloc2::OperandConstraint::FixedReg(regalloc2::PReg::new(reg as usize, regalloc2::RegClass::Int)),
+                regalloc2::OperandKind::Def,
+                regalloc2::OperandPos::Late,
+            ));
+        }
+
+        instructions.push(prologue);
+
+        for nth_instruction in start_at..end_at {
+            let (_, instruction) = &block.ops[nth_instruction];
+            let mut operands = Vec::new();
+
+            for (reg, is_dst) in instruction.operands(imports) {
+                if is_dst {
+                    let value_index = counter;
+                    counter += 1;
+                    reg_to_value_index[reg as usize] = value_index;
+                    operands.push(regalloc2::Operand::new(
+                        regalloc2::VReg::new(value_index, regalloc2::RegClass::Int),
+                        if reg.fake_register_index().is_none() {
+                            regalloc2::OperandConstraint::FixedReg(regalloc2::PReg::new(reg as usize, regalloc2::RegClass::Int))
+                        } else {
+                            regalloc2::OperandConstraint::Reg
+                        },
+                        regalloc2::OperandKind::Def,
+                        regalloc2::OperandPos::Late,
+                    ));
+                } else {
+                    let value_index = reg_to_value_index[reg as usize];
+                    operands.push(regalloc2::Operand::new(
+                        regalloc2::VReg::new(value_index, regalloc2::RegClass::Int),
+                        if reg.fake_register_index().is_none() {
+                            regalloc2::OperandConstraint::FixedReg(regalloc2::PReg::new(reg as usize, regalloc2::RegClass::Int))
+                        } else {
+                            regalloc2::OperandConstraint::Reg
+                        },
+                        regalloc2::OperandKind::Use,
+                        regalloc2::OperandPos::Early,
+                    ));
+                }
+            }
+
+            instructions.push(operands);
+        }
+
+        let mut epilogue = Vec::new();
+        for reg in RegMask::all() & !RegMask::fake() {
+            let value_index = reg_to_value_index[reg as usize];
+            epilogue.push(regalloc2::Operand::new(
+                regalloc2::VReg::new(value_index, regalloc2::RegClass::Int),
+                regalloc2::OperandConstraint::FixedReg(regalloc2::PReg::new(reg as usize, regalloc2::RegClass::Int)),
+                regalloc2::OperandKind::Use,
+                regalloc2::OperandPos::Early,
+            ));
+        }
+
+        instructions.push(epilogue);
+
+        let alloc_block = RegAllocBlock {
+            instructions: &instructions,
+            num_vregs: counter,
+        };
+
+        let env = regalloc2::MachineEnv {
+            preferred_regs_by_class: [
+                [Reg::T0, Reg::T1, Reg::T2]
+                    .map(|reg| regalloc2::PReg::new(reg as usize, regalloc2::RegClass::Int))
+                    .into(),
+                vec![],
+                vec![],
+            ],
+            non_preferred_regs_by_class: [
+                [Reg::S0, Reg::S1]
+                    .map(|reg| regalloc2::PReg::new(reg as usize, regalloc2::RegClass::Int))
+                    .into(),
+                vec![],
+                vec![],
+            ],
+            scratch_by_class: [None, None, None],
+            fixed_stack_slots: vec![],
+        };
+
+        let opts = regalloc2::RegallocOptions {
+            validate_ssa: true,
+            ..regalloc2::RegallocOptions::default()
+        };
+
+        let output = match regalloc2::run(&alloc_block, &env, &opts) {
+            Ok(output) => output,
+            Err(regalloc2::RegAllocError::SSA(vreg, inst)) => {
+                let nth_instruction: isize = inst.index() as isize - 1 + start_at as isize;
+                let instruction = block.ops.get(nth_instruction as usize).map(|(_, instruction)| instruction);
+                panic!("internal error: register allocation failed because of invalid SSA for {vreg} for instruction {instruction:?}");
+            }
+            Err(error) => {
+                panic!("internal error: register allocation failed: {error}")
+            }
+        };
+
+        let mut buffer = Vec::new();
+        let mut edits = output.edits.into_iter().peekable();
+        for nth_instruction in start_at..=end_at {
+            while let Some((next_edit_at, edit)) = edits.peek() {
+                let target_nth_instruction: isize = next_edit_at.inst().index() as isize - 1 + start_at as isize;
+                if target_nth_instruction < 0
+                    || target_nth_instruction > nth_instruction as isize
+                    || (target_nth_instruction == nth_instruction as isize && next_edit_at.pos() == regalloc2::InstPosition::After)
+                {
+                    break;
+                }
+
+                let target_nth_instruction = target_nth_instruction as usize;
+                let regalloc2::Edit::Move { from: src, to: dst } = edit.clone();
+
+                // Advance the iterator so that we can use `continue` later.
+                edits.next();
+
+                let src_reg = src.as_reg();
+                let dst_reg = dst.as_reg();
+                let new_instruction = match (dst_reg, src_reg) {
+                    (Some(dst_reg), None) => {
+                        let dst_reg = Reg::from_usize(dst_reg.hw_enc()).unwrap();
+                        let src_slot = src.as_stack().unwrap();
+                        let offset = src_slot.index() * 4;
+                        *regspill_size = core::cmp::max(*regspill_size, offset + 4);
+                        BasicInst::LoadAbsolute {
+                            kind: LoadKind::U32,
+                            dst: dst_reg,
+                            target: SectionTarget {
+                                section_index: section_regspill,
+                                offset: offset as u64,
+                            },
+                        }
+                    }
+                    (None, Some(src_reg)) => {
+                        let src_reg = Reg::from_usize(src_reg.hw_enc()).unwrap();
+                        let dst_slot = dst.as_stack().unwrap();
+                        let offset = dst_slot.index() * 4;
+                        *regspill_size = core::cmp::max(*regspill_size, offset + 4);
+                        BasicInst::StoreAbsolute {
+                            kind: StoreKind::U32,
+                            src: src_reg.into(),
+                            target: SectionTarget {
+                                section_index: section_regspill,
+                                offset: offset as u64,
+                            },
+                        }
+                    }
+                    (Some(dst_reg), Some(src_reg)) => {
+                        let dst_reg = Reg::from_usize(dst_reg.hw_enc()).unwrap();
+                        let src_reg = Reg::from_usize(src_reg.hw_enc()).unwrap();
+                        if src_reg == dst_reg {
+                            continue;
+                        }
+                        BasicInst::AnyAny {
+                            kind: AnyAnyKind::Add,
+                            dst: dst_reg,
+                            src1: src_reg.into(),
+                            src2: RegImm::Imm(0),
+                        }
+                    }
+                    // Won't be emitted according to `regalloc2` docs.
+                    (None, None) => unreachable!(),
+                };
+
+                log::trace!("Injected:\n     {new_instruction:?}");
+
+                let source = block.ops.get(target_nth_instruction).or(block.ops.last()).unwrap().0.clone();
+                buffer.push((source, new_instruction));
+            }
+
+            if nth_instruction == end_at {
+                assert!(edits.next().is_none());
+                break;
+            }
+
+            let (source, instruction) = &block.ops[nth_instruction];
+            let mut alloc_index = output.inst_alloc_offsets[nth_instruction - start_at + 1];
+            let new_instruction = instruction
+                .map_register(|reg, _| {
+                    let alloc = &output.allocs[alloc_index as usize];
+                    alloc_index += 1;
+
+                    assert_eq!(alloc.kind(), regalloc2::AllocationKind::Reg);
+                    let allocated_reg = Reg::from_usize(alloc.as_reg().unwrap().hw_enc() as usize).unwrap();
+                    if reg.fake_register_index().is_none() {
+                        assert_eq!(reg, allocated_reg);
+                    } else {
+                        assert_ne!(reg, allocated_reg);
+                        assert!(allocated_reg.fake_register_index().is_none());
+                    }
+
+                    allocated_reg
+                })
+                .unwrap_or(*instruction);
+
+            if *instruction == new_instruction {
+                log::trace!("Unmodified:\n     {instruction:?}");
+            } else {
+                log::trace!("Replaced:\n     {instruction:?}\n  -> {new_instruction:?}");
+            }
+
+            buffer.push((source.clone(), new_instruction));
+        }
+
+        assert!(edits.next().is_none());
+
+        reachability_graph
+            .for_data
+            .entry(section_regspill)
+            .or_insert_with(Default::default)
+            .address_taken_in
+            .insert(*current);
+
+        block.ops.splice(start_at..end_at, buffer);
+    }
 }
 
 fn replace_immediates_with_registers(
@@ -3959,8 +4750,20 @@ impl RegMask {
         RegMask((1 << Reg::ALL.len()) - 1)
     }
 
+    fn fake() -> Self {
+        let mut mask = RegMask(0);
+        for reg in Reg::FAKE {
+            mask.insert(reg);
+        }
+        mask
+    }
+
     fn empty() -> Self {
         RegMask(0)
+    }
+
+    fn is_empty(self) -> bool {
+        self == Self::empty()
     }
 
     fn remove(&mut self, mask: impl Into<RegMask>) {
@@ -4123,6 +4926,28 @@ fn emit_code(
     jump_target_for_block: &[Option<JumpTarget>],
     is_optimized: bool,
 ) -> Result<Vec<(SourceStack, Instruction)>, ProgramFromElfError> {
+    use polkavm_common::program::Reg as PReg;
+    fn conv_reg(reg: Reg) -> PReg {
+        match reg {
+            Reg::RA => PReg::RA,
+            Reg::SP => PReg::SP,
+            Reg::T0 => PReg::T0,
+            Reg::T1 => PReg::T1,
+            Reg::T2 => PReg::T2,
+            Reg::S0 => PReg::S0,
+            Reg::S1 => PReg::S1,
+            Reg::A0 => PReg::A0,
+            Reg::A1 => PReg::A1,
+            Reg::A2 => PReg::A2,
+            Reg::A3 => PReg::A3,
+            Reg::A4 => PReg::A4,
+            Reg::A5 => PReg::A5,
+            Reg::E0 | Reg::E1 | Reg::E2 => {
+                unreachable!("internal error: temporary register was not spilled into memory");
+            }
+        }
+    }
+
     let can_fallthrough_to_next_block = calculate_whether_can_fallthrough(all_blocks, used_blocks);
     let get_data_address = |target: SectionTarget| -> Result<u32, ProgramFromElfError> {
         if let Some(base_address) = base_address_for_section.get(&target.section_index) {
@@ -4184,10 +5009,10 @@ fn emit_code(
 
         for (source, op) in &block.ops {
             let op = match *op {
-                BasicInst::LoadImmediate { dst, imm } => Instruction::load_imm(dst, imm as u32),
+                BasicInst::LoadImmediate { dst, imm } => Instruction::load_imm(conv_reg(dst), imm as u32),
                 BasicInst::LoadAbsolute { kind, dst, target } => {
                     codegen! {
-                        args = (dst, get_data_address(target)?),
+                        args = (conv_reg(dst), get_data_address(target)?),
                         kind = kind,
                         {
                             LoadKind::I8 => load_i8,
@@ -4203,7 +5028,7 @@ fn emit_code(
                     match src {
                         RegImm::Reg(src) => {
                             codegen! {
-                                args = (src, target),
+                                args = (conv_reg(src), target),
                                 kind = kind,
                                 {
                                     StoreKind::U32 => store_u32,
@@ -4227,7 +5052,7 @@ fn emit_code(
                 }
                 BasicInst::LoadIndirect { kind, dst, base, offset } => {
                     codegen! {
-                        args = (dst, base, offset as u32),
+                        args = (conv_reg(dst), conv_reg(base), offset as u32),
                         kind = kind,
                         {
                             LoadKind::I8 => load_indirect_i8,
@@ -4241,7 +5066,7 @@ fn emit_code(
                 BasicInst::StoreIndirect { kind, src, base, offset } => match src {
                     RegImm::Reg(src) => {
                         codegen! {
-                            args = (src, base, offset as u32),
+                            args = (conv_reg(src), conv_reg(base), offset as u32),
                             kind = kind,
                             {
                                 StoreKind::U32 => store_indirect_u32,
@@ -4252,7 +5077,7 @@ fn emit_code(
                     }
                     RegImm::Imm(value) => {
                         codegen! {
-                            args = (base, offset as u32, value),
+                            args = (conv_reg(base), offset as u32, value),
                             kind = kind,
                             {
                                 StoreKind::U32 => store_imm_indirect_u32,
@@ -4274,7 +5099,7 @@ fn emit_code(
                         AnyTarget::Data(target) => get_data_address(target)?,
                     };
 
-                    Instruction::load_imm(dst, value)
+                    Instruction::load_imm(conv_reg(dst), value)
                 }
                 BasicInst::LoadAddressIndirect { dst, target } => {
                     let Some(&offset) = target_to_got_offset.get(&target) else {
@@ -4289,12 +5114,12 @@ fn emit_code(
                     };
 
                     let value = get_data_address(target)?;
-                    Instruction::load_u32(dst, value)
+                    Instruction::load_u32(conv_reg(dst), value)
                 }
                 BasicInst::RegReg { kind, dst, src1, src2 } => {
                     use RegRegKind as K;
                     codegen! {
-                        args = (dst, src1, src2),
+                        args = (conv_reg(dst), conv_reg(src1), conv_reg(src2)),
                         kind = kind,
                         {
                             K::MulUpperSignedUnsigned => mul_upper_signed_unsigned,
@@ -4308,10 +5133,11 @@ fn emit_code(
                 BasicInst::AnyAny { kind, dst, src1, src2 } => {
                     use AnyAnyKind as K;
                     use Instruction as I;
+                    let dst = conv_reg(dst);
                     match (src1, src2) {
                         (RegImm::Reg(src1), RegImm::Reg(src2)) => {
                             codegen! {
-                                args = (dst, src1, src2),
+                                args = (dst, conv_reg(src1), conv_reg(src2)),
                                 kind = kind,
                                 {
                                     K::Add => add,
@@ -4330,44 +5156,60 @@ fn emit_code(
                                 }
                             }
                         }
-                        (RegImm::Reg(src1), RegImm::Imm(src2)) => match kind {
-                            K::Add if src2 == 0 => I::move_reg(dst, src1),
-                            K::Add => I::add_imm(dst, src1, src2),
-                            K::Sub => I::add_imm(dst, src1, (-(src2 as i32)) as u32),
-                            K::ShiftLogicalLeft => I::shift_logical_left_imm(dst, src1, src2),
-                            K::SetLessThanSigned => I::set_less_than_signed_imm(dst, src1, src2),
-                            K::SetLessThanUnsigned => I::set_less_than_unsigned_imm(dst, src1, src2),
-                            K::Xor => I::xor_imm(dst, src1, src2),
-                            K::ShiftLogicalRight => I::shift_logical_right_imm(dst, src1, src2),
-                            K::ShiftArithmeticRight => I::shift_arithmetic_right_imm(dst, src1, src2),
-                            K::Or => I::or_imm(dst, src1, src2),
-                            K::And => I::and_imm(dst, src1, src2),
-                            K::Mul => I::mul_imm(dst, src1, src2),
-                            K::MulUpperSignedSigned => I::mul_upper_signed_signed_imm(dst, src1, src2),
-                            K::MulUpperUnsignedUnsigned => I::mul_upper_unsigned_unsigned_imm(dst, src1, src2),
-                        },
-                        (RegImm::Imm(src1), RegImm::Reg(src2)) => match kind {
-                            K::Add => I::add_imm(dst, src2, src1),
-                            K::Xor => I::xor_imm(dst, src2, src1),
-                            K::Or => I::or_imm(dst, src2, src1),
-                            K::And => I::and_imm(dst, src2, src1),
-                            K::Mul => I::mul_imm(dst, src2, src1),
-                            K::MulUpperSignedSigned => I::mul_upper_signed_signed_imm(dst, src2, src1),
-                            K::MulUpperUnsignedUnsigned => I::mul_upper_unsigned_unsigned_imm(dst, src2, src1),
+                        (RegImm::Reg(src1), RegImm::Imm(src2)) => {
+                            let src1 = conv_reg(src1);
+                            match kind {
+                                K::Add if src2 == 0 => I::move_reg(dst, src1),
+                                K::Add => I::add_imm(dst, src1, src2),
+                                K::Sub => I::add_imm(dst, src1, (-(src2 as i32)) as u32),
+                                K::ShiftLogicalLeft => I::shift_logical_left_imm(dst, src1, src2),
+                                K::SetLessThanSigned => I::set_less_than_signed_imm(dst, src1, src2),
+                                K::SetLessThanUnsigned => I::set_less_than_unsigned_imm(dst, src1, src2),
+                                K::Xor => I::xor_imm(dst, src1, src2),
+                                K::ShiftLogicalRight => I::shift_logical_right_imm(dst, src1, src2),
+                                K::ShiftArithmeticRight => I::shift_arithmetic_right_imm(dst, src1, src2),
+                                K::Or => I::or_imm(dst, src1, src2),
+                                K::And => I::and_imm(dst, src1, src2),
+                                K::Mul => I::mul_imm(dst, src1, src2),
+                                K::MulUpperSignedSigned => I::mul_upper_signed_signed_imm(dst, src1, src2),
+                                K::MulUpperUnsignedUnsigned => I::mul_upper_unsigned_unsigned_imm(dst, src1, src2),
+                            }
+                        }
+                        (RegImm::Imm(src1), RegImm::Reg(src2)) => {
+                            let src2 = conv_reg(src2);
+                            match kind {
+                                K::Add => I::add_imm(dst, src2, src1),
+                                K::Xor => I::xor_imm(dst, src2, src1),
+                                K::Or => I::or_imm(dst, src2, src1),
+                                K::And => I::and_imm(dst, src2, src1),
+                                K::Mul => I::mul_imm(dst, src2, src1),
+                                K::MulUpperSignedSigned => I::mul_upper_signed_signed_imm(dst, src2, src1),
+                                K::MulUpperUnsignedUnsigned => I::mul_upper_unsigned_unsigned_imm(dst, src2, src1),
 
-                            K::Sub => I::negate_and_add_imm(dst, src2, src1),
-                            K::ShiftLogicalLeft => I::shift_logical_left_imm_alt(dst, src2, src1),
-                            K::SetLessThanSigned => I::set_greater_than_signed_imm(dst, src2, src1),
-                            K::SetLessThanUnsigned => I::set_greater_than_unsigned_imm(dst, src2, src1),
-                            K::ShiftLogicalRight => I::shift_logical_right_imm_alt(dst, src2, src1),
-                            K::ShiftArithmeticRight => I::shift_arithmetic_right_imm_alt(dst, src2, src1),
-                        },
+                                K::Sub => I::negate_and_add_imm(dst, src2, src1),
+                                K::ShiftLogicalLeft => I::shift_logical_left_imm_alt(dst, src2, src1),
+                                K::SetLessThanSigned => I::set_greater_than_signed_imm(dst, src2, src1),
+                                K::SetLessThanUnsigned => I::set_greater_than_unsigned_imm(dst, src2, src1),
+                                K::ShiftLogicalRight => I::shift_logical_right_imm_alt(dst, src2, src1),
+                                K::ShiftArithmeticRight => I::shift_arithmetic_right_imm_alt(dst, src2, src1),
+                            }
+                        }
                         (RegImm::Imm(src1), RegImm::Imm(src2)) => {
                             if is_optimized {
                                 unreachable!("internal error: instruction with only constant operands: {op:?}")
                             } else {
                                 I::load_imm(dst, OperationKind::from(kind).apply_const(src1 as i32, src2 as i32) as u32)
                             }
+                        }
+                    }
+                }
+                BasicInst::Cmov { kind, dst, src, cond } => {
+                    codegen! {
+                        args = (conv_reg(dst), conv_reg(src), conv_reg(cond)),
+                        kind = kind,
+                        {
+                            CmovKind::EqZero => cmov_if_zero,
+                            CmovKind::NotEqZero => cmov_if_not_zero,
                         }
                     }
                 }
@@ -4407,10 +5249,10 @@ fn emit_code(
                 let target = get_jump_target(target)?;
                 get_jump_target(target_return)?;
 
-                code.push((block.next.source.clone(), Instruction::call(ra, target.static_target)));
+                code.push((block.next.source.clone(), Instruction::call(conv_reg(ra), target.static_target)));
             }
             ControlInst::JumpIndirect { base, offset } => {
-                code.push((block.next.source.clone(), Instruction::jump_indirect(base, offset as u32)));
+                code.push((block.next.source.clone(), Instruction::jump_indirect(conv_reg(base), offset as u32)));
             }
             ControlInst::CallIndirect {
                 ra,
@@ -4420,7 +5262,10 @@ fn emit_code(
             } => {
                 assert!(can_fallthrough_to_next_block.contains(block_target));
                 get_jump_target(target_return)?;
-                code.push((block.next.source.clone(), Instruction::call_indirect(ra, base, offset as u32)));
+                code.push((
+                    block.next.source.clone(),
+                    Instruction::call_indirect(conv_reg(ra), conv_reg(base), offset as u32),
+                ));
             }
             ControlInst::Branch {
                 kind,
@@ -4437,7 +5282,7 @@ fn emit_code(
                 let instruction = match (src1, src2) {
                     (RegImm::Reg(src1), RegImm::Reg(src2)) => {
                         codegen! {
-                            args = (src1, src2, target_true.static_target),
+                            args = (conv_reg(src1), conv_reg(src2), target_true.static_target),
                             kind = kind,
                             {
                                 BranchKind::Eq => branch_eq,
@@ -4451,7 +5296,7 @@ fn emit_code(
                     }
                     (RegImm::Imm(src1), RegImm::Reg(src2)) => {
                         codegen! {
-                            args = (src2, src1, target_true.static_target),
+                            args = (conv_reg(src2), src1, target_true.static_target),
                             kind = kind,
                             {
                                 BranchKind::Eq => branch_eq_imm,
@@ -4465,7 +5310,7 @@ fn emit_code(
                     }
                     (RegImm::Reg(src1), RegImm::Imm(src2)) => {
                         codegen! {
-                            args = (src1, src2, target_true.static_target),
+                            args = (conv_reg(src1), src2, target_true.static_target),
                             kind = kind,
                             {
                                 BranchKind::Eq => branch_eq_imm,
@@ -5413,6 +6258,9 @@ pub fn program_from_elf(config: Config, data: &[u8]) -> Result<ProgramBlob, Prog
         return Err(ProgramFromElfError::other("missing '.text' section"));
     }
 
+    let section_regspill = elf.add_empty_data_section(".regspill");
+    sections_rw_data.insert(0, section_regspill);
+
     let code_sections_set: HashSet<SectionIndex> = sections_code.iter().copied().collect();
     let data_sections = sections_ro_data
         .iter()
@@ -5506,10 +6354,20 @@ pub fn program_from_elf(config: Config, data: &[u8]) -> Result<ProgramBlob, Prog
     let mut reachability_graph;
     let mut used_blocks;
 
+    let mut regspill_size = 0;
     if config.optimize {
         reachability_graph = calculate_reachability(&section_to_block, &all_blocks, &data_sections_set, &export_metadata, &relocations)?;
         optimize_program(&config, &elf, &import_metadata, &mut all_blocks, &mut reachability_graph);
-        used_blocks = add_missing_fallthrough_blocks(&mut all_blocks, &mut reachability_graph);
+        used_blocks = collect_used_blocks(&all_blocks, &reachability_graph);
+        spill_fake_registers(
+            section_regspill,
+            &mut all_blocks,
+            &mut reachability_graph,
+            &import_metadata,
+            &used_blocks,
+            &mut regspill_size,
+        );
+        used_blocks = add_missing_fallthrough_blocks(&mut all_blocks, &mut reachability_graph, used_blocks);
         merge_consecutive_fallthrough_blocks(&mut all_blocks, &mut reachability_graph, &mut section_to_block, &mut used_blocks);
         replace_immediates_with_registers(&mut all_blocks, &import_metadata, &used_blocks);
 
@@ -5535,7 +6393,17 @@ pub fn program_from_elf(config: Config, data: &[u8]) -> Result<ProgramBlob, Prog
         }
 
         used_blocks = (0..all_blocks.len()).map(BlockTarget::from_raw).collect();
+        spill_fake_registers(
+            section_regspill,
+            &mut all_blocks,
+            &mut reachability_graph,
+            &import_metadata,
+            &used_blocks,
+            &mut regspill_size,
+        );
     }
+
+    elf.extend_section_to_at_least(section_regspill, regspill_size);
 
     for &section_index in &sections_other {
         if reachability_graph.is_data_section_reachable(section_index) {

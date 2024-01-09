@@ -444,21 +444,91 @@ fn pinky(config: Config) {
     }
 }
 
-fn test_blob(config: Config) {
-    let _ = env_logger::try_init();
-    let blob = get_blob(include_bytes!("../../../test-data/test-blob.elf.zst"));
+struct TestInstance {
+    instance: crate::Instance<()>,
+}
 
-    let engine = Engine::new(&config).unwrap();
-    let module = Module::from_blob(&engine, &Default::default(), &blob).unwrap();
-    let linker = Linker::new(&engine);
-    let instance_pre = linker.instantiate_pre(&module).unwrap();
-    let instance = instance_pre.instantiate().unwrap();
+impl TestInstance {
+    fn new(config: &Config) -> Self {
+        let _ = env_logger::try_init();
+        let blob = get_blob(include_bytes!("../../../test-data/test-blob.elf.zst"));
 
+        let engine = Engine::new(config).unwrap();
+        let module = Module::from_blob(&engine, &Default::default(), &blob).unwrap();
+        let linker = Linker::new(&engine);
+        let instance_pre = linker.instantiate_pre(&module).unwrap();
+        let instance = instance_pre.instantiate().unwrap();
+
+        TestInstance { instance }
+    }
+
+    pub fn call<FnArgs, FnResult>(&self, name: &str, args: FnArgs) -> Result<FnResult, crate::ExecutionError<crate::Error>>
+    where
+        FnArgs: crate::api::FuncArgs,
+        FnResult: crate::api::FuncResult,
     {
-        let function = instance.get_typed_func::<(), u32>("push_one_to_global_vec").unwrap();
-        assert_eq!(function.call(&mut (), ()).unwrap(), 1);
-        assert_eq!(function.call(&mut (), ()).unwrap(), 2);
-        assert_eq!(function.call(&mut (), ()).unwrap(), 3);
+        let function = self
+            .instance
+            .get_typed_func::<FnArgs, FnResult>(name)
+            .expect("function doesn't exist");
+        function.call(&mut (), args)
+    }
+}
+
+fn test_blob_basic_test(config: Config) {
+    let i = TestInstance::new(&config);
+    assert_eq!(i.call::<(), u32>("push_one_to_global_vec", ()).unwrap(), 1);
+    assert_eq!(i.call::<(), u32>("push_one_to_global_vec", ()).unwrap(), 2);
+    assert_eq!(i.call::<(), u32>("push_one_to_global_vec", ()).unwrap(), 3);
+}
+
+fn test_blob_atomic_fetch_add(config: Config) {
+    let i = TestInstance::new(&config);
+    assert_eq!(i.call::<(u32,), u32>("atomic_fetch_add", (1,)).unwrap(), 0);
+    assert_eq!(i.call::<(u32,), u32>("atomic_fetch_add", (1,)).unwrap(), 1);
+    assert_eq!(i.call::<(u32,), u32>("atomic_fetch_add", (1,)).unwrap(), 2);
+    assert_eq!(i.call::<(u32,), u32>("atomic_fetch_add", (0,)).unwrap(), 3);
+    assert_eq!(i.call::<(u32,), u32>("atomic_fetch_add", (0,)).unwrap(), 3);
+    assert_eq!(i.call::<(u32,), u32>("atomic_fetch_add", (2,)).unwrap(), 3);
+    assert_eq!(i.call::<(u32,), u32>("atomic_fetch_add", (0,)).unwrap(), 5);
+}
+
+fn test_blob_atomic_fetch_swap(config: Config) {
+    let i = TestInstance::new(&config);
+    assert_eq!(i.call::<(u32,), u32>("atomic_fetch_swap", (10,)).unwrap(), 0);
+    assert_eq!(i.call::<(u32,), u32>("atomic_fetch_swap", (100,)).unwrap(), 10);
+    assert_eq!(i.call::<(u32,), u32>("atomic_fetch_swap", (1000,)).unwrap(), 100);
+}
+
+fn test_blob_atomic_fetch_minmax(config: Config) {
+    use core::cmp::{max, min};
+
+    fn maxu(a: i32, b: i32) -> i32 {
+        max(a as u32, b as u32) as i32
+    }
+
+    fn minu(a: i32, b: i32) -> i32 {
+        min(a as u32, b as u32) as i32
+    }
+
+    #[allow(clippy::type_complexity)]
+    let list: [(&str, fn(i32, i32) -> i32); 4] = [
+        ("atomic_fetch_max_signed", max),
+        ("atomic_fetch_min_signed", min),
+        ("atomic_fetch_max_unsigned", maxu),
+        ("atomic_fetch_min_unsigned", minu),
+    ];
+
+    let i = TestInstance::new(&config);
+    for (name, cb) in list {
+        for a in [-10, 0, 10] {
+            for b in [-10, 0, 10] {
+                let new_value = cb(a, b);
+                i.call::<(i32,), ()>("set_atomic_global", (a,)).unwrap();
+                assert_eq!(i.call::<(i32,), i32>(name, (b,)).unwrap(), a);
+                assert_eq!(i.call::<(), i32>("get_atomic_global", ()).unwrap(), new_value);
+            }
+        }
     }
 }
 
@@ -603,7 +673,11 @@ run_tests! {
     doom_o1_dwarf5
     doom_o3_dwarf2
     pinky
-    test_blob
+
+    test_blob_basic_test
+    test_blob_atomic_fetch_add
+    test_blob_atomic_fetch_swap
+    test_blob_atomic_fetch_minmax
 
     basic_gas_metering_sync
     basic_gas_metering_async

@@ -1,5 +1,4 @@
 #![doc = include_str!("../README.md")]
-#![forbid(unsafe_code)]
 #![deny(unused_must_use)]
 
 mod dwarf;
