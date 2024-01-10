@@ -52,7 +52,6 @@ pub fn polkavm_export(input: syn::ItemFn) -> Result<proc_macro2::TokenStream, sy
 
     unsupported_if_some!(sig.constness);
     unsupported_if_some!(sig.asyncness);
-    unsupported_if_some!(sig.unsafety);
     unsupported_if_some!(sig.generics.lt_token);
     unsupported_if_some!(sig.generics.params.first());
     unsupported_if_some!(sig.generics.gt_token);
@@ -75,6 +74,7 @@ pub fn polkavm_export(input: syn::ItemFn) -> Result<proc_macro2::TokenStream, sy
     let ident = &sig.ident;
     let args = &sig.inputs;
     let return_ty = &sig.output;
+    let unsafety = &sig.unsafety;
     let vis = &input.vis;
     let body = &input.block;
 
@@ -90,7 +90,7 @@ pub fn polkavm_export(input: syn::ItemFn) -> Result<proc_macro2::TokenStream, sy
         #(#cfg_attributes)*
         #(#fn_attributes)*
         #[cfg_attr(any(target_arch = "riscv32", target_arch = "riscv64"), link_section = ".text.polkavm_export")]
-        #vis extern "C" fn #ident(#args) #return_ty #body
+        #vis #unsafety extern "C" fn #ident(#args) #return_ty #body
 
         // A dirty hack to remove the need for a linker script.
         #(#cfg_attributes)*
