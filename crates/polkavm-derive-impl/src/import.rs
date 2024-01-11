@@ -45,7 +45,13 @@ fn generate_import_assembly(index: Option<u32>, sig: &syn::Signature, bitness: B
         }
     }
 
-    let import_symbol = syn::Ident::new(&format!("__polkavm_import_{}", sig.ident), sig.ident.span());
+    // A hack to generate a unique ID.
+    let mut unique = String::new();
+    for b in format!("{:?}", sig.ident.span()).bytes() {
+        write!(&mut unique, "{:02x}", b).unwrap();
+    }
+
+    let import_symbol = syn::Ident::new(&format!("__polkavm_import_{}_{}", sig.ident, unique), sig.ident.span());
     let name = &sig.ident;
     gen_asm! {
         (".pushsection .polkavm_imports.{},\"a\",@progbits", name)
@@ -68,18 +74,19 @@ fn generate_import_assembly(index: Option<u32>, sig: &syn::Signature, bitness: B
 
     assembly.push_str(&bytes_to_asm(&metadata_bytes));
 
+    let unique_name = format!("{name}_{unique}");
     gen_asm! {
         (".popsection")
         (".pushsection .text.{},\"ax\",@progbits", name)
-        (".globl {}", name)
-        (".hidden {}", name)
+        (".weak {}", name)
+        (".set {}, {}", name, unique_name)
         (".balign 4")
         (".type {},@function", name)
-        ("{}:", name)
+        ("{}:", unique_name)
         (".4byte 0x{:08x}", INSTRUCTION_ECALLI)
         (".4byte {}", import_symbol)
         ("ret")
-        (".size {}, . - {}", name, name)
+        (".size {}, . - {}", unique_name, unique_name)
         (".popsection")
     }
 
