@@ -5745,7 +5745,6 @@ fn harvest_code_relocations(
     }
 
     let mut pcrel_relocations = RelocPairs::default();
-    let mut skip_lo12: HashSet<SectionTarget> = Default::default();
 
     let section_name = section.name();
     log::trace!("Harvesting code relocations from section: {}", section_name);
@@ -5951,96 +5950,25 @@ fn harvest_code_relocations(
                         );
                     }
                     object::elf::R_RISCV_HI20 => {
-                        // This relocation is for a LUI + ADDI.
-                        let Some(xs) = section_data.get(relative_address as usize..relative_address as usize + 8) else {
-                            return Err(ProgramFromElfError::other("invalid R_RISCV_HI20 relocation"));
-                        };
-
-                        let hi_inst_raw = u32::from_le_bytes([xs[0], xs[1], xs[2], xs[3]]);
-                        let Some(hi_inst) = Inst::decode(hi_inst_raw) else {
+                        // This relocation is for a LUI.
+                        let inst_raw = read_u32(section_data, relative_address)?;
+                        let Some(inst) = Inst::decode(inst_raw) else {
                             return Err(ProgramFromElfError::other(format!(
-                                "R_RISCV_HI20 for an unsupported instruction (1st): 0x{hi_inst_raw:08}"
+                                "R_RISCV_HI20 for an unsupported instruction: 0x{inst_raw:08}"
                             )));
                         };
 
-                        let lo_inst_raw = u32::from_le_bytes([xs[4], xs[5], xs[6], xs[7]]);
-                        let Some(lo_inst) = Inst::decode(lo_inst_raw) else {
+                        let Inst::LoadUpperImmediate { dst, value: _ } = inst else {
                             return Err(ProgramFromElfError::other(format!(
-                                "R_RISCV_HI20 for an unsupported instruction (2nd): 0x{lo_inst_raw:08}"
+                                "R_RISCV_HI20 for an unsupported instruction: 0x{inst_raw:08} ({inst:?})"
                             )));
                         };
 
-                        let Inst::LoadUpperImmediate { dst: hi_dst, value: _ } = hi_inst else {
-                            return Err(ProgramFromElfError::other(format!(
-                                "R_RISCV_HI20 for an unsupported instruction (1st): 0x{hi_inst_raw:08} ({hi_inst:?})"
-                            )));
+                        let Some(dst) = cast_reg_non_zero(dst)? else {
+                            return Err(ProgramFromElfError::other("R_RISCV_HI20 with a zero destination register"));
                         };
 
-                        match lo_inst {
-                            Inst::RegImm {
-                                kind: RegImmKind::Add,
-                                dst,
-                                src: lo_src,
-                                imm: _,
-                            } => {
-                                if hi_dst != lo_src {
-                                    return Err(ProgramFromElfError::other(
-                                        "R_RISCV_HI20 for a pair of instructions with different destination registers: {hi_inst:?}, {lo_inst:?}",
-                                    ));
-                                }
-
-                                let Some(dst) = cast_reg_non_zero(dst)? else {
-                                    return Err(ProgramFromElfError::other("R_RISCV_HI20 with a zero destination register"));
-                                };
-
-                                instruction_overrides.insert(current_location, InstExt::nop());
-                                instruction_overrides
-                                    .insert(current_location.add(4), InstExt::Basic(BasicInst::LoadAddress { dst, target }));
-                            }
-                            Inst::Load {
-                                kind,
-                                dst,
-                                base: lo_base,
-                                offset: _,
-                            } => {
-                                if hi_dst != lo_base {
-                                    return Err(ProgramFromElfError::other(
-                                        "R_RISCV_HI20 for a pair of instructions with different destination registers: {hi_inst:?}, {lo_inst:?}",
-                                    ));
-                                }
-
-                                let Some(dst) = cast_reg_non_zero(dst)? else {
-                                    return Err(ProgramFromElfError::other("R_RISCV_HI20 with a zero destination register"));
-                                };
-
-                                instruction_overrides.insert(current_location, InstExt::nop());
-                                instruction_overrides.insert(
-                                    current_location.add(4),
-                                    InstExt::Basic(BasicInst::LoadAbsolute { kind, dst, target }),
-                                );
-                            }
-                            Inst::Store {
-                                kind,
-                                src,
-                                base: _,
-                                offset: _,
-                            } => {
-                                let src = cast_reg_any(src)?;
-                                instruction_overrides.insert(current_location, InstExt::nop());
-                                instruction_overrides.insert(
-                                    current_location.add(4),
-                                    InstExt::Basic(BasicInst::StoreAbsolute { kind, src, target }),
-                                );
-                            }
-                            _ => {
-                                return Err(ProgramFromElfError::other(format!(
-                                    "R_RISCV_HI20 for an unsupported instruction (2nd): 0x{lo_inst_raw:08} ({lo_inst:?}) (at {loc})",
-                                    loc = current_location.fmt_human_readable(elf),
-                                )));
-                            }
-                        }
-
-                        skip_lo12.insert(current_location.add(4));
+                        instruction_overrides.insert(current_location, InstExt::Basic(BasicInst::LoadAddress { dst, target }));
 
                         log::trace!(
                             "  R_RISCV_HI20: {}[0x{relative_address:x}] (0x{absolute_address:x}): -> {}",
@@ -6051,24 +5979,88 @@ fn harvest_code_relocations(
                         continue;
                     }
                     object::elf::R_RISCV_LO12_I => {
-                        if skip_lo12.contains(&current_location) {
-                            continue;
-                        }
+                        let inst_raw = read_u32(section_data, relative_address)?;
+                        let Some(inst) = Inst::decode(inst_raw) else {
+                            return Err(ProgramFromElfError::other(format!(
+                                "R_RISCV_LO12_I for an unsupported instruction: 0x{inst_raw:08}"
+                            )));
+                        };
 
-                        return Err(ProgramFromElfError::other(format!(
-                            "found a R_RISCV_LO12_I relocation in '{}' without a R_RISCV_HI20 preceding it",
-                            section.name()
-                        )));
+                        let new_instruction = match inst {
+                            Inst::RegImm {
+                                kind: RegImmKind::Add,
+                                dst,
+                                src: _,
+                                imm: _,
+                            } => {
+                                let Some(dst) = cast_reg_non_zero(dst)? else {
+                                    return Err(ProgramFromElfError::other("R_RISCV_LO12_I with a zero destination register"));
+                                };
+
+                                InstExt::Basic(BasicInst::LoadAddress { dst, target })
+                            }
+                            Inst::Load {
+                                kind,
+                                dst,
+                                base: _,
+                                offset: _,
+                            } => {
+                                let Some(dst) = cast_reg_non_zero(dst)? else {
+                                    return Err(ProgramFromElfError::other("R_RISCV_LO12_I with a zero destination register"));
+                                };
+
+                                InstExt::Basic(BasicInst::LoadAbsolute { kind, dst, target })
+                            }
+                            _ => {
+                                return Err(ProgramFromElfError::other(format!(
+                                    "R_RISCV_LO12_I for an unsupported instruction: 0x{inst_raw:08} ({inst:?}) (at {loc})",
+                                    loc = current_location.fmt_human_readable(elf),
+                                )));
+                            }
+                        };
+
+                        instruction_overrides.insert(current_location, new_instruction);
+
+                        log::trace!(
+                            "  R_RISCV_LO12_I: {}[0x{relative_address:x}] (0x{absolute_address:x}): -> {}",
+                            section.name(),
+                            target
+                        );
                     }
                     object::elf::R_RISCV_LO12_S => {
-                        if skip_lo12.contains(&current_location) {
-                            continue;
-                        }
+                        let inst_raw = read_u32(section_data, relative_address)?;
+                        let Some(inst) = Inst::decode(inst_raw) else {
+                            return Err(ProgramFromElfError::other(format!(
+                                "R_RISCV_LO12_S for an unsupported instruction: 0x{inst_raw:08}"
+                            )));
+                        };
 
-                        return Err(ProgramFromElfError::other(format!(
-                            "found a R_RISCV_LO12_S relocation in '{}' without a R_RISCV_HI20 preceding it",
-                            section.name()
-                        )));
+                        let new_instruction = match inst {
+                            Inst::Store {
+                                kind,
+                                src,
+                                base: _,
+                                offset: _,
+                            } => InstExt::Basic(BasicInst::StoreAbsolute {
+                                kind,
+                                src: cast_reg_any(src)?,
+                                target,
+                            }),
+                            _ => {
+                                return Err(ProgramFromElfError::other(format!(
+                                    "R_RISCV_LO12_S for an unsupported instruction: 0x{inst_raw:08} ({inst:?}) (at {loc})",
+                                    loc = current_location.fmt_human_readable(elf),
+                                )));
+                            }
+                        };
+
+                        instruction_overrides.insert(current_location, new_instruction);
+
+                        log::trace!(
+                            "  R_RISCV_LO12_S: {}[0x{relative_address:x}] (0x{absolute_address:x}): -> {}",
+                            section.name(),
+                            target
+                        );
                     }
                     object::elf::R_RISCV_RELAX => {}
                     _ => {
