@@ -115,3 +115,29 @@ extern "C" fn atomic_fetch_min_unsigned(value: u32) -> u32 {
         output
     }
 }
+
+// Test that an unused import will be stripped.
+#[polkavm_derive::polkavm_import]
+extern "C" {
+    fn unused_import(value: u32) -> u32;
+}
+
+// Test duplicate imports.
+mod a {
+    #[polkavm_derive::polkavm_import]
+    extern "C" {
+        pub fn multiply_by_2(value: u32) -> u32;
+    }
+}
+
+mod b {
+    #[polkavm_derive::polkavm_import]
+    extern "C" {
+        pub fn multiply_by_2(value: u32) -> u32;
+    }
+}
+
+#[polkavm_derive::polkavm_export]
+extern "C" fn test_multiply_by_6(value: u32) -> u32 {
+    unsafe { a::multiply_by_2(value * 3) }
+}
