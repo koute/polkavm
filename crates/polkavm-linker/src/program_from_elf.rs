@@ -365,6 +365,10 @@ fn test_extract_delimited() {
 }
 
 impl SectionTarget {
+    fn fmt_human_readable(&self, elf: &Elf) -> String {
+        Self::make_human_readable_in_debug_string(elf, &self.to_string())
+    }
+
     fn make_human_readable_in_debug_string(elf: &Elf, mut str: &str) -> String {
         // A hack-ish way to make nested `Debug` error messages more readable by replacing
         // raw section indexes and offsets with a more human readable string.
@@ -5998,7 +6002,8 @@ fn harvest_code_relocations(
                             }
                             _ => {
                                 return Err(ProgramFromElfError::other(format!(
-                                    "R_RISCV_HI20 for an unsupported instruction (2nd): 0x{lo_inst_raw:08} ({lo_inst:?})"
+                                    "R_RISCV_HI20 for an unsupported instruction (2nd): 0x{lo_inst_raw:08} ({lo_inst:?}) (at {loc})",
+                                    loc = current_location.fmt_human_readable(elf),
                                 )));
                             }
                         }
