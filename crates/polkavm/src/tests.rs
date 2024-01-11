@@ -455,7 +455,13 @@ impl TestInstance {
 
         let engine = Engine::new(config).unwrap();
         let module = Module::from_blob(&engine, &Default::default(), &blob).unwrap();
-        let linker = Linker::new(&engine);
+        let mut linker = Linker::new(&engine);
+        linker
+            .func_wrap("multiply_by_2", |_caller: Caller<()>, value: u32| -> Result<u32, Trap> {
+                Ok(value * 2)
+            })
+            .unwrap();
+
         let instance_pre = linker.instantiate_pre(&module).unwrap();
         let instance = instance_pre.instantiate().unwrap();
 
@@ -530,6 +536,11 @@ fn test_blob_atomic_fetch_minmax(config: Config) {
             }
         }
     }
+}
+
+fn test_blob_hostcall(config: Config) {
+    let i = TestInstance::new(&config);
+    assert_eq!(i.call::<(u32,), u32>("test_multiply_by_6", (10,)).unwrap(), 60);
 }
 
 fn basic_gas_metering(config: Config, gas_metering_kind: GasMeteringKind) {
@@ -678,6 +689,7 @@ run_tests! {
     test_blob_atomic_fetch_add
     test_blob_atomic_fetch_swap
     test_blob_atomic_fetch_minmax
+    test_blob_hostcall
 
     basic_gas_metering_sync
     basic_gas_metering_async
