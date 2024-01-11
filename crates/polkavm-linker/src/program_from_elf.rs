@@ -5615,6 +5615,25 @@ fn harvest_data_relocations(
                 );
                 continue;
             }
+            [(
+                _,
+                Kind::Set(RelocationKind::Abs {
+                    target: target_1,
+                    size: size_1,
+                }),
+            ), (_, Kind::Mut(MutOp::Sub, size_2, target_2))]
+                if size_1 == size_2 && target_1.section_index == target_2.section_index && target_1.offset >= target_2.offset =>
+            {
+                relocations.insert(
+                    current_location,
+                    RelocationKind::Size {
+                        section_index: target_1.section_index,
+                        range: (target_2.offset..target_1.offset).into(),
+                        size: SizeRelocationSize::Generic(*size_1),
+                    },
+                );
+                continue;
+            }
             [(_, Kind::Set6 { target: target_1 }), (_, Kind::Sub6 { target: target_2 })]
                 if target_1.section_index == target_2.section_index && target_1.offset >= target_2.offset =>
             {
@@ -5998,6 +6017,19 @@ fn harvest_code_relocations(
                                 instruction_overrides.insert(
                                     current_location.add(4),
                                     InstExt::Basic(BasicInst::LoadAbsolute { kind, dst, target }),
+                                );
+                            }
+                            Inst::Store {
+                                kind,
+                                src,
+                                base: _,
+                                offset: _,
+                            } => {
+                                let src = cast_reg_any(src)?;
+                                instruction_overrides.insert(current_location, InstExt::nop());
+                                instruction_overrides.insert(
+                                    current_location.add(4),
+                                    InstExt::Basic(BasicInst::StoreAbsolute { kind, src, target }),
                                 );
                             }
                             _ => {
