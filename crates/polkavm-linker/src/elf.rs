@@ -12,6 +12,12 @@ type ElfSectionIndex = object::read::SectionIndex;
 #[derive(Copy, Clone, PartialEq, Eq, PartialOrd, Ord, Debug, Hash)]
 pub struct SectionIndex(usize);
 
+impl SectionIndex {
+    pub fn raw(self) -> usize {
+        self.0
+    }
+}
+
 impl core::fmt::Display for SectionIndex {
     fn fmt(&self, fmt: &mut core::fmt::Formatter) -> core::fmt::Result {
         write!(fmt, "section #{}", self.0)
@@ -221,6 +227,10 @@ impl<'data> Elf<'data> {
 
     pub fn section_by_index(&self, index: SectionIndex) -> &Section<'data> {
         &self.sections[index.0]
+    }
+
+    pub fn section_by_raw_index(&self, index: usize) -> Option<&Section<'data>> {
+        self.sections.get(index)
     }
 
     pub fn sections<'r>(&'r self) -> impl ExactSizeIterator<Item = &'r Section<'data>> + 'r {

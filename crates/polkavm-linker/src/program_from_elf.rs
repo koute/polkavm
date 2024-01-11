@@ -330,7 +330,7 @@ impl From<Range<u64>> for AddressRange {
     }
 }
 
-#[derive(Copy, Clone, PartialEq, Eq, PartialOrd, Ord, Debug, Hash)]
+#[derive(Copy, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub(crate) struct SectionTarget {
     pub(crate) section_index: SectionIndex,
     pub(crate) offset: u64,
@@ -342,7 +342,77 @@ impl core::fmt::Display for SectionTarget {
     }
 }
 
+impl core::fmt::Debug for SectionTarget {
+    fn fmt(&self, fmt: &mut core::fmt::Formatter) -> core::fmt::Result {
+        write!(fmt, "<{}+{}>", self.section_index, self.offset)
+    }
+}
+
+fn extract_delimited<'a>(str: &mut &'a str, prefix: &str, suffix: &str) -> Option<(&'a str, &'a str)> {
+    let original = *str;
+    let start_of_prefix = str.find(prefix)?;
+    let start = start_of_prefix + prefix.len();
+    let end = str[start..].find(suffix)? + start;
+    *str = &str[end + suffix.len()..];
+    Some((&original[..start_of_prefix], &original[start..end]))
+}
+
+#[test]
+fn test_extract_delimited() {
+    let mut str = "foo <section #1234+567> bar";
+    assert_eq!(extract_delimited(&mut str, "<section #", ">").unwrap(), ("foo ", "1234+567"));
+    assert_eq!(str, " bar");
+}
+
 impl SectionTarget {
+    fn make_human_readable_in_debug_string(elf: &Elf, mut str: &str) -> String {
+        // A hack-ish way to make nested `Debug` error messages more readable by replacing
+        // raw section indexes and offsets with a more human readable string.
+
+        let mut output = String::new();
+        while let Some((prefix, chunk)) = extract_delimited(&mut str, "<section #", ">") {
+            output.push_str(prefix);
+
+            let mut iter = chunk.split('+');
+            if let Some(section_index) = iter.next().and_then(|s| s.parse::<usize>().ok()) {
+                if let Some(offset) = iter.next().and_then(|s| s.parse::<u64>().ok()) {
+                    if let Some(section) = elf.section_by_raw_index(section_index) {
+                        use core::fmt::Write;
+
+                        let symbol = elf.symbols().find(|symbol| {
+                            let Ok((symbol_section, symbol_offset)) = symbol.section_and_offset() else {
+                                return false;
+                            };
+                            symbol_section.index().raw() == section_index
+                                && offset >= symbol_offset
+                                && offset < (symbol_offset + symbol.size())
+                        });
+
+                        let section_name = section.name();
+                        write!(&mut output, "<section #{section_index}+{offset} ('{section_name}'").unwrap();
+                        if let Some(symbol) = symbol {
+                            if let Some(symbol_name) = symbol.name() {
+                                write!(
+                                    &mut output,
+                                    ": '{}'+{}",
+                                    symbol_name,
+                                    offset - symbol.section_and_offset().unwrap().1
+                                )
+                                .unwrap();
+                            }
+                        }
+                        output.push_str(")>");
+                        continue;
+                    }
+                }
+            }
+            output.push_str(chunk);
+        }
+
+        output.push_str(str);
+        output
+    }
+
     fn add(self, offset: u64) -> Self {
         SectionTarget {
             section_index: self.section_index,
@@ -5573,8 +5643,9 @@ fn harvest_data_relocations(
         };
 
         return Err(ProgramFromElfError::other(format!(
-            "unsupported relocations for '{section_name}'[{relative_address:x}] (0x{absolute_address:08x}): {list:?}",
-            absolute_address = section.original_address() + relative_address
+            "unsupported relocations for '{section_name}'[{relative_address:x}] (0x{absolute_address:08x}): {list}",
+            absolute_address = section.original_address() + relative_address,
+            list = SectionTarget::make_human_readable_in_debug_string(elf, &format!("{list:?}")),
         )));
     }
 
