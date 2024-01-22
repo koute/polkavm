@@ -1,5 +1,6 @@
 #include <asm/signal.h>
 #include <asm/unistd_64.h>
+#include <asm/prctl.h>
 
 #include <asm-generic/resource.h>
 #include <asm-generic/fcntl.h>
