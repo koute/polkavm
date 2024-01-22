@@ -302,6 +302,10 @@ impl ChildProcess {
 
 impl Drop for ChildProcess {
     fn drop(&mut self) {
+        #[cfg(polkavm_dev_debug_zygote)]
+        let _ = self.send_signal(linux_raw::SIGINT);
+
+        #[cfg(not(polkavm_dev_debug_zygote))]
         if self.send_signal(linux_raw::SIGKILL).is_ok() {
             // Reap the zombie process.
             let _ = self.check_status(false);
@@ -309,12 +313,7 @@ impl Drop for ChildProcess {
     }
 }
 
-#[cfg(polkavm_dev_use_built_zygote)]
-const ZYGOTE_BLOB_CONST: &[u8] = include_bytes!("../../polkavm-zygote/target/x86_64-unknown-linux-gnu/release/polkavm-zygote");
-
-#[cfg(not(polkavm_dev_use_built_zygote))]
 const ZYGOTE_BLOB_CONST: &[u8] = include_bytes!("./polkavm-zygote");
-
 static ZYGOTE_BLOB: &[u8] = ZYGOTE_BLOB_CONST;
 
 // Here we extract the necessary addresses directly from the zygote binary at compile time.
@@ -517,6 +516,25 @@ fn prepare_sealed_memfd<const N: usize>(memfd: Fd, length: usize, data: [&[u8]; 
 }
 
 fn prepare_zygote() -> Result<Fd, Error> {
+    #[cfg(debug_assertions)]
+    if cfg!(polkavm_dev_debug_zygote) {
+        let paths = [
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../polkavm-zygote/target/x86_64-unknown-linux-gnu/debug/polkavm-zygote"),
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../polkavm-zygote/target/x86_64-unknown-linux-gnu/release/polkavm-zygote"),
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/sandbox/polkavm-zygote"),
+            std::path::PathBuf::from("./polkavm-zygote"),
+        ];
+
+        let Some(path) = paths.into_iter().find(|path| {
+            path.exists() && std::fs::read(path).map(|data| data == ZYGOTE_BLOB).unwrap_or(false)
+        }) else {
+            panic!("no matching zygote binary found for debugging");
+        };
+
+        let path = std::ffi::CString::new(path.to_str().expect("invalid path to zygote")).expect("invalid path to zygote");
+        return Ok(linux_raw::sys_open(&path, linux_raw::O_CLOEXEC | linux_raw::O_PATH).unwrap());
+    }
+
     let native_page_size = get_native_page_size();
 
     #[allow(clippy::unwrap_used)]
@@ -561,26 +579,28 @@ unsafe fn child_main(zygote_memfd: Fd, child_socket: Fd, uid_map: &str, gid_map:
     // Change the name of the process.
     linux_raw::sys_prctl_set_name(b"polkavm-sandbox\0")?;
 
-    // Overwrite the hostname and domainname.
-    linux_raw::sys_sethostname("localhost")?;
-    linux_raw::sys_setdomainname("localhost")?;
+    if !cfg!(polkavm_dev_debug_zygote) {
+        // Overwrite the hostname and domainname.
+        linux_raw::sys_sethostname("localhost")?;
+        linux_raw::sys_setdomainname("localhost")?;
 
-    // Disable the 'setgroups' syscall. Probably unnecessary since we'll do it though seccomp anyway, but just in case.
-    // (See CVE-2014-8989 for more details.)
-    let proc_self = linux_raw::sys_open(cstr!("/proc/self"), linux_raw::O_CLOEXEC | linux_raw::O_PATH)?;
-    let fd = linux_raw::sys_openat(proc_self.borrow(), cstr!("setgroups"), linux_raw::O_CLOEXEC | linux_raw::O_WRONLY)?;
-    linux_raw::sys_write(fd.borrow(), b"deny")?;
-    fd.close()?;
+        // Disable the 'setgroups' syscall. Probably unnecessary since we'll do it though seccomp anyway, but just in case.
+        // (See CVE-2014-8989 for more details.)
+        let proc_self = linux_raw::sys_open(cstr!("/proc/self"), linux_raw::O_CLOEXEC | linux_raw::O_PATH)?;
+        let fd = linux_raw::sys_openat(proc_self.borrow(), cstr!("setgroups"), linux_raw::O_CLOEXEC | linux_raw::O_WRONLY)?;
+        linux_raw::sys_write(fd.borrow(), b"deny")?;
+        fd.close()?;
 
-    // Set up UID and GID maps. This can only be done once, so if we do it here we'll block the possibility of doing it later.
-    let fd = linux_raw::sys_openat(proc_self.borrow(), cstr!("gid_map"), linux_raw::O_CLOEXEC | linux_raw::O_RDWR)?;
-    linux_raw::sys_write(fd.borrow(), gid_map.as_bytes())?;
-    fd.close()?;
+        // Set up UID and GID maps. This can only be done once, so if we do it here we'll block the possibility of doing it later.
+        let fd = linux_raw::sys_openat(proc_self.borrow(), cstr!("gid_map"), linux_raw::O_CLOEXEC | linux_raw::O_RDWR)?;
+        linux_raw::sys_write(fd.borrow(), gid_map.as_bytes())?;
+        fd.close()?;
 
-    let fd = linux_raw::sys_openat(proc_self.borrow(), cstr!("uid_map"), linux_raw::O_CLOEXEC | linux_raw::O_RDWR)?;
-    linux_raw::sys_write(fd.borrow(), uid_map.as_bytes())?;
-    fd.close()?;
-    proc_self.close()?;
+        let fd = linux_raw::sys_openat(proc_self.borrow(), cstr!("uid_map"), linux_raw::O_CLOEXEC | linux_raw::O_RDWR)?;
+        linux_raw::sys_write(fd.borrow(), uid_map.as_bytes())?;
+        fd.close()?;
+        proc_self.close()?;
+    }
 
     let fd_limit = if logging_pipe.is_some() {
         4
@@ -622,12 +642,14 @@ unsafe fn child_main(zygote_memfd: Fd, child_socket: Fd, uid_map: &str, gid_map:
     };
     close_other_file_descriptors(fds_to_keep)?;
 
-    // Hide the host filesystem.
-    let mount_flags = linux_raw::MS_REC | linux_raw::MS_NODEV | linux_raw::MS_NOEXEC | linux_raw::MS_NOSUID | linux_raw::MS_RDONLY;
-    linux_raw::sys_mount(cstr!("none"), cstr!("/mnt"), cstr!("tmpfs"), mount_flags, Some(cstr!("size=0")))?;
-    linux_raw::sys_chdir(cstr!("/mnt"))?;
-    linux_raw::sys_pivot_root(cstr!("."), cstr!("."))?;
-    linux_raw::sys_umount2(cstr!("."), linux_raw::MNT_DETACH)?;
+    if !cfg!(polkavm_dev_debug_zygote) {
+        // Hide the host filesystem.
+        let mount_flags = linux_raw::MS_REC | linux_raw::MS_NODEV | linux_raw::MS_NOEXEC | linux_raw::MS_NOSUID | linux_raw::MS_RDONLY;
+        linux_raw::sys_mount(cstr!("none"), cstr!("/mnt"), cstr!("tmpfs"), mount_flags, Some(cstr!("size=0")))?;
+        linux_raw::sys_chdir(cstr!("/mnt"))?;
+        linux_raw::sys_pivot_root(cstr!("."), cstr!("."))?;
+        linux_raw::sys_umount2(cstr!("."), linux_raw::MNT_DETACH)?;
+    }
 
     // Clear all of our ambient capabilities.
     linux_raw::sys_prctl_cap_ambient_clear_all()?;
@@ -635,17 +657,19 @@ unsafe fn child_main(zygote_memfd: Fd, child_socket: Fd, uid_map: &str, gid_map:
     // Flag ourselves that we won't ever want to acquire any new privileges.
     linux_raw::sys_prctl_set_no_new_privs()?;
 
-    linux_raw::sys_prctl_set_securebits(
-        // Make UID == 0 have no special privileges.
-        linux_raw::SECBIT_NOROOT |
-        linux_raw::SECBIT_NOROOT_LOCKED |
-        // Calling 'setuid' from/to UID == 0 doesn't change any privileges.
-        linux_raw::SECBIT_NO_SETUID_FIXUP |
-        linux_raw::SECBIT_NO_SETUID_FIXUP_LOCKED |
-        // The process cannot add capabilities to its ambient set.
-        linux_raw::SECBIT_NO_CAP_AMBIENT_RAISE |
-        linux_raw::SECBIT_NO_CAP_AMBIENT_RAISE_LOCKED,
-    )?;
+    if !cfg!(polkavm_dev_debug_zygote) {
+        linux_raw::sys_prctl_set_securebits(
+            // Make UID == 0 have no special privileges.
+            linux_raw::SECBIT_NOROOT |
+            linux_raw::SECBIT_NOROOT_LOCKED |
+            // Calling 'setuid' from/to UID == 0 doesn't change any privileges.
+            linux_raw::SECBIT_NO_SETUID_FIXUP |
+            linux_raw::SECBIT_NO_SETUID_FIXUP_LOCKED |
+            // The process cannot add capabilities to its ambient set.
+            linux_raw::SECBIT_NO_CAP_AMBIENT_RAISE |
+            linux_raw::SECBIT_NO_CAP_AMBIENT_RAISE_LOCKED,
+        )?;
+    }
 
     // Set resource limits.
     let max_memory = 8 * 1024 * 1024 * 1024;
@@ -673,6 +697,11 @@ unsafe fn child_main(zygote_memfd: Fd, child_socket: Fd, uid_map: &str, gid_map:
 
     // Finally, drop all capabilities.
     linux_raw::sys_capset_drop_all()?;
+
+    if cfg!(polkavm_dev_debug_zygote) {
+        let pid = linux_raw::sys_getpid()?;
+        linux_raw::sys_kill(pid, linux_raw::SIGSTOP)?;
+    }
 
     let child_argv: [*const u8; 2] = [b"polkavm-zygote\0".as_ptr(), core::ptr::null()];
     let child_envp: [*const u8; 1] = [core::ptr::null()];
@@ -944,13 +973,18 @@ impl super::Sandbox for Sandbox {
         let (socket, child_socket) = linux_raw::sys_socketpair(linux_raw::AF_UNIX, linux_raw::SOCK_SEQPACKET | linux_raw::SOCK_CLOEXEC, 0)?;
         let (lifetime_pipe_host, lifetime_pipe_child) = linux_raw::sys_pipe2(linux_raw::O_CLOEXEC)?;
 
-        let sandbox_flags = linux_raw::CLONE_NEWCGROUP as u64
-            | linux_raw::CLONE_NEWIPC as u64
-            | linux_raw::CLONE_NEWNET as u64
-            | linux_raw::CLONE_NEWNS as u64
-            | linux_raw::CLONE_NEWPID as u64
-            | linux_raw::CLONE_NEWUSER as u64
-            | linux_raw::CLONE_NEWUTS as u64;
+        let sandbox_flags =
+            if !cfg!(polkavm_dev_debug_zygote) {
+                linux_raw::CLONE_NEWCGROUP as u64
+                    | linux_raw::CLONE_NEWIPC as u64
+                    | linux_raw::CLONE_NEWNET as u64
+                    | linux_raw::CLONE_NEWNS as u64
+                    | linux_raw::CLONE_NEWPID as u64
+                    | linux_raw::CLONE_NEWUSER as u64
+                    | linux_raw::CLONE_NEWUTS as u64
+            } else {
+                0
+            };
 
         let mut pidfd: c_int = -1;
         let args = CloneArgs {
@@ -1090,7 +1124,7 @@ impl super::Sandbox for Sandbox {
                     }
                 }
 
-                if instant.elapsed() > core::time::Duration::from_secs(10) {
+                if !cfg!(polkavm_dev_debug_zygote) && instant.elapsed() > core::time::Duration::from_secs(10) {
                     // This should never happen, but just in case.
                     return Err(Error::from_str("failed to initialize sandbox process: initialization timeout"));
                 }
@@ -1107,6 +1141,64 @@ impl super::Sandbox for Sandbox {
                     Err(error) => return Err(error),
                 }
             }
+        }
+
+        #[cfg(debug_assertions)]
+        if cfg!(polkavm_dev_debug_zygote) {
+            use std::fmt::Write;
+            std::thread::sleep(core::time::Duration::from_millis(200));
+
+            let mut command = String::new();
+            // Make sure gdb can actually attach to the worker process.
+            if std::fs::read_to_string("/proc/sys/kernel/yama/ptrace_scope").map(|value| value.trim() == "1").unwrap_or(false) {
+                command.push_str("echo 0 | sudo tee /proc/sys/kernel/yama/ptrace_scope ;");
+            }
+
+            command.push_str(concat!(
+                "gdb",
+                " -ex 'set pagination off'",
+                " -ex 'layout split'",
+                " -ex 'set print asm-demangle on'",
+                " -ex 'set debuginfod enabled off'",
+                " -ex 'tcatch exec'",
+                " -ex 'handle SIGSTOP nostop'",
+            ));
+
+            let _ = write!(&mut command, " -ex 'attach {}' -ex 'continue'", child.pid);
+
+            let mut cmd =
+                if std::env::var_os("DISPLAY").is_some() {
+                    // Running X11; open gdb in a terminal.
+                    let mut cmd = std::process::Command::new("urxvt");
+                    cmd
+                        .args(["-fg", "rgb:ffff/ffff/ffff"])
+                        .args(["-bg", "rgba:0000/0000/0000/7777"])
+                        .arg("-e")
+                        .arg("sh")
+                        .arg("-c")
+                        .arg(&command);
+                    cmd
+                } else {
+                    // Not running under X11; just run it as-is.
+                    let mut cmd = std::process::Command::new("sh");
+                    cmd
+                        .arg("-c")
+                        .arg(&command);
+                    cmd
+                };
+
+            let mut gdb = match cmd.spawn() {
+                Ok(child) => child,
+                Err(error) => {
+                    panic!("failed to launch: '{cmd:?}': {error}");
+                }
+            };
+
+            let pid = child.pid;
+            std::thread::spawn(move || {
+                let _ = gdb.wait();
+                let _ = linux_raw::sys_kill(pid, linux_raw::SIGKILL);
+            });
         }
 
         let vmctx = unsafe { &*vmctx_mmap.as_ptr().cast::<VmCtx>() };
