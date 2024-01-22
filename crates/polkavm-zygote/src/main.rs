@@ -87,6 +87,13 @@ where
     }
 }
 
+fn graceful_abort() -> ! {
+    let in_signal_handler = IN_SIGNAL_HANDLER.swap(true, Ordering::Relaxed);
+    let errcode = if in_signal_handler { 101 } else { 100 };
+    let _ = linux_raw::sys_exit(errcode);
+    linux_raw::abort();
+}
+
 #[cold]
 fn abort_with_message(error: &str) -> ! {
     let fd = linux_raw::FdRef::from_raw_unchecked(linux_raw::STDERR_FILENO);
@@ -98,9 +105,7 @@ fn abort_with_message(error: &str) -> ! {
     append_to_message(error.as_bytes());
 
     core::sync::atomic::fence(Ordering::Release);
-
-    IN_SIGNAL_HANDLER.store(true, Ordering::Relaxed);
-    linux_raw::abort();
+    graceful_abort();
 }
 
 #[cold]
@@ -119,9 +124,7 @@ fn abort_with_error(error: &str, err_obj: linux_raw::Error) -> ! {
     let _ = linux_raw::sys_write(fd, b"\n");
 
     core::sync::atomic::fence(Ordering::Release);
-
-    IN_SIGNAL_HANDLER.store(true, Ordering::Relaxed);
-    linux_raw::abort();
+    graceful_abort();
 }
 
 #[naked]
@@ -169,7 +172,7 @@ static NATIVE_PAGE_SIZE: AtomicUsize = AtomicUsize::new(!0);
 
 unsafe extern "C" fn signal_handler(signal: u32, _info: &linux_raw::siginfo_t, context: &linux_raw::ucontext) {
     if IN_SIGNAL_HANDLER.load(Ordering::Relaxed) || signal == linux_raw::SIGIO {
-        let _ = linux_raw::sys_exit(255);
+        graceful_abort();
     }
 
     IN_SIGNAL_HANDLER.store(true, Ordering::Relaxed);
