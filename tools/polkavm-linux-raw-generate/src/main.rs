@@ -7,6 +7,7 @@ fn main() {
         "_LINUX_CAPABILITY_.+",
         "AT_.+",
         "BPF_.+",
+        "CLD_.+",
         "CLOCK_.+",
         "CLONE_.+",
         "F_.+",
