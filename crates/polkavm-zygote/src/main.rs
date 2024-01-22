@@ -324,6 +324,7 @@ unsafe fn initialize(mut stack: *mut usize) -> linux_raw::Fd {
     };
 
     let minsigstksz;
+    let mut fsgsbase_supported = false;
     let page_size = {
         let mut page_size_opt = None;
         let mut minsigstksz_opt = None;
@@ -340,6 +341,10 @@ unsafe fn initialize(mut stack: *mut usize) -> linux_raw::Fd {
 
             if kind == linux_raw::AT_MINSIGSTKSZ as usize {
                 minsigstksz_opt = Some(value);
+            }
+
+            if kind == linux_raw::AT_HWCAP2 as usize && value & linux_raw::HWCAP2_FSGSBASE != 0 {
+                fsgsbase_supported = true;
             }
 
             auxv = auxv.add(1);
@@ -498,11 +503,18 @@ unsafe fn initialize(mut stack: *mut usize) -> linux_raw::Fd {
     )
     .unwrap_or_else(|error| abort_with_error("failed to map the sysreturn jump table", error));
 
-    unsafe {
-        core::arch::asm!(
-            "wrgsbase {addr}",
-            addr = in(reg) VM_ADDR_JUMP_TABLE
-        );
+    if fsgsbase_supported {
+        trace!("fsgsbase is supported");
+        unsafe {
+            core::arch::asm!(
+                "wrgsbase {addr}",
+                addr = in(reg) VM_ADDR_JUMP_TABLE
+            );
+        }
+    } else {
+        trace!("fsgsbase is NOT supported; falling back to arch_prctl");
+        linux_raw::sys_arch_prctl_set_gs(VM_ADDR_JUMP_TABLE as usize)
+            .unwrap_or_else(|error| abort_with_error("failed to set the %gs register", error));
     }
 
     // Change the name of the process.
