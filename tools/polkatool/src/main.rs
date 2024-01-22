@@ -175,10 +175,12 @@ fn main_disassemble(input: PathBuf, format: DisassemblyFormat, output: Option<Pa
             bail!("the selected disassembly format is not supported on this architecture");
         }
 
-        let config = match polkavm::Config::from_env() {
+        let mut config = match polkavm::Config::from_env() {
             Ok(config) => config,
             Err(error) => bail!("failed to fetch VM configuration from the environment: {error}"),
         };
+
+        config.set_worker_count(0);
 
         let engine = match polkavm::Engine::new(&config) {
             Ok(engine) => engine,
