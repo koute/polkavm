@@ -187,6 +187,43 @@ impl ChildStatus {
     }
 }
 
+struct Signal(c_int);
+impl core::fmt::Display for Signal {
+    fn fmt(&self, fmt: &mut core::fmt::Formatter) -> core::fmt::Result {
+        let name = match self.0 as u32 {
+            linux_raw::SIGABRT => "SIGABRT",
+            linux_raw::SIGBUS => "SIGBUS",
+            linux_raw::SIGCHLD => "SIGCHLD",
+            linux_raw::SIGCONT => "SIGCONT",
+            linux_raw::SIGFPE => "SIGFPE",
+            linux_raw::SIGHUP => "SIGHUP",
+            linux_raw::SIGILL => "SIGILL",
+            linux_raw::SIGINT => "SIGINT",
+            linux_raw::SIGKILL => "SIGKILL",
+            linux_raw::SIGPIPE => "SIGPIPE",
+            linux_raw::SIGSEGV => "SIGSEGV",
+            linux_raw::SIGSTOP => "SIGSTOP",
+            linux_raw::SIGSYS => "SIGSYS",
+            linux_raw::SIGTERM => "SIGTERM",
+            linux_raw::SIGTRAP => "SIGTRAP",
+            _ => return write!(fmt, "{}", self.0)
+        };
+
+        fmt.write_str(name)
+    }
+}
+
+impl core::fmt::Display for ChildStatus {
+    fn fmt(&self, fmt: &mut core::fmt::Formatter) -> core::fmt::Result {
+        match self {
+            ChildStatus::Running => fmt.write_str("running"),
+            ChildStatus::NotRunning => fmt.write_str("not running"),
+            ChildStatus::Exited(code) => write!(fmt, "exited (status = {code})"),
+            ChildStatus::ExitedDueToSignal(signum) => write!(fmt, "exited due to signal (signal = {})", Signal(*signum)),
+        }
+    }
+}
+
 impl ChildProcess {
     fn waitid(&mut self, flags: u32) -> Result<linux_raw::siginfo_t, Error> {
         let mut siginfo: linux_raw::siginfo_t = unsafe { core::mem::zeroed() };
@@ -225,10 +262,18 @@ impl ChildProcess {
             Ok(ok) => unsafe {
                 if ok.si_signo() == 0 && ok.si_pid() == 0 {
                     Ok(ChildStatus::Running)
-                } else if linux_raw::WIFSIGNALED(ok.si_status()) {
+                } else if ok.si_signo() as u32 == linux_raw::SIGCHLD && ok.si_code() as u32 == linux_raw::CLD_EXITED {
+                    Ok(ChildStatus::Exited(ok.si_status()))
+                } else if ok.si_signo() as u32 == linux_raw::SIGCHLD && (ok.si_code() as u32 == linux_raw::CLD_KILLED || ok.si_code() as u32 == linux_raw::CLD_DUMPED) {
                     Ok(ChildStatus::ExitedDueToSignal(linux_raw::WTERMSIG(ok.si_status())))
-                } else if linux_raw::WIFEXITED(ok.si_status()) {
-                    Ok(ChildStatus::Exited(linux_raw::WEXITSTATUS(ok.si_status())))
+                } else if ok.si_signo() as u32 == linux_raw::SIGCHLD && ok.si_code() as u32 == linux_raw::CLD_STOPPED {
+                    Err(Error::from_last_os_error("waitid failed: unexpected CLD_STOPPED status"))
+                } else if ok.si_signo() as u32 == linux_raw::SIGCHLD && ok.si_code() as u32 == linux_raw::CLD_TRAPPED {
+                    Err(Error::from_last_os_error("waitid failed: unexpected CLD_TRAPPED status"))
+                } else if ok.si_signo() as u32 == linux_raw::SIGCHLD && ok.si_code() as u32 == linux_raw::CLD_CONTINUED {
+                    Err(Error::from_last_os_error("waitid failed: unexpected CLD_CONTINUED status"))
+                } else if ok.si_signo() != 0 {
+                    Ok(ChildStatus::ExitedDueToSignal(ok.si_signo()))
                 } else {
                     Err(Error::from_last_os_error("waitid failed: internal error: unexpected state"))
                 }
@@ -1032,15 +1077,16 @@ impl super::Sandbox for Sandbox {
                     return Err(Error::from_str("failed to initialize sandbox process: unexpected futex state"));
                 }
 
-                if !child.check_status(true)?.is_running() {
+                let status = child.check_status(true)?;
+                if !status.is_running() {
                     let message = get_message(vmctx);
                     if let Some(message) = message {
-                        let error = Error::from(format!("failed to initialize sandbox process: {}", message));
+                        let error = Error::from(format!("failed to initialize sandbox process: {status}: {message}"));
                         return Err(error);
                     } else {
-                        return Err(Error::from_str(
-                            "failed to initialize sandbox process: child process unexpectedly quit",
-                        ));
+                        return Err(Error::from(format!(
+                            "failed to initialize sandbox process: child process unexpectedly quit: {status}",
+                        )));
                     }
                 }
 
@@ -1317,12 +1363,12 @@ impl Sandbox {
                     log::trace!("Timeout expired while waiting for child #{}...", self.child.pid);
                     let status = self.child.check_status(true)?;
                     if !status.is_running() {
-                        log::trace!("Child #{} is not running anymore!", self.child.pid);
+                        log::trace!("Child #{} is not running anymore: {status}", self.child.pid);
                         let message = get_message(self.vmctx());
                         if let Some(message) = message {
-                            return Err(Error::from(message).into());
+                            return Err(Error::from(format!("{status}: {message}")).into());
                         } else {
-                            return Err(Error::from_str("worker process unexpectedly quit").into());
+                            return Err(Error::from(format!("worker process unexpectedly quit: {status}")).into());
                         }
                     }
                 }
