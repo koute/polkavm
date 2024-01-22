@@ -5,6 +5,7 @@ fn main() {
         "__WCLONE",
         "__WNOTHREAD",
         "_LINUX_CAPABILITY_.+",
+        "ARCH_.+",
         "AT_.+",
         "BPF_.+",
         "CLD_.+",

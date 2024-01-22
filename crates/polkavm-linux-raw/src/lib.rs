@@ -62,11 +62,16 @@ pub const MNT_EXPIRE: u32 = 4;
 pub const SIG_DFL: usize = 0;
 pub const SIG_IGN: usize = 1;
 
+// Bindgen seems to not want to emit this constant,
+// so let's define it manually.
+pub const HWCAP2_FSGSBASE: usize = 1 << 1;
+
 #[rustfmt::skip]
 pub use crate::arch_amd64_bindings::{
     __kernel_gid_t as gid_t,
     __kernel_pid_t as pid_t,
     __kernel_uid_t as uid_t,
+    __NR_arch_prctl as SYS_arch_prctl,
     __NR_capset as SYS_capset,
     __NR_chdir as SYS_chdir,
     __NR_clock_gettime as SYS_clock_gettime,
@@ -126,7 +131,12 @@ pub use crate::arch_amd64_bindings::{
     __user_cap_header_struct,
     __WALL,
     _LINUX_CAPABILITY_VERSION_3,
+    ARCH_GET_FS,
+    ARCH_GET_GS,
+    ARCH_SET_FS,
+    ARCH_SET_GS,
     AT_EMPTY_PATH,
+    AT_HWCAP2,
     AT_MINSIGSTKSZ,
     AT_NULL,
     AT_PAGESZ,
@@ -1077,6 +1087,12 @@ fn sys_getdents64(fd: FdRef, buffer: &mut [u8]) -> Result<Option<usize>, Error> 
     } else {
         Ok(Some(bytes_read as usize))
     }
+}
+
+pub unsafe fn sys_arch_prctl_set_gs(value: usize) -> Result<(), Error> {
+    let result = syscall_readonly!(SYS_arch_prctl, ARCH_SET_GS, value);
+    Error::from_syscall("arch_prctl(ARCH_SET_GS)", result)?;
+    Ok(())
 }
 
 pub fn sys_sched_yield() -> Result<(), Error> {
