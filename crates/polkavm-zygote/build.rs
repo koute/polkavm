@@ -6,7 +6,7 @@ fn generate_linker_script() -> String {
                 NOTE: If the binary grows too much an 'address range overlaps' error will be generated during linking.
                       If so then this has to be adjusted to move everything further back so that there's no overlap.
             */
-            . = 0x{vmctx_address:010x} - 0x8000;
+            . = 0x{vmctx_address:010x} - 0x9000;
 
             /* Section for read-only globals. */
             .rodata : {{ *(.rodata) *(.rodata.*) }}
