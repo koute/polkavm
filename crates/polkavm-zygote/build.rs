@@ -9,27 +9,36 @@ fn generate_linker_script() -> String {
             . = 0x{vmctx_address:010x} - 0x9000;
 
             /* Section for read-only globals. */
-            .rodata : {{ *(.rodata) *(.rodata.*) }}
-            .note.gnu.property : {{ *(.note.gnu.property) }}
+            .rodata : {{ *(.rodata) *(.rodata.*) *(.gcc_except_table.*) }} : rodata
+            .note.gnu.property : {{ *(.note.gnu.property) }} : rodata
 
             . = ALIGN(0x1000);
             /* Section for non-zero read-write globals. */
-            .data : {{ *(.got) *(.got.*) *(.data.rel.ro) *(.data.rel.ro.*) *(.sdata) *(.sdata.*) *(.data) *(.data.*) }}
+            .data : {{ *(.got) *(.got.*) *(.data.rel.ro) *(.data.rel.ro.*) *(.sdata) *(.sdata.*) *(.data) *(.data.*) }} : data
             /* Section for zeroed read-write globals. */
-            .bss : {{ *(.sbss) *(.sbss.*) *(.bss) *(.bss.*) }}
+            .bss : {{ *(.sbss) *(.sbss.*) *(.bss) *(.bss.*) }} : data
 
             . = ALIGN(0x1000);
             /* Section for code. */
-            .text : {{ *(.text_hot) *(.text .text.*) }}
+            .text : {{ *(.text_hot) *(.text .text.*) }} : text
 
             /* Global virtual machine context. Must be located at a statically known address. */
             . = 0x{vmctx_address:010x};
-            .vmctx : {{ KEEP(*(.vmctx)) }}
+            .vmctx : {{ KEEP(*(.vmctx)) }} : vmctx
 
             .address_table (INFO) : {{ KEEP(*(.address_table)) }}
 
             /* Strip away junk we don't need. */
             /DISCARD/ : {{ *(.comment) *(.eh_frame) *(.eh_frame_hdr) }}
+        }}
+
+        PHDRS
+        {{
+            rodata PT_LOAD FLAGS(4);
+            data PT_LOAD FLAGS(6);
+            text PT_LOAD FLAGS(5);
+            vmctx PT_LOAD FLAGS(0);
+            gnustack PT_GNU_STACK FLAGS(6);
         }}
 
         ENTRY(_start)
