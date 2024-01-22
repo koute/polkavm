@@ -55,7 +55,7 @@ if_compiler_is_supported! {
 
 pub use polkavm_common::{
     error::{ExecutionError, Trap},
-    program::{ProgramBlob, Reg},
+    program::{ProgramBlob, ProgramParseError, Reg},
     utils::{AsUninitSliceMut, Gas},
 };
 
