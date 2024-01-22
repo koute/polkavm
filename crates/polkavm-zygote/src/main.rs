@@ -18,6 +18,12 @@ use polkavm_common::{
 };
 use polkavm_linux_raw as linux_raw;
 
+#[cfg(debug_assertions)]
+#[no_mangle]
+extern "C" fn rust_eh_personality() {
+    abort_with_message("rust_eh_personality called");
+}
+
 macro_rules! trace {
     ($arg:expr) => {{
         let fd = linux_raw::FdRef::from_raw_unchecked(linux_raw::STDERR_FILENO);
