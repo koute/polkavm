@@ -2,6 +2,7 @@
 resolver = "2"
 members = [
     "crates/polkavm-derive",
+    "crates/polkavm-derive-impl",
     "crates/polkavm-linker",
     "crates/polkavm-assembler",
     "crates/polkavm-common",
