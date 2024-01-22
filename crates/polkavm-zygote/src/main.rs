@@ -510,6 +510,7 @@ unsafe fn initialize(mut stack: *mut usize) -> linux_raw::Fd {
         (if a == linux_raw::SYS_recvmsg => jump @2),
         (if a == linux_raw::SYS_rt_sigreturn => jump @1),
         (if a == linux_raw::SYS_sched_yield => jump @1),
+        (if a == linux_raw::SYS_exit => jump @1),
         (seccomp_kill_thread),
 
         // SYS_recvmsg
