@@ -275,6 +275,10 @@ impl siginfo_t {
         self.__bindgen_anon_1.__bindgen_anon_1.si_signo
     }
 
+    pub unsafe fn si_code(&self) -> c_int {
+        self.__bindgen_anon_1.__bindgen_anon_1.si_code
+    }
+
     pub unsafe fn si_pid(&self) -> pid_t {
         self.__bindgen_anon_1.__bindgen_anon_1._sifields._sigchld._pid
     }
