@@ -450,7 +450,7 @@ impl<S> CompiledInstance<S> where S: SandboxExt {
             }
         }
 
-        let mut on_hostcall = wrap_on_hostcall(on_hostcall);
+        let mut on_hostcall = wrap_on_hostcall::<S>(on_hostcall);
         exec_args.set_on_hostcall(&mut on_hostcall);
 
         let sandbox = self.sandbox.as_mut().unwrap();
