@@ -4,6 +4,7 @@
 #![no_main]
 #![allow(clippy::missing_safety_doc)]
 
+use core::ptr::addr_of_mut;
 use core::sync::atomic::Ordering;
 use core::sync::atomic::{AtomicBool, AtomicUsize};
 use polkavm_common::{
@@ -215,7 +216,7 @@ unsafe extern "C" fn signal_handler(signal: u32, _info: &linux_raw::siginfo_t, c
             .unwrap_or_else(|error| abort_with_error("failed to wait for the host process (trap)", error));
 
         *VMCTX.rip().get() = SANDBOX_EMPTY_NATIVE_PROGRAM_COUNTER;
-        longjmp(&mut RESUME_IDLE_LOOP_JMPBUF, 1);
+        longjmp(addr_of_mut!(RESUME_IDLE_LOOP_JMPBUF), 1);
     } else {
         abort_with_message("segmentation fault")
     }
@@ -576,7 +577,7 @@ unsafe fn initialize(mut stack: *mut usize) -> linux_raw::Fd {
 #[link_section = ".text_hot"]
 #[inline(never)]
 unsafe fn main_loop(socket: linux_raw::Fd) -> ! {
-    if setjmp(&mut RESUME_IDLE_LOOP_JMPBUF) != 0 {
+    if setjmp(addr_of_mut!(RESUME_IDLE_LOOP_JMPBUF)) != 0 {
         IN_SIGNAL_HANDLER.store(false, Ordering::Relaxed);
 
         trace!("returning to idle...");
@@ -624,7 +625,7 @@ unsafe fn main_loop(socket: linux_raw::Fd) -> ! {
             trace!("jumping to: 0x{:x}", rpc_address as usize);
             rpc_address();
         } else {
-            longjmp(&mut RESUME_IDLE_LOOP_JMPBUF, 1);
+            longjmp(addr_of_mut!(RESUME_IDLE_LOOP_JMPBUF), 1);
         }
     }
 }
@@ -664,7 +665,7 @@ pub unsafe extern "C" fn syscall_hostcall(hostcall: u32) {
         .unwrap_or_else(|error| abort_with_error("failed to wait for the host process (hostcall)", error));
 
     if *VMCTX.hostcall().get() == polkavm_common::zygote::HOSTCALL_ABORT_EXECUTION {
-        longjmp(&mut RESUME_IDLE_LOOP_JMPBUF, 1);
+        longjmp(addr_of_mut!(RESUME_IDLE_LOOP_JMPBUF), 1);
     }
 }
 
@@ -675,14 +676,14 @@ pub unsafe extern "C" fn syscall_trap() -> ! {
     signal_host(VMCTX_FUTEX_TRAP, SignalHostKind::Normal)
         .unwrap_or_else(|error| abort_with_error("failed to wait for the host process (trap)", error));
 
-    longjmp(&mut RESUME_IDLE_LOOP_JMPBUF, 1);
+    longjmp(addr_of_mut!(RESUME_IDLE_LOOP_JMPBUF), 1);
 }
 
 #[inline(never)]
 #[no_mangle]
 pub unsafe extern "C" fn syscall_return() -> ! {
     trace!("syscall: return triggered");
-    longjmp(&mut RESUME_IDLE_LOOP_JMPBUF, 1);
+    longjmp(addr_of_mut!(RESUME_IDLE_LOOP_JMPBUF), 1);
 }
 
 // Just for debugging. Normally should never be used.
@@ -700,7 +701,7 @@ pub unsafe extern "C" fn syscall_trace(nth_instruction: u32, rip: u64) {
     *VMCTX.rip().get() = SANDBOX_EMPTY_NATIVE_PROGRAM_COUNTER;
 
     if *VMCTX.hostcall().get() == polkavm_common::zygote::HOSTCALL_ABORT_EXECUTION {
-        longjmp(&mut RESUME_IDLE_LOOP_JMPBUF, 1);
+        longjmp(addr_of_mut!(RESUME_IDLE_LOOP_JMPBUF), 1);
     }
 }
 
