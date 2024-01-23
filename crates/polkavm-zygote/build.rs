@@ -47,6 +47,34 @@ fn generate_linker_script() -> String {
     )
 }
 
+#[allow(non_upper_case_globals)]
+fn generate_assembly() -> String {
+    // Duplicate these here to avoid depending on `polkavm-linux-raw`.
+    const SYS_rt_sigreturn: u32 = 15;
+    const SYS_mmap: u32 = 9;
+    const PROT_READ: u32 = 1;
+    const PROT_WRITE: u32 = 2;
+    const MAP_FIXED: u32 = 16;
+    const MAP_PRIVATE: u32 = 2;
+    const MAP_ANONYMOUS: u32 = 32;
+
+    let template = include_str!("src/global_asm.s");
+    template
+        .replace("{native_stack_low}", &polkavm_common::zygote::VM_ADDR_NATIVE_STACK_LOW.to_string())
+        .replace(
+            "{native_stack_high}",
+            &polkavm_common::zygote::VM_ADDR_NATIVE_STACK_HIGH.to_string(),
+        )
+        .replace(
+            "{native_stack_size}",
+            &polkavm_common::zygote::VM_ADDR_NATIVE_STACK_SIZE.to_string(),
+        )
+        .replace("{SYS_rt_sigreturn}", &SYS_rt_sigreturn.to_string())
+        .replace("{SYS_mmap}", &SYS_mmap.to_string())
+        .replace("{stack_mmap_protection}", &(PROT_READ | PROT_WRITE).to_string())
+        .replace("{stack_mmap_flags}", &(MAP_FIXED | MAP_PRIVATE | MAP_ANONYMOUS).to_string())
+}
+
 fn write(path: &std::path::Path, data: &[u8]) -> std::io::Result<()> {
     if path.exists() {
         let old_data = std::fs::read(path)?;
@@ -63,5 +91,9 @@ fn main() {
     let linker_script_path = out_dir.join("memory.ld");
     write(&linker_script_path, generate_linker_script().as_bytes()).unwrap();
 
+    let assembly_path = out_dir.join("global_asm.s");
+    write(&assembly_path, generate_assembly().as_bytes()).unwrap();
+
     println!("cargo:rustc-link-arg=-T{}", linker_script_path.to_str().unwrap());
+    println!("cargo:rerun-if-changed=src/global_asm.s");
 }

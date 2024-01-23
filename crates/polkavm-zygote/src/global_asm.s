@@ -7,8 +7,8 @@ _start:
 mov rax, {SYS_mmap}
 mov rdi, {native_stack_low}
 mov rsi, {native_stack_size}
-mov rdx, {protection}
-mov r10, {flags}
+mov rdx, {stack_mmap_protection}
+mov r10, {stack_mmap_flags}
 mov r8, -1
 mov r9, 0
 syscall

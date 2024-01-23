@@ -1,4 +1,3 @@
-#![feature(asm_const)]
 #![no_std]
 #![no_main]
 #![allow(clippy::missing_safety_doc)]
@@ -324,14 +323,7 @@ use zygote_setjmp as setjmp;
 use zygote_signal_restorer as signal_restorer;
 
 core::arch::global_asm!(
-    include_str!("global_asm.s"),
-    SYS_rt_sigreturn = const linux_raw::SYS_rt_sigreturn,
-    SYS_mmap = const linux_raw::SYS_mmap,
-    native_stack_low = const polkavm_common::zygote::VM_ADDR_NATIVE_STACK_LOW,
-    native_stack_high = const polkavm_common::zygote::VM_ADDR_NATIVE_STACK_HIGH,
-    native_stack_size = const polkavm_common::zygote::VM_ADDR_NATIVE_STACK_SIZE,
-    protection = const linux_raw::PROT_READ | linux_raw::PROT_WRITE,
-    flags = const linux_raw::MAP_FIXED | linux_raw::MAP_PRIVATE | linux_raw::MAP_ANONYMOUS,
+    include_str!(concat!(env!("OUT_DIR"), "/global_asm.s")),
     entry_point = sym entry_point,
 );
 
