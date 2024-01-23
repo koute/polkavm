@@ -593,40 +593,38 @@ unsafe fn main_loop(socket: linux_raw::Fd) -> ! {
         linux_raw::sys_futex_wake_one(&VMCTX.futex).unwrap_or_else(|error| abort_with_error("failed to wake up the host process", error));
     }
 
-    loop {
-        'wait_loop: while VMCTX.futex.load(Ordering::Relaxed) == VMCTX_FUTEX_IDLE {
-            for _ in 0..20 {
-                let _ = linux_raw::sys_sched_yield();
-                if VMCTX.futex.load(Ordering::Relaxed) != VMCTX_FUTEX_IDLE {
-                    break 'wait_loop;
-                }
-            }
-
-            match linux_raw::sys_futex_wait(&VMCTX.futex, VMCTX_FUTEX_IDLE, None) {
-                Ok(()) => continue,
-                Err(error) if error.errno() == linux_raw::EAGAIN || error.errno() == linux_raw::EINTR => continue,
-                Err(error) => {
-                    abort_with_error("failed to wait for the host process", error);
-                }
+    'wait_loop: while VMCTX.futex.load(Ordering::Relaxed) == VMCTX_FUTEX_IDLE {
+        for _ in 0..20 {
+            let _ = linux_raw::sys_sched_yield();
+            if VMCTX.futex.load(Ordering::Relaxed) != VMCTX_FUTEX_IDLE {
+                break 'wait_loop;
             }
         }
 
-        core::sync::atomic::fence(Ordering::Acquire);
-        trace!("work received...");
-
-        let rpc_flags = *VMCTX.rpc_flags.get();
-        let rpc_address = *VMCTX.rpc_address.get().cast::<Option<extern "C" fn() -> !>>();
-
-        if rpc_flags & VM_RPC_FLAG_RECONFIGURE != 0 {
-            reconfigure(socket.borrow());
+        match linux_raw::sys_futex_wait(&VMCTX.futex, VMCTX_FUTEX_IDLE, None) {
+            Ok(()) => continue,
+            Err(error) if error.errno() == linux_raw::EAGAIN || error.errno() == linux_raw::EINTR => continue,
+            Err(error) => {
+                abort_with_error("failed to wait for the host process", error);
+            }
         }
+    }
 
-        if let Some(rpc_address) = rpc_address {
-            trace!("jumping to: 0x{:x}", rpc_address as usize);
-            rpc_address();
-        } else {
-            longjmp(addr_of_mut!(RESUME_IDLE_LOOP_JMPBUF), 1);
-        }
+    core::sync::atomic::fence(Ordering::Acquire);
+    trace!("work received...");
+
+    let rpc_flags = *VMCTX.rpc_flags.get();
+    let rpc_address = *VMCTX.rpc_address.get().cast::<Option<extern "C" fn() -> !>>();
+
+    if rpc_flags & VM_RPC_FLAG_RECONFIGURE != 0 {
+        reconfigure(socket.borrow());
+    }
+
+    if let Some(rpc_address) = rpc_address {
+        trace!("jumping to: 0x{:x}", rpc_address as usize);
+        rpc_address();
+    } else {
+        longjmp(addr_of_mut!(RESUME_IDLE_LOOP_JMPBUF), 1);
     }
 }
 
