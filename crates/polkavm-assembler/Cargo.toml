@@ -13,3 +13,6 @@ log = { workspace = true }
 
 [dev-dependencies]
 iced-x86 = { workspace = true, features = ["code_asm"] }
+
+[lints]
+workspace = true

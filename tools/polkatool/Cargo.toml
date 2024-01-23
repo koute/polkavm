@@ -14,3 +14,6 @@ iced-x86 = { workspace = true, features = ["code_asm"] }
 polkavm = { workspace = true }
 polkavm-common = { workspace = true }
 polkavm-linker = { workspace = true }
+
+[lints]
+workspace = true
