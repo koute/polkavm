@@ -594,7 +594,8 @@ unsafe fn main_loop(socket: linux_raw::Fd) -> ! {
     }
 
     'wait_loop: while VMCTX.futex.load(Ordering::Relaxed) == VMCTX_FUTEX_IDLE {
-        for _ in 0..20 {
+        // Use a `black_box` to prevent loop unrolling.
+        for _ in 0..core::hint::black_box(20) {
             let _ = linux_raw::sys_sched_yield();
             if VMCTX.futex.load(Ordering::Relaxed) != VMCTX_FUTEX_IDLE {
                 break 'wait_loop;
