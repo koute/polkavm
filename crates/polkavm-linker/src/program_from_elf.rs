@@ -2382,7 +2382,10 @@ fn remove_code_if_globally_unreachable(
     mut optimize_queue: Option<&mut VecSet<BlockTarget>>,
     block_target: BlockTarget,
 ) {
-    if !reachability_graph.for_code.get(&block_target).unwrap().is_unreachable() {
+    let Some(reachability) = reachability_graph.for_code.get(&block_target) else {
+        return;
+    };
+    if !reachability.is_unreachable() {
         return;
     }
 
@@ -2429,7 +2432,10 @@ fn remove_if_data_is_globally_unreachable(
     mut optimize_queue: Option<&mut VecSet<BlockTarget>>,
     data_target: SectionIndex,
 ) {
-    if !reachability_graph.for_data.get(&data_target).unwrap().is_unreachable() {
+    let Some(reachability) = reachability_graph.for_data.get(&data_target) else {
+        return;
+    };
+    if !reachability.is_unreachable() {
         return;
     }
 
