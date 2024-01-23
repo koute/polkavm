@@ -25,6 +25,81 @@ extern "C" fn rust_eh_personality() {
     abort_with_message("rust_eh_personality called");
 }
 
+fn write_number_base10(value: u64, write_str: &mut dyn FnMut(&str)) {
+    let n = if value >= 10 {
+        write_number_base10(value / 10, write_str);
+        value % 10
+    } else {
+        value
+    };
+
+    let s = [n as u8 + b'0'];
+    let s = unsafe { core::str::from_utf8_unchecked(&s) };
+    write_str(s);
+}
+
+fn write_number_base16(value: u64, write_str: &mut dyn FnMut(&str)) {
+    let n = if value >= 16 {
+        write_number_base16(value / 16, write_str);
+        value % 16
+    } else {
+        value
+    };
+
+    let s = [if n < 10 { n as u8 + b'0' } else { (n - 10) as u8 + b'a' }];
+    let s = unsafe { core::str::from_utf8_unchecked(&s) };
+    write_str(s);
+}
+
+trait DisplayLite {
+    fn fmt_lite(&self, write_str: impl FnMut(&str));
+}
+
+impl DisplayLite for &str {
+    fn fmt_lite(&self, mut write_str: impl FnMut(&str)) {
+        write_str(self)
+    }
+}
+
+impl DisplayLite for usize {
+    fn fmt_lite(&self, write_str: impl FnMut(&str)) {
+        (*self as u64).fmt_lite(write_str)
+    }
+}
+
+impl DisplayLite for u32 {
+    fn fmt_lite(&self, write_str: impl FnMut(&str)) {
+        u64::from(*self).fmt_lite(write_str)
+    }
+}
+
+impl DisplayLite for u64 {
+    fn fmt_lite(&self, mut write_str: impl FnMut(&str)) {
+        write_number_base10(*self, &mut write_str)
+    }
+}
+
+struct Hex<T>(T);
+
+impl DisplayLite for Hex<usize> {
+    fn fmt_lite(&self, write_str: impl FnMut(&str)) {
+        Hex(self.0 as u64).fmt_lite(write_str)
+    }
+}
+
+impl DisplayLite for Hex<u32> {
+    fn fmt_lite(&self, write_str: impl FnMut(&str)) {
+        Hex(u64::from(self.0)).fmt_lite(write_str)
+    }
+}
+
+impl DisplayLite for Hex<u64> {
+    fn fmt_lite(&self, mut write_str: impl FnMut(&str)) {
+        write_str("0x");
+        write_number_base16(self.0, &mut write_str)
+    }
+}
+
 macro_rules! trace {
     ($arg:expr) => {{
         let fd = linux_raw::FdRef::from_raw_unchecked(linux_raw::STDERR_FILENO);
@@ -32,9 +107,14 @@ macro_rules! trace {
         let _ = linux_raw::sys_write(fd, b"\n");
     }};
 
-    ($($args:expr),+) => {{
-        use core::fmt::Write;
-        let _ = writeln!(&mut linux_raw::FdRef::from_raw_unchecked(linux_raw::STDERR_FILENO), $($args),+);
+    ($($arg:expr),+) => {{
+        let fd = linux_raw::FdRef::from_raw_unchecked(linux_raw::STDERR_FILENO);
+        $(
+            DisplayLite::fmt_lite(&$arg, |s| {
+                let _ = linux_raw::sys_write(fd, s.as_bytes());
+            });
+        )+
+        let _ = linux_raw::sys_write(fd, b"\n");
     }};
 }
 
@@ -187,25 +267,44 @@ unsafe extern "C" fn signal_handler(signal: u32, _info: &linux_raw::siginfo_t, c
     let rip = context.uc_mcontext.rip;
     *VMCTX.rip().get() = rip;
 
-    trace!("signal triggered from 0x{:x} (signal = {})", rip, signal);
     trace!(
-        "  rax = 0x{:x}, rcx = 0x{:x}, rdx = 0x{:x}, rbx = 0x{:x}\n  rsp = 0x{:x} rbp = 0x{:x} rsi = 0x{:x} rdi = 0x{:x}\n  r8 = 0x{:x} r9 = 0x{:x} r10 = 0x{:x} r11 = 0x{:x}\n  r12 = 0x{:x} r13 = 0x{:x} r14 = 0x{:x} r15 = 0x{:x}",
-        context.uc_mcontext.rax,
-        context.uc_mcontext.rcx,
-        context.uc_mcontext.rdx,
-        context.uc_mcontext.rbx,
-        context.uc_mcontext.rsp,
-        context.uc_mcontext.rbp,
-        context.uc_mcontext.rsi,
-        context.uc_mcontext.rdi,
-        context.uc_mcontext.r8,
-        context.uc_mcontext.r9,
-        context.uc_mcontext.r10,
-        context.uc_mcontext.r11,
-        context.uc_mcontext.r12,
-        context.uc_mcontext.r13,
-        context.uc_mcontext.r14,
-        context.uc_mcontext.r15
+        "signal triggered from ",
+        Hex(rip),
+        " (signal = ",
+        signal,
+        ")",
+        ", rax = ",
+        Hex(context.uc_mcontext.rax),
+        ", rcx = ",
+        Hex(context.uc_mcontext.rcx),
+        ", rdx = ",
+        Hex(context.uc_mcontext.rdx),
+        ", rbx = ",
+        Hex(context.uc_mcontext.rbx),
+        ", rsp = ",
+        Hex(context.uc_mcontext.rsp),
+        ", rbp = ",
+        Hex(context.uc_mcontext.rbp),
+        ", rsi = ",
+        Hex(context.uc_mcontext.rsi),
+        ", rdi = ",
+        Hex(context.uc_mcontext.rdi),
+        ", r8 = ",
+        Hex(context.uc_mcontext.r8),
+        ", r9 = ",
+        Hex(context.uc_mcontext.r9),
+        ", r10 = ",
+        Hex(context.uc_mcontext.r10),
+        ", r11 = ",
+        Hex(context.uc_mcontext.r11),
+        ", r12 = ",
+        Hex(context.uc_mcontext.r12),
+        ", r13 = ",
+        Hex(context.uc_mcontext.r13),
+        ", r14 = ",
+        Hex(context.uc_mcontext.r14),
+        ", r15 = ",
+        Hex(context.uc_mcontext.r15)
     );
 
     let user_code = VM_ADDR_NATIVE_CODE;
@@ -352,7 +451,7 @@ unsafe fn initialize(mut stack: *mut usize) -> linux_raw::Fd {
         }
 
         if let Some(size) = minsigstksz_opt {
-            trace!("signal stack size: {}", size);
+            trace!("signal stack size: ", size);
         }
 
         let base_sigstack_size = core::cmp::max(linux_raw::MINSIGSTKSZ as usize, 4 * 4096);
@@ -622,7 +721,7 @@ unsafe fn main_loop(socket: linux_raw::Fd) -> ! {
     }
 
     if let Some(rpc_address) = rpc_address {
-        trace!("jumping to: 0x{:x}", rpc_address as usize);
+        trace!("jumping to: ", Hex(rpc_address as usize));
         rpc_address();
     } else {
         longjmp(addr_of_mut!(RESUME_IDLE_LOOP_JMPBUF), 1);
@@ -774,7 +873,9 @@ fn signal_host(futex_value_to_set: u32, kind: SignalHostKind) -> Result<(), linu
 #[inline(never)]
 unsafe fn reconfigure(socket: linux_raw::FdRef) {
     trace!("reconfiguring...");
-    assert_ne!(NATIVE_PAGE_SIZE.load(Ordering::Relaxed), 0);
+    if NATIVE_PAGE_SIZE.load(Ordering::Relaxed) == 0 {
+        abort_with_message("assertion failed: native page size is zero");
+    }
 
     let fd = linux_raw::recvfd(socket).unwrap_or_else(|_| abort_with_message("failed to receive reconfiguration fd"));
 
@@ -795,10 +896,13 @@ unsafe fn reconfigure(socket: linux_raw::FdRef) {
             .unwrap_or_else(|error| abort_with_error("failed to mmap user memory (ro data)", error));
 
             trace!(
-                "new rodata range: 0x{:x}-0x{:x} (0x{:x})",
-                new.ro_data_address(),
-                new.ro_data_address() + new.ro_data_size(),
-                new.ro_data_size()
+                "new rodata range: ",
+                Hex(new.ro_data_address()),
+                "-",
+                Hex(new.ro_data_address() + new.ro_data_size()),
+                " (",
+                Hex(new.ro_data_size()),
+                ")"
             );
             if let Err(error) = current.set_ro_data_size(new.ro_data_size()) {
                 abort_with_message(error);
@@ -817,10 +921,13 @@ unsafe fn reconfigure(socket: linux_raw::FdRef) {
             .unwrap_or_else(|error| abort_with_error("failed to mmap user memory (rw data)", error));
 
             trace!(
-                "new rwdata range: 0x{:x}-0x{:x} (0x{:x})",
-                new.rw_data_address(),
-                new.rw_data_address() + new.rw_data_size(),
-                new.rw_data_size()
+                "new rwdata range: ",
+                Hex(new.rw_data_address()),
+                "-",
+                Hex(new.rw_data_address() + new.rw_data_size()),
+                " (",
+                Hex(new.rw_data_size()),
+                ")"
             );
             if let Err(error) = current.set_rw_data_size(new.rw_data_size()) {
                 abort_with_message(error);
@@ -840,10 +947,13 @@ unsafe fn reconfigure(socket: linux_raw::FdRef) {
         .unwrap_or_else(|error| abort_with_error("failed to mmap user code", error));
 
         trace!(
-            "new code range: 0x{:x}-0x{:x} (0x{:x})",
-            VM_ADDR_NATIVE_CODE,
-            VM_ADDR_NATIVE_CODE + new.code_size() as u64,
-            new.code_size()
+            "new code range: ",
+            Hex(VM_ADDR_NATIVE_CODE),
+            "-",
+            Hex(VM_ADDR_NATIVE_CODE + new.code_size() as u64),
+            " (",
+            Hex(new.code_size()),
+            ")"
         );
         if let Err(error) = current.set_code_size(NATIVE_PAGE_SIZE.load(Ordering::Relaxed), new.code_size()) {
             abort_with_message(error);
@@ -862,10 +972,13 @@ unsafe fn reconfigure(socket: linux_raw::FdRef) {
         .unwrap_or_else(|error| abort_with_error("failed to mmap jump table", error));
 
         trace!(
-            "new jump table range: 0x{:x}-0x{:x} (0x{:x})",
-            VM_ADDR_JUMP_TABLE,
-            VM_ADDR_JUMP_TABLE + new.jump_table_size() as u64,
-            new.jump_table_size()
+            "new jump table range: ",
+            Hex(VM_ADDR_JUMP_TABLE),
+            "-",
+            Hex(VM_ADDR_JUMP_TABLE + new.jump_table_size() as u64),
+            " (",
+            Hex(new.jump_table_size()),
+            ")"
         );
         if let Err(error) = current.set_jump_table_size(NATIVE_PAGE_SIZE.load(Ordering::Relaxed), new.jump_table_size()) {
             abort_with_message(error);
@@ -887,10 +1000,13 @@ unsafe fn reconfigure(socket: linux_raw::FdRef) {
         .unwrap_or_else(|error| abort_with_error("failed to mmap user memory (bss)", error));
 
         trace!(
-            "new bss range: 0x{:x}-0x{:x} (0x{:x})",
-            new.bss_address(),
-            new.bss_address() + new.bss_size(),
-            new.bss_size()
+            "new bss range: ",
+            Hex(new.bss_address()),
+            "-",
+            Hex(new.bss_address() + new.bss_size()),
+            " (",
+            Hex(new.bss_size()),
+            ")"
         );
         if let Err(error) = current.set_bss_size(new.bss_size()) {
             abort_with_message(error);
@@ -909,10 +1025,13 @@ unsafe fn reconfigure(socket: linux_raw::FdRef) {
         .unwrap_or_else(|error| abort_with_error("failed to mmap user memory (stack)", error));
 
         trace!(
-            "new stack range: 0x{:x}-0x{:x} (0x{:x})",
-            new.stack_address_low(),
-            new.stack_address_low() + new.stack_size(),
-            new.stack_size()
+            "new stack range: ",
+            Hex(new.stack_address_low()),
+            "-",
+            Hex(new.stack_address_low() + new.stack_size()),
+            " (",
+            Hex(new.stack_size()),
+            ")"
         );
         if let Err(error) = current.set_stack_size(new.stack_size()) {
             abort_with_message(error);
@@ -926,9 +1045,11 @@ unsafe fn reconfigure(socket: linux_raw::FdRef) {
 
     let sysreturn = *VMCTX.new_sysreturn_address.get() as usize;
     trace!(
-        "new sysreturn address: 0x{:x} (set at 0x{:x})",
-        sysreturn,
-        VM_ADDR_JUMP_TABLE_RETURN_TO_HOST
+        "new sysreturn address: ",
+        Hex(sysreturn),
+        " (set at ",
+        Hex(VM_ADDR_JUMP_TABLE_RETURN_TO_HOST),
+        ")"
     );
     *(VM_ADDR_JUMP_TABLE_RETURN_TO_HOST as *mut usize) = sysreturn;
 }
