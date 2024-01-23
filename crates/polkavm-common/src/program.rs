@@ -104,6 +104,7 @@ impl core::fmt::Display for Reg {
     }
 }
 
+#[allow(clippy::partial_pub_fields)]
 #[doc(hidden)]
 pub struct VisitorHelper<'a, T> {
     pub visitor: T,
@@ -2122,7 +2123,7 @@ impl<'a> SourceLocation<'a> {
 
 impl<'a> core::fmt::Display for SourceLocation<'a> {
     fn fmt(&self, fmt: &mut core::fmt::Formatter) -> core::fmt::Result {
-        match self {
+        match *self {
             Self::Path { path } => fmt.write_str(path),
             Self::PathAndLine { path, line } => write!(fmt, "{}:{}", path, line),
             Self::Full { path, line, column } => write!(fmt, "{}:{}:{}", path, line, column),
@@ -2513,7 +2514,7 @@ fn binary_search(slice: &[u8], chunk_size: usize, compare: impl Fn(&[u8]) -> cor
     if ord == core::cmp::Ordering::Equal {
         Ok(base * chunk_size)
     } else {
-        Err((base + (ord == core::cmp::Ordering::Less) as usize) * chunk_size)
+        Err((base + usize::from(ord == core::cmp::Ordering::Less)) * chunk_size)
     }
 }
 
@@ -2523,6 +2524,7 @@ extern crate std;
 #[cfg(test)]
 proptest::proptest! {
     #![proptest_config(proptest::prelude::ProptestConfig::with_cases(20000))]
+    #[allow(clippy::ignored_unit_patterns)]
     #[test]
     fn test_binary_search(needle: u8, mut xs: std::vec::Vec<u8>) {
         xs.sort();

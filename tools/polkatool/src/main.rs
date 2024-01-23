@@ -1,3 +1,7 @@
+#![allow(clippy::print_stdout)]
+#![allow(clippy::print_stderr)]
+#![allow(clippy::exit)]
+
 use clap::Parser;
 use polkavm_common::program::{Opcode, ProgramBlob};
 use std::collections::HashMap;
@@ -343,12 +347,12 @@ fn disassemble_into(
             if !matches!(format, DisassemblyFormat::DiffFriendly) {
                 format!("@{jump_target_counter:x}: [@dyn {jump_table_index:x}]")
             } else {
-                "@_: [_]".to_string()
+                "@_: [_]".to_owned()
             }
         } else if !matches!(format, DisassemblyFormat::DiffFriendly) {
             format!("@{jump_target_counter:x}:")
         } else {
-            "@_:".to_string()
+            "@_:".to_owned()
         }
     };
 
@@ -451,7 +455,7 @@ fn disassemble_into(
 
             if let Some(index_1) = string.find("[0x") {
                 let index_2 = string[index_1..].find(']').unwrap() + index_1;
-                string.replace_range(index_1..index_2 + 1, "[_]");
+                string.replace_range(index_1..=index_2, "[_]");
             }
 
             if let Err(error) = writeln!(&mut writer, "    {}", string) {

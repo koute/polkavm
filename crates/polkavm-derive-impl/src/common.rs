@@ -120,7 +120,7 @@ pub fn parse_ty(ty: &syn::Type) -> Option<SimpleTy> {
 }
 
 pub fn bytes_to_asm(bytes: &[u8]) -> String {
-    use std::fmt::Write;
+    use core::fmt::Write;
 
     let mut out = String::with_capacity(bytes.len() * 11);
     for &byte in bytes {
@@ -174,12 +174,7 @@ pub fn create_fn_prototype(sig: &syn::Signature, bitness: Bitness) -> Result<FnM
                     _ => unsupported!(pat),
                 }
 
-                let ty = match parse_ty(ty) {
-                    Some(ty) => ty,
-                    None => {
-                        unsupported!(ty);
-                    }
-                };
+                let Some(ty) = parse_ty(ty) else { unsupported!(ty) };
 
                 available_regs -= used_regs(ty, bitness) as isize;
                 parsed_args.push(ty);

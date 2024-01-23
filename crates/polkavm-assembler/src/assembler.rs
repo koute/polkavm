@@ -327,9 +327,9 @@ impl InstBuf {
     #[inline]
     pub fn append(&mut self, byte: u8) {
         if self.length < 8 {
-            self.out_1 |= (byte as u64) << (self.length * 8);
+            self.out_1 |= u64::from(byte) << (self.length * 8);
         } else {
-            self.out_2 |= (byte as u64) << ((self.length - 8) * 8);
+            self.out_2 |= u64::from(byte) << ((self.length - 8) * 8);
         }
 
         self.length += 1;
@@ -355,6 +355,7 @@ impl InstBuf {
         core::ptr::write_unaligned(output.add(8).cast::<u64>(), u64::from_le(self.out_2));
     }
 
+    #[allow(clippy::debug_assert_with_mut_call)]
     #[inline]
     unsafe fn encode_into_vec_unsafe(self, output: &mut Vec<u8>) {
         debug_assert!(output.spare_capacity_mut().len() >= MAXIMUM_INSTRUCTION_SIZE);

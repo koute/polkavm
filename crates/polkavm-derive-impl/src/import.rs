@@ -1,6 +1,6 @@
+use core::fmt::Write;
 use polkavm_common::elf::INSTRUCTION_ECALLI;
 use quote::quote;
-use std::fmt::Write;
 use syn::spanned::Spanned;
 use syn::Token;
 

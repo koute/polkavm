@@ -325,7 +325,7 @@ impl<R: gimli::Reader> AttributeParser<R> {
                     ..
                 } => {
                     log::trace!("  = DW_AT_low_pc + {value} (size/data4)");
-                    self.size = Some(value as u64);
+                    self.size = Some(u64::from(value));
                     Ok(())
                 }
                 _ => Err(UnsupportedValue(value)),
@@ -655,9 +655,8 @@ where
     R: gimli::Reader,
 {
     let mut output = Vec::new();
-    let program = match raw_unit.line_program.as_ref() {
-        Some(program) => program,
-        None => return Ok(output),
+    let Some(program) = raw_unit.line_program.as_ref() else {
+        return Ok(output);
     };
 
     let header = program.header();
@@ -693,13 +692,10 @@ where
 
     for file in header.file_names().iter() {
         let filename = dwarf.attr_string(raw_unit, file.path_name())?.to_string_lossy()?.into_owned();
-        let directory = match dirs.get(file.directory_index() as usize) {
-            Some(directory) => directory,
-            None => {
-                return Err(ProgramFromElfError::other(
-                    "failed to process DWARF: file refers to a directory index which doesn't exist",
-                ))
-            }
+        let Some(directory) = dirs.get(file.directory_index() as usize) else {
+            return Err(ProgramFromElfError::other(
+                "failed to process DWARF: file refers to a directory index which doesn't exist",
+            ));
         };
 
         fn has_unix_root(p: &str) -> bool {
@@ -838,13 +834,13 @@ where
             };
 
             let location = match (row.line(), row.column()) {
-                (None, _) => SourceCodeLocation::Path { path: path.clone() },
+                (None, _) => SourceCodeLocation::Path { path: Arc::clone(path) },
                 (Some(line), gimli::ColumnType::LeftEdge) => SourceCodeLocation::Line {
-                    path: path.clone(),
+                    path: Arc::clone(path),
                     line: line.get() as u32,
                 },
                 (Some(line), gimli::ColumnType::Column(column)) => SourceCodeLocation::Column {
-                    path: path.clone(),
+                    path: Arc::clone(path),
                     line: line.get() as u32,
                     column: column.get() as u32,
                 },
@@ -1005,7 +1001,7 @@ where
                         None | Some(SourceCodeLocation::Path { .. }) => {}
                         Some(SourceCodeLocation::Line { ref path, line } | SourceCodeLocation::Column { ref path, line, .. }) => {
                             function_line_boundaries_for_file
-                                .entry(path.clone())
+                                .entry(Arc::clone(path))
                                 .or_insert_with(Vec::new)
                                 .push(line);
                         }
@@ -1153,12 +1149,12 @@ where
                                                 if line_entry.location < *call_location {
                                                     target_position =
                                                         Some((position, inlined.namespace.clone(), inlined.function_name.clone()));
-                                                    break;
                                                 } else {
                                                     target_position =
                                                         Some((position + 1, inlined.namespace.clone(), inlined.function_name.clone()));
-                                                    break;
                                                 }
+
+                                                break;
                                             }
                                         }
                                         LocationKindRef::InlineDecl(inlined) => {
@@ -1283,7 +1279,7 @@ where
 
                     if let Some((ref last_list, ref last_arc_list)) = last_emitted {
                         if list == *last_list {
-                            location_map.insert(target, last_arc_list.clone());
+                            location_map.insert(target, Arc::clone(last_arc_list));
                             continue;
                         }
                     }
@@ -1327,7 +1323,7 @@ where
                     }
 
                     let arc_list: Arc<[Location]> = arc_list.into();
-                    location_map.insert(target, arc_list.clone());
+                    location_map.insert(target, Arc::clone(&arc_list));
                     last_emitted = Some((list, arc_list));
                 }
             }
@@ -2205,7 +2201,6 @@ where
             AttributeValue {
                 value: gimli::AttributeValue::Addr(address),
                 offset: Some(offset),
-                ..
             } => {
                 let relocation_target = SectionTarget {
                     section_index: sections.debug_info.index(),
@@ -2283,11 +2278,9 @@ pub(crate) fn load_dwarf(
     {
         let mut iter = dwarf.units();
         while let Some(header) = iter.next()? {
-            let offset = match header.offset().as_debug_info_offset() {
-                Some(offset) => offset,
-                None => continue,
+            let Some(offset) = header.offset().as_debug_info_offset() else {
+                continue;
             };
-
             let unit = match dwarf.unit(header) {
                 Ok(unit) => unit,
                 Err(error @ gimli::Error::UnexpectedEof(reader_offset_id)) => {

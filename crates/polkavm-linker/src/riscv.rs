@@ -695,8 +695,8 @@ impl Inst {
                     | (0b010 << 12)
                     | ((dst as u32) << 7)
                     | ((src as u32) << 15)
-                    | ((release as u32) << 25)
-                    | ((acquire as u32) << 26)
+                    | (u32::from(release) << 25)
+                    | (u32::from(acquire) << 26)
                     | (0b00010 << 27),
             ),
             Inst::StoreConditional {
@@ -711,8 +711,8 @@ impl Inst {
                     | ((dst as u32) << 7)
                     | ((addr as u32) << 15)
                     | ((src as u32) << 20)
-                    | ((release as u32) << 25)
-                    | ((acquire as u32) << 26)
+                    | (u32::from(release) << 25)
+                    | (u32::from(acquire) << 26)
                     | (0b00011 << 27),
             ),
             Inst::Atomic {
@@ -728,8 +728,8 @@ impl Inst {
                     | ((dst as u32) << 7)
                     | ((addr as u32) << 15)
                     | ((src as u32) << 20)
-                    | ((release as u32) << 25)
-                    | ((acquire as u32) << 26)
+                    | (u32::from(release) << 25)
+                    | (u32::from(acquire) << 26)
                     | ((kind as u32) << 27),
             ),
             Inst::Cmov { kind, dst, src, cond } => {
@@ -843,9 +843,9 @@ fn test_encode() {
                     "failed to encode instruction: {inst:?}, expected = 0x{expected:08x} (0b{expected:b}, {expected}), actual = {actual} ({actual_binary}, {actual_dec})",
                     inst = inst,
                     expected = op,
-                    actual = encoded.map(|encoded| format!("0x{:08x}", encoded)).unwrap_or_else(|| "None".to_owned()),
-                    actual_binary = encoded.map(|encoded| format!("{:b}", encoded)).unwrap_or_else(|| "None".to_owned()),
-                    actual_dec = encoded.map(|encoded| format!("{}", encoded)).unwrap_or_else(|| "None".to_owned()),
+                    actual = encoded.map_or_else(|| "None".to_owned(), |encoded| format!("0x{:08x}", encoded)),
+                    actual_binary = encoded.map_or_else(|| "None".to_owned(), |encoded| format!("{:b}", encoded)),
+                    actual_dec = encoded.map_or_else(|| "None".to_owned(), |encoded| format!("{}", encoded)),
                 );
             }
         }

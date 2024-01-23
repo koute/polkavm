@@ -153,6 +153,7 @@ enum ShiftKind {
 impl<'a> Compiler<'a> {
     pub const PADDING_BYTE: u8 = 0x90; // NOP
 
+    #[allow(clippy::unused_self)]
     #[cfg_attr(not(debug_assertions), inline(always))]
     fn reg_size(&self) -> RegSize {
         RegSize::R32
@@ -867,17 +868,16 @@ impl<'a> InstructionVisitor for VisitorWrapper<'a, Compiler<'a>> {
         if d == s1 {
             // d = d * s2
             self.push(imul(RegSize::R64, conv_reg(d), conv_reg(s2)));
-            self.push(shr_imm(RegSize::R64, conv_reg(d), 32));
         } else if d == s2 {
             // d = s1 * d
             self.push(imul(RegSize::R64, conv_reg(d), conv_reg(s1)));
-            self.push(shr_imm(RegSize::R64, conv_reg(d), 32));
         } else {
             // d = s1 * s2
             self.push(mov(RegSize::R32, conv_reg(d), conv_reg(s1)));
             self.push(imul(RegSize::R64, conv_reg(d), conv_reg(s2)));
-            self.push(shr_imm(RegSize::R64, conv_reg(d), 32));
         }
+
+        self.push(shr_imm(RegSize::R64, conv_reg(d), 32));
     }
 
     #[inline(always)]
@@ -911,13 +911,13 @@ impl<'a> InstructionVisitor for VisitorWrapper<'a, Compiler<'a>> {
             self.push(mov(RegSize::R32, TMP_REG, conv_reg(s2)));
             self.push(movsxd_32_to_64(conv_reg(d), conv_reg(s1)));
             self.push(imul(RegSize::R64, conv_reg(d), TMP_REG));
-            self.push(shr_imm(RegSize::R64, conv_reg(d), 32));
         } else {
             // d = s1 * s2
             self.push(movsxd_32_to_64(conv_reg(d), conv_reg(s1)));
             self.push(imul(RegSize::R64, conv_reg(d), conv_reg(s2)));
-            self.push(shr_imm(RegSize::R64, conv_reg(d), 32));
         }
+
+        self.push(shr_imm(RegSize::R64, conv_reg(d), 32));
     }
 
     #[inline(always)]

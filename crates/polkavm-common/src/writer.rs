@@ -202,7 +202,7 @@ impl<'a> Writer<'a> {
         for arg_ty in meta.args() {
             self.push_byte(arg_ty as u8);
         }
-        self.push_byte(meta.return_ty().map(|ty| ty as u8).unwrap_or(0));
+        self.push_byte(meta.return_ty().map_or(0, |ty| ty as u8));
     }
 
     pub fn len(&self) -> usize {

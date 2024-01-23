@@ -57,11 +57,11 @@ impl<'a> Section<'a> {
     }
 
     pub fn is_writable(&self) -> bool {
-        self.flags & object::elf::SHF_WRITE as u64 != 0
+        self.flags & u64::from(object::elf::SHF_WRITE) != 0
     }
 
     pub fn is_allocated(&self) -> bool {
-        self.flags & object::elf::SHF_ALLOC as u64 != 0
+        self.flags & u64::from(object::elf::SHF_ALLOC) != 0
     }
 
     pub fn data(&self) -> &[u8] {
@@ -172,16 +172,15 @@ impl<'data> Elf<'data> {
                 .get(file_range)
                 .ok_or_else(|| ProgramFromElfError::other(format!("out of range '{name}' section (out of bounds of ELF file)")))?;
 
-            let flags = match section.flags() {
-                object::SectionFlags::Elf { sh_flags } => sh_flags,
-                _ => unreachable!(),
-            };
-
             if section.size() < file_data.len() as u64 {
                 return Err(ProgramFromElfError::other(format!(
                     "section '{name}' has bigger physical size than virtual size"
                 )));
             }
+
+            let object::SectionFlags::Elf { sh_flags: flags } = section.flags() else {
+                unreachable!()
+            };
 
             let index = SectionIndex(sections.len());
             sections.push(Section {
@@ -252,7 +251,7 @@ impl<'data> Elf<'data> {
             align: 4,
             size: 0,
             data: Cow::Owned(Vec::new()),
-            flags: object::elf::SHF_ALLOC as u64,
+            flags: u64::from(object::elf::SHF_ALLOC),
             raw_section_index: None,
         });
 

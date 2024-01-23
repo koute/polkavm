@@ -5,9 +5,9 @@ use polkavm_common::utils::align_to_next_page_u64;
 use polkavm_common::varint;
 use polkavm_common::writer::{ProgramBlobBuilder, Writer};
 
+use core::ops::Range;
 use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
-use std::ops::Range;
 use std::sync::Arc;
 
 use crate::dwarf::Location;
@@ -167,7 +167,7 @@ impl core::fmt::Display for ProgramFromElfError {
                     "unsupported instruction in section '{section}' at offset 0x{offset:x}: 0x{instruction:08x}"
                 )
             }
-            ProgramFromElfErrorKind::UnsupportedRegister { reg } => write!(fmt, "unsupported register: {:?}", reg),
+            ProgramFromElfErrorKind::UnsupportedRegister { reg } => write!(fmt, "unsupported register: {reg}"),
             ProgramFromElfErrorKind::Other(message) => fmt.write_str(message),
         }
     }
@@ -197,7 +197,7 @@ fn cast_reg_non_zero(reg: RReg) -> Result<Option<Reg>, ProgramFromElfError> {
 }
 
 fn cast_reg_any(reg: RReg) -> Result<RegImm, ProgramFromElfError> {
-    Ok(cast_reg_non_zero(reg)?.map(RegImm::Reg).unwrap_or(RegImm::Imm(0)))
+    Ok(cast_reg_non_zero(reg)?.map_or(RegImm::Imm(0), RegImm::Reg))
 }
 
 #[derive(Copy, Clone, PartialEq, Eq, PartialOrd, Ord, Debug, Hash)]
@@ -265,14 +265,14 @@ impl SourceStack {
 
     fn overlay_on_top_of(&self, stack: &SourceStack) -> Self {
         let mut vec = Vec::with_capacity(self.0.len() + stack.0.len());
-        vec.extend(self.0.iter().cloned());
-        vec.extend(stack.0.iter().cloned());
+        vec.extend(self.0.iter().copied());
+        vec.extend(stack.0.iter().copied());
 
         SourceStack(vec)
     }
 
     fn overlay_on_top_of_inplace(&mut self, stack: &SourceStack) {
-        self.0.extend(stack.0.iter().cloned());
+        self.0.extend(stack.0.iter().copied());
     }
 }
 
@@ -428,7 +428,7 @@ impl SectionTarget {
         let offset: u32 = self.offset.try_into().expect("section offset is too large");
         SectionTarget {
             section_index: self.section_index,
-            offset: cb(offset as i32) as u32 as u64,
+            offset: u64::from(cb(offset as i32) as u32),
         }
     }
 }
@@ -885,16 +885,15 @@ impl<BasicT, ControlT> BasicBlock<BasicT, ControlT> {
 }
 
 fn split_function_name(name: &str) -> (String, String) {
-    let name = rustc_demangle::try_demangle(name)
-        .ok()
-        .map(|name| name.to_string())
-        .unwrap_or_else(|| name.to_string());
+    let (with_hash, without_hash) = if let Ok(name) = rustc_demangle::try_demangle(name) {
+        (name.to_string(), format!("{:#}", name))
+    } else {
+        (name.to_owned(), name.to_owned())
+    };
 
     // Ideally we'd parse the symbol into an actual AST and use that,
     // but that's a lot of work, so for now let's just do it like this.
-    let with_hash = name.to_string();
-    let without_hash = format!("{:#}", name);
-
+    //
     // Here we want to split the symbol into two parts: the namespace, and the name + hash.
     // The idea being that multiple symbols most likely share the namespcae, allowing us to
     // deduplicate those strings in the output blob.
@@ -984,7 +983,7 @@ fn extract_memory_config(
     section_min_stack_size: Option<SectionIndex>,
     base_address_for_section: &mut HashMap<SectionIndex, u64>,
 ) -> Result<MemoryConfig, ProgramFromElfError> {
-    let mut memory_end = VM_ADDR_USER_MEMORY as u64;
+    let mut memory_end = u64::from(VM_ADDR_USER_MEMORY);
     let mut ro_data = Vec::new();
     let mut ro_data_size = 0;
 
@@ -996,7 +995,7 @@ fn extract_memory_config(
         }
     }
 
-    assert_eq!(memory_end % VM_MAX_PAGE_SIZE as u64, 0);
+    assert_eq!(memory_end % u64::from(VM_MAX_PAGE_SIZE), 0);
 
     let ro_data_address = memory_end;
     for &section_index in sections_ro_data {
@@ -1033,15 +1032,15 @@ fn extract_memory_config(
     {
         let ro_data_size_unaligned = ro_data_size;
 
-        assert_eq!(ro_data_address % VM_PAGE_SIZE as u64, 0);
-        ro_data_size = align_to_next_page_u64(VM_PAGE_SIZE as u64, ro_data_size)
+        assert_eq!(ro_data_address % u64::from(VM_PAGE_SIZE), 0);
+        ro_data_size = align_to_next_page_u64(u64::from(VM_PAGE_SIZE), ro_data_size)
             .ok_or(ProgramFromElfError::other("out of range size for read-only sections"))?;
 
         memory_end += ro_data_size - ro_data_size_unaligned;
     }
 
-    assert_eq!(memory_end % VM_PAGE_SIZE as u64, 0);
-    memory_end = align_to_next_page_u64(VM_MAX_PAGE_SIZE as u64, memory_end).unwrap();
+    assert_eq!(memory_end % u64::from(VM_PAGE_SIZE), 0);
+    memory_end = align_to_next_page_u64(u64::from(VM_MAX_PAGE_SIZE), memory_end).unwrap();
 
     if ro_data_size > 0 {
         // Add a guard page between read-only data and read-write data.
@@ -1085,8 +1084,8 @@ fn extract_memory_config(
     let bss_explicit_address = {
         let rw_data_size_unaligned = rw_data_size;
 
-        assert_eq!(rw_data_address % VM_PAGE_SIZE as u64, 0);
-        rw_data_size = align_to_next_page_u64(VM_PAGE_SIZE as u64, rw_data_size)
+        assert_eq!(rw_data_address % u64::from(VM_PAGE_SIZE), 0);
+        rw_data_size = align_to_next_page_u64(u64::from(VM_PAGE_SIZE), rw_data_size)
             .ok_or(ProgramFromElfError::other("out of range size for read-write sections"))?;
 
         memory_end + (rw_data_size - rw_data_size_unaligned)
@@ -1121,8 +1120,8 @@ fn extract_memory_config(
         0
     };
 
-    bss_size =
-        align_to_next_page_u64(VM_PAGE_SIZE as u64, bss_size).ok_or(ProgramFromElfError::other("out of range size for BSS sections"))?;
+    bss_size = align_to_next_page_u64(u64::from(VM_PAGE_SIZE), bss_size)
+        .ok_or(ProgramFromElfError::other("out of range size for BSS sections"))?;
 
     let stack_size = if let Some(section_index) = section_min_stack_size {
         let section = elf.section_by_index(section_index);
@@ -1137,10 +1136,10 @@ fn extract_memory_config(
             stack_size = core::cmp::max(stack_size, value);
         }
 
-        align_to_next_page_u64(VM_PAGE_SIZE as u64, stack_size as u64)
+        align_to_next_page_u64(u64::from(VM_PAGE_SIZE), u64::from(stack_size))
             .ok_or(ProgramFromElfError::other("out of range size for the stack"))?
     } else {
-        VM_PAGE_SIZE as u64
+        u64::from(VM_PAGE_SIZE)
     };
 
     log::trace!("Configured stack size: 0x{stack_size:x}");
@@ -1160,8 +1159,8 @@ fn extract_memory_config(
             }
         };
 
-        assert_eq!(config.ro_data_address() as u64, ro_data_address);
-        assert_eq!(config.rw_data_address() as u64, rw_data_address);
+        assert_eq!(u64::from(config.ro_data_address()), ro_data_address);
+        assert_eq!(u64::from(config.rw_data_address()), rw_data_address);
     }
 
     let memory_config = MemoryConfig {
@@ -1472,8 +1471,8 @@ fn emit_minmax(
     emit(InstExt::Basic(BasicInst::AnyAny {
         kind: cmp_kind,
         dst,
-        src1: cmp_src1.map(RegImm::Reg).unwrap_or(RegImm::Imm(0)),
-        src2: cmp_src2.map(RegImm::Reg).unwrap_or(RegImm::Imm(0)),
+        src1: cmp_src1.map_or(RegImm::Imm(0), RegImm::Reg),
+        src2: cmp_src2.map_or(RegImm::Imm(0), RegImm::Reg),
     }));
     if let Some(src1) = src1 {
         emit(InstExt::Basic(BasicInst::Cmov {
@@ -1518,7 +1517,7 @@ fn convert_instruction(
         Inst::JumpAndLink { dst, target } => {
             let target = SectionTarget {
                 section_index: section.index(),
-                offset: current_location.offset.wrapping_add_signed(target as i32 as i64),
+                offset: current_location.offset.wrapping_add_signed(i64::from(target as i32)),
             };
 
             if target.offset > section.size() {
@@ -1545,7 +1544,7 @@ fn convert_instruction(
 
             let target_true = SectionTarget {
                 section_index: section.index(),
-                offset: current_location.offset.wrapping_add_signed(target as i32 as i64),
+                offset: current_location.offset.wrapping_add_signed(i64::from(target as i32)),
             };
 
             if target_true.offset > section.size() {
@@ -1774,7 +1773,7 @@ fn convert_instruction(
             };
 
             let operand = cast_reg_non_zero(operand)?;
-            let operand_regimm = operand.map(RegImm::Reg).unwrap_or(RegImm::Imm(0));
+            let operand_regimm = operand.map_or(RegImm::Imm(0), RegImm::Reg);
             let (old_value, new_value, output) = match cast_reg_non_zero(old_value)? {
                 None => (Reg::E0, Reg::E0, None),
                 Some(old_value) if old_value == addr => (Reg::E0, Reg::E1, Some(old_value)),
@@ -2064,7 +2063,7 @@ fn split_code_into_basic_blocks(
                     blocks.push(BasicBlock::new(
                         block_index,
                         block_source,
-                        std::mem::take(&mut current_block),
+                        core::mem::take(&mut current_block),
                         EndOfBlock {
                             source: end_of_block_source.into(),
                             instruction: ControlInst::Jump { target: source.begin() },
@@ -2092,7 +2091,7 @@ fn split_code_into_basic_blocks(
                 blocks.push(BasicBlock::new(
                     block_index,
                     block_source,
-                    std::mem::take(&mut current_block),
+                    core::mem::take(&mut current_block),
                     EndOfBlock {
                         source: source.into(),
                         instruction,
@@ -2551,18 +2550,13 @@ fn perform_inlining(
         // Everything which the inner block accesses will be reachable from here, so update reachability.
         each_reference(&all_blocks[inner.index()], |ext| match ext {
             ExtRef::Jump(target) => {
-                reachability_graph
-                    .for_code
-                    .entry(target)
-                    .or_insert_with(Default::default)
-                    .reachable_from
-                    .insert(outer);
+                reachability_graph.for_code.entry(target).or_default().reachable_from.insert(outer);
             }
             ExtRef::Address(target) => {
                 reachability_graph
                     .for_code
                     .entry(target)
-                    .or_insert_with(Default::default)
+                    .or_default()
                     .address_taken_in
                     .insert(outer);
             }
@@ -2570,7 +2564,7 @@ fn perform_inlining(
                 reachability_graph
                     .for_data
                     .entry(target)
-                    .or_insert_with(Default::default)
+                    .or_default()
                     .address_taken_in
                     .insert(outer);
             }
@@ -2679,7 +2673,7 @@ fn gather_references(block: &BasicBlock<AnyTarget, BlockTarget>) -> HashSet<ExtR
 }
 
 fn update_references(
-    all_blocks: &mut [BasicBlock<AnyTarget, BlockTarget>],
+    all_blocks: &[BasicBlock<AnyTarget, BlockTarget>],
     reachability_graph: &mut ReachabilityGraph,
     mut optimize_queue: Option<&mut VecSet<BlockTarget>>,
     block_target: BlockTarget,
@@ -2857,7 +2851,7 @@ fn perform_dead_code_elimination(
         } => registers_needed_for_block[target_true.index()] | registers_needed_for_block[target_false.index()],
         // ...otherwise assume it'll need all of them.
         ControlInst::Call { .. } | ControlInst::CallIndirect { .. } => unreachable!(),
-        _ => RegMask::all(),
+        ControlInst::JumpIndirect { .. } => RegMask::all(),
     };
 
     let mut modified = false;
@@ -3004,8 +2998,8 @@ impl OperationKind {
             Self::And => lhs & rhs,
             Self::Or => lhs | rhs,
             Self::Xor => lhs ^ rhs,
-            Self::SetLessThanUnsigned => ((lhs as u32) < (rhs as u32)) as i32,
-            Self::SetLessThanSigned => ((lhs as i32) < (rhs as i32)) as i32,
+            Self::SetLessThanUnsigned => i32::from((lhs as u32) < (rhs as u32)),
+            Self::SetLessThanSigned => i32::from((lhs as i32) < (rhs as i32)),
             Self::ShiftLogicalLeft => ((lhs as u32).wrapping_shl(rhs as u32)) as i32,
             Self::ShiftLogicalRight => ((lhs as u32).wrapping_shr(rhs as u32)) as i32,
             Self::ShiftArithmeticRight => (lhs as i32).wrapping_shr(rhs as u32),
@@ -3019,10 +3013,10 @@ impl OperationKind {
             Self::Rem => rem(lhs, rhs),
             Self::RemUnsigned => remu(lhs as u32, rhs as u32) as i32,
 
-            Self::Eq => (lhs == rhs) as i32,
-            Self::NotEq => (lhs != rhs) as i32,
-            Self::SetGreaterOrEqualUnsigned => ((lhs as u32) >= (rhs as u32)) as i32,
-            Self::SetGreaterOrEqualSigned => ((lhs as i32) >= (rhs as i32)) as i32,
+            Self::Eq => i32::from(lhs == rhs),
+            Self::NotEq => i32::from(lhs != rhs),
+            Self::SetGreaterOrEqualUnsigned => i32::from((lhs as u32) >= (rhs as u32)),
+            Self::SetGreaterOrEqualSigned => i32::from((lhs as i32) >= (rhs as i32)),
         }
     }
 
@@ -3153,7 +3147,7 @@ impl BlockRegs {
 
     fn simplify_control_instruction(&self, instruction: ControlInst<BlockTarget>) -> Option<ControlInst<BlockTarget>> {
         match instruction {
-            ControlInst::JumpIndirect { base, offset } if offset == 0 => {
+            ControlInst::JumpIndirect { base, offset: 0 } => {
                 if let RegValue::CodeAddress(target) = self.get_reg(base) {
                     return Some(ControlInst::Jump { target });
                 }
@@ -3457,7 +3451,7 @@ impl BlockRegs {
             | BasicInst::LoadIndirect {
                 kind: LoadKind::U8, dst, ..
             } => {
-                self.set_reg_unknown(dst, unknown_counter, u8::MAX as u32);
+                self.set_reg_unknown(dst, unknown_counter, u32::from(u8::MAX));
             }
             BasicInst::LoadAbsolute {
                 kind: LoadKind::U16, dst, ..
@@ -3465,7 +3459,7 @@ impl BlockRegs {
             | BasicInst::LoadIndirect {
                 kind: LoadKind::U16, dst, ..
             } => {
-                self.set_reg_unknown(dst, unknown_counter, u16::MAX as u32);
+                self.set_reg_unknown(dst, unknown_counter, u32::from(u16::MAX));
             }
             _ => {
                 for dst in instruction.dst_mask(imports) {
@@ -3530,13 +3524,13 @@ fn perform_constant_propagation(
                         LoadKind::U16 => section
                             .data()
                             .get(target.offset as usize..target.offset as usize + 2)
-                            .map(|xs| u16::from_le_bytes([xs[0], xs[1]]) as u32 as i32),
+                            .map(|xs| u32::from(u16::from_le_bytes([xs[0], xs[1]])) as i32),
                         LoadKind::I16 => section
                             .data()
                             .get(target.offset as usize..target.offset as usize + 2)
-                            .map(|xs| i16::from_le_bytes([xs[0], xs[1]]) as i32),
-                        LoadKind::I8 => section.data().get(target.offset as usize).map(|&x| x as i8 as i32),
-                        LoadKind::U8 => section.data().get(target.offset as usize).map(|&x| x as u32 as i32),
+                            .map(|xs| i32::from(i16::from_le_bytes([xs[0], xs[1]]))),
+                        LoadKind::I8 => section.data().get(target.offset as usize).map(|&x| i32::from(x as i8)),
+                        LoadKind::U8 => section.data().get(target.offset as usize).map(|&x| u32::from(x) as i32),
                     };
 
                     if let Some(imm) = value {
@@ -4320,7 +4314,7 @@ fn spill_fake_registers(
         reachability_graph
             .for_data
             .entry(section_regspill)
-            .or_insert_with(Default::default)
+            .or_default()
             .address_taken_in
             .insert(*current);
 
@@ -4542,7 +4536,7 @@ impl ReachabilityGraph {
     }
 
     fn mark_data_section_reachable(&mut self, section_index: SectionIndex) {
-        self.for_data.entry(section_index).or_insert_with(Default::default).always_reachable = true;
+        self.for_data.entry(section_index).or_default().always_reachable = true;
     }
 }
 
@@ -4657,7 +4651,7 @@ fn calculate_reachability(
             return Err(ProgramFromElfError::other("export points to a non-block"));
         };
 
-        graph.for_code.entry(block_target).or_insert_with(Default::default).always_reachable = true;
+        graph.for_code.entry(block_target).or_default().always_reachable = true;
         block_queue.push(block_target);
     }
 
@@ -4665,30 +4659,15 @@ fn calculate_reachability(
         while let Some(current_block) = block_queue.pop_unique() {
             each_reference(&all_blocks[current_block.index()], |ext| match ext {
                 ExtRef::Jump(target) => {
-                    graph
-                        .for_code
-                        .entry(target)
-                        .or_insert_with(Default::default)
-                        .reachable_from
-                        .insert(current_block);
+                    graph.for_code.entry(target).or_default().reachable_from.insert(current_block);
                     block_queue.push(target);
                 }
                 ExtRef::Address(target) => {
-                    graph
-                        .for_code
-                        .entry(target)
-                        .or_insert_with(Default::default)
-                        .address_taken_in
-                        .insert(current_block);
+                    graph.for_code.entry(target).or_default().address_taken_in.insert(current_block);
                     block_queue.push(target)
                 }
                 ExtRef::DataAddress(target) => {
-                    graph
-                        .for_data
-                        .entry(target)
-                        .or_insert_with(Default::default)
-                        .address_taken_in
-                        .insert(current_block);
+                    graph.for_data.entry(target).or_default().address_taken_in.insert(current_block);
                     section_queue.push(target)
                 }
             });
@@ -4710,13 +4689,13 @@ fn calculate_reachability(
                         graph
                             .code_references_in_data_section
                             .entry(section_index)
-                            .or_insert_with(Default::default)
+                            .or_default()
                             .push(block_target);
 
                         graph
                             .for_code
                             .entry(block_target)
-                            .or_insert_with(Default::default)
+                            .or_default()
                             .referenced_by_data
                             .insert(section_index);
 
@@ -4725,13 +4704,13 @@ fn calculate_reachability(
                         graph
                             .data_references_in_data_section
                             .entry(section_index)
-                            .or_insert_with(Default::default)
+                            .or_default()
                             .push(relocation_target.section_index);
 
                         graph
                             .for_data
                             .entry(relocation_target.section_index)
-                            .or_insert_with(Default::default)
+                            .or_default()
                             .referenced_by_data
                             .insert(section_index);
 
@@ -6100,13 +6079,10 @@ fn harvest_code_relocations(
             )));
         };
 
-        let hi_reg = match hi_inst {
-            Inst::AddUpperImmediateToPc { dst, .. } => dst,
-            _ => {
-                return Err(ProgramFromElfError::other(format!(
-                    "{hi_kind} relocation for an unsupported instruction at '{section_name}'[0x{relative_hi:x}]: {hi_inst:?}"
-                )))
-            }
+        let Inst::AddUpperImmediateToPc { dst: hi_reg, .. } = hi_inst else {
+            return Err(ProgramFromElfError::other(format!(
+                "{hi_kind} relocation for an unsupported instruction at '{section_name}'[0x{relative_hi:x}]: {hi_inst:?}"
+            )));
         };
 
         let Some(lo_inst) = lo_inst else {
@@ -6479,14 +6455,14 @@ pub fn program_from_elf(config: Config, data: &[u8]) -> Result<ProgramBlob, Prog
     } else {
         reachability_graph = ReachabilityGraph::default();
         for current in (0..all_blocks.len()).map(BlockTarget::from_raw) {
-            let reachability = reachability_graph.for_code.entry(current).or_insert_with(Default::default);
+            let reachability = reachability_graph.for_code.entry(current).or_default();
 
             reachability.always_reachable = true;
             reachability.always_dynamically_reachable = true;
         }
 
         for &section_index in sections_ro_data.iter().chain(sections_rw_data.iter()) {
-            let reachability = reachability_graph.for_data.entry(section_index).or_insert_with(Default::default);
+            let reachability = reachability_graph.for_data.entry(section_index).or_default();
 
             reachability.always_reachable = true;
             reachability.always_dynamically_reachable = true;
@@ -6700,7 +6676,7 @@ pub fn program_from_elf(config: Config, data: &[u8]) -> Result<ProgramBlob, Prog
                             return Err(ProgramFromElfError::other("six bit relocation overflow"));
                         }
 
-                        let output = ((read_u8(data, relocation_target.offset)? as u64) & (!mask)) | (value & mask);
+                        let output = (u64::from(read_u8(data, relocation_target.offset)?) & (!mask)) | (value & mask);
                         data[relocation_target.offset as usize] = output as u8;
                     }
                     SizeRelocationSize::Generic(size) => {
@@ -6835,7 +6811,7 @@ pub fn program_from_elf(config: Config, data: &[u8]) -> Result<ProgramBlob, Prog
 
             let location_stack: Arc<[Location]> = vec![location].into();
             for target in source.iter() {
-                location_map.insert(target, location_stack.clone());
+                location_map.insert(target, Arc::clone(&location_stack));
             }
         }
     }
@@ -6929,7 +6905,7 @@ pub fn program_from_elf(config: Config, data: &[u8]) -> Result<ProgramBlob, Prog
                             function_name = locations[0].function_name.as_deref();
                         }
 
-                        list.push(locations.clone());
+                        list.push(Arc::clone(locations));
                         break;
                     }
                 }
@@ -7298,8 +7274,7 @@ fn emit_debug_info(builder: &mut ProgramBlobBuilder, locations_for_instruction: 
                         let namespace_offset = location
                             .namespace
                             .as_ref()
-                            .map(|string| dbg_strings.dedup(string))
-                            .unwrap_or(empty_string_id);
+                            .map_or(empty_string_id, |string| dbg_strings.dedup(string));
                         writer.push_varint(namespace_offset);
                     }
 
@@ -7311,8 +7286,7 @@ fn emit_debug_info(builder: &mut ProgramBlobBuilder, locations_for_instruction: 
                         let function_name_offset = location
                             .function_name
                             .as_ref()
-                            .map(|string| dbg_strings.dedup(string))
-                            .unwrap_or(empty_string_id);
+                            .map_or(empty_string_id, |string| dbg_strings.dedup(string));
                         writer.push_varint(function_name_offset);
                     }
 
@@ -7324,15 +7298,14 @@ fn emit_debug_info(builder: &mut ProgramBlobBuilder, locations_for_instruction: 
                                 .source_code_location
                                 .as_ref()
                                 .map(|location| match simplify_path(location.path()) {
-                                    Cow::Borrowed(_) => location.path().clone(),
+                                    Cow::Borrowed(_) => Arc::clone(location.path()),
                                     Cow::Owned(path) => path.into(),
                                 });
 
                         let path_offset = location
                             .source_code_location
                             .as_ref()
-                            .map(|location| dbg_strings.dedup_cow(simplify_path(location.path())))
-                            .unwrap_or(empty_string_id);
+                            .map_or(empty_string_id, |location| dbg_strings.dedup_cow(simplify_path(location.path())));
                         writer.push_varint(path_offset);
                     }
 

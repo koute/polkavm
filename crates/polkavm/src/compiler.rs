@@ -375,7 +375,7 @@ impl<S> crate::api::BackendModule for CompiledModule<S> where S: Sandbox {
             .with_sysreturn_address(result.sysreturn_address);
 
         let sandbox_program = S::prepare_program(init, address_space, gas_metering).map_err(Error::from_display)?;
-        let export_trampolines = result.export_trampolines.to_owned();
+        let export_trampolines = result.export_trampolines;
 
         let module = CompiledModule {
             sandbox_program,

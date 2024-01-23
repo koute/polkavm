@@ -160,6 +160,8 @@ impl AsUninitSliceMut for [MaybeUninit<u8>] {
 impl AsUninitSliceMut for [u8] {
     fn as_uninit_slice_mut(&mut self) -> &mut [MaybeUninit<u8>] {
         #[allow(unsafe_code)]
+        // SAFETY: `MaybeUnunit<T>` is guaranteed to have the same representation as `T`,
+        //         so casting `[T]` into `[MaybeUninit<T>]` is safe.
         unsafe {
             core::slice::from_raw_parts_mut(self.as_mut_ptr().cast(), self.len())
         }
@@ -169,6 +171,8 @@ impl AsUninitSliceMut for [u8] {
 impl<const N: usize> AsUninitSliceMut for MaybeUninit<[u8; N]> {
     fn as_uninit_slice_mut(&mut self) -> &mut [MaybeUninit<u8>] {
         #[allow(unsafe_code)]
+        // SAFETY: `MaybeUnunit<T>` is guaranteed to have the same representation as `T`,
+        //         so casting `[T; N]` into `[MaybeUninit<T>]` is safe.
         unsafe {
             core::slice::from_raw_parts_mut(self.as_mut_ptr().cast(), N)
         }
@@ -233,7 +237,7 @@ impl Gas {
 
 impl From<u32> for Gas {
     fn from(gas: u32) -> Self {
-        Gas(gas as u64)
+        Gas(u64::from(gas))
     }
 }
 
@@ -285,6 +289,7 @@ pub trait Access<'a> {
         assert_eq!(slice.len(), length as usize);
 
         #[allow(unsafe_code)]
+        // SAFETY: `read_memory_into_slice` initialized this buffer, and we've verified this with `assert`s.
         unsafe {
             buffer.set_len(length as usize);
         }
@@ -298,6 +303,7 @@ pub trait Access<'a> {
 #[allow(clippy::missing_safety_doc)]
 #[allow(unsafe_code)]
 pub unsafe fn slice_assume_init_mut<T>(slice: &mut [MaybeUninit<T>]) -> &mut [T] {
+    // SAFETY: The caller is responsible for making sure the `slice` was properly initialized.
     unsafe { &mut *(slice as *mut [MaybeUninit<T>] as *mut [T]) }
 }
 
@@ -305,11 +311,16 @@ pub unsafe fn slice_assume_init_mut<T>(slice: &mut [MaybeUninit<T>]) -> &mut [T]
 pub fn byte_slice_init<'dst>(dst: &'dst mut [MaybeUninit<u8>], src: &[u8]) -> &'dst mut [u8] {
     assert_eq!(dst.len(), src.len());
 
+    let length = dst.len();
+    let src_ptr: *const u8 = src.as_ptr();
+    let dst_ptr: *mut u8 = dst.as_mut_ptr().cast::<u8>();
+
+    // SAFETY: Both pointers are valid and are guaranteed to point to a region of memory
+    // at least `length` bytes big.
     unsafe {
-        let length = dst.len();
-        let src_ptr: *const u8 = src.as_ptr();
-        let dst_ptr: *mut u8 = dst.as_mut_ptr().cast::<u8>();
         core::ptr::copy_nonoverlapping(src_ptr, dst_ptr, length);
-        slice_assume_init_mut(dst)
     }
+
+    // SAFETY: We've just initialized this slice.
+    unsafe { slice_assume_init_mut(dst) }
 }

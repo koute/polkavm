@@ -10,6 +10,7 @@
 #![allow(clippy::manual_range_contains)]
 // This crate mostly contains syscall wrappers. If you use them you should know what you're doing.
 #![allow(clippy::missing_safety_doc)]
+#![allow(clippy::undocumented_unsafe_blocks)]
 #![cfg(all(target_os = "linux", target_arch = "x86_64"))]
 
 #[cfg(feature = "std")]
@@ -26,6 +27,8 @@ pub mod arch_amd64_syscall;
 #[allow(non_upper_case_globals)]
 #[allow(non_camel_case_types)]
 #[allow(non_snake_case)]
+#[allow(clippy::ptr_as_ptr)]
+#[allow(clippy::used_underscore_binding)]
 mod arch_amd64_bindings;
 
 mod mmap;
@@ -722,7 +725,7 @@ const fn CMSG_ALIGN(len: usize) -> usize {
 #[allow(non_snake_case)]
 pub unsafe fn CMSG_FIRSTHDR(mhdr: *const msghdr) -> *mut cmsghdr {
     if (*mhdr).msg_controllen >= core::mem::size_of::<cmsghdr>() {
-        (*mhdr).msg_control as *mut cmsghdr
+        (*mhdr).msg_control.cast::<cmsghdr>()
     } else {
         core::ptr::null_mut()
     }
@@ -730,7 +733,7 @@ pub unsafe fn CMSG_FIRSTHDR(mhdr: *const msghdr) -> *mut cmsghdr {
 
 #[allow(non_snake_case)]
 pub unsafe fn CMSG_DATA(cmsg: *mut cmsghdr) -> *mut c_uchar {
-    cmsg.add(1) as *mut c_uchar
+    cmsg.add(1).cast::<c_uchar>()
 }
 
 #[allow(non_snake_case)]
@@ -1387,7 +1390,7 @@ pub fn sys_seccomp_set_mode_filter(filter: &[sock_filter]) -> Result<(), Error> 
         filter: filter.as_ptr(),
     };
 
-    let result = unsafe { syscall_readonly!(SYS_seccomp, SECCOMP_SET_MODE_FILTER, 0, &filter as *const sock_fprog) };
+    let result = unsafe { syscall_readonly!(SYS_seccomp, SECCOMP_SET_MODE_FILTER, 0, core::ptr::addr_of!(filter)) };
     Error::from_syscall("seccomp(SECCOMP_SET_MODE_FILTER)", result)
 }
 
@@ -1414,7 +1417,7 @@ pub fn sys_mount(dev_name: &CStr, dir_name: &CStr, kind: &CStr, flags: u32, data
             dir_name.as_ptr(),
             kind.as_ptr(),
             flags,
-            data.map(|data| data.as_ptr()).unwrap_or(core::ptr::null())
+            data.map_or(core::ptr::null(), |data| data.as_ptr())
         )
     };
     Error::from_syscall("mount", result)
@@ -1435,7 +1438,7 @@ pub fn sys_unshare(flags: u32) -> Result<(), Error> {
     Error::from_syscall("unshare", result)
 }
 
-/// Calls the `futex` syscall with FUTEX_WAIT operation.
+/// Calls the `futex` syscall with `FUTEX_WAIT` operation.
 ///
 /// This will block *if* the value of the `futex` is equal to the `expected_value`.
 ///
@@ -1455,7 +1458,7 @@ pub fn sys_futex_wait(futex: &AtomicU32, expected_value: u32, timeout: Option<Du
             futex as *const AtomicU32,
             FUTEX_WAIT,
             expected_value,
-            ts.as_ref().map(|ts| ts as *const timespec).unwrap_or(core::ptr::null())
+            ts.as_ref().map_or(core::ptr::null(), |ts| ts as *const timespec)
         )
     };
     Error::from_syscall("futex (wait)", result)
@@ -1482,9 +1485,7 @@ pub unsafe fn sys_rt_sigaction(signal: u32, new_action: &kernel_sigaction, old_a
             SYS_rt_sigaction,
             signal,
             new_action as *const kernel_sigaction,
-            old_action
-                .map(|old_action| old_action as *mut kernel_sigaction)
-                .unwrap_or(core::ptr::null_mut()),
+            old_action.map_or(core::ptr::null_mut(), |old_action| old_action as *mut kernel_sigaction),
             core::mem::size_of::<kernel_sigset_t>()
         )
     };
@@ -1498,9 +1499,7 @@ pub unsafe fn sys_rt_sigprocmask(how: u32, new_sigset: &kernel_sigset_t, old_sig
             SYS_rt_sigprocmask,
             how,
             new_sigset as *const kernel_sigset_t,
-            old_sigset
-                .map(|old_sigset| old_sigset as *mut kernel_sigset_t)
-                .unwrap_or(core::ptr::null_mut()),
+            old_sigset.map_or(core::ptr::null_mut(), |old_sigset| old_sigset as *mut kernel_sigset_t),
             core::mem::size_of::<kernel_sigset_t>()
         )
     };
@@ -1513,9 +1512,7 @@ pub unsafe fn sys_sigaltstack(new_stack: &stack_t, old_stack: Option<&mut stack_
         syscall_readonly!(
             SYS_sigaltstack,
             new_stack as *const stack_t,
-            old_stack
-                .map(|old_stack| old_stack as *mut stack_t)
-                .unwrap_or(core::ptr::null_mut())
+            old_stack.map_or(core::ptr::null_mut(), |old_stack| old_stack as *mut stack_t)
         )
     };
     Error::from_syscall("sigaltstack", result)?;
@@ -1524,8 +1521,7 @@ pub unsafe fn sys_sigaltstack(new_stack: &stack_t, old_stack: Option<&mut stack_
 
 pub fn sys_clock_gettime(clock_id: u32) -> Result<Duration, Error> {
     let mut output = timespec { tv_sec: 0, tv_nsec: 0 };
-
-    let result = unsafe { syscall_readonly!(SYS_clock_gettime, clock_id, &mut output as *mut timespec) };
+    let result = unsafe { syscall_readonly!(SYS_clock_gettime, clock_id, core::ptr::addr_of_mut!(output)) };
     Error::from_syscall("clock_gettime", result)?;
 
     let duration = Duration::new(output.tv_sec as u64, output.tv_nsec as u32);
@@ -1540,7 +1536,7 @@ pub fn sys_waitid(which: u32, pid: pid_t, info: &mut siginfo_t, options: u32, us
             pid,
             info as *mut siginfo_t,
             options,
-            usage.map(|usage| usage as *mut rusage).unwrap_or(core::ptr::null_mut())
+            usage.map_or(core::ptr::null_mut(), |usage| usage as *mut rusage)
         )
     };
 
@@ -1570,7 +1566,7 @@ pub fn vm_write_memory<const N_LOCAL: usize, const N_REMOTE: usize>(
     remote: [(usize, usize); N_REMOTE],
 ) -> Result<usize, Error> {
     let local_iovec = local.map(|slice| iovec {
-        iov_base: (slice.as_ptr() as *mut u8).cast(),
+        iov_base: slice.as_ptr().cast_mut().cast(),
         iov_len: slice.len() as u64,
     });
     let remote_iovec = remote.map(|(address, length)| iovec {
@@ -1582,7 +1578,7 @@ pub fn vm_write_memory<const N_LOCAL: usize, const N_REMOTE: usize>(
 
 pub fn writev<const N: usize>(fd: FdRef, list: [&[u8]; N]) -> Result<usize, Error> {
     let iv = list.map(|slice| iovec {
-        iov_base: (slice.as_ptr() as *mut u8).cast(),
+        iov_base: slice.as_ptr().cast_mut().cast(),
         iov_len: slice.len() as u64,
     });
     unsafe { sys_writev(fd, &iv) }
@@ -1599,22 +1595,29 @@ pub fn readdir(dirfd: FdRef) -> Dirent64Iter {
 }
 
 #[repr(transparent)]
-pub struct Dirent64(linux_dirent64);
+pub struct Dirent64<'a> {
+    raw: linux_dirent64,
+    _lifetime: core::marker::PhantomData<&'a [u8]>,
+}
 
-impl Dirent64 {
+impl<'a> Dirent64<'a> {
     pub fn d_type(&self) -> c_uchar {
-        self.0.d_type
+        self.raw.d_type
     }
 
-    pub fn d_name(&self) -> &[u8] {
+    pub fn d_name(&self) -> &'a [u8] {
         unsafe {
-            let mut p = self.0.d_name.as_ptr();
-            while *p != 0 {
-                p = p.add(1);
-            }
+            let name = self.raw.d_name.as_ptr();
+            let length = {
+                let mut p = self.raw.d_name.as_ptr();
+                while *p != 0 {
+                    p = p.add(1);
+                }
 
-            let length = p as usize - self.0.d_name.as_ptr() as usize;
-            core::slice::from_raw_parts(self.0.d_name.as_ptr().cast(), length)
+                p as usize - name as usize
+            };
+
+            core::slice::from_raw_parts(name.cast(), length)
         }
     }
 }
@@ -1627,13 +1630,13 @@ pub struct Dirent64Iter<'a> {
 }
 
 impl<'a> Iterator for Dirent64Iter<'a> {
-    type Item = Result<&'a Dirent64, Error>;
+    type Item = Result<Dirent64<'a>, Error>;
     fn next(&mut self) -> Option<Self::Item> {
         loop {
             if self.position < self.bytes_available {
-                let dirent = unsafe { &*(self.buffer.as_ptr().add(self.position) as *const Dirent64) };
+                let dirent = unsafe { core::ptr::read_unaligned(self.buffer.as_ptr().add(self.position).cast::<Dirent64>()) };
 
-                self.position += usize::from(dirent.0.d_reclen);
+                self.position += usize::from(dirent.raw.d_reclen);
                 return Some(Ok(dirent));
             }
 
@@ -1651,7 +1654,7 @@ pub fn sendfd(socket: FdRef, fd: FdRef) -> Result<(), Error> {
     let mut buffer = [0; CMSG_SPACE(core::mem::size_of::<c_int>())];
 
     let mut iov = iovec {
-        iov_base: &mut dummy as *mut c_int as *mut c_void,
+        iov_base: core::ptr::addr_of_mut!(dummy).cast::<c_void>(),
         iov_len: core::mem::size_of_val(&dummy) as u64,
     };
 
@@ -1671,9 +1674,10 @@ pub fn sendfd(socket: FdRef, fd: FdRef) -> Result<(), Error> {
         cmsg_type: SCM_RIGHTS,
     };
 
+    #[allow(clippy::cast_ptr_alignment)]
     unsafe {
         core::ptr::write_unaligned(CMSG_FIRSTHDR(&header), control_header);
-        core::ptr::write_unaligned(CMSG_DATA(buffer.as_mut_ptr() as *mut cmsghdr) as *mut c_int, fd.raw());
+        core::ptr::write_unaligned(CMSG_DATA(buffer.as_mut_ptr().cast::<cmsghdr>()).cast::<c_int>(), fd.raw());
     }
 
     header.msg_controllen = CMSG_LEN(core::mem::size_of::<c_int>());
@@ -1687,7 +1691,7 @@ pub fn recvfd(socket: FdRef) -> Result<Fd, Error> {
     let mut buffer = [0; CMSG_SPACE(core::mem::size_of::<c_int>())];
 
     let mut iov = iovec {
-        iov_base: &mut dummy as *mut c_int as *mut c_void,
+        iov_base: core::ptr::addr_of_mut!(dummy).cast::<c_void>(),
         iov_len: core::mem::size_of_val(&dummy) as u64,
     };
 
@@ -1720,7 +1724,7 @@ pub fn recvfd(socket: FdRef) -> Result<Fd, Error> {
         return Err(Error::from_str("recvfd failed: invalid control message type"));
     }
 
-    let fd = unsafe { core::ptr::read_unaligned(CMSG_DATA(control_header) as *mut c_int) };
+    let fd = unsafe { core::ptr::read_unaligned(CMSG_DATA(control_header).cast::<c_int>()) };
 
     Ok(Fd::from_raw_unchecked(fd))
 }

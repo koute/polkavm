@@ -1,6 +1,7 @@
 #![forbid(unused_must_use)]
 #![forbid(clippy::missing_safety_doc)]
 #![deny(clippy::undocumented_unsafe_blocks)]
+#![deny(clippy::exhaustive_structs)]
 
 #[cfg(all(
     not(miri),

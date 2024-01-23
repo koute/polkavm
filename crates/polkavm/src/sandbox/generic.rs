@@ -160,7 +160,7 @@ impl Mmap {
     }
 
     fn mmap_within(&mut self, offset: usize, length: usize, protection: c_int) -> Result<(), Error> {
-        if !offset.checked_add(length).map(|end| end <= self.length).unwrap_or(false) {
+        if !offset.checked_add(length).map_or(false, |end| end <= self.length) {
             return Err("out of bounds mmap".into())
         }
 
@@ -183,7 +183,7 @@ impl Mmap {
             }
 
             self.length = 0;
-            self.pointer = core::ptr::NonNull::<u8>::dangling().as_ptr() as *mut c_void;
+            self.pointer = core::ptr::NonNull::<u8>::dangling().as_ptr().cast::<c_void>();
         }
 
         Ok(())
@@ -203,7 +203,7 @@ impl Mmap {
     }
 
     pub fn mprotect(&mut self, offset: usize, length: usize, protection: c_int) -> Result<(), Error> {
-        if !offset.checked_add(length).map(|end| end <= self.length).unwrap_or(false) {
+        if !offset.checked_add(length).map_or(false, |end| end <= self.length) {
             return Err("out of bounds mprotect".into())
         }
 
@@ -262,7 +262,7 @@ impl Mmap {
 impl Default for Mmap {
     fn default() -> Self {
         Self {
-            pointer: core::ptr::NonNull::<u8>::dangling().as_ptr() as *mut c_void,
+            pointer: core::ptr::NonNull::<u8>::dangling().as_ptr().cast::<c_void>(),
             length: 0,
         }
     }
@@ -331,6 +331,7 @@ unsafe extern "C" fn signal_handler(signal: c_int, info: &sys::siginfo_t, contex
     }
 }
 
+#[allow(clippy::fn_to_numeric_cast_any)]
 unsafe fn register_signal_handler_for_signal(signal: c_int, old_sa: &mut MaybeUninit<sys::sigaction>) -> Result<(), Error> {
     let mut sa: sys::sigaction = core::mem::zeroed();
     let old_sa = old_sa.write(core::mem::zeroed());
@@ -477,6 +478,7 @@ unsafe fn vmctx_ptr(memory: &Mmap) -> *const VmCtx {
     memory.as_ptr().cast::<u8>().offset(get_guest_memory_offset() as isize + GUEST_MEMORY_TO_VMCTX_OFFSET).cast()
 }
 
+#[allow(clippy::needless_pass_by_ref_mut)]
 unsafe fn vmctx_mut_ptr(memory: &mut Mmap) -> *mut VmCtx {
     memory.as_mut_ptr().cast::<u8>().offset(get_guest_memory_offset() as isize + GUEST_MEMORY_TO_VMCTX_OFFSET).cast()
 }
@@ -676,7 +678,7 @@ impl Sandbox {
 
         #[inline]
         fn check(range: Range<u32>, access_range: Range<u64>) -> Result<bool, ()> {
-            let range = range.start as u64..range.end as u64;
+            let range = u64::from(range.start)..u64::from(range.end);
             if access_range.end <= range.start || access_range.start >= range.end {
                 // No overlap.
                 Ok(false)
@@ -690,7 +692,7 @@ impl Sandbox {
             }
         }
 
-        let range = address as u64..address as u64 + length as u64;
+        let range = u64::from(address)..u64::from(address) + u64::from(length);
         if check(self.memory_config.ro_data_range(), range.clone())? || check(self.memory_config.heap_range(), range.clone())? || check(self.memory_config.stack_range(), range)? {
             Ok(())
         } else {
@@ -802,7 +804,7 @@ impl Sandbox {
             let native_page_size = get_native_page_size();
             current.set_code_size(native_page_size, new.code_size()).unwrap();
             current.set_jump_table_size(native_page_size, new.jump_table_size()).unwrap();
-            self.program = Some(SandboxProgram(program.clone()));
+            self.program = Some(SandboxProgram(Arc::clone(program)));
 
             if *current != new {
                 panic!("internal error: failed to fully update memory configuration");

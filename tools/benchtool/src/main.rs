@@ -165,7 +165,7 @@ fn find_benchmarks_in(root_path: &Path) -> Result<Vec<Benchmark>, std::io::Error
             } else if extension == "polkavm" {
                 BenchmarkKind::PolkaVM
             } else if extension == "so" {
-                if target.as_ref().map(|target| *target == "sbf-solana-solana").unwrap_or(false) {
+                if target.as_ref().map_or(false, |target| *target == "sbf-solana-solana") {
                     BenchmarkKind::Solana
                 } else {
                     BenchmarkKind::Native

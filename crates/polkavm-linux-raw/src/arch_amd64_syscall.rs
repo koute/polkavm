@@ -98,7 +98,7 @@ impl<'a> From<crate::FdRef<'a>> for SyscallArg<'a> {
 impl<'a> From<Option<crate::FdRef<'a>>> for SyscallArg<'a> {
     #[inline]
     fn from(value: Option<crate::FdRef<'a>>) -> Self {
-        SyscallArg(value.map(|fd| fd.raw()).unwrap_or(-1) as isize as usize, PhantomData)
+        SyscallArg(value.map_or(-1, |fd| fd.raw()) as isize as usize, PhantomData)
     }
 }
 

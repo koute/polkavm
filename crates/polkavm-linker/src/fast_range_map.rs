@@ -1,7 +1,7 @@
 #![allow(dead_code)]
 
+use core::ops::Range;
 use std::collections::BTreeMap;
-use std::ops::Range;
 
 // This was copied from `ahash`.
 #[inline(always)]
@@ -332,13 +332,10 @@ impl<V> RangeMap<V> {
         // |NNNNNNN|
 
         loop {
-            let index = match index_opt {
-                Some(index) => index,
-                None => {
-                    let new_index = self.data.insert_back(key.clone(), value);
-                    self.map.insert(key.end, new_index);
-                    break;
-                }
+            let Some(index) = index_opt else {
+                let new_index = self.data.insert_back(key.clone(), value);
+                self.map.insert(key.end, new_index);
+                break;
             };
 
             let old = self.data.get_key(index).clone();
@@ -568,7 +565,7 @@ impl<V> RangeMap<V> {
 
     pub fn get_in_range(&self, range: Range<u64>) -> impl Iterator<Item = (Range<u64>, &V)> {
         self.get_all_overlapping(range.clone())
-            .map(move |(key, value)| (std::cmp::max(range.start, key.start)..std::cmp::min(range.end, key.end), value))
+            .map(move |(key, value)| (core::cmp::max(range.start, key.start)..core::cmp::min(range.end, key.end), value))
     }
 
     pub fn values(&self) -> impl ExactSizeIterator<Item = &V> {
@@ -631,11 +628,7 @@ where
 {
     type Item = (Range<u64>, V);
     fn next(&mut self) -> Option<Self::Item> {
-        let index = match self.index_opt {
-            Some(index) => index,
-            None => return None,
-        };
-
+        let index = self.index_opt?;
         let old = self.range_map.data.get_key(index).clone();
         if self.key.end <= old.start {
             // The new key ends *before* this range starts, so there's no overlap.
