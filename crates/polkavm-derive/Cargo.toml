@@ -15,3 +15,6 @@ proc-macro = true
 [dependencies]
 polkavm-derive-impl = { workspace = true }
 syn = { workspace = true, features = ["full"] }
+
+[lints]
+workspace = true

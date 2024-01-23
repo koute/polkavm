@@ -13,3 +13,6 @@ description = "Raw bindings to Linux kernel APIs"
 [features]
 default = []
 std = []
+
+[lints]
+workspace = true

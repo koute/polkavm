@@ -17,3 +17,6 @@ polkavm-common = { workspace = true, features = ["alloc"] }
 rustc-demangle = { workspace = true }
 hashbrown = { workspace = true, features = ["raw"] }
 regalloc2 = "0.9.3"
+
+[lints]
+workspace = true
