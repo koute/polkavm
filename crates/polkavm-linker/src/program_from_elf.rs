@@ -2664,8 +2664,8 @@ fn perform_inlining(
     false
 }
 
-fn gather_references(block: &BasicBlock<AnyTarget, BlockTarget>) -> HashSet<ExtRef> {
-    let mut references = HashSet::new();
+fn gather_references(block: &BasicBlock<AnyTarget, BlockTarget>) -> BTreeSet<ExtRef> {
+    let mut references = BTreeSet::new();
     each_reference(block, |ext| {
         references.insert(ext);
     });
@@ -2677,7 +2677,7 @@ fn update_references(
     reachability_graph: &mut ReachabilityGraph,
     mut optimize_queue: Option<&mut VecSet<BlockTarget>>,
     block_target: BlockTarget,
-    mut old_references: HashSet<ExtRef>,
+    mut old_references: BTreeSet<ExtRef>,
 ) {
     let mut new_references = gather_references(&all_blocks[block_target.index()]);
     new_references.retain(|ext| !old_references.remove(ext));
@@ -3494,7 +3494,7 @@ fn perform_constant_propagation(
             break;
         }
 
-        let mut references = HashSet::new();
+        let mut references = BTreeSet::new();
         let mut modified_this_block = false;
         for nth_instruction in 0..all_blocks[current.index()].ops.len() {
             let mut instruction = all_blocks[current.index()].ops[nth_instruction].1;
@@ -4572,7 +4572,7 @@ impl Reachability {
     }
 }
 
-#[derive(Clone, PartialEq, Eq, Hash, Debug)]
+#[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
 enum ExtRef {
     Address(BlockTarget),
     Jump(BlockTarget),

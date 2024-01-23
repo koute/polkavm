@@ -948,7 +948,7 @@ where
 }
 
 fn get_function_line_region_id(
-    function_line_boundaries_for_file: &HashMap<Arc<str>, Vec<u32>>,
+    function_line_boundaries_for_file: &BTreeMap<Arc<str>, Vec<u32>>,
     location: &SourceCodeLocation,
 ) -> Option<(usize, isize)> {
     let (path, line) = match location {
@@ -988,7 +988,7 @@ where
         let mut lines_for_unit: Vec<Vec<LineEntry>> = Vec::new();
         let mut subprograms_for_unit: Vec<Vec<SubProgram<R>>> = Vec::new();
         let mut subprogram_offset_to_namespace: HashMap<gimli::DebugInfoOffset<R::Offset>, Option<Arc<str>>> = Default::default();
-        let mut function_line_boundaries_for_file: HashMap<Arc<str>, Vec<u32>> = HashMap::new();
+        let mut function_line_boundaries_for_file: BTreeMap<Arc<str>, Vec<u32>> = BTreeMap::new();
         for unit in self.units {
             let mut subprograms = self.parse_tree(unit)?;
             subprograms.retain(|subprogram| {
