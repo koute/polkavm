@@ -63,7 +63,7 @@ pub(crate) type OnHostcall<'a> = &'a mut dyn for<'r> FnMut(u32, BackendAccess<'r
 
 if_compiler_is_supported! {
     {
-        use std::sync::atomic::{AtomicUsize, Ordering};
+        use core::sync::atomic::{AtomicUsize, Ordering};
 
         pub(crate) trait SandboxExt: Sandbox {
             fn as_compiled_module(module: &Module) -> &CompiledModule<Self>;
@@ -127,6 +127,7 @@ if_compiler_is_supported! {
                 }
             }
 
+            #[allow(clippy::match_wildcard_for_single_variants)]
             fn as_sandbox_vec(sandbox_vec: &SandboxVec) -> &Mutex<Vec<Self>> {
                 match sandbox_vec {
                     SandboxVec::Linux(vec) => vec,
@@ -1176,8 +1177,8 @@ impl Module {
         GuestMemoryConfig::new(
             blob.ro_data().len() as u64,
             blob.rw_data().len() as u64,
-            blob.bss_size() as u64,
-            blob.stack_size() as u64,
+            u64::from(blob.bss_size()),
+            u64::from(blob.stack_size()),
         )
         .map_err(Error::from_static_str)?;
 
@@ -1207,8 +1208,7 @@ impl Module {
         let (initial_maximum_seen_jump_target, basic_block_by_jump_table_index, jump_table_index_by_basic_block) = {
             log::trace!("Parsing jump table...");
             let mut basic_block_by_jump_table_index = Vec::with_capacity(blob.jump_table_upper_bound() + 1);
-            let mut jump_table_index_by_basic_block = Vec::new();
-            jump_table_index_by_basic_block.resize(blob.basic_block_count() as usize, 0);
+            let mut jump_table_index_by_basic_block = vec![0; blob.basic_block_count() as usize];
 
             // The very first entry is always invalid.
             basic_block_by_jump_table_index.push(u32::MAX);
@@ -1586,10 +1586,7 @@ impl Module {
 
         for _ in 0..128 {
             // Have an upper bound on the number of iterations, just in case.
-            let region_info = match line_program.run() {
-                Ok(Some(region_info)) => region_info,
-                Ok(None) | Err(..) => break,
-            };
+            let Ok(Some(region_info)) = line_program.run() else { break };
 
             if !region_info.instruction_range().contains(&pc) {
                 continue;
@@ -1717,7 +1714,7 @@ pub struct ExternFnArc<T>(Arc<dyn ExternFn<T>>);
 
 impl<T> Clone for ExternFnArc<T> {
     fn clone(&self) -> Self {
-        Self(self.0.clone())
+        Self(Arc::clone(&self.0))
     }
 }
 
@@ -1774,7 +1771,7 @@ impl AbiTy for u64 {
     fn _get(mut get_reg: impl FnMut() -> u32) -> Self {
         let value_lo = get_reg();
         let value_hi = get_reg();
-        (value_lo as u64) | ((value_hi as u64) << 32)
+        u64::from(value_lo) | (u64::from(value_hi) << 32)
     }
 
     fn _set(self, mut set_reg: impl FnMut(u32)) {
@@ -2119,7 +2116,7 @@ where
 
                     let lo = access.get_reg(reg_1);
                     let hi = access.get_reg(reg_2);
-                    *arg = Val::I64((lo as u64 | ((hi as u64) << 32)) as i64);
+                    *arg = Val::I64((u64::from(lo) | (u64::from(hi) << 32)) as i64);
                 }
             }
         }
@@ -2214,7 +2211,7 @@ pub struct Linker<T> {
 impl<T> Linker<T> {
     pub fn new(engine: &Engine) -> Self {
         Self {
-            engine_state: engine.state.clone(),
+            engine_state: Arc::clone(&engine.state),
             host_functions: Default::default(),
             fallback_handler: None,
             phantom: PhantomData,
@@ -2270,15 +2267,12 @@ impl<T> Linker<T> {
 
         for (index, import) in &module.0.imports {
             let prototype = import.prototype();
-            let host_fn = match self.host_functions.get(prototype.name()) {
-                Some(host_fn) => host_fn,
-                None => {
-                    if self.fallback_handler.is_some() {
-                        continue;
-                    }
-
-                    bail!("failed to instantiate module: missing host function: '{}'", prototype.name());
+            let Some(host_fn) = self.host_functions.get(prototype.name()) else {
+                if self.fallback_handler.is_some() {
+                    continue;
                 }
+
+                bail!("failed to instantiate module: missing host function: '{}'", prototype.name());
             };
 
             host_fn.0.typecheck(prototype)?;
@@ -2286,7 +2280,7 @@ impl<T> Linker<T> {
         }
 
         Ok(InstancePre(Arc::new(InstancePrePrivate {
-            engine_state: self.engine_state.clone(),
+            engine_state: Arc::clone(&self.engine_state),
             module: module.clone(),
             host_functions,
             fallback_handler: self.fallback_handler.clone(),
@@ -2308,7 +2302,7 @@ pub struct InstancePre<T>(Arc<InstancePrePrivate<T>>);
 
 impl<T> Clone for InstancePre<T> {
     fn clone(&self) -> Self {
-        InstancePre(self.0.clone())
+        InstancePre(Arc::clone(&self.0))
     }
 }
 
@@ -2321,11 +2315,11 @@ impl<T> InstancePre<T> {
                 match compiled_module {
                     #[cfg(target_os = "linux")]
                     CompiledModuleKind::Linux(..) => {
-                        let compiled_instance = CompiledInstance::new(self.0.engine_state.clone(), self.0.module.clone())?;
+                        let compiled_instance = CompiledInstance::new(Arc::clone(&self.0.engine_state), self.0.module.clone())?;
                         Some(InstanceBackend::CompiledLinux(compiled_instance))
                     },
                     CompiledModuleKind::Generic(..) => {
-                        let compiled_instance = CompiledInstance::new(self.0.engine_state.clone(), self.0.module.clone())?;
+                        let compiled_instance = CompiledInstance::new(Arc::clone(&self.0.engine_state), self.0.module.clone())?;
                         Some(InstanceBackend::CompiledGeneric(compiled_instance))
                     },
                     CompiledModuleKind::Unavailable => None
@@ -2445,7 +2439,7 @@ where
             fmt,
             "out of range memory access in 0x{:x}-0x{:x} ({} bytes): {}",
             self.address,
-            (self.address as u64) + self.length,
+            u64::from(self.address) + self.length,
             self.length,
             self.error
         )
@@ -2559,7 +2553,7 @@ pub struct Instance<T>(Arc<InstancePrivate<T>>);
 
 impl<T> Clone for Instance<T> {
     fn clone(&self) -> Self {
-        Instance(self.0.clone())
+        Instance(Arc::clone(&self.0))
     }
 }
 
@@ -2765,17 +2759,14 @@ fn on_hostcall<'a, T>(
             return Err(Trap::default());
         }
 
-        let host_fn = match host_functions.get(&hostcall) {
-            Some(host_fn) => host_fn,
-            None => {
-                if let Some(fallback_handler) = fallback_handler {
-                    return Caller::wrap(user_data, &mut access, raw, move |caller| fallback_handler(caller, hostcall));
-                }
-
-                // This should never happen.
-                log::error!("hostcall to a function which doesn't exist: {}", hostcall);
-                return Err(Trap::default());
+        let Some(host_fn) = host_functions.get(&hostcall) else {
+            if let Some(fallback_handler) = fallback_handler {
+                return Caller::wrap(user_data, &mut access, raw, move |caller| fallback_handler(caller, hostcall));
             }
+
+            // This should never happen.
+            log::error!("hostcall to a function which doesn't exist: {}", hostcall);
+            return Err(Trap::default());
         };
 
         if let Err(trap) = host_fn.0.call(user_data, access, raw) {

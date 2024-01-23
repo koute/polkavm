@@ -627,18 +627,20 @@ unsafe fn child_main(zygote_memfd: Fd, child_socket: Fd, uid_map: &str, gid_map:
     // Clean up any file descriptors which might have been opened by the host process.
     let mut fds_to_keep = [core::ffi::c_int::MAX; 3];
     let fds_to_keep = {
-        let mut index = 1;
+        let mut count = 1;
         fds_to_keep[0] = STDIN_FILENO;
         if let Some(logging_pipe) = logging_pipe {
             linux_raw::sys_dup3(logging_pipe.raw(), STDERR_FILENO, 0)?;
             logging_pipe.close()?;
-            fds_to_keep[index] = STDERR_FILENO;
-            index += 1;
+            fds_to_keep[count] = STDERR_FILENO;
+            count += 1;
         }
 
-        fds_to_keep[index] = zygote_memfd.raw();
+        fds_to_keep[count] = zygote_memfd.raw();
+        count += 1;
+
         fds_to_keep.sort_unstable(); // Should be a no-op.
-        &fds_to_keep[..index + 1]
+        &fds_to_keep[..count]
     };
     close_other_file_descriptors(fds_to_keep)?;
 
@@ -732,8 +734,7 @@ impl super::SandboxProgram for SandboxProgram {
     fn machine_code(&self) -> Cow<[u8]> {
         // The code is kept inside of the memfd and we don't have it readily accessible.
         // So if necessary just read it back from the memfd.
-        let mut buffer = Vec::new();
-        buffer.resize(self.0.code_range.len(), 0);
+        let mut buffer = vec![0; self.0.code_range.len()];
         linux_raw::sys_lseek(self.0.memfd.borrow(), self.0.code_range.start as i64, linux_raw::SEEK_SET).expect("failed to get machine code of the program: seek failed");
 
         let mut position = 0;
@@ -931,7 +932,7 @@ impl super::Sandbox for Sandbox {
         Ok(())
     }
 
-    fn prepare_program(init: SandboxProgramInit, _: Self::AddressSpace, gas_metering: Option<GasMeteringKind>) -> Result<Self::Program, Self::Error> {
+    fn prepare_program(init: SandboxProgramInit, (): Self::AddressSpace, gas_metering: Option<GasMeteringKind>) -> Result<Self::Program, Self::Error> {
         static PADDING: [u8; VM_PAGE_SIZE as usize] = [0; VM_PAGE_SIZE as usize];
 
         let native_page_size = get_native_page_size();
@@ -975,20 +976,20 @@ impl super::Sandbox for Sandbox {
 
         let sandbox_flags =
             if !cfg!(polkavm_dev_debug_zygote) {
-                linux_raw::CLONE_NEWCGROUP as u64
-                    | linux_raw::CLONE_NEWIPC as u64
-                    | linux_raw::CLONE_NEWNET as u64
-                    | linux_raw::CLONE_NEWNS as u64
-                    | linux_raw::CLONE_NEWPID as u64
-                    | linux_raw::CLONE_NEWUSER as u64
-                    | linux_raw::CLONE_NEWUTS as u64
+                u64::from(linux_raw::CLONE_NEWCGROUP
+                    | linux_raw::CLONE_NEWIPC
+                    | linux_raw::CLONE_NEWNET
+                    | linux_raw::CLONE_NEWNS
+                    | linux_raw::CLONE_NEWPID
+                    | linux_raw::CLONE_NEWUSER
+                    | linux_raw::CLONE_NEWUTS)
             } else {
                 0
             };
 
         let mut pidfd: c_int = -1;
         let args = CloneArgs {
-            flags: linux_raw::CLONE_CLEAR_SIGHAND | linux_raw::CLONE_PIDFD as u64 | sandbox_flags,
+            flags: linux_raw::CLONE_CLEAR_SIGHAND | u64::from(linux_raw::CLONE_PIDFD) | sandbox_flags,
             pidfd: &mut pidfd,
             child_tid: 0,
             parent_tid: 0,
@@ -1013,7 +1014,7 @@ impl super::Sandbox for Sandbox {
 
         // Fork a new process.
         let mut child_pid =
-            unsafe { linux_raw::syscall!(linux_raw::SYS_clone3, &args as *const CloneArgs, core::mem::size_of::<CloneArgs>()) };
+            unsafe { linux_raw::syscall!(linux_raw::SYS_clone3, core::ptr::addr_of!(args), core::mem::size_of::<CloneArgs>()) };
 
         if child_pid < 0 {
             // Fallback for Linux versions older than 5.5.
@@ -1145,7 +1146,7 @@ impl super::Sandbox for Sandbox {
 
         #[cfg(debug_assertions)]
         if cfg!(polkavm_dev_debug_zygote) {
-            use std::fmt::Write;
+            use core::fmt::Write;
             std::thread::sleep(core::time::Duration::from_millis(200));
 
             let mut command = String::new();

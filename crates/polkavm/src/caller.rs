@@ -35,17 +35,17 @@ impl CallerRaw {
 
     unsafe fn data_mut<T>(&mut self) -> &mut T {
         // SAFETY: The caller will make sure that the invariants hold.
-        unsafe { &mut *(self.user_data as *mut T) }
+        unsafe { &mut *self.user_data.cast::<T>() }
     }
 
     unsafe fn access(&self) -> &BackendAccess {
         // SAFETY: The caller will make sure that the invariants hold.
-        unsafe { &*(self.access as *mut BackendAccess as *const BackendAccess) }
+        unsafe { &*(self.access.cast::<BackendAccess>().cast_const()) }
     }
 
     unsafe fn access_mut(&mut self) -> &mut BackendAccess {
         // SAFETY: The caller will make sure that the invariants hold.
-        unsafe { &mut *(self.access as *mut BackendAccess) }
+        unsafe { &mut *self.access.cast::<BackendAccess>() }
     }
 
     pub(crate) fn tracer(&mut self) -> Option<&mut Tracer> {
@@ -153,8 +153,8 @@ impl<'a, T> Caller<'a, T> {
     where
         T: 'a,
     {
-        raw.user_data = user_data as *mut T as *mut core::ffi::c_void;
-        raw.access = access as *mut BackendAccess as *mut core::ffi::c_void;
+        raw.user_data = (user_data as *mut T).cast::<core::ffi::c_void>();
+        raw.access = (access as *mut BackendAccess).cast::<core::ffi::c_void>();
 
         let mut lifetime = None;
         let caller = Caller {

@@ -175,12 +175,11 @@ impl SandboxMemoryConfig {
             return Err("size of the native code exceeded the maximum code size");
         }
 
-        let code_size = match align_to_next_page_usize(native_page_size, code_size) {
-            Some(value) => value,
-            None => unreachable!(),
+        let Some(code_size) = align_to_next_page_usize(native_page_size, code_size) else {
+            unreachable!()
         };
-
         self.code_size = code_size as u32;
+
         Ok(())
     }
 
@@ -199,12 +198,11 @@ impl SandboxMemoryConfig {
             return Err("size of the jump table exceeded te maximum size");
         }
 
-        let jump_table_size = match align_to_next_page_usize(native_page_size, jump_table_size) {
-            Some(value) => value,
-            None => unreachable!(),
+        let Some(jump_table_size) = align_to_next_page_usize(native_page_size, jump_table_size) else {
+            unreachable!()
         };
-
         self.jump_table_size = jump_table_size as u32;
+
         Ok(())
     }
 }
@@ -280,6 +278,7 @@ pub struct VmCtxCounters {
 ///
 /// This is mapped in shared memory and used by the sandbox to keep its state in,
 /// as well as by the host to communicate with the sandbox.
+#[allow(clippy::partial_pub_fields)]
 #[repr(C)]
 pub struct VmCtx {
     /// Fields used when making syscalls from the VM into the host.

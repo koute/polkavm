@@ -10,6 +10,7 @@ pub struct SourceCache {
 }
 
 impl SourceCache {
+    #[allow(clippy::unused_self)]
     fn home_path_uncached(&self) -> Option<PathBuf> {
         let buffer = std::env::var("HOME").ok()?;
         if buffer.is_empty() {
@@ -86,12 +87,9 @@ impl SourceCache {
                 continue;
             }
 
-            let version_string = match String::from_utf8(output.stdout) {
-                Ok(version_string) => version_string,
-                Err(_) => {
-                    log::warn!("Error extracting version from {rustc_path:?}: returned version is not valid UTF-8");
-                    continue;
-                }
+            let Ok(version_string) = String::from_utf8(output.stdout) else {
+                log::warn!("Error extracting version from {rustc_path:?}: returned version is not valid UTF-8");
+                continue;
             };
 
             // For example: "rustc 1.70.0-nightly (61863f31c 2023-08-15)"
@@ -122,7 +120,7 @@ impl SourceCache {
 
     fn rustc_sources(&mut self) -> &[(String, PathBuf)] {
         if self.rustc_sources.is_none() {
-            self.rustc_sources = Some(self.rustc_sources_uncached().unwrap_or(Vec::new()));
+            self.rustc_sources = Some(self.rustc_sources_uncached().unwrap_or_default());
         }
 
         self.rustc_sources.as_ref().unwrap()

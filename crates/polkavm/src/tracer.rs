@@ -102,7 +102,7 @@ impl Tracer {
             let expected_result = interpreter.access().write_memory(address, data);
             let expected_success = expected_result.is_ok();
             if success != expected_result.is_ok() {
-                let address_end = address as u64 + data.len() as u64;
+                let address_end = u64::from(address) + data.len() as u64;
                 log::error!("Memory write in hostcall mismatch when writing to 0x{address:x}..0x{address_end:x}! (crosscheck interpreter = {expected_success}, actual = {success})");
             }
         }

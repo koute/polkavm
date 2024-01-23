@@ -81,7 +81,7 @@ impl FnMetadata {
     pub fn serialize(&self, mut cb: impl FnMut(&[u8])) {
         cb(&(self.name.len() as u32).to_le_bytes());
         cb(self.name.as_bytes());
-        cb(&[self.return_ty.map(|ty| ty as u8).unwrap_or(0)]);
+        cb(&[self.return_ty.map_or(0, |ty| ty as u8)]);
         cb(&[self.args().count() as u8]);
         for arg in self.args() {
             cb(&[arg as u8]);

@@ -243,7 +243,7 @@ impl InterpretedInstance {
     fn on_start_new_basic_block(&mut self) -> Result<(), ExecutionError> {
         if let Some(ref mut gas_remaining) = self.gas_remaining {
             let module = self.module.interpreted_module().unwrap();
-            let gas_cost = module.gas_cost_for_basic_block[self.nth_basic_block as usize] as i64;
+            let gas_cost = i64::from(module.gas_cost_for_basic_block[self.nth_basic_block as usize]);
             *gas_remaining -= gas_cost;
             if *gas_remaining < 0 {
                 return Err(ExecutionError::OutOfGas);
@@ -397,7 +397,7 @@ impl<'a, 'b> Visitor<'a, 'b> {
     fn load<T: LoadTy>(&mut self, dst: Reg, base: Option<Reg>, offset: u32) -> Result<(), ExecutionError> {
         assert!(core::mem::size_of::<T>() >= 1);
 
-        let address = base.map(|base| self.inner.regs[base as usize]).unwrap_or(0).wrapping_add(offset);
+        let address = base.map_or(0, |base| self.inner.regs[base as usize]).wrapping_add(offset);
         let length = core::mem::size_of::<T>() as u32;
         let Some(slice) = self.inner.get_memory_slice(address, length) else {
             log::debug!(
@@ -411,7 +411,7 @@ impl<'a, 'b> Visitor<'a, 'b> {
             return Err(ExecutionError::Trap(Default::default()));
         };
 
-        log::trace!("{dst} = {kind} [0x{address:x}]", kind = std::any::type_name::<T>());
+        log::trace!("{dst} = {kind} [0x{address:x}]", kind = core::any::type_name::<T>());
 
         let value = T::from_slice(slice);
         self.set(dst, value)?;
@@ -422,15 +422,15 @@ impl<'a, 'b> Visitor<'a, 'b> {
     fn store<T: StoreTy>(&mut self, src: impl Into<RegImm>, base: Option<Reg>, offset: u32) -> Result<(), ExecutionError> {
         assert!(core::mem::size_of::<T>() >= 1);
 
-        let address = base.map(|base| self.inner.regs[base as usize]).unwrap_or(0).wrapping_add(offset);
+        let address = base.map_or(0, |base| self.inner.regs[base as usize]).wrapping_add(offset);
         let value = match src.into() {
             RegImm::Reg(src) => {
                 let value = self.inner.regs[src as usize];
-                log::trace!("{kind} [0x{address:x}] = {src} = 0x{value:x}", kind = std::any::type_name::<T>());
+                log::trace!("{kind} [0x{address:x}] = {src} = 0x{value:x}", kind = core::any::type_name::<T>());
                 value
             }
             RegImm::Imm(value) => {
-                log::trace!("{kind} [0x{address:x}] = 0x{value:x}", kind = std::any::type_name::<T>());
+                log::trace!("{kind} [0x{address:x}] = 0x{value:x}", kind = core::any::type_name::<T>());
                 value
             }
         };
@@ -524,25 +524,25 @@ trait LoadTy {
 
 impl LoadTy for u8 {
     fn from_slice(xs: &[u8]) -> u32 {
-        xs[0] as u32
+        u32::from(xs[0])
     }
 }
 
 impl LoadTy for i8 {
     fn from_slice(xs: &[u8]) -> u32 {
-        xs[0] as i8 as i32 as u32
+        i32::from(xs[0] as i8) as u32
     }
 }
 
 impl LoadTy for u16 {
     fn from_slice(xs: &[u8]) -> u32 {
-        u16::from_le_bytes([xs[0], xs[1]]) as u32
+        u32::from(u16::from_le_bytes([xs[0], xs[1]]))
     }
 }
 
 impl LoadTy for i16 {
     fn from_slice(xs: &[u8]) -> u32 {
-        i16::from_le_bytes([xs[0], xs[1]]) as i32 as u32
+        i32::from(i16::from_le_bytes([xs[0], xs[1]])) as u32
     }
 }
 
@@ -610,15 +610,15 @@ impl<'a, 'b> InstructionVisitor for Visitor<'a, 'b> {
     }
 
     fn set_less_than_unsigned(&mut self, d: Reg, s1: Reg, s2: Reg) -> Self::ReturnTy {
-        self.set3(d, s1, s2, |s1, s2| (s1 < s2) as u32)
+        self.set3(d, s1, s2, |s1, s2| u32::from(s1 < s2))
     }
 
     fn set_less_than_signed(&mut self, d: Reg, s1: Reg, s2: Reg) -> Self::ReturnTy {
-        self.set3(d, s1, s2, |s1, s2| ((s1 as i32) < (s2 as i32)) as u32)
+        self.set3(d, s1, s2, |s1, s2| u32::from((s1 as i32) < (s2 as i32)))
     }
 
     fn shift_logical_right(&mut self, d: Reg, s1: Reg, s2: Reg) -> Self::ReturnTy {
-        self.set3(d, s1, s2, |s1, s2| s1.wrapping_shr(s2))
+        self.set3(d, s1, s2, u32::wrapping_shr)
     }
 
     fn shift_arithmetic_right(&mut self, d: Reg, s1: Reg, s2: Reg) -> Self::ReturnTy {
@@ -626,7 +626,7 @@ impl<'a, 'b> InstructionVisitor for Visitor<'a, 'b> {
     }
 
     fn shift_logical_left(&mut self, d: Reg, s1: Reg, s2: Reg) -> Self::ReturnTy {
-        self.set3(d, s1, s2, |s1, s2| s1.wrapping_shl(s2))
+        self.set3(d, s1, s2, u32::wrapping_shl)
     }
 
     fn xor(&mut self, d: Reg, s1: Reg, s2: Reg) -> Self::ReturnTy {
@@ -642,11 +642,11 @@ impl<'a, 'b> InstructionVisitor for Visitor<'a, 'b> {
     }
 
     fn add(&mut self, d: Reg, s1: Reg, s2: Reg) -> Self::ReturnTy {
-        self.set3(d, s1, s2, |s1, s2| s1.wrapping_add(s2))
+        self.set3(d, s1, s2, u32::wrapping_add)
     }
 
     fn sub(&mut self, d: Reg, s1: Reg, s2: Reg) -> Self::ReturnTy {
-        self.set3(d, s1, s2, |s1, s2| s1.wrapping_sub(s2))
+        self.set3(d, s1, s2, u32::wrapping_sub)
     }
 
     fn negate_and_add_imm(&mut self, d: Reg, s1: Reg, s2: u32) -> Self::ReturnTy {
@@ -654,11 +654,11 @@ impl<'a, 'b> InstructionVisitor for Visitor<'a, 'b> {
     }
 
     fn mul(&mut self, d: Reg, s1: Reg, s2: Reg) -> Self::ReturnTy {
-        self.set3(d, s1, s2, |s1, s2| s1.wrapping_mul(s2))
+        self.set3(d, s1, s2, u32::wrapping_mul)
     }
 
     fn mul_imm(&mut self, d: Reg, s1: Reg, s2: u32) -> Self::ReturnTy {
-        self.set3(d, s1, s2, |s1, s2| s1.wrapping_mul(s2))
+        self.set3(d, s1, s2, u32::wrapping_mul)
     }
 
     fn mul_upper_signed_signed(&mut self, d: Reg, s1: Reg, s2: Reg) -> Self::ReturnTy {
@@ -698,27 +698,27 @@ impl<'a, 'b> InstructionVisitor for Visitor<'a, 'b> {
     }
 
     fn set_less_than_unsigned_imm(&mut self, d: Reg, s1: Reg, s2: u32) -> Self::ReturnTy {
-        self.set3(d, s1, s2, |s1, s2| (s1 < s2) as u32)
+        self.set3(d, s1, s2, |s1, s2| u32::from(s1 < s2))
     }
 
     fn set_greater_than_unsigned_imm(&mut self, d: Reg, s1: Reg, s2: u32) -> Self::ReturnTy {
-        self.set3(d, s1, s2, |s1, s2| (s1 > s2) as u32)
+        self.set3(d, s1, s2, |s1, s2| u32::from(s1 > s2))
     }
 
     fn set_less_than_signed_imm(&mut self, d: Reg, s1: Reg, s2: u32) -> Self::ReturnTy {
-        self.set3(d, s1, s2, |s1, s2| ((s1 as i32) < (s2 as i32)) as u32)
+        self.set3(d, s1, s2, |s1, s2| u32::from((s1 as i32) < (s2 as i32)))
     }
 
     fn set_greater_than_signed_imm(&mut self, d: Reg, s1: Reg, s2: u32) -> Self::ReturnTy {
-        self.set3(d, s1, s2, |s1, s2| ((s1 as i32) > (s2 as i32)) as u32)
+        self.set3(d, s1, s2, |s1, s2| u32::from((s1 as i32) > (s2 as i32)))
     }
 
     fn shift_logical_right_imm(&mut self, d: Reg, s1: Reg, s2: u32) -> Self::ReturnTy {
-        self.set3(d, s1, s2, |s1, s2| s1.wrapping_shr(s2))
+        self.set3(d, s1, s2, u32::wrapping_shr)
     }
 
     fn shift_logical_right_imm_alt(&mut self, d: Reg, s2: Reg, s1: u32) -> Self::ReturnTy {
-        self.set3(d, s1, s2, |s1, s2| s1.wrapping_shr(s2))
+        self.set3(d, s1, s2, u32::wrapping_shr)
     }
 
     fn shift_arithmetic_right_imm(&mut self, d: Reg, s1: Reg, s2: u32) -> Self::ReturnTy {
@@ -730,11 +730,11 @@ impl<'a, 'b> InstructionVisitor for Visitor<'a, 'b> {
     }
 
     fn shift_logical_left_imm(&mut self, d: Reg, s1: Reg, s2: u32) -> Self::ReturnTy {
-        self.set3(d, s1, s2, |s1, s2| s1.wrapping_shl(s2))
+        self.set3(d, s1, s2, u32::wrapping_shl)
     }
 
     fn shift_logical_left_imm_alt(&mut self, d: Reg, s2: Reg, s1: u32) -> Self::ReturnTy {
-        self.set3(d, s1, s2, |s1, s2| s1.wrapping_shl(s2))
+        self.set3(d, s1, s2, u32::wrapping_shl)
     }
 
     fn or_imm(&mut self, d: Reg, s1: Reg, s2: u32) -> Self::ReturnTy {
@@ -771,7 +771,7 @@ impl<'a, 'b> InstructionVisitor for Visitor<'a, 'b> {
     }
 
     fn add_imm(&mut self, d: Reg, s1: Reg, s2: u32) -> Self::ReturnTy {
-        self.set3(d, s1, s2, |s1, s2| s1.wrapping_add(s2))
+        self.set3(d, s1, s2, u32::wrapping_add)
     }
 
     fn store_imm_u8(&mut self, value: u32, offset: u32) -> Self::ReturnTy {

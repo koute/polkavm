@@ -244,7 +244,7 @@ pub enum SegReg {
 
 impl core::fmt::Display for SegReg {
     fn fmt(&self, fmt: &mut core::fmt::Formatter) -> core::fmt::Result {
-        let name = match self {
+        let name = match *self {
             Self::fs => "fs",
             Self::gs => "gs",
         };
@@ -351,7 +351,7 @@ impl core::fmt::Display for MemOp {
                     if offset > 0 {
                         fmt.write_fmt(core::format_args!("+0x{:x}", offset))?;
                     } else {
-                        fmt.write_fmt(core::format_args!("-0x{:x}", -(offset as i64)))?;
+                        fmt.write_fmt(core::format_args!("-0x{:x}", -i64::from(offset)))?;
                     }
                 }
 
@@ -394,12 +394,12 @@ impl core::fmt::Display for MemOp {
                         fmt.write_fmt(core::format_args!("-0x{:x}", offset as u32))?;
                     }
                 } else {
-                    fmt.write_fmt(core::format_args!("-0x{:x}", -(offset as i64)))?;
+                    fmt.write_fmt(core::format_args!("-0x{:x}", -i64::from(offset)))?;
                 }
             } else if offset_reg_size == RegSize::R32 {
                 fmt.write_fmt(core::format_args!("0x{:x}", offset))?;
             } else {
-                fmt.write_fmt(core::format_args!("0x{:x}", offset as i64))?;
+                fmt.write_fmt(core::format_args!("0x{:x}", i64::from(offset)))?;
             }
         }
 
@@ -1120,7 +1120,7 @@ pub mod inst {
                 ImmKind::I16(value) => {
                     // These instructions have a special variant which sign extends the immediate,
                     // so we can get away with using a shorter immediate if possible.
-                    if value as i16 <= i8::MAX as i16 && value as i16 >= i8::MIN as i16 {
+                    if value as i16 <= i16::from(i8::MAX) && value as i16 >= i16::from(i8::MIN) {
                         Inst::new(0x83).imm8(value as u8)
                     } else {
                         Inst::new(0x81).imm16(value)
@@ -1128,13 +1128,13 @@ pub mod inst {
                     .override_op_size()
                 }
                 ImmKind::I32(value) => {
-                    if value as i32 <= i8::MAX as i32 && value as i32 >= i8::MIN as i32 {
+                    if value as i32 <= i32::from(i8::MAX) && value as i32 >= i32::from(i8::MIN) {
                         Inst::new(0x83).imm8(value as u8)
                     } else {
                         Inst::new(0x81).imm32(value)
                     }
                 }
-                ImmKind::I64(value) => if value <= i8::MAX as i32 && value >= i8::MIN as i32 {
+                ImmKind::I64(value) => if value <= i32::from(i8::MAX) && value >= i32::from(i8::MIN) {
                     Inst::new(0x83).imm8(value as u8)
                 } else {
                     Inst::new(0x81).imm32(value as u32)
@@ -1430,7 +1430,7 @@ pub mod inst {
             None,
             ({
                 match self.0 {
-                    RegSize::R64 => fmt.write_fmt(core::format_args!("bts {}, 0x{:x}", self.1.display(Size::from(self.0)), self.2 as i64)),
+                    RegSize::R64 => fmt.write_fmt(core::format_args!("bts {}, 0x{:x}", self.1.display(Size::from(self.0)), i64::from(self.2))),
                     RegSize::R32 => fmt.write_fmt(core::format_args!("bts {}, 0x{:x}", self.1.display(Size::from(self.0)), self.2)),
                 }
             }),
@@ -1542,7 +1542,7 @@ pub mod inst {
         imul_imm(RegSize, Reg, RegMem, i32) =>
             {
                 let value = self.3;
-                if value <= i8::MAX as i32 && value >= i8::MIN as i32 {
+                if value <= i32::from(i8::MAX) && value >= i32::from(i8::MIN) {
                     Inst::new(0x6b).imm8(value as u8)
                 } else {
                     Inst::new(0x69).imm32(value as u32)
@@ -1554,8 +1554,8 @@ pub mod inst {
                 impl core::fmt::Display for DisplaySignExtend {
                     fn fmt(&self, fmt: &mut core::fmt::Formatter) -> core::fmt::Result {
                         let value = match self.0 {
-                            RegSize::R64 => self.1 as i64 as u64,
-                            RegSize::R32 => self.1 as u32 as u64,
+                            RegSize::R64 => i64::from(self.1) as u64,
+                            RegSize::R32 => u64::from(self.1 as u32),
                         };
 
                         fmt.write_fmt(core::format_args!("0x{:x}", value))
@@ -1624,7 +1624,7 @@ pub mod inst {
         call_rel32(i32) =>
             Inst::new(0xe8).imm32(self.0 as u32).encode(),
             None,
-            (fmt.write_fmt(core::format_args!("call 0x{:x}", (self.0 as i64).wrapping_add(5)))),
+            (fmt.write_fmt(core::format_args!("call 0x{:x}", i64::from(self.0).wrapping_add(5)))),
 
         // https://www.felixcloutier.com/x86/jmp
         jmp(RegMem) => {
@@ -1641,23 +1641,23 @@ pub mod inst {
         jmp_rel8(i8) =>
             Inst::new(0xeb).imm8(self.0 as u8).encode(),
             None,
-            (fmt.write_fmt(core::format_args!("jmp short 0x{:x}", (self.0 as i64).wrapping_add(2)))),
+            (fmt.write_fmt(core::format_args!("jmp short 0x{:x}", i64::from(self.0).wrapping_add(2)))),
 
         jmp_rel32(i32) =>
             Inst::new(0xe9).imm32(self.0 as u32).encode(),
             None,
-            (fmt.write_fmt(core::format_args!("jmp 0x{:x}", (self.0 as i64).wrapping_add(5)))),
+            (fmt.write_fmt(core::format_args!("jmp 0x{:x}", i64::from(self.0).wrapping_add(5)))),
 
         // https://www.felixcloutier.com/x86/jcc
         jcc_rel8(Condition, i8) =>
             Inst::new(0x70 | self.0 as u8).imm8(self.1 as u8).encode(),
             None,
-            (fmt.write_fmt(core::format_args!("j{} short 0x{:x}", self.0.suffix(), (self.1 as i64).wrapping_add(2)))),
+            (fmt.write_fmt(core::format_args!("j{} short 0x{:x}", self.0.suffix(), i64::from(self.1).wrapping_add(2)))),
 
         jcc_rel32(Condition, i32) =>
             Inst::new(0x80 | self.0 as u8).op_alt().imm32(self.1 as u32).encode(),
             None,
-            (fmt.write_fmt(core::format_args!("j{} near 0x{:x}", self.0.suffix(), (self.1 as i64).wrapping_add(6)))),
+            (fmt.write_fmt(core::format_args!("j{} near 0x{:x}", self.0.suffix(), i64::from(self.1).wrapping_add(6)))),
 
         // (label instructions)
         jmp_label8(Label) =>
@@ -1846,7 +1846,7 @@ pub enum ImmKind {
 impl core::fmt::Display for ImmKind {
     fn fmt(&self, fmt: &mut core::fmt::Formatter) -> core::fmt::Result {
         match *self {
-            ImmKind::I64(value) => fmt.write_fmt(core::format_args!("0x{:x}", value as i64)),
+            ImmKind::I64(value) => fmt.write_fmt(core::format_args!("0x{:x}", i64::from(value))),
             ImmKind::I32(value) => fmt.write_fmt(core::format_args!("0x{:x}", value)),
             ImmKind::I16(value) => fmt.write_fmt(core::format_args!("0x{:x}", value)),
             ImmKind::I8(value) => fmt.write_fmt(core::format_args!("0x{:x}", value)),

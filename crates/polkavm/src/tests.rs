@@ -2,7 +2,7 @@ use crate::{
     Caller, CallerRef, Config, Engine, ExecutionConfig, ExecutionError, Gas, GasMeteringKind, Linker, Module, ModuleConfig, ProgramBlob,
     Reg, Trap, Val,
 };
-use std::cell::RefCell;
+use core::cell::RefCell;
 use std::collections::HashMap;
 use std::rc::Rc;
 use std::sync::Mutex;
@@ -126,7 +126,7 @@ fn caller_and_caller_ref_work(config: Config) {
                 let value = caller.read_u32(VM_ADDR_USER_MEMORY)?;
                 assert_eq!(value, 0x12345678);
 
-                let illegal_contraband = caller.data().illegal_contraband.clone();
+                let illegal_contraband = Rc::clone(&caller.data().illegal_contraband);
                 *illegal_contraband.borrow_mut() = Some(caller);
             }
 
@@ -146,7 +146,7 @@ fn caller_and_caller_ref_work(config: Config) {
     assert_eq!(result, 111);
 
     let caller = state.illegal_contraband.borrow_mut().take().unwrap();
-    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| caller.get_reg(Reg::A0)));
+    let result = std::panic::catch_unwind(core::panic::AssertUnwindSafe(|| caller.get_reg(Reg::A0)));
     assert!(result.is_err());
 }
 

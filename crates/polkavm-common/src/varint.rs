@@ -14,12 +14,12 @@ pub const MAX_VARINT_LENGTH: usize = 5;
 pub(crate) fn read_varint(input: &[u8], first_byte: u8) -> Option<(usize, u32)> {
     let length = (!first_byte).leading_zeros();
     let upper_mask = 0b11111111_u32 >> length;
-    let upper_bits = (upper_mask & (first_byte as u32)).wrapping_shl(length * 8);
+    let upper_bits = (upper_mask & u32::from(first_byte)).wrapping_shl(length * 8);
     let input = input.get(..length as usize)?;
     let value = match input.len() {
         0 => upper_bits,
-        1 => upper_bits | input[0] as u32,
-        2 => upper_bits | u16::from_le_bytes([input[0], input[1]]) as u32,
+        1 => upper_bits | u32::from(input[0]),
+        2 => upper_bits | u32::from(u16::from_le_bytes([input[0], input[1]])),
         3 => upper_bits | u32::from_le_bytes([input[0], input[1], input[2], 0]),
         4 => upper_bits | u32::from_le_bytes([input[0], input[1], input[2], input[3]]),
         _ => return None,
@@ -67,6 +67,7 @@ pub fn write_varint(value: u32, buffer: &mut [u8]) -> usize {
 
 #[cfg(test)]
 proptest::proptest! {
+    #[allow(clippy::ignored_unit_patterns)]
     #[test]
     fn varint_serialization(value in 0u32..=0xffffffff) {
         let mut buffer = [0; MAX_VARINT_LENGTH];

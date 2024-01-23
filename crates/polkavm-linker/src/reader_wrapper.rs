@@ -1,9 +1,9 @@
+use core::cell::RefCell;
 use gimli::Format;
 use gimli::ReaderOffset;
 use gimli::ReaderOffsetId;
 use gimli::Result;
 use std::borrow::Cow;
-use std::cell::RefCell;
 use std::rc::Rc;
 
 #[derive(Debug)]
@@ -72,7 +72,7 @@ where
             tracker.list.clear();
         }
         ReaderTracker {
-            tracker: self.tracker.clone(),
+            tracker: Rc::clone(&self.tracker),
         }
     }
 
@@ -133,7 +133,7 @@ where
     fn split(&mut self, len: Self::Offset) -> Result<Self> {
         Ok(Self {
             inner: self.inner.split(len)?,
-            tracker: self.tracker.clone(),
+            tracker: Rc::clone(&self.tracker),
         })
     }
 
@@ -225,7 +225,7 @@ where
         self.track();
         Ok(Self {
             inner: self.inner.read_null_terminated_slice()?,
-            tracker: self.tracker.clone(),
+            tracker: Rc::clone(&self.tracker),
         })
     }
 

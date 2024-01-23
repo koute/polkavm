@@ -64,8 +64,8 @@ impl<'a> GuestProgramInit<'a> {
         GuestMemoryConfig::new(
             self.ro_data.len() as u64,
             self.rw_data.len() as u64,
-            self.bss_size as u64,
-            self.stack_size as u64,
+            u64::from(self.bss_size),
+            u64::from(self.stack_size),
         )
     }
 }

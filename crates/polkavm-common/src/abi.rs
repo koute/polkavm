@@ -103,24 +103,17 @@ impl GuestMemoryConfig {
             assert!(VM_MAXIMUM_MEMORY_SIZE as u64 + VM_MAX_PAGE_SIZE as u64 <= u32::MAX as u64);
         };
 
-        let ro_data_size = match align_to_next_page_u64(VM_PAGE_SIZE as u64, ro_data_size) {
-            Some(value) => value,
-            None => unreachable!(),
+        let Some(ro_data_size) = align_to_next_page_u64(VM_PAGE_SIZE as u64, ro_data_size) else {
+            unreachable!()
         };
-
-        let rw_data_size = match align_to_next_page_u64(VM_PAGE_SIZE as u64, rw_data_size) {
-            Some(value) => value,
-            None => unreachable!(),
+        let Some(rw_data_size) = align_to_next_page_u64(VM_PAGE_SIZE as u64, rw_data_size) else {
+            unreachable!()
         };
-
-        let bss_size = match align_to_next_page_u64(VM_PAGE_SIZE as u64, bss_size) {
-            Some(value) => value,
-            None => unreachable!(),
+        let Some(bss_size) = align_to_next_page_u64(VM_PAGE_SIZE as u64, bss_size) else {
+            unreachable!()
         };
-
-        let stack_size = match align_to_next_page_u64(VM_PAGE_SIZE as u64, stack_size) {
-            Some(value) => value,
-            None => unreachable!(),
+        let Some(stack_size) = align_to_next_page_u64(VM_PAGE_SIZE as u64, stack_size) else {
+            unreachable!()
         };
 
         let config = Self {
@@ -194,7 +187,7 @@ impl GuestMemoryConfig {
             return Err("size of the read-only data exceeded the maximum memory size");
         }
 
-        let ro_data_size = match align_to_next_page_u64(VM_PAGE_SIZE as u64, ro_data_size as u64) {
+        let ro_data_size = match align_to_next_page_u64(u64::from(VM_PAGE_SIZE), u64::from(ro_data_size)) {
             Some(value) => value,
             None => unreachable!(),
         } as u32;
@@ -227,7 +220,7 @@ impl GuestMemoryConfig {
             return Err("size of the read-write data exceeded the maximum memory size");
         }
 
-        let rw_data_size = match align_to_next_page_u64(VM_PAGE_SIZE as u64, rw_data_size as u64) {
+        let rw_data_size = match align_to_next_page_u64(u64::from(VM_PAGE_SIZE), u64::from(rw_data_size)) {
             Some(value) => value,
             None => unreachable!(),
         } as u32;
@@ -254,7 +247,7 @@ impl GuestMemoryConfig {
             return Err("size of the bss section exceeded the maximum memory size");
         }
 
-        let bss_size = match align_to_next_page_u64(VM_PAGE_SIZE as u64, bss_size as u64) {
+        let bss_size = match align_to_next_page_u64(u64::from(VM_PAGE_SIZE), u64::from(bss_size)) {
             Some(value) => value,
             None => unreachable!(),
         } as u32;
@@ -292,7 +285,7 @@ impl GuestMemoryConfig {
             return Err("size of the stack exceeded the maximum memory size");
         }
 
-        let stack_size = match align_to_next_page_u64(VM_PAGE_SIZE as u64, stack_size as u64) {
+        let stack_size = match align_to_next_page_u64(u64::from(VM_PAGE_SIZE), u64::from(stack_size)) {
             Some(value) => value,
             None => unreachable!(),
         } as u32;
