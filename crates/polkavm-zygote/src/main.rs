@@ -1,4 +1,3 @@
-#![feature(naked_functions)]
 #![feature(asm_const)]
 #![no_std]
 #![no_main]
@@ -214,38 +213,6 @@ fn abort_with_error(error: &str, err_obj: linux_raw::Error) -> ! {
     graceful_abort();
 }
 
-#[naked]
-#[no_mangle]
-#[export_name = "_start"]
-pub unsafe extern "C" fn _start() -> ! {
-    #[cfg(target_arch = "x86_64")]
-    core::arch::asm!(r#"
-        // Map ourselves a new stack.
-        mov rax, {SYS_mmap}
-        mov rdi, {native_stack_low}
-        mov rsi, {native_stack_size}
-        mov rdx, {protection}
-        mov r10, {flags}
-        mov r8, -1
-        mov r9, 0
-        syscall
-
-        mov rdi, rsp
-        mov rsp, {native_stack_high}
-        push rbp
-        jmp {entry_point}
-    "#,
-        SYS_mmap = const linux_raw::SYS_mmap,
-        native_stack_low = const polkavm_common::zygote::VM_ADDR_NATIVE_STACK_LOW,
-        native_stack_high = const polkavm_common::zygote::VM_ADDR_NATIVE_STACK_HIGH,
-        native_stack_size = const polkavm_common::zygote::VM_ADDR_NATIVE_STACK_SIZE,
-        protection = const linux_raw::PROT_READ | linux_raw::PROT_WRITE,
-        flags = const linux_raw::MAP_FIXED | linux_raw::MAP_PRIVATE | linux_raw::MAP_ANONYMOUS,
-        entry_point = sym entry_point,
-        options (noreturn)
-    );
-}
-
 const HOST_SOCKET_FILENO: linux_raw::c_int = linux_raw::STDIN_FILENO;
 
 unsafe extern "C" fn entry_point(stack: *mut usize) -> ! {
@@ -321,17 +288,6 @@ unsafe extern "C" fn signal_handler(signal: u32, _info: &linux_raw::siginfo_t, c
     }
 }
 
-#[naked]
-unsafe extern "C" fn signal_restorer() {
-    core::arch::asm!(
-        "mov rax, {SYS_rt_sigreturn}",
-        "syscall",
-        "ud2",
-        SYS_rt_sigreturn = const linux_raw::SYS_rt_sigreturn,
-        options(noreturn)
-    );
-}
-
 #[repr(C)]
 struct JmpBuf {
     return_address: u64,
@@ -357,47 +313,27 @@ static mut RESUME_IDLE_LOOP_JMPBUF: JmpBuf = JmpBuf {
     return_value: 0,
 };
 
-#[naked]
-unsafe extern "C" fn longjmp(_jmpbuf: *mut JmpBuf, _return_value: u64) -> ! {
-    core::arch::asm!(
-        // Restore registers.
-        "mov rbx, [rdi + 8]",
-        "mov rsp, [rdi + 16]",
-        "mov rbp, [rdi + 24]",
-        "mov r12, [rdi + 32]",
-        "mov r13, [rdi + 40]",
-        "mov r14, [rdi + 48]",
-        "mov r15, [rdi + 56]",
-        // Set return value.
-        "mov rax, rsi",
-        // Jump out.
-        "mov rdx, [rdi]",
-        "jmp rdx",
-        options(noreturn)
-    );
+extern "C" {
+    fn zygote_longjmp(jmpbuf: *mut JmpBuf, return_value: u64) -> !;
+    fn zygote_setjmp(jmpbuf: *mut JmpBuf) -> u64;
+    fn zygote_signal_restorer();
 }
 
-#[naked]
-unsafe extern "C" fn setjmp(_jmpbuf: *mut JmpBuf) -> u64 {
-    core::arch::asm!(
-        // Save the return address.
-        "mov rax, [rsp]",
-        "mov [rdi], rax",
-        // Save the callee-saved registers.
-        "mov [rdi + 8], rbx",
-        "lea rax, [rsp + 8]", // Get the stack pointer as if it was *after* popping the return address.
-        "mov [rdi + 16], rax",
-        "mov [rdi + 24], rbp",
-        "mov [rdi + 32], r12",
-        "mov [rdi + 40], r13",
-        "mov [rdi + 48], r14",
-        "mov [rdi + 56], r15",
-        // Return '0'.
-        "xor rax, rax",
-        "ret",
-        options(noreturn)
-    );
-}
+use zygote_longjmp as longjmp;
+use zygote_setjmp as setjmp;
+use zygote_signal_restorer as signal_restorer;
+
+core::arch::global_asm!(
+    include_str!("global_asm.s"),
+    SYS_rt_sigreturn = const linux_raw::SYS_rt_sigreturn,
+    SYS_mmap = const linux_raw::SYS_mmap,
+    native_stack_low = const polkavm_common::zygote::VM_ADDR_NATIVE_STACK_LOW,
+    native_stack_high = const polkavm_common::zygote::VM_ADDR_NATIVE_STACK_HIGH,
+    native_stack_size = const polkavm_common::zygote::VM_ADDR_NATIVE_STACK_SIZE,
+    protection = const linux_raw::PROT_READ | linux_raw::PROT_WRITE,
+    flags = const linux_raw::MAP_FIXED | linux_raw::MAP_PRIVATE | linux_raw::MAP_ANONYMOUS,
+    entry_point = sym entry_point,
+);
 
 #[inline(never)]
 unsafe fn initialize(mut stack: *mut usize) -> linux_raw::Fd {
