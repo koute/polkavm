@@ -1581,6 +1581,17 @@ impl Module {
         }
     }
 
+    /// A map with gas costs for each basic block of the program.
+    ///
+    /// Will return `None` when *not* running under an interpreter or if the gas metering was not enabled.
+    /// Mostly only useful for debugging.
+    pub fn nth_basic_block_to_gas_cost_map(&self) -> Option<&[u32]> {
+        self.0
+            .interpreted_module
+            .as_ref()
+            .map(|module| module.gas_cost_for_basic_block.as_slice())
+    }
+
     pub(crate) fn debug_print_location(&self, log_level: log::Level, pc: u32) {
         log::log!(log_level, "  At #{pc}:");
 
