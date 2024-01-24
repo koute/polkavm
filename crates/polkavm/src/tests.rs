@@ -676,6 +676,49 @@ fn consume_gas_in_host_function_async(config: Config) {
     consume_gas_in_host_function(config, GasMeteringKind::Async);
 }
 
+fn gas_metering_with_more_than_one_basic_block(config: Config) {
+    let _ = env_logger::try_init();
+
+    let mut builder = ProgramBlobBuilder::new();
+    builder.add_export(0, &FnMetadata::new("export_1", &[], Some(I32)));
+    builder.add_export(1, &FnMetadata::new("export_2", &[], Some(I32)));
+    builder.set_code(&[
+        asm::add_imm(A0, A0, 666),
+        asm::ret(),
+        asm::add_imm(A0, A0, 666),
+        asm::add_imm(A0, A0, 100),
+        asm::ret(),
+    ]);
+
+    let blob = ProgramBlob::parse(builder.into_vec()).unwrap();
+    let engine = Engine::new(&config).unwrap();
+    let mut module_config = ModuleConfig::default();
+    module_config.set_gas_metering(Some(GasMeteringKind::Sync));
+
+    let module = Module::from_blob(&engine, &module_config, &blob).unwrap();
+    let linker = Linker::new(&engine);
+    let instance_pre = linker.instantiate_pre(&module).unwrap();
+    let instance = instance_pre.instantiate().unwrap();
+
+    {
+        let mut config = ExecutionConfig::default();
+        config.set_gas(Gas::new(10).unwrap());
+
+        let result = instance.get_typed_func::<(), i32>("export_1").unwrap().call_ex(&mut (), (), config);
+        assert!(matches!(result, Ok(666)), "unexpected result: {result:?}");
+        assert_eq!(instance.gas_remaining().unwrap(), Gas::new(8).unwrap());
+    }
+
+    {
+        let mut config = ExecutionConfig::default();
+        config.set_gas(Gas::new(10).unwrap());
+
+        let result = instance.get_typed_func::<(), i32>("export_2").unwrap().call_ex(&mut (), (), config);
+        assert!(matches!(result, Ok(766)), "unexpected result: {result:?}");
+        assert_eq!(instance.gas_remaining().unwrap(), Gas::new(7).unwrap());
+    }
+}
+
 run_tests! {
     caller_and_caller_ref_work
     caller_split_works
@@ -695,6 +738,7 @@ run_tests! {
     basic_gas_metering_async
     consume_gas_in_host_function_sync
     consume_gas_in_host_function_async
+    gas_metering_with_more_than_one_basic_block
 }
 
 // Source: https://users.rust-lang.org/t/a-macro-to-assert-that-a-type-does-not-implement-trait-bounds/31179
