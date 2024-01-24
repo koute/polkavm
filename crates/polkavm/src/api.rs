@@ -446,6 +446,10 @@ impl<'a, T> CommonVisitor<'a, T>
 where
     VisitorWrapper<'a, T>: BackendVisitor,
 {
+    fn nth_basic_block(&self) -> usize {
+        self.instruction_by_basic_block.len() - 1
+    }
+
     fn start_new_basic_block(&mut self) -> Result<(), Error> {
         if !self.is_last_instruction() {
             let nth = (self.nth_instruction + 1) as u32;
@@ -478,7 +482,8 @@ where
     fn on_pre_visit(&mut self, offset: usize, _opcode: u8) -> Self::ReturnTy {
         if self.config.gas_metering.is_some() {
             // TODO: Come up with a better cost model.
-            *self.gas_cost_for_basic_block.last_mut().unwrap() += 1;
+            let nth_basic_block = self.nth_basic_block();
+            self.gas_cost_for_basic_block[nth_basic_block] += 1;
         }
 
         self.current_instruction_offset = offset;
