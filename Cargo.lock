@@ -169,7 +169,7 @@ dependencies = [
 
 [[package]]
 name = "benchtool"
-version = "0.6.0"
+version = "0.7.0"
 dependencies = [
  "ckb-vm",
  "clap 4.4.6",
@@ -1563,7 +1563,7 @@ checksum = "b4596b6d070b27117e987119b4dac604f3c58cfb0b191112e24771b2faeac1a6"
 
 [[package]]
 name = "polkatool"
-version = "0.6.0"
+version = "0.7.0"
 dependencies = [
  "clap 4.4.6",
  "env_logger 0.10.0",
@@ -1575,7 +1575,7 @@ dependencies = [
 
 [[package]]
 name = "polkavm"
-version = "0.6.0"
+version = "0.7.0"
 dependencies = [
  "env_logger 0.10.0",
  "image",
@@ -1590,7 +1590,7 @@ dependencies = [
 
 [[package]]
 name = "polkavm-assembler"
-version = "0.6.0"
+version = "0.7.0"
 dependencies = [
  "iced-x86",
  "log",
@@ -1598,7 +1598,7 @@ dependencies = [
 
 [[package]]
 name = "polkavm-common"
-version = "0.6.0"
+version = "0.7.0"
 dependencies = [
  "log",
  "proptest",
@@ -1606,7 +1606,7 @@ dependencies = [
 
 [[package]]
 name = "polkavm-derive"
-version = "0.6.0"
+version = "0.7.0"
 dependencies = [
  "polkavm-derive-impl",
  "syn 2.0.38",
@@ -1614,7 +1614,7 @@ dependencies = [
 
 [[package]]
 name = "polkavm-derive-impl"
-version = "0.6.0"
+version = "0.7.0"
 dependencies = [
  "polkavm-common",
  "proc-macro2",
@@ -1624,7 +1624,7 @@ dependencies = [
 
 [[package]]
 name = "polkavm-linker"
-version = "0.6.0"
+version = "0.7.0"
 dependencies = [
  "gimli 0.28.0",
  "hashbrown 0.14.1",
@@ -1637,7 +1637,7 @@ dependencies = [
 
 [[package]]
 name = "polkavm-linux-raw"
-version = "0.6.0"
+version = "0.7.0"
 
 [[package]]
 name = "polkavm-linux-raw-generate"
@@ -2226,7 +2226,7 @@ checksum = "f27f6278552951f1f2b8cf9da965d10969b2efdea95a6ec47987ab46edfe263a"
 
 [[package]]
 name = "simplealloc"
-version = "0.6.0"
+version = "0.7.0"
 
 [[package]]
 name = "slice-group-by"
