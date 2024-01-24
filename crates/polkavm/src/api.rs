@@ -1178,6 +1178,8 @@ impl Module {
 
     /// Creates a new module from a deserialized program `blob`.
     pub fn from_blob(engine: &Engine, config: &ModuleConfig, blob: &ProgramBlob) -> Result<Self, Error> {
+        log::debug!("Preparing a module from a blob of length {}...", blob.as_bytes().len());
+
         // Do an early check for memory config validity.
         GuestMemoryConfig::new(
             blob.ro_data().len() as u64,
@@ -1470,7 +1472,6 @@ impl Module {
         let imports = imports.into_iter().map(|(index, import)| (index, import.into_owned())).collect();
 
         let memory_config = init.memory_config().map_err(Error::from_static_str)?;
-        log::debug!("Prepared new module:");
         log::debug!(
             "  Memory map: RO data: 0x{:08x}..0x{:08x}",
             memory_config.ro_data_range().start,
@@ -2867,6 +2868,11 @@ impl<T> Func<T> {
             &mut mutable.raw,
         );
 
+        log::trace!(
+            "Calling into '{}'... (gas limit = {:?})",
+            prototype.name(),
+            self.instance.0.instance_pre.0.module.0.gas_metering.and(config.gas)
+        );
         let result = mutable.backend.call(self.export_index, &mut on_hostcall, &config);
         core::mem::drop(on_hostcall);
 
@@ -2875,16 +2881,25 @@ impl<T> Func<T> {
         }
 
         match result {
-            Ok(()) => {}
+            Ok(()) => {
+                log::trace!(
+                    "...execution finished: success, leftover gas = {:?}",
+                    mutable.backend.access().gas_remaining()
+                );
+            }
             Err(ExecutionError::Error(error)) => {
+                log::trace!("...execution finished: error: {error}");
+
                 return Err(ExecutionError::Error(
                     format!("failed to call function '{}': {}", export.prototype().name(), error).into(),
                 ));
             }
             Err(ExecutionError::Trap(trap)) => {
+                log::trace!("...execution finished: trapped");
                 return Err(ExecutionError::Trap(trap));
             }
             Err(ExecutionError::OutOfGas) => {
+                log::trace!("...execution finished: ran out of gas");
                 return Err(ExecutionError::OutOfGas);
             }
         }
@@ -2959,6 +2974,11 @@ where
             &mut mutable.raw,
         );
 
+        log::trace!(
+            "Calling into '{}'... (gas limit = {:?})",
+            export.prototype().name(),
+            self.instance.0.instance_pre.0.module.0.gas_metering.and(config.gas)
+        );
         let result = mutable.backend.call(self.export_index, &mut on_hostcall, &config);
         core::mem::drop(on_hostcall);
 
@@ -2967,16 +2987,25 @@ where
         }
 
         match result {
-            Ok(()) => {}
+            Ok(()) => {
+                log::trace!(
+                    "...execution finished: success, leftover gas = {:?}",
+                    mutable.backend.access().gas_remaining()
+                );
+            }
             Err(ExecutionError::Error(error)) => {
+                log::trace!("...execution finished: error: {error}");
+
                 return Err(ExecutionError::Error(
                     format!("failed to call function '{}': {}", export.prototype().name(), error).into(),
                 ));
             }
             Err(ExecutionError::Trap(trap)) => {
+                log::trace!("...execution finished: trapped");
                 return Err(ExecutionError::Trap(trap));
             }
             Err(ExecutionError::OutOfGas) => {
+                log::trace!("...execution finished: ran out of gas");
                 return Err(ExecutionError::OutOfGas);
             }
         }
