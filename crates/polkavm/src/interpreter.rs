@@ -15,7 +15,7 @@ pub(crate) struct InterpretedModule {
     pub(crate) instructions: Vec<Instruction>,
     ro_data: Vec<u8>,
     rw_data: Vec<u8>,
-    gas_cost_for_basic_block: Vec<u32>,
+    pub(crate) gas_cost_for_basic_block: Vec<u32>,
 }
 
 impl InterpretedModule {

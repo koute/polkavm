@@ -47,6 +47,9 @@ enum Args {
         #[clap(short = 'f', long, value_enum, default_value_t = DisassemblyFormat::Guest)]
         format: DisassemblyFormat,
 
+        #[clap(long)]
+        display_gas: bool,
+
         /// The input file.
         input: PathBuf,
     },
@@ -75,7 +78,12 @@ fn main() {
             strip,
             run_only_if_newer,
         } => main_link(input, output, strip, run_only_if_newer),
-        Args::Disassemble { output, format, input } => main_disassemble(input, format, output),
+        Args::Disassemble {
+            output,
+            format,
+            display_gas,
+            input,
+        } => main_disassemble(input, format, display_gas, output),
         Args::Stats { inputs } => main_stats(inputs),
     };
 
@@ -171,7 +179,7 @@ fn main_stats(inputs: Vec<PathBuf>) -> Result<(), String> {
     Ok(())
 }
 
-fn main_disassemble(input: PathBuf, format: DisassemblyFormat, output: Option<PathBuf>) -> Result<(), String> {
+fn main_disassemble(input: PathBuf, format: DisassemblyFormat, display_gas: bool, output: Option<PathBuf>) -> Result<(), String> {
     let blob = load_blob(&input)?;
 
     let native = if matches!(format, DisassemblyFormat::Native | DisassemblyFormat::GuestAndNative) {
@@ -212,6 +220,36 @@ fn main_disassemble(input: PathBuf, format: DisassemblyFormat, output: Option<Pa
         None
     };
 
+    let gas_cost_map = if display_gas {
+        let mut config = match polkavm::Config::from_env() {
+            Ok(config) => config,
+            Err(error) => bail!("failed to fetch VM configuration from the environment: {error}"),
+        };
+
+        config.set_worker_count(0);
+        config.set_backend(Some(polkavm::BackendKind::Interpreter));
+
+        let engine = match polkavm::Engine::new(&config) {
+            Ok(engine) => engine,
+            Err(error) => bail!("failed to create VM engine: {error}"),
+        };
+
+        let mut config = polkavm::ModuleConfig::default();
+        config.set_gas_metering(Some(polkavm::GasMeteringKind::Sync));
+
+        let module = match polkavm::Module::from_blob(&engine, &config, &blob) {
+            Ok(module) => module,
+            Err(error) => bail!("failed to compile {input:?}: {error}"),
+        };
+
+        match module.nth_basic_block_to_gas_cost_map() {
+            Some(map) => Some(map.to_vec()),
+            None => bail!("the gas cost map is unavailable"),
+        }
+    } else {
+        None
+    };
+
     match output {
         Some(output) => {
             let fp = match std::fs::File::create(&output) {
@@ -221,11 +259,11 @@ fn main_disassemble(input: PathBuf, format: DisassemblyFormat, output: Option<Pa
                 }
             };
 
-            disassemble_into(format, &blob, native, std::io::BufWriter::new(fp))
+            disassemble_into(format, &blob, native, gas_cost_map, std::io::BufWriter::new(fp))
         }
         None => {
             let stdout = std::io::stdout();
-            disassemble_into(format, &blob, native, std::io::BufWriter::new(stdout))
+            disassemble_into(format, &blob, native, gas_cost_map, std::io::BufWriter::new(stdout))
         }
     }
 }
@@ -298,6 +336,7 @@ fn disassemble_into(
     format: DisassemblyFormat,
     blob: &polkavm_linker::ProgramBlob,
     native: Option<(u64, Vec<u8>, Vec<u32>)>,
+    gas_cost_map: Option<Vec<u32>>,
     mut writer: impl Write,
 ) -> Result<(), String> {
     let mut instructions = Vec::new();
@@ -343,17 +382,28 @@ fn disassemble_into(
     }
 
     let format_jump_target = |jump_target_counter: u32| {
+        use core::fmt::Write;
+
+        let mut buf = String::new();
+        if !matches!(format, DisassemblyFormat::DiffFriendly) {
+            write!(&mut buf, "@{jump_target_counter:x}:").unwrap()
+        } else {
+            buf.push_str("@_:");
+        }
+
         if let Some(jump_table_index) = jump_table_map.get(&jump_target_counter) {
             if !matches!(format, DisassemblyFormat::DiffFriendly) {
-                format!("@{jump_target_counter:x}: [@dyn {jump_table_index:x}]")
+                write!(&mut buf, " [@dyn {jump_table_index:x}]").unwrap()
             } else {
-                "@_: [_]".to_owned()
+                buf.push_str(" [_]");
             }
-        } else if !matches!(format, DisassemblyFormat::DiffFriendly) {
-            format!("@{jump_target_counter:x}:")
-        } else {
-            "@_:".to_owned()
         }
+
+        if let Some(ref map) = gas_cost_map {
+            write!(&mut buf, " (gas: {})", map[jump_target_counter as usize]).unwrap();
+        }
+
+        buf
     };
 
     let mut fmt = AssemblyFormatter::default();
