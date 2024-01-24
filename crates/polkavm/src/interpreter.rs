@@ -244,6 +244,15 @@ impl InterpretedInstance {
         if let Some(ref mut gas_remaining) = self.gas_remaining {
             let module = self.module.interpreted_module().unwrap();
             let gas_cost = i64::from(module.gas_cost_for_basic_block[self.nth_basic_block as usize]);
+
+            log::trace!(
+                "Consume gas at @{:x}: {} ({} -> {})",
+                self.nth_basic_block,
+                gas_cost,
+                *gas_remaining,
+                *gas_remaining - gas_cost
+            );
+
             *gas_remaining -= gas_cost;
             if *gas_remaining < 0 {
                 return Err(ExecutionError::OutOfGas);
