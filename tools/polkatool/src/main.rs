@@ -361,7 +361,7 @@ fn disassemble_into(
         };
 
         exports_for_jump_target
-            .entry(export.address())
+            .entry(export.jump_target())
             .or_insert_with(Vec::new)
             .push((nth_export, export));
     }

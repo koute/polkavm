@@ -124,7 +124,7 @@ impl<'data, 'file> Symbol<'data, 'file> {
 
 pub struct Elf<'data> {
     sections: Vec<Section<'data>>,
-    section_index_by_name: HashMap<String, SectionIndex>,
+    section_index_by_name: HashMap<String, Vec<SectionIndex>>,
     section_index_map: HashMap<ElfSectionIndex, SectionIndex>,
     raw_elf: ElfFile<'data>,
 }
@@ -136,8 +136,9 @@ impl<'data> Elf<'data> {
             return Err(ProgramFromElfError::other("file is not a little endian ELF file"));
         }
 
-        if elf.raw_header().e_ident.os_abi != object::elf::ELFOSABI_SYSV {
-            return Err(ProgramFromElfError::other("file doesn't use the System V ABI"));
+        let os_abi = elf.raw_header().e_ident.os_abi;
+        if os_abi != object::elf::ELFOSABI_SYSV && os_abi != object::elf::ELFOSABI_GNU {
+            return Err(ProgramFromElfError::other("file doesn't use the System V nor GNU ABI"));
         }
 
         if !matches!(
@@ -194,12 +195,7 @@ impl<'data> Elf<'data> {
                 raw_section_index: Some(section.index()),
             });
 
-            if section_index_by_name.insert(name.to_owned(), index).is_some() {
-                return Err(ProgramFromElfError::other(format!(
-                    "multiple sections with the same name: '{name}'"
-                )));
-            }
-
+            section_index_by_name.entry(name.to_owned()).or_insert_with(Vec::new).push(index);
             if section_index_map.insert(section.index(), index).is_some() {
                 return Err(ProgramFromElfError::other("multiple sections with the same section index"));
             }
@@ -219,9 +215,10 @@ impl<'data> Elf<'data> {
             .map(|elf_symbol| Symbol::new(self, elf_symbol))
     }
 
-    pub fn section_by_name(&self, name: &str) -> Option<&Section> {
-        let index = *self.section_index_by_name.get(name)?;
-        Some(&self.sections[index.0])
+    pub fn section_by_name(&self, name: &str) -> impl ExactSizeIterator<Item = &Section> {
+        #[allow(clippy::map_unwrap_or)]
+        let indexes = self.section_index_by_name.get(name).map(|vec| vec.as_slice()).unwrap_or(&[]);
+        indexes.iter().map(|&index| &self.sections[index.0])
     }
 
     pub fn section_by_index(&self, index: SectionIndex) -> &Section<'data> {
@@ -243,7 +240,10 @@ impl<'data> Elf<'data> {
     pub fn add_empty_data_section(&mut self, name: &str) -> SectionIndex {
         let index = SectionIndex(self.sections.len());
 
-        self.section_index_by_name.insert(name.to_owned(), index);
+        self.section_index_by_name
+            .entry(name.to_owned())
+            .or_insert_with(Vec::new)
+            .push(index);
         self.sections.push(Section {
             index,
             name: name.to_owned(),

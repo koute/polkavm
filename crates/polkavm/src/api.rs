@@ -1,18 +1,15 @@
 use std::borrow::Cow;
-use std::collections::BTreeMap;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
 use core::marker::PhantomData;
 
-use polkavm_common::abi::{
-    GuestMemoryConfig, VM_MAXIMUM_EXPORT_COUNT, VM_MAXIMUM_EXTERN_ARG_COUNT, VM_MAXIMUM_IMPORT_COUNT, VM_MAXIMUM_INSTRUCTION_COUNT,
-};
+use polkavm_common::abi::{GuestMemoryConfig, VM_MAXIMUM_EXPORT_COUNT, VM_MAXIMUM_IMPORT_COUNT, VM_MAXIMUM_INSTRUCTION_COUNT};
 use polkavm_common::abi::{VM_ADDR_RETURN_TO_HOST, VM_ADDR_USER_STACK_HIGH};
 use polkavm_common::error::Trap;
 use polkavm_common::init::GuestProgramInit;
-use polkavm_common::program::{ExternFnPrototype, ExternTy, ProgramBlob, ProgramExport, ProgramImport};
 use polkavm_common::program::{FrameKind, Instruction, InstructionVisitor, Reg};
+use polkavm_common::program::{ProgramBlob, ProgramExport, ProgramImport, ProgramSymbol};
 use polkavm_common::utils::{Access, AsUninitSliceMut, Gas};
 
 use crate::caller::{Caller, CallerRaw};
@@ -30,34 +27,7 @@ if_compiler_is_supported! {
     use crate::sandbox::linux::Sandbox as SandboxLinux;
 }
 
-struct DisplayFn<'a, Args> {
-    name: &'a str,
-    args: Args,
-    return_ty: Option<ExternTy>,
-}
-
-impl<'a, Args> core::fmt::Display for DisplayFn<'a, Args>
-where
-    Args: Clone + Iterator<Item = ExternTy>,
-{
-    fn fmt(&self, fmt: &mut core::fmt::Formatter) -> core::fmt::Result {
-        fmt.write_str(self.name)?;
-        fmt.write_str("(")?;
-        for (index, ty) in self.args.clone().enumerate() {
-            if index > 0 {
-                fmt.write_str(", ")?;
-            }
-            ty.fmt(fmt)?;
-        }
-        fmt.write_str(")")?;
-        if let Some(return_ty) = self.return_ty {
-            fmt.write_str(" -> ")?;
-            return_ty.fmt(fmt)?;
-        }
-
-        Ok(())
-    }
-}
+pub type RegValue = u32;
 
 pub(crate) type OnHostcall<'a> = &'a mut dyn for<'r> FnMut(u32, BackendAccess<'r>) -> Result<(), Trap>;
 
@@ -332,8 +302,8 @@ impl CompiledModuleKind {
 struct ModulePrivate {
     debug_trace_execution: bool,
     exports: Vec<ProgramExport<'static>>,
-    imports: BTreeMap<u32, ProgramImport<'static>>,
-    export_index_by_name: HashMap<String, usize>,
+    imports: Vec<ProgramImport<'static>>,
+    export_index_by_symbol: HashMap<Vec<u8>, usize>,
 
     instruction_by_basic_block: Vec<u32>,
     jump_table_index_by_basic_block: Vec<u32>,
@@ -384,7 +354,7 @@ impl<'a> BackendVisitor for VisitorWrapper<'a, Vec<Instruction>> {
 pub(crate) struct Common<'a> {
     pub(crate) code: &'a [u8],
     pub(crate) config: &'a ModuleConfig,
-    pub(crate) imports: &'a BTreeMap<u32, ProgramImport<'a>>,
+    pub(crate) imports: &'a Vec<ProgramImport<'a>>,
     pub(crate) jump_table_index_by_basic_block: &'a Vec<u32>,
     pub(crate) instruction_by_basic_block: Vec<u32>,
     pub(crate) gas_cost_for_basic_block: Vec<u32>,
@@ -523,7 +493,7 @@ where
 
     #[inline(always)]
     fn ecalli(&mut self, imm: u32) -> Self::ReturnTy {
-        if self.imports.get(&imm).is_none() {
+        if self.imports.get(imm as usize).is_none() {
             #[cold]
             fn error_unrecognized_ecall(imm: u32) -> Error {
                 Error::from(format!("found an unrecognized ecall number: {imm}"))
@@ -1191,16 +1161,10 @@ impl Module {
 
         let imports = {
             log::trace!("Parsing imports...");
-            let mut imports = BTreeMap::new();
+            let mut imports = Vec::new();
             for import in blob.imports() {
                 let import = import.map_err(Error::from_display)?;
-                if import.index() & (1 << 31) != 0 {
-                    bail!("out of range import index");
-                }
-
-                if imports.insert(import.index(), import).is_some() {
-                    bail!("duplicate import index");
-                }
+                log::trace!("  Import #{}: {}", imports.len(), import.symbol());
 
                 if imports.len() > VM_MAXIMUM_IMPORT_COUNT as usize {
                     bail!(
@@ -1208,6 +1172,8 @@ impl Module {
                         VM_MAXIMUM_IMPORT_COUNT
                     );
                 }
+
+                imports.push(import);
             }
             imports
         };
@@ -1249,8 +1215,9 @@ impl Module {
             let mut exports = Vec::with_capacity(1);
             for export in blob.exports() {
                 let export = export.map_err(Error::from_display)?;
-                maximum_export_jump_target = core::cmp::max(maximum_export_jump_target, export.address());
+                maximum_export_jump_target = core::cmp::max(maximum_export_jump_target, export.jump_target());
 
+                log::trace!("  Export at @{}: {}", export.jump_target(), export.symbol());
                 exports.push(export);
                 if exports.len() > VM_MAXIMUM_EXPORT_COUNT as usize {
                     bail!(
@@ -1439,12 +1406,12 @@ impl Module {
         if maximum_export_jump_target > maximum_valid_jump_target {
             let export = exports
                 .iter()
-                .find(|export| export.address() == maximum_export_jump_target)
+                .find(|export| export.jump_target() == maximum_export_jump_target)
                 .unwrap();
             bail!(
-                "out of range export found; export '{}' points to @{:x}, while the very last valid jump target is @{maximum_valid_jump_target:x}",
-                export.prototype().name(),
-                export.address(),
+                "out of range export found; export {} points to @{:x}, while the very last valid jump target is @{maximum_valid_jump_target:x}",
+                export.symbol(),
+                export.jump_target(),
             );
         }
 
@@ -1463,13 +1430,14 @@ impl Module {
             log::debug!("Backend used: 'interpreted'");
         }
 
-        let export_index_by_name = exports
+        let export_index_by_symbol = exports
             .iter()
             .enumerate()
-            .map(|(index, export)| (export.prototype().name().to_owned(), index))
+            .map(|(index, export)| (export.symbol().to_vec(), index))
             .collect();
+
         let exports = exports.into_iter().map(|export| export.into_owned()).collect();
-        let imports = imports.into_iter().map(|(index, import)| (index, import.into_owned())).collect();
+        let imports = imports.into_iter().map(|import| import.into_owned()).collect();
 
         let memory_config = init.memory_config().map_err(Error::from_static_str)?;
         log::debug!(
@@ -1492,7 +1460,7 @@ impl Module {
             debug_trace_execution: engine.debug_trace_execution,
             exports,
             imports,
-            export_index_by_name,
+            export_index_by_symbol,
 
             instruction_by_basic_block,
             jump_table_index_by_basic_block,
@@ -1628,184 +1596,86 @@ impl Module {
     }
 }
 
-#[derive(Clone)]
-pub enum ValType {
-    I32,
-    I64,
-}
-
-#[derive(Clone, Debug)]
-pub enum Val {
-    I32(i32),
-    I64(i64),
-}
-
-impl core::fmt::Display for Val {
-    fn fmt(&self, fmt: &mut core::fmt::Formatter) -> core::fmt::Result {
-        match self {
-            Val::I32(value) => value.fmt(fmt),
-            Val::I64(value) => value.fmt(fmt),
-        }
-    }
-}
-
-impl From<i32> for Val {
-    fn from(value: i32) -> Val {
-        Val::I32(value)
-    }
-}
-
-impl From<u32> for Val {
-    fn from(value: u32) -> Val {
-        Val::I32(value as i32)
-    }
-}
-
-impl ValType {
-    fn extern_ty(&self) -> ExternTy {
-        match self {
-            ValType::I32 => ExternTy::I32,
-            ValType::I64 => ExternTy::I64,
-        }
-    }
-}
-
-impl Val {
-    fn extern_ty(&self) -> ExternTy {
-        match self {
-            Val::I32(_) => ExternTy::I32,
-            Val::I64(_) => ExternTy::I64,
-        }
-    }
-
-    pub fn i32(&self) -> Option<i32> {
-        match self {
-            Val::I32(value) => Some(*value),
-            Val::I64(_) => None,
-        }
-    }
-
-    pub fn u32(&self) -> Option<u32> {
-        self.i32().map(|value| value as u32)
-    }
-}
-
-impl From<ExternTy> for ValType {
-    fn from(ty: ExternTy) -> Self {
-        match ty {
-            ExternTy::I32 => ValType::I32,
-            ExternTy::I64 => ValType::I64,
-        }
-    }
-}
-
-pub struct FuncType {
-    args: Vec<ExternTy>,
-    return_ty: Option<ExternTy>,
-}
-
-impl FuncType {
-    pub fn new(params: impl IntoIterator<Item = ValType>, return_ty: Option<ValType>) -> Self {
-        FuncType {
-            args: params.into_iter().map(|ty| ty.extern_ty()).collect(),
-            return_ty: return_ty.map(|ty| ty.extern_ty()),
-        }
-    }
-
-    pub fn params(&'_ self) -> impl ExactSizeIterator<Item = ValType> + '_ {
-        self.args.iter().map(|&ty| ValType::from(ty))
-    }
-
-    pub fn return_ty(&self) -> Option<ValType> {
-        self.return_ty.map(ValType::from)
-    }
-}
-
-trait ExternFn<T>: Send + Sync {
+trait CallFn<T>: Send + Sync {
     fn call(&self, user_data: &mut T, access: BackendAccess, raw: &mut CallerRaw) -> Result<(), Trap>;
-    fn typecheck(&self, prototype: &ExternFnPrototype) -> Result<(), Error>;
 }
 
 #[repr(transparent)]
-pub struct ExternFnArc<T>(Arc<dyn ExternFn<T>>);
+pub struct CallFnArc<T>(Arc<dyn CallFn<T>>);
 
-impl<T> Clone for ExternFnArc<T> {
+impl<T> Clone for CallFnArc<T> {
     fn clone(&self) -> Self {
         Self(Arc::clone(&self.0))
     }
 }
 
-pub trait IntoExternFn<T, Params, Result>: Send + Sync + 'static {
+pub trait IntoCallFn<T, Params, Result>: Send + Sync + 'static {
     #[doc(hidden)]
-    fn _into_extern_fn(self) -> ExternFnArc<T>;
+    const _REGS_REQUIRED: usize;
+
+    #[doc(hidden)]
+    fn _into_extern_fn(self) -> CallFnArc<T>;
 }
 
 /// A type which can be marshalled through the VM's FFI boundary.
 pub trait AbiTy: Sized + Send + 'static {
     #[doc(hidden)]
-    const _PRIVATE_EXTERN_TY: ExternTy;
-
-    #[doc(hidden)]
     const _REGS_REQUIRED: usize;
 
     #[doc(hidden)]
-    fn _get(get_reg: impl FnMut() -> u32) -> Self;
+    fn _get(get_reg: impl FnMut() -> RegValue) -> Self;
 
     #[doc(hidden)]
-    fn _set(self, set_reg: impl FnMut(u32));
+    fn _set(self, set_reg: impl FnMut(RegValue));
 }
 
 impl AbiTy for u32 {
-    const _PRIVATE_EXTERN_TY: ExternTy = ExternTy::I32;
     const _REGS_REQUIRED: usize = 1;
 
-    fn _get(mut get_reg: impl FnMut() -> u32) -> Self {
+    fn _get(mut get_reg: impl FnMut() -> RegValue) -> Self {
         get_reg()
     }
 
-    fn _set(self, mut set_reg: impl FnMut(u32)) {
+    fn _set(self, mut set_reg: impl FnMut(RegValue)) {
         set_reg(self)
     }
 }
 
 impl AbiTy for i32 {
-    const _PRIVATE_EXTERN_TY: ExternTy = <u32 as AbiTy>::_PRIVATE_EXTERN_TY;
     const _REGS_REQUIRED: usize = <u32 as AbiTy>::_REGS_REQUIRED;
 
-    fn _get(get_reg: impl FnMut() -> u32) -> Self {
+    fn _get(get_reg: impl FnMut() -> RegValue) -> Self {
         <u32 as AbiTy>::_get(get_reg) as i32
     }
 
-    fn _set(self, set_reg: impl FnMut(u32)) {
+    fn _set(self, set_reg: impl FnMut(RegValue)) {
         (self as u32)._set(set_reg)
     }
 }
 
 impl AbiTy for u64 {
-    const _PRIVATE_EXTERN_TY: ExternTy = ExternTy::I64;
     const _REGS_REQUIRED: usize = 2;
 
-    fn _get(mut get_reg: impl FnMut() -> u32) -> Self {
+    fn _get(mut get_reg: impl FnMut() -> RegValue) -> Self {
         let value_lo = get_reg();
         let value_hi = get_reg();
         u64::from(value_lo) | (u64::from(value_hi) << 32)
     }
 
-    fn _set(self, mut set_reg: impl FnMut(u32)) {
+    fn _set(self, mut set_reg: impl FnMut(RegValue)) {
         set_reg(self as u32);
         set_reg((self >> 32) as u32);
     }
 }
 
 impl AbiTy for i64 {
-    const _PRIVATE_EXTERN_TY: ExternTy = <u64 as AbiTy>::_PRIVATE_EXTERN_TY;
     const _REGS_REQUIRED: usize = <u64 as AbiTy>::_REGS_REQUIRED;
 
-    fn _get(get_reg: impl FnMut() -> u32) -> Self {
+    fn _get(get_reg: impl FnMut() -> RegValue) -> Self {
         <u64 as AbiTy>::_get(get_reg) as i64
     }
 
-    fn _set(self, set_reg: impl FnMut(u32)) {
+    fn _set(self, set_reg: impl FnMut(RegValue)) {
         (self as u64)._set(set_reg)
     }
 }
@@ -1815,31 +1685,36 @@ impl AbiTy for i64 {
 /// A type which can be returned from a host function.
 pub trait ReturnTy: Sized + Send + 'static {
     #[doc(hidden)]
-    const _PRIVATE_EXTERN_TY: Option<ExternTy>;
-    fn _handle_return(self, set_reg: impl FnMut(u32)) -> Result<(), Trap>;
+    const _REGS_REQUIRED: usize;
+
+    #[doc(hidden)]
+    fn _handle_return(self, set_reg: impl FnMut(RegValue)) -> Result<(), Trap>;
 }
 
 impl<T> ReturnTy for T
 where
     T: AbiTy,
 {
-    const _PRIVATE_EXTERN_TY: Option<ExternTy> = Some(T::_PRIVATE_EXTERN_TY);
-    fn _handle_return(self, set_reg: impl FnMut(u32)) -> Result<(), Trap> {
+    const _REGS_REQUIRED: usize = <T as AbiTy>::_REGS_REQUIRED;
+
+    fn _handle_return(self, set_reg: impl FnMut(RegValue)) -> Result<(), Trap> {
         self._set(set_reg);
         Ok(())
     }
 }
 
 impl ReturnTy for () {
-    const _PRIVATE_EXTERN_TY: Option<ExternTy> = None;
-    fn _handle_return(self, _set_reg: impl FnMut(u32)) -> Result<(), Trap> {
+    const _REGS_REQUIRED: usize = 0;
+
+    fn _handle_return(self, _set_reg: impl FnMut(RegValue)) -> Result<(), Trap> {
         Ok(())
     }
 }
 
 impl ReturnTy for Result<(), Trap> {
-    const _PRIVATE_EXTERN_TY: Option<ExternTy> = None;
-    fn _handle_return(self, _set_reg: impl FnMut(u32)) -> Result<(), Trap> {
+    const _REGS_REQUIRED: usize = 0;
+
+    fn _handle_return(self, _set_reg: impl FnMut(RegValue)) -> Result<(), Trap> {
         self
     }
 }
@@ -1848,8 +1723,9 @@ impl<T> ReturnTy for Result<T, Trap>
 where
     T: AbiTy,
 {
-    const _PRIVATE_EXTERN_TY: Option<ExternTy> = Some(T::_PRIVATE_EXTERN_TY);
-    fn _handle_return(self, set_reg: impl FnMut(u32)) -> Result<(), Trap> {
+    const _REGS_REQUIRED: usize = <T as AbiTy>::_REGS_REQUIRED;
+
+    fn _handle_return(self, set_reg: impl FnMut(RegValue)) -> Result<(), Trap> {
         self?._set(set_reg);
         Ok(())
     }
@@ -1857,33 +1733,33 @@ where
 
 pub trait FuncArgs: Send {
     #[doc(hidden)]
-    const _PRIVATE_EXTERN_TY: &'static [ExternTy];
+    const _REGS_REQUIRED: usize;
 
     #[doc(hidden)]
-    fn _set(self, set_reg: impl FnMut(u32));
+    fn _set(self, set_reg: impl FnMut(RegValue));
 }
 
 pub trait FuncResult: Send {
     #[doc(hidden)]
-    const _PRIVATE_EXTERN_TY: Option<ExternTy>;
+    const _REGS_REQUIRED: usize;
 
     #[doc(hidden)]
-    fn _get(get_reg: impl FnMut() -> u32) -> Self;
+    fn _get(get_reg: impl FnMut() -> RegValue) -> Self;
 }
 
 impl FuncResult for () {
-    const _PRIVATE_EXTERN_TY: Option<ExternTy> = None;
+    const _REGS_REQUIRED: usize = 0;
 
-    fn _get(_: impl FnMut() -> u32) -> Self {}
+    fn _get(_: impl FnMut() -> RegValue) -> Self {}
 }
 
 impl<T> FuncResult for T
 where
     T: AbiTy,
 {
-    const _PRIVATE_EXTERN_TY: Option<ExternTy> = Some(<T as AbiTy>::_PRIVATE_EXTERN_TY);
+    const _REGS_REQUIRED: usize = 1;
 
-    fn _get(get_reg: impl FnMut() -> u32) -> Self {
+    fn _get(get_reg: impl FnMut() -> RegValue) -> Self {
         <T as AbiTy>::_get(get_reg)
     }
 }
@@ -1904,7 +1780,7 @@ macro_rules! impl_into_extern_fn {
     (@get_reg $caller:expr) => {{
         let mut reg_index = 0;
         let caller = &mut $caller;
-        move || -> u32 {
+        move || -> RegValue {
             let value = caller.get_reg(Reg::ARG_REGS[reg_index]);
             reg_index += 1;
             value
@@ -1975,7 +1851,7 @@ macro_rules! impl_into_extern_fn {
     }};
 
     ($arg_count:tt $($args:ident)*) => {
-        impl<T, F, $($args,)* R> ExternFn<T> for (F, UnsafePhantomData<(R, $($args),*)>)
+        impl<T, F, $($args,)* R> CallFn<T> for (F, UnsafePhantomData<(R, $($args),*)>)
             where
             F: Fn(Caller<'_, T>, $($args),*) -> R + Send + Sync + 'static,
             $($args: AbiTy,)*
@@ -1989,12 +1865,12 @@ macro_rules! impl_into_extern_fn {
 
                 let set_reg = {
                     let mut reg_index = 0;
-                    move |value: u32| {
+                    move |value: RegValue| {
                         let reg = Reg::ARG_REGS[reg_index];
                         access.set_reg(reg, value);
 
                         if let Some(ref mut tracer) = raw.tracer() {
-                            tracer.on_set_reg_in_hostcall(reg, value as u32);
+                            tracer.on_set_reg_in_hostcall(reg, value);
                         }
 
                         reg_index += 1;
@@ -2002,56 +1878,45 @@ macro_rules! impl_into_extern_fn {
                 };
                 result._handle_return(set_reg)
             }
-
-            fn typecheck(&self, prototype: &ExternFnPrototype) -> Result<(), Error> {
-                let args: [ExternTy; $arg_count] = [$($args::_PRIVATE_EXTERN_TY,)*];
-                if args.len() != prototype.args().len() || args.into_iter().zip(prototype.args()).any(|(lhs, rhs)| lhs != rhs) || R::_PRIVATE_EXTERN_TY != prototype.return_ty() {
-                    bail!(
-                        "failed to instantiate module: the module wanted to import function '{}', while the function that was registered was '{}'",
-                        DisplayFn { name: prototype.name(), args: prototype.args(), return_ty: prototype.return_ty() },
-                        DisplayFn { name: prototype.name(), args: args.into_iter(), return_ty: R::_PRIVATE_EXTERN_TY },
-                    );
-                }
-
-                Ok(())
-            }
         }
 
-        impl<T, F, $($args,)* R> IntoExternFn<T, ($($args,)*), R> for F
+        impl<T, F, $($args,)* R> IntoCallFn<T, ($($args,)*), R> for F
         where
             F: Fn($($args),*) -> R + Send + Sync + 'static,
             $($args: AbiTy,)*
             R: ReturnTy,
         {
-            fn _into_extern_fn(self) -> ExternFnArc<T> {
+            const _REGS_REQUIRED: usize = 0 $(+ $args::_REGS_REQUIRED)*;
+
+            fn _into_extern_fn(self) -> CallFnArc<T> {
                 #[allow(non_snake_case)]
                 let callback = move |_caller: Caller<T>, $($args: $args),*| -> R {
                     self($($args),*)
                 };
-                ExternFnArc(Arc::new((callback, UnsafePhantomData(PhantomData::<(R, $($args),*)>))))
+                CallFnArc(Arc::new((callback, UnsafePhantomData(PhantomData::<(R, $($args),*)>))))
             }
         }
 
-        impl<T, F, $($args,)* R> IntoExternFn<T, (Caller<'_, T>, $($args,)*), R> for F
+        impl<T, F, $($args,)* R> IntoCallFn<T, (Caller<'_, T>, $($args,)*), R> for F
         where
             F: Fn(Caller<'_, T>, $($args),*) -> R + Send + Sync + 'static,
             $($args: AbiTy,)*
             R: ReturnTy,
         {
-            fn _into_extern_fn(self) -> ExternFnArc<T> {
-                ExternFnArc(Arc::new((self, UnsafePhantomData(PhantomData::<(R, $($args),*)>))))
+            const _REGS_REQUIRED: usize = 0 $(+ $args::_REGS_REQUIRED)*;
+
+            fn _into_extern_fn(self) -> CallFnArc<T> {
+                CallFnArc(Arc::new((self, UnsafePhantomData(PhantomData::<(R, $($args),*)>))))
             }
         }
 
         impl<$($args: Send + AbiTy,)*> FuncArgs for ($($args,)*) {
-            const _PRIVATE_EXTERN_TY: &'static [ExternTy] = &[
-                $(<$args as AbiTy>::_PRIVATE_EXTERN_TY,)*
-            ];
+            const _REGS_REQUIRED: usize = 0 $(+ $args::_REGS_REQUIRED)*;
 
             #[allow(unused_mut)]
             #[allow(unused_variables)]
             #[allow(non_snake_case)]
-            fn _set(self, mut set_reg: impl FnMut(u32)) {
+            fn _set(self, mut set_reg: impl FnMut(RegValue)) {
                 let ($($args,)*) = self;
                 $($args._set(&mut set_reg);)*
             }
@@ -2077,13 +1942,9 @@ unsafe impl<T> Send for UnsafePhantomData<T> {}
 unsafe impl<T> Sync for UnsafePhantomData<T> {}
 
 struct DynamicFn<T, F> {
-    args: Vec<ExternTy>,
-    return_ty: Option<ExternTy>,
     callback: F,
     _phantom: UnsafePhantomData<T>,
 }
-
-polkavm_common::static_assert!(Reg::ARG_REGS.len() == VM_MAXIMUM_EXTERN_ARG_COUNT);
 
 fn catch_hostcall_panic<R>(callback: impl FnOnce() -> R) -> Result<R, Trap> {
     std::panic::catch_unwind(core::panic::AssertUnwindSafe(callback)).map_err(|panic| {
@@ -2099,127 +1960,25 @@ fn catch_hostcall_panic<R>(callback: impl FnOnce() -> R) -> Result<R, Trap> {
     })
 }
 
-impl<T, F> ExternFn<T> for DynamicFn<T, F>
+impl<T, F> CallFn<T> for DynamicFn<T, F>
 where
-    F: Fn(Caller<'_, T>, &[Val], Option<&mut Val>) -> Result<(), Trap> + Send + Sync + 'static,
+    F: Fn(Caller<'_, T>) -> Result<(), Trap> + Send + Sync + 'static,
     T: 'static,
 {
     fn call(&self, user_data: &mut T, mut access: BackendAccess, raw: &mut CallerRaw) -> Result<(), Trap> {
-        const DEFAULT: Val = Val::I64(0);
-        let mut args = [DEFAULT; VM_MAXIMUM_EXTERN_ARG_COUNT];
-        let args = &mut args[..self.args.len()];
-
-        let mut arg_regs = Reg::ARG_REGS.into_iter();
-        for (&arg_ty, arg) in self.args.iter().zip(args.iter_mut()) {
-            match arg_ty {
-                ExternTy::I32 => {
-                    let Some(reg) = arg_regs.next() else {
-                        log::error!("dynamic host call called with too many arguments");
-                        return Err(Trap::default());
-                    };
-
-                    *arg = Val::I32(access.get_reg(reg) as i32);
-                }
-                ExternTy::I64 => {
-                    let Some(reg_1) = arg_regs.next() else {
-                        log::error!("dynamic host call called with too many arguments");
-                        return Err(Trap::default());
-                    };
-
-                    let Some(reg_2) = arg_regs.next() else {
-                        log::error!("dynamic host call called with too many arguments");
-                        return Err(Trap::default());
-                    };
-
-                    let lo = access.get_reg(reg_1);
-                    let hi = access.get_reg(reg_2);
-                    *arg = Val::I64((u64::from(lo) | (u64::from(hi) << 32)) as i64);
-                }
-            }
-        }
-
-        let mut return_value = match self.return_ty.unwrap_or(ExternTy::I32) {
-            ExternTy::I32 => Val::I32(0),
-            ExternTy::I64 => Val::I64(0),
-        };
-
-        {
-            let return_value = self.return_ty.map(|_| &mut return_value);
-            Caller::wrap(user_data, &mut access, raw, move |caller| {
-                catch_hostcall_panic(|| (self.callback)(caller, args, return_value))
-            })??;
-        }
-
-        if let Some(return_ty) = self.return_ty {
-            match return_value {
-                Val::I32(value) => {
-                    if return_ty != ExternTy::I32 {
-                        // TODO: Print out the name of the hostcall.
-                        log::error!(
-                            "Hostcall return type mismatch: expected a hostcall to return '{}', but it returned 'i32'",
-                            return_ty
-                        );
-                        return Err(Trap::default());
-                    }
-
-                    access.set_reg(Reg::A0, value as u32);
-                    if let Some(tracer) = raw.tracer() {
-                        tracer.on_set_reg_in_hostcall(Reg::A0, value as u32);
-                    }
-                }
-                Val::I64(value) => {
-                    if return_ty != ExternTy::I64 {
-                        log::error!(
-                            "Hostcall return type mismatch: expected a hostcall to return '{}', but it returned 'i64'",
-                            return_ty
-                        );
-                        return Err(Trap::default());
-                    }
-
-                    let value = value as u64;
-                    access.set_reg(Reg::A0, value as u32);
-                    access.set_reg(Reg::A1, (value >> 32) as u32);
-
-                    if let Some(tracer) = raw.tracer() {
-                        tracer.on_set_reg_in_hostcall(Reg::A0, value as u32);
-                        tracer.on_set_reg_in_hostcall(Reg::A1, (value >> 32) as u32);
-                    }
-                }
-            }
-        }
-
-        Ok(())
-    }
-
-    fn typecheck(&self, prototype: &ExternFnPrototype) -> Result<(), Error> {
-        if self.args.len() != prototype.args().len()
-            || self.args.iter().zip(prototype.args()).any(|(lhs, rhs)| *lhs != rhs)
-            || self.return_ty != prototype.return_ty()
-        {
-            bail!(
-                "failed to instantiate module: the module wanted to import function '{}', while the function that was registered was '{}'",
-                DisplayFn {
-                    name: prototype.name(),
-                    args: prototype.args(),
-                    return_ty: prototype.return_ty()
-                },
-                DisplayFn {
-                    name: prototype.name(),
-                    args: self.args.iter().copied(),
-                    return_ty: self.return_ty
-                },
-            );
-        }
+        Caller::wrap(user_data, &mut access, raw, move |caller| {
+            catch_hostcall_panic(|| (self.callback)(caller))
+        })??;
 
         Ok(())
     }
 }
 
-type FallbackHandlerArc<T> = Arc<dyn Fn(Caller<'_, T>, u32) -> Result<(), Trap> + Send + Sync + 'static>;
+type FallbackHandlerArc<T> = Arc<dyn Fn(Caller<'_, T>, &[u8]) -> Result<(), Trap> + Send + Sync + 'static>;
 
 pub struct Linker<T> {
     engine_state: Arc<EngineState>,
-    host_functions: HashMap<String, ExternFnArc<T>>,
+    host_functions: HashMap<Vec<u8>, CallFnArc<T>>,
     #[allow(clippy::type_complexity)]
     fallback_handler: Option<FallbackHandlerArc<T>>,
     phantom: PhantomData<T>,
@@ -2236,29 +1995,30 @@ impl<T> Linker<T> {
     }
 
     /// Defines a fallback external call handler, in case no other registered functions match.
-    pub fn func_fallback(&mut self, func: impl Fn(Caller<'_, T>, u32) -> Result<(), Trap> + Send + Sync + 'static) {
+    pub fn func_fallback(&mut self, func: impl Fn(Caller<'_, T>, &[u8]) -> Result<(), Trap> + Send + Sync + 'static) {
         self.fallback_handler = Some(Arc::new(func));
     }
 
-    /// Defines a new dynamically typed handler for external calls with a given name.
+    /// Defines a new dynamically typed handler for external calls with a given symbol.
     pub fn func_new(
         &mut self,
-        name: &str,
-        ty: FuncType,
-        func: impl Fn(Caller<'_, T>, &[Val], Option<&mut Val>) -> Result<(), Trap> + Send + Sync + 'static,
+        symbol: impl AsRef<[u8]>,
+        func: impl Fn(Caller<'_, T>) -> Result<(), Trap> + Send + Sync + 'static,
     ) -> Result<&mut Self, Error>
     where
         T: 'static,
     {
-        if self.host_functions.contains_key(name) {
-            bail!("cannot register host function: host function was already registered: '{}'", name);
+        let symbol = symbol.as_ref();
+        if self.host_functions.contains_key(symbol) {
+            bail!(
+                "cannot register host function: host function was already registered: {}",
+                ProgramSymbol::from(symbol)
+            );
         }
 
         self.host_functions.insert(
-            name.to_owned(),
-            ExternFnArc(Arc::new(DynamicFn {
-                args: ty.args,
-                return_ty: ty.return_ty,
+            symbol.to_owned(),
+            CallFnArc(Arc::new(DynamicFn {
                 callback: func,
                 _phantom: UnsafePhantomData(PhantomData),
             })),
@@ -2267,33 +2027,38 @@ impl<T> Linker<T> {
         Ok(self)
     }
 
-    /// Defines a new statically typed handler for external calls with a given name.
-    pub fn func_wrap<Params, Args>(&mut self, name: &str, func: impl IntoExternFn<T, Params, Args>) -> Result<&mut Self, Error> {
-        if self.host_functions.contains_key(name) {
-            bail!("cannot register host function: host function was already registered: '{}'", name);
+    /// Defines a new statically typed handler for external calls with a given symbol.
+    pub fn func_wrap<Params, Args>(
+        &mut self,
+        symbol: impl AsRef<[u8]>,
+        func: impl IntoCallFn<T, Params, Args>,
+    ) -> Result<&mut Self, Error> {
+        let symbol = symbol.as_ref();
+        if self.host_functions.contains_key(symbol) {
+            bail!(
+                "cannot register host function: host function was already registered: {}",
+                ProgramSymbol::from(symbol)
+            );
         }
 
-        self.host_functions.insert(name.to_owned(), func._into_extern_fn());
+        self.host_functions.insert(symbol.to_owned(), func._into_extern_fn());
         Ok(self)
     }
 
     /// Pre-instantiates a new module, linking it with the external functions previously defined on this object.
     pub fn instantiate_pre(&self, module: &Module) -> Result<InstancePre<T>, Error> {
-        let mut host_functions: HashMap<u32, ExternFnArc<T>> = HashMap::new();
-        host_functions.reserve(module.0.imports.len());
-
-        for (index, import) in &module.0.imports {
-            let prototype = import.prototype();
-            let Some(host_fn) = self.host_functions.get(prototype.name()) else {
+        let mut host_functions: Vec<CallFnArc<T>> = Vec::with_capacity(module.0.imports.len());
+        for import in &module.0.imports {
+            let symbol_bytes: &[u8] = import.symbol();
+            let Some(host_fn) = self.host_functions.get(symbol_bytes) else {
                 if self.fallback_handler.is_some() {
                     continue;
                 }
 
-                bail!("failed to instantiate module: missing host function: '{}'", prototype.name());
+                bail!("failed to instantiate module: missing host function: {}", import.symbol());
             };
 
-            host_fn.0.typecheck(prototype)?;
-            host_functions.insert(*index, host_fn.clone());
+            host_functions.push(host_fn.clone());
         }
 
         Ok(InstancePre(Arc::new(InstancePrePrivate {
@@ -2310,7 +2075,7 @@ struct InstancePrePrivate<T> {
     #[allow(dead_code)]
     engine_state: Arc<EngineState>,
     module: Module,
-    host_functions: HashMap<u32, ExternFnArc<T>>,
+    host_functions: Vec<CallFnArc<T>>,
     fallback_handler: Option<FallbackHandlerArc<T>>,
     _private: PhantomData<T>,
 }
@@ -2512,11 +2277,11 @@ if_compiler_is_supported! {
 impl<'a> Access<'a> for BackendAccess<'a> {
     type Error = Trap;
 
-    fn get_reg(&self, reg: Reg) -> u32 {
+    fn get_reg(&self, reg: Reg) -> RegValue {
         access_backend!(self, |access| access.get_reg(reg))
     }
 
-    fn set_reg(&mut self, reg: Reg, value: u32) {
+    fn set_reg(&mut self, reg: Reg, value: RegValue) {
         access_backend!(self, |access| access.set_reg(reg, value))
     }
 
@@ -2575,54 +2340,29 @@ impl<T> Clone for Instance<T> {
 }
 
 impl<T> Instance<T> {
-    /// Returns a handle to a function of a given name exported by the module.
-    pub fn get_func(&self, name: &str) -> Option<Func<T>> {
-        let export_index = *self.0.instance_pre.0.module.0.export_index_by_name.get(name)?;
+    /// Returns a handle to a function of a given symbol exported by the module.
+    pub fn get_func(&self, symbol: impl AsRef<[u8]>) -> Option<Func<T>> {
+        let symbol = symbol.as_ref();
+        let export_index = *self.0.instance_pre.0.module.0.export_index_by_symbol.get(symbol)?;
         Some(Func {
             instance: self.clone(),
             export_index,
         })
     }
 
-    /// Returns a handle to a function of a given name exported by the module.
-    pub fn get_typed_func<FnArgs, FnResult>(&self, name: &str) -> Result<TypedFunc<T, FnArgs, FnResult>, Error>
+    /// Returns a handle to a function of a given symbol exported by the module.
+    pub fn get_typed_func<FnArgs, FnResult>(&self, symbol: impl AsRef<[u8]>) -> Result<TypedFunc<T, FnArgs, FnResult>, Error>
     where
         FnArgs: FuncArgs,
         FnResult: FuncResult,
     {
-        let Some(&export_index) = self.0.instance_pre.0.module.0.export_index_by_name.get(name) else {
+        let symbol = symbol.as_ref();
+        let Some(&export_index) = self.0.instance_pre.0.module.0.export_index_by_symbol.get(symbol) else {
             return Err(Error::from(format!(
-                "failed to get function '{}': no such function is exported",
-                name
+                "failed to acquire a typed function handle: no such function is exported: {}",
+                ProgramSymbol::from(symbol)
             )));
         };
-
-        let export = &self.0.instance_pre.0.module.0.exports[export_index];
-        let prototype = export.prototype();
-
-        let return_ty = FnResult::_PRIVATE_EXTERN_TY;
-        let args = FnArgs::_PRIVATE_EXTERN_TY;
-
-        if args.len() != prototype.args().len()
-            || args.iter().copied().zip(prototype.args()).any(|(lhs, rhs)| lhs != rhs)
-            || return_ty != prototype.return_ty()
-        {
-            let error = format!(
-                "failed to get function: wanted to get function '{}', while the function that was exported was '{}'",
-                DisplayFn {
-                    name: prototype.name(),
-                    args: args.iter().copied(),
-                    return_ty
-                },
-                DisplayFn {
-                    name: prototype.name(),
-                    args: prototype.args(),
-                    return_ty: prototype.return_ty()
-                },
-            );
-
-            return Err(error.into());
-        }
 
         Ok(TypedFunc {
             instance: self.clone(),
@@ -2666,7 +2406,7 @@ impl<T> Instance<T> {
         result
     }
 
-    pub fn get_reg(&self, reg: Reg) -> u32 {
+    pub fn get_reg(&self, reg: Reg) -> RegValue {
         let mut mutable = match self.0.mutable.lock() {
             Ok(mutable) => mutable,
             Err(poison) => poison.into_inner(),
@@ -2705,7 +2445,7 @@ impl<T> Instance<T> {
 pub struct ExecutionConfig {
     pub(crate) reset_memory_after_execution: bool,
     pub(crate) clear_program_after_execution: bool,
-    pub(crate) initial_regs: [u32; Reg::ALL.len()],
+    pub(crate) initial_regs: [RegValue; Reg::ALL.len()],
     pub(crate) gas: Option<Gas>,
 }
 
@@ -2735,7 +2475,7 @@ impl ExecutionConfig {
         self
     }
 
-    pub fn set_reg(&mut self, reg: Reg, value: u32) -> &mut Self {
+    pub fn set_reg(&mut self, reg: Reg, value: RegValue) -> &mut Self {
         self.initial_regs[reg as usize] = value;
         self
     }
@@ -2762,7 +2502,8 @@ impl<T> Clone for Func<T> {
 
 fn on_hostcall<'a, T>(
     user_data: &'a mut T,
-    host_functions: &'a HashMap<u32, ExternFnArc<T>>,
+    host_functions: &'a [CallFnArc<T>],
+    imports: &'a [ProgramImport<'a>],
     fallback_handler: Option<&'a FallbackHandlerArc<T>>,
     raw: &'a mut CallerRaw,
 ) -> impl for<'r> FnMut(u32, BackendAccess<'r>) -> Result<(), Trap> + 'a {
@@ -2781,9 +2522,10 @@ fn on_hostcall<'a, T>(
             return Err(Trap::default());
         }
 
-        let Some(host_fn) = host_functions.get(&hostcall) else {
+        let Some(host_fn) = host_functions.get(hostcall as usize) else {
             if let Some(fallback_handler) = fallback_handler {
-                return Caller::wrap(user_data, &mut access, raw, move |caller| fallback_handler(caller, hostcall));
+                let import = &imports[hostcall as usize];
+                return Caller::wrap(user_data, &mut access, raw, move |caller| fallback_handler(caller, import.symbol()));
             }
 
             // This should never happen.
@@ -2802,69 +2544,22 @@ fn on_hostcall<'a, T>(
 
 impl<T> Func<T> {
     /// Calls the function.
-    pub fn call(&self, user_data: &mut T, args: &[Val]) -> Result<Option<Val>, ExecutionError> {
-        self.call_ex(user_data, args, ExecutionConfig::default())
+    pub fn call(&self, user_data: &mut T, args: &[RegValue], return_value: &mut [RegValue]) -> Result<(), ExecutionError> {
+        self.call_ex(user_data, args, return_value, ExecutionConfig::default())
     }
 
     /// Calls the function with the given configuration.
-    pub fn call_ex(&self, user_data: &mut T, args: &[Val], mut config: ExecutionConfig) -> Result<Option<Val>, ExecutionError> {
+    pub fn call_ex(
+        &self,
+        user_data: &mut T,
+        args: &[RegValue],
+        return_value: &mut [RegValue],
+        mut config: ExecutionConfig,
+    ) -> Result<(), ExecutionError> {
         let instance_pre = &self.instance.0.instance_pre;
         let export = &instance_pre.0.module.0.exports[self.export_index];
-        let prototype = export.prototype();
 
-        if args.len() != prototype.args().len()
-            || args
-                .iter()
-                .map(|value| value.extern_ty())
-                .zip(prototype.args())
-                .any(|(lhs, rhs)| lhs != rhs)
-        {
-            let error = format!(
-                "failed to call function: wanted to call function '{}', while the function that was exported was '{}'",
-                DisplayFn {
-                    name: prototype.name(),
-                    args: args.iter().map(|value| value.extern_ty()),
-                    return_ty: prototype.return_ty()
-                },
-                DisplayFn {
-                    name: prototype.name(),
-                    args: prototype.args(),
-                    return_ty: prototype.return_ty()
-                },
-            );
-
-            return Err(ExecutionError::Error(error.into()));
-        }
-
-        let mut input_count = 0;
-        if prototype.args().len() > 0 {
-            let required_count = args
-                .iter()
-                .map(|arg| match arg {
-                    Val::I32(..) => i32::_REGS_REQUIRED,
-                    Val::I64(..) => i64::_REGS_REQUIRED,
-                })
-                .sum::<usize>();
-
-            if required_count > Reg::ARG_REGS.len() {
-                return Err(ExecutionError::Error(
-                    format!("failed to call function '{}': too many arguments", prototype.name()).into(),
-                ));
-            }
-
-            let mut cb = |value: u32| {
-                assert!(input_count <= VM_MAXIMUM_EXTERN_ARG_COUNT);
-                config.initial_regs[Reg::A0 as usize + input_count] = value;
-                input_count += 1;
-            };
-
-            for arg in args {
-                match arg {
-                    Val::I32(value) => i32::_set(*value, &mut cb),
-                    Val::I64(value) => i64::_set(*value, &mut cb),
-                }
-            }
-        }
+        config.initial_regs[Reg::A0 as usize..Reg::A0 as usize + args.len()].copy_from_slice(args);
 
         let mutable = &self.instance.0.mutable;
         let mut mutable = match mutable.lock() {
@@ -2880,13 +2575,14 @@ impl<T> Func<T> {
         let mut on_hostcall = on_hostcall(
             user_data,
             &instance_pre.0.host_functions,
+            &instance_pre.0.module.0.imports,
             instance_pre.0.fallback_handler.as_ref(),
             &mut mutable.raw,
         );
 
         log::trace!(
-            "Calling into '{}'... (gas limit = {:?})",
-            prototype.name(),
+            "Calling into {}... (gas limit = {:?})",
+            export.symbol(),
             self.instance.0.instance_pre.0.module.0.gas_metering.and(config.gas)
         );
         let result = mutable.backend.call(self.export_index, &mut on_hostcall, &config);
@@ -2907,7 +2603,7 @@ impl<T> Func<T> {
                 log::trace!("...execution finished: error: {error}");
 
                 return Err(ExecutionError::Error(
-                    format!("failed to call function '{}': {}", export.prototype().name(), error).into(),
+                    format!("failed to call function {}: {}", export.symbol(), error).into(),
                 ));
             }
             Err(ExecutionError::Trap(trap)) => {
@@ -2920,27 +2616,11 @@ impl<T> Func<T> {
             }
         }
 
-        if let Some(return_ty) = prototype.return_ty() {
-            let mut output_count = 0;
-            let get = || {
-                let value = mutable.backend.access().get_reg(Reg::ARG_REGS[output_count]);
-                output_count += 1;
-                value
-            };
-
-            match return_ty {
-                ExternTy::I32 => {
-                    let value = <i32 as AbiTy>::_get(get);
-                    Ok(Some(Val::I32(value)))
-                }
-                ExternTy::I64 => {
-                    let value = <i64 as AbiTy>::_get(get);
-                    Ok(Some(Val::I64(value)))
-                }
-            }
-        } else {
-            Ok(None)
+        for (nth, return_value) in return_value.iter_mut().enumerate() {
+            *return_value = mutable.backend.access().get_reg(Reg::ARG_REGS[nth]);
         }
+
+        Ok(())
     }
 }
 
@@ -2967,7 +2647,7 @@ where
 
         let mut input_count = 0;
         args._set(|value| {
-            assert!(input_count <= VM_MAXIMUM_EXTERN_ARG_COUNT);
+            assert!(input_count <= Reg::MAXIMUM_INPUT_REGS);
             config.initial_regs[Reg::A0 as usize + input_count] = value;
             input_count += 1;
         });
@@ -2986,13 +2666,14 @@ where
         let mut on_hostcall = on_hostcall(
             user_data,
             &instance_pre.0.host_functions,
+            &instance_pre.0.module.0.imports,
             instance_pre.0.fallback_handler.as_ref(),
             &mut mutable.raw,
         );
 
         log::trace!(
-            "Calling into '{}'... (gas limit = {:?})",
-            export.prototype().name(),
+            "Calling into {}... (gas limit = {:?})",
+            export.symbol(),
             self.instance.0.instance_pre.0.module.0.gas_metering.and(config.gas)
         );
         let result = mutable.backend.call(self.export_index, &mut on_hostcall, &config);
@@ -3013,7 +2694,7 @@ where
                 log::trace!("...execution finished: error: {error}");
 
                 return Err(ExecutionError::Error(
-                    format!("failed to call function '{}': {}", export.prototype().name(), error).into(),
+                    format!("failed to call function {}: {}", export.symbol(), error).into(),
                 ));
             }
             Err(ExecutionError::Trap(trap)) => {

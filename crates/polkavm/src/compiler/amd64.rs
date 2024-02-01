@@ -496,10 +496,10 @@ impl<'a> Compiler<'a> {
 
     pub(crate) fn emit_export_trampolines(&mut self) {
         for export in self.exports {
-            log::trace!("Emitting trampoline: export: '{}'", export.prototype().name());
+            log::trace!("Emitting trampoline: export: {}", export.symbol());
 
             let trampoline_label = self.asm.create_label();
-            self.export_to_label.insert(export.address(), trampoline_label);
+            self.export_to_label.insert(export.jump_target(), trampoline_label);
 
             if matches!(self.sandbox_kind, SandboxKind::Linux) {
                 self.push(mov_imm64(LINUX_SANDBOX_VMCTX_REG, VM_ADDR_VMCTX));
@@ -512,7 +512,7 @@ impl<'a> Compiler<'a> {
                 self.push(jcc_label32(Condition::Sign, self.trap_label));
             }
 
-            let target_label = self.get_or_forward_declare_label(export.address());
+            let target_label = self.get_or_forward_declare_label(export.jump_target());
             self.push(jmp_label32(target_label));
         }
     }

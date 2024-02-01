@@ -1,5 +1,4 @@
-use crate::elf::FnMetadata;
-use crate::program::{self, Instruction};
+use crate::program::{self, Instruction, ProgramExport, ProgramImport};
 use alloc::vec::Vec;
 use core::ops::Range;
 
@@ -9,8 +8,8 @@ pub struct ProgramBlobBuilder {
     stack_size: u32,
     ro_data: Vec<u8>,
     rw_data: Vec<u8>,
-    imports: Vec<(u32, FnMetadata)>,
-    exports: Vec<(u32, FnMetadata)>,
+    imports: Vec<ProgramImport<'static>>,
+    exports: Vec<ProgramExport<'static>>,
     jump_table: Vec<u8>,
     code: Vec<u8>,
     custom: Vec<(u8, Vec<u8>)>,
@@ -39,12 +38,12 @@ impl ProgramBlobBuilder {
         self.rw_data = data;
     }
 
-    pub fn add_import(&mut self, index: u32, metadata: &FnMetadata) {
-        self.imports.push((index, metadata.clone()));
+    pub fn add_import(&mut self, import: ProgramImport) {
+        self.imports.push(import.into_owned());
     }
 
-    pub fn add_export(&mut self, jump_target: u32, metadata: &FnMetadata) {
-        self.exports.push((jump_target, metadata.clone()));
+    pub fn add_export(&mut self, export: ProgramExport) {
+        self.exports.push(export.into_owned());
     }
 
     pub fn set_jump_table(&mut self, jump_table: &[u32]) {
@@ -93,9 +92,8 @@ impl ProgramBlobBuilder {
         if !self.imports.is_empty() {
             writer.push_section_inplace(program::SECTION_IMPORTS, |writer| {
                 writer.push_varint(self.imports.len().try_into().expect("too many imports"));
-                for (index, prototype) in self.imports {
-                    writer.push_varint(index);
-                    writer.push_function_prototype(&prototype);
+                for import in self.imports {
+                    writer.push_bytes_with_length(import.symbol());
                 }
             });
         }
@@ -103,9 +101,9 @@ impl ProgramBlobBuilder {
         if !self.exports.is_empty() {
             writer.push_section_inplace(program::SECTION_EXPORTS, |writer| {
                 writer.push_varint(self.exports.len().try_into().expect("too many exports"));
-                for (jump_target, prototype) in self.exports {
-                    writer.push_varint(jump_target);
-                    writer.push_function_prototype(&prototype);
+                for export in self.exports {
+                    writer.push_varint(export.jump_target());
+                    writer.push_bytes_with_length(export.symbol());
                 }
             });
         }
@@ -194,15 +192,6 @@ impl<'a> Writer<'a> {
     pub fn push_bytes_with_length(&mut self, slice: &[u8]) {
         self.push_varint(slice.len().try_into().expect("length overflow"));
         self.push_raw_bytes(slice);
-    }
-
-    fn push_function_prototype(&mut self, meta: &FnMetadata) {
-        self.push_bytes_with_length(meta.name().as_bytes());
-        self.push_varint(meta.args().count() as u32);
-        for arg_ty in meta.args() {
-            self.push_byte(arg_ty as u8);
-        }
-        self.push_byte(meta.return_ty().map_or(0, |ty| ty as u8));
     }
 
     pub fn len(&self) -> usize {

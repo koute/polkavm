@@ -51,9 +51,9 @@ impl Tracer {
     pub fn on_before_call(&mut self, export_index: usize, export: &ProgramExport, config: &ExecutionConfig) {
         let target = self
             .module
-            .instruction_by_basic_block(export.address())
+            .instruction_by_basic_block(export.jump_target())
             .expect("internal error: invalid export address");
-        log::trace!("Calling export: '{}' (at #{})", export.prototype().name(), target);
+        log::trace!("Calling export: {} (at #{})", export.symbol(), target);
 
         if let Some(ref mut interpreter) = self.crosscheck_interpreter {
             self.crosscheck_reset_memory_after_execution = config.reset_memory_after_execution;

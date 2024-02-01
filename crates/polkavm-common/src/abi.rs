@@ -51,9 +51,6 @@ pub const VM_MAXIMUM_IMPORT_COUNT: u32 = 1024;
 /// The maximum number of functions the program can export.
 pub const VM_MAXIMUM_EXPORT_COUNT: u32 = 1024;
 
-/// The maximum number of arguments that can be used in imported functions.
-pub const VM_MAXIMUM_EXTERN_ARG_COUNT: usize = 6;
-
 /// The minimum required alignment of runtime code pointers.
 // TODO: Support the C extension in the linker and lower this to 2.
 pub const VM_CODE_ADDRESS_ALIGNMENT: u32 = 4;

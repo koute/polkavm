@@ -167,7 +167,7 @@ impl InterpretedInstance {
             .module
             .get_export(export_index)
             .expect("internal error: invalid export index")
-            .address();
+            .jump_target();
 
         let nth_instruction = self
             .module

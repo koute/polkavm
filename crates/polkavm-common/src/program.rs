@@ -1,34 +1,6 @@
-use crate::utils::{CowBytes, CowString};
+use crate::utils::CowBytes;
 use crate::varint::{read_varint, write_varint, MAX_VARINT_LENGTH};
 use core::ops::Range;
-
-#[derive(Copy, Clone, PartialEq, Eq, Debug)]
-pub enum ExternTy {
-    I32 = 1,
-    I64 = 2,
-}
-
-impl core::fmt::Display for ExternTy {
-    fn fmt(&self, fmt: &mut core::fmt::Formatter) -> core::fmt::Result {
-        let name = match *self {
-            ExternTy::I32 => "i32",
-            ExternTy::I64 => "i64",
-        };
-
-        fmt.write_str(name)
-    }
-}
-
-impl ExternTy {
-    pub fn try_deserialize(value: u8) -> Option<Self> {
-        use ExternTy::*;
-        match value {
-            1 => Some(I32),
-            2 => Some(I64),
-            _ => None,
-        }
-    }
-}
 
 #[derive(Copy, Clone, PartialEq, Eq, Debug, Hash)]
 #[repr(u8)]
@@ -94,8 +66,11 @@ impl Reg {
         [RA, SP, T0, T1, T2, S0, S1, A0, A1, A2, A3, A4, A5]
     };
 
-    /// List of all argument registers.
-    pub const ARG_REGS: [Reg; 6] = [Reg::A0, Reg::A1, Reg::A2, Reg::A3, Reg::A4, Reg::A5];
+    /// List of all input/output argument registers.
+    pub const ARG_REGS: [Reg; 9] = [Reg::A0, Reg::A1, Reg::A2, Reg::A3, Reg::A4, Reg::A5, Reg::T0, Reg::T1, Reg::T2];
+
+    pub const MAXIMUM_INPUT_REGS: usize = 9;
+    pub const MAXIMUM_OUTPUT_REGS: usize = 2;
 }
 
 impl core::fmt::Display for Reg {
@@ -1358,113 +1333,113 @@ impl std::error::Error for ProgramParseError {}
 
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub struct ProgramExport<'a> {
-    address: u32,
-    prototype: ExternFnPrototype<'a>,
+    jump_target: u32,
+    symbol: ProgramSymbol<'a>,
 }
 
 impl<'a> ProgramExport<'a> {
-    pub fn address(&self) -> u32 {
-        self.address
+    pub fn new(jump_target: u32, symbol: ProgramSymbol<'a>) -> Self {
+        Self { jump_target, symbol }
     }
 
-    pub fn prototype(&self) -> &ExternFnPrototype<'a> {
-        &self.prototype
+    pub fn jump_target(&self) -> u32 {
+        self.jump_target
+    }
+
+    pub fn symbol(&self) -> &ProgramSymbol<'a> {
+        &self.symbol
     }
 
     #[cfg(feature = "alloc")]
     pub fn into_owned(self) -> ProgramExport<'static> {
         ProgramExport {
-            address: self.address,
-            prototype: self.prototype.into_owned(),
+            jump_target: self.jump_target,
+            symbol: self.symbol.into_owned(),
         }
     }
 }
 
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub struct ProgramImport<'a> {
-    index: u32,
-    prototype: ExternFnPrototype<'a>,
+    symbol: ProgramSymbol<'a>,
 }
 
 impl<'a> ProgramImport<'a> {
-    pub fn index(&self) -> u32 {
-        self.index
+    pub fn new(symbol: ProgramSymbol<'a>) -> Self {
+        Self { symbol }
     }
 
-    pub fn prototype(&self) -> &ExternFnPrototype<'a> {
-        &self.prototype
+    pub fn symbol(&self) -> &ProgramSymbol<'a> {
+        &self.symbol
     }
 
     #[cfg(feature = "alloc")]
     pub fn into_owned(self) -> ProgramImport<'static> {
         ProgramImport {
-            index: self.index,
-            prototype: self.prototype.into_owned(),
+            symbol: self.symbol.into_owned(),
         }
     }
 }
 
 #[derive(Clone, PartialEq, Eq, Debug)]
-pub struct ExternFnPrototype<'a> {
-    name: CowString<'a>,
-    arg_count: u32,
-    args: [Option<ExternTy>; crate::abi::VM_MAXIMUM_EXTERN_ARG_COUNT],
-    return_ty: Option<ExternTy>,
-}
+pub struct ProgramSymbol<'a>(CowBytes<'a>);
 
-impl<'a> ExternFnPrototype<'a> {
-    pub fn name(&self) -> &str {
-        &self.name
+impl<'a> ProgramSymbol<'a> {
+    pub fn new(bytes: CowBytes<'a>) -> Self {
+        Self(bytes)
     }
 
-    pub fn args(&'_ self) -> impl ExactSizeIterator<Item = ExternTy> + Clone + '_ {
-        #[derive(Clone)]
-        struct ArgIter<'r> {
-            position: usize,
-            length: usize,
-            args: &'r [Option<ExternTy>; crate::abi::VM_MAXIMUM_EXTERN_ARG_COUNT],
-        }
-
-        impl<'r> Iterator for ArgIter<'r> {
-            type Item = ExternTy;
-
-            fn next(&mut self) -> Option<Self::Item> {
-                if self.position >= self.length {
-                    None
-                } else {
-                    let ty = self.args[self.position].unwrap();
-                    self.position += 1;
-                    Some(ty)
-                }
-            }
-
-            fn size_hint(&self) -> (usize, Option<usize>) {
-                let remaining = self.length - self.position;
-                (remaining, Some(remaining))
-            }
-        }
-
-        impl<'r> ExactSizeIterator for ArgIter<'r> {}
-
-        ArgIter {
-            position: 0,
-            length: self.arg_count as usize,
-            args: &self.args,
-        }
-    }
-
-    pub fn return_ty(&self) -> Option<ExternTy> {
-        self.return_ty
+    pub fn into_inner(self) -> CowBytes<'a> {
+        self.0
     }
 
     #[cfg(feature = "alloc")]
-    pub fn into_owned(self) -> ExternFnPrototype<'static> {
-        ExternFnPrototype {
-            name: self.name.into_owned(),
-            arg_count: self.arg_count,
-            args: self.args,
-            return_ty: self.return_ty,
+    pub fn into_owned(self) -> ProgramSymbol<'static> {
+        ProgramSymbol(self.0.into_owned())
+    }
+}
+
+impl<'a> From<&'a [u8]> for ProgramSymbol<'a> {
+    fn from(symbol: &'a [u8]) -> Self {
+        ProgramSymbol(symbol.into())
+    }
+}
+
+impl<'a> From<&'a str> for ProgramSymbol<'a> {
+    fn from(symbol: &'a str) -> Self {
+        ProgramSymbol(symbol.into())
+    }
+}
+
+#[cfg(feature = "alloc")]
+impl<'a> From<alloc::vec::Vec<u8>> for ProgramSymbol<'a> {
+    fn from(symbol: alloc::vec::Vec<u8>) -> Self {
+        ProgramSymbol(symbol.into())
+    }
+}
+
+impl<'a> core::ops::Deref for ProgramSymbol<'a> {
+    type Target = CowBytes<'a>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+impl<'a> core::fmt::Display for ProgramSymbol<'a> {
+    fn fmt(&self, fmt: &mut core::fmt::Formatter) -> core::fmt::Result {
+        if let Ok(ident) = core::str::from_utf8(&self.0) {
+            fmt.write_str("'")?;
+            fmt.write_str(ident)?;
+            fmt.write_str("'")?;
+        } else {
+            fmt.write_str("0x")?;
+            for &byte in self.0.iter() {
+                core::write!(fmt, "{:02x}", byte)?;
+            }
         }
+
+        Ok(())
     }
 }
 
@@ -1576,10 +1551,15 @@ impl<'a> Reader<'a> {
         Err(ProgramParseError::failed_to_read_instruction_arguments(self.position - 1))
     }
 
+    fn read_bytes_with_length(&mut self) -> Result<&'a [u8], ProgramParseError> {
+        let length = self.read_varint()? as usize;
+        self.read_slice(length)
+    }
+
     fn read_string_with_length(&mut self) -> Result<&'a str, ProgramParseError> {
         let offset = self.position;
-        let length = self.read_varint()? as usize;
-        let slice = self.read_slice(length)?;
+        let slice = self.read_bytes_with_length()?;
+
         core::str::from_utf8(slice)
             .ok()
             .ok_or(ProgramParseError(ProgramParseErrorKind::FailedToReadStringNonUtf { offset }))
@@ -1613,41 +1593,6 @@ impl<'a> Reader<'a> {
         }
 
         Ok(())
-    }
-
-    fn read_extern_fn_prototype(&mut self) -> Result<ExternFnPrototype<'a>, ProgramParseError> {
-        let name = self.read_string_with_length()?;
-        let arg_count = self.read_varint()?;
-        if arg_count > crate::abi::VM_MAXIMUM_EXTERN_ARG_COUNT as u32 {
-            return Err(ProgramParseError(ProgramParseErrorKind::Other(
-                "found a function prototype which accepts more than the maximum allowed number of arguments",
-            )));
-        }
-
-        let mut args: [Option<ExternTy>; crate::abi::VM_MAXIMUM_EXTERN_ARG_COUNT] = [None; crate::abi::VM_MAXIMUM_EXTERN_ARG_COUNT];
-        for nth_arg in 0..arg_count {
-            let ty = ExternTy::try_deserialize(self.read_byte()?).ok_or(ProgramParseError(ProgramParseErrorKind::Other(
-                "found a function prototype with an unrecognized argument type",
-            )))?;
-            args[nth_arg as usize] = Some(ty);
-        }
-
-        let return_ty = match self.read_byte()? {
-            0 => None,
-            return_ty => {
-                let ty = ExternTy::try_deserialize(return_ty).ok_or(ProgramParseError(ProgramParseErrorKind::Other(
-                    "found a function prototype with an unrecognized return type",
-                )))?;
-                Some(ty)
-            }
-        };
-
-        Ok(ExternFnPrototype {
-            name: name.into(),
-            arg_count,
-            args,
-            return_ty,
-        })
     }
 }
 
@@ -1842,9 +1787,8 @@ impl<'a> ProgramBlob<'a> {
                     return Ok(None);
                 }
 
-                let index = self.reader.read_varint()?;
-                let prototype = self.reader.read_extern_fn_prototype()?;
-                let import = ProgramImport { index, prototype };
+                let symbol = self.reader.read_bytes_with_length()?;
+                let import = ProgramImport { symbol: symbol.into() };
 
                 self.state = State::Pending(remaining - 1);
                 Ok(Some(import))
@@ -1901,9 +1845,12 @@ impl<'a> ProgramBlob<'a> {
                     return Ok(None);
                 }
 
-                let address = self.reader.read_varint()?;
-                let prototype = self.reader.read_extern_fn_prototype()?;
-                let export = ProgramExport { address, prototype };
+                let jump_target = self.reader.read_varint()?;
+                let symbol = self.reader.read_bytes_with_length()?;
+                let export = ProgramExport {
+                    jump_target,
+                    symbol: symbol.into(),
+                };
 
                 self.state = State::Pending(remaining - 1);
                 Ok(Some(export))
