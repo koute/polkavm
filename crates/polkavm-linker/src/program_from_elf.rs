@@ -4338,31 +4338,27 @@ fn replace_immediates_with_registers(
         let mut reg_to_imm: [Option<u32>; Reg::ALL.len()] = [None; Reg::ALL.len()];
         imm_to_reg.clear();
 
-        for (_, op) in &mut all_blocks[block_target.index()].ops {
-            for reg in op.dst_mask(imports) {
-                if let Some(imm) = reg_to_imm[reg as usize].take() {
-                    imm_to_reg.get_mut(&imm).unwrap().remove(reg);
-                }
-            }
-
-            // If there already exists a register which contains a given immediate value
-            // then there's no point in duplicating it here again; just use that register.
-            macro_rules! replace {
-                ($src:ident) => {
-                    if let RegImm::Imm(imm) = $src {
-                        if *imm != 0 {
-                            let mask = imm_to_reg.get(imm).copied().unwrap_or(RegMask::empty());
-                            if let Some(reg) = mask.into_iter().next() {
-                                *$src = RegImm::Reg(reg);
-                            }
+        // If there already exists a register which contains a given immediate value
+        // then there's no point in duplicating it here again; just use that register.
+        macro_rules! replace {
+            ($src:ident) => {
+                if let RegImm::Imm(imm) = $src {
+                    if *imm != 0 {
+                        let mask = imm_to_reg.get(imm).copied().unwrap_or(RegMask::empty());
+                        if let Some(reg) = mask.into_iter().next() {
+                            *$src = RegImm::Reg(reg);
                         }
                     }
-                };
-            }
+                }
+            };
+        }
 
+        for (_, op) in &mut all_blocks[block_target.index()].ops {
             match op {
                 BasicInst::LoadImmediate { dst, imm } => {
                     imm_to_reg.entry(*imm as u32).or_insert(RegMask::empty()).insert(*dst);
+                    reg_to_imm[*dst as usize] = Some(*imm as u32);
+                    continue;
                 }
                 BasicInst::AnyAny {
                     ref mut src1,
@@ -4381,15 +4377,21 @@ fn replace_immediates_with_registers(
                 _ => {}
             }
 
-            if let ControlInst::Branch {
-                ref mut src1,
-                ref mut src2,
-                ..
-            } = all_blocks[block_target.index()].next.instruction
-            {
-                replace!(src1);
-                replace!(src2);
+            for reg in op.dst_mask(imports) {
+                if let Some(imm) = reg_to_imm[reg as usize].take() {
+                    imm_to_reg.get_mut(&imm).unwrap().remove(reg);
+                }
             }
+        }
+
+        if let ControlInst::Branch {
+            ref mut src1,
+            ref mut src2,
+            ..
+        } = all_blocks[block_target.index()].next.instruction
+        {
+            replace!(src1);
+            replace!(src2);
         }
     }
 }
