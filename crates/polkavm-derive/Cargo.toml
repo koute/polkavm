@@ -9,12 +9,8 @@ repository.workspace = true
 documentation = "https://docs.rs/polkavm-derive"
 description = "The derive crate for PolkaVM guest programs"
 
-[lib]
-proc-macro = true
-
 [dependencies]
-polkavm-derive-impl = { workspace = true }
-syn = { workspace = true, features = ["full"] }
+polkavm-derive-impl-macro = { workspace = true }
 
 [lints]
 workspace = true

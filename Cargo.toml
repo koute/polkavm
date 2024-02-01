@@ -3,6 +3,7 @@ resolver = "2"
 members = [
     "crates/polkavm-derive",
     "crates/polkavm-derive-impl",
+    "crates/polkavm-derive-impl-macro",
     "crates/polkavm-linker",
     "crates/polkavm-assembler",
     "crates/polkavm-common",
@@ -28,13 +29,14 @@ rust-version = "1.70.0"
 repository = "https://github.com/koute/polkavm"
 
 [workspace.dependencies]
-polkavm                 = { version = "0.8.0", path = "crates/polkavm" }
-polkavm-assembler       = { version = "0.8.0", path = "crates/polkavm-assembler" }
-polkavm-common          = { version = "0.8.0", path = "crates/polkavm-common" }
-polkavm-derive          = { version = "0.8.0", path = "crates/polkavm-derive" }
-polkavm-derive-impl     = { version = "0.8.0", path = "crates/polkavm-derive-impl" }
-polkavm-linker          = { version = "0.8.0", path = "crates/polkavm-linker" }
-polkavm-linux-raw       = { version = "0.8.0", path = "crates/polkavm-linux-raw" }
+polkavm                   = { version = "0.8.0", path = "crates/polkavm" }
+polkavm-assembler         = { version = "0.8.0", path = "crates/polkavm-assembler" }
+polkavm-common            = { version = "0.8.0", path = "crates/polkavm-common" }
+polkavm-derive            = { version = "0.8.0", path = "crates/polkavm-derive" }
+polkavm-derive-impl       = { version = "0.8.0", path = "crates/polkavm-derive-impl" }
+polkavm-derive-impl-macro = { version = "0.8.0", path = "crates/polkavm-derive-impl-macro" }
+polkavm-linker            = { version = "0.8.0", path = "crates/polkavm-linker" }
+polkavm-linux-raw         = { version = "0.8.0", path = "crates/polkavm-linux-raw" }
 
 clap = "4.4.6"
 env_logger = { version = "0.10.0", default-features = false }
