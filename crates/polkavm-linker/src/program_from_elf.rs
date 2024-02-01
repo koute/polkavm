@@ -4361,12 +4361,18 @@ fn replace_immediates_with_registers(
                     continue;
                 }
                 BasicInst::AnyAny {
+                    kind,
                     ref mut src1,
                     ref mut src2,
                     ..
                 } => {
                     replace!(src1);
-                    replace!(src2);
+                    if !matches!(
+                        kind,
+                        AnyAnyKind::ShiftLogicalLeft | AnyAnyKind::ShiftLogicalRight | AnyAnyKind::ShiftArithmeticRight
+                    ) {
+                        replace!(src2);
+                    }
                 }
                 BasicInst::StoreAbsolute { src, .. } => {
                     replace!(src);
