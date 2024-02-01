@@ -2248,21 +2248,21 @@ pub(crate) fn load_dwarf(
 ) -> Result<DwarfInfo, ProgramFromElfError> {
     log::trace!("Loading DWARF...");
 
-    let Some(debug_info) = elf.section_by_name(".debug_info") else {
+    let Some(debug_info) = elf.section_by_name(".debug_info").next() else {
         return Ok(Default::default());
     };
 
     let sections = Sections {
         debug_info,
-        debug_addr: elf.section_by_name(".debug_addr"),
-        debug_ranges: elf.section_by_name(".debug_ranges"),
-        debug_rnglists: elf.section_by_name(".debug_rnglists"),
-        debug_line: elf.section_by_name(".debug_line"),
+        debug_addr: elf.section_by_name(".debug_addr").next(),
+        debug_ranges: elf.section_by_name(".debug_ranges").next(),
+        debug_rnglists: elf.section_by_name(".debug_rnglists").next(),
+        debug_line: elf.section_by_name(".debug_line").next(),
     };
 
     let mut load_section = |id: gimli::SectionId| -> Result<_, ProgramFromElfError> {
         let name = id.name();
-        let data = match elf.section_by_name(name) {
+        let data = match elf.section_by_name(name).next() {
             Some(section) => section.data().to_owned(),
             None => Vec::with_capacity(1),
         };

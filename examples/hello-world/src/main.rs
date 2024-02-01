@@ -1,4 +1,4 @@
-use polkavm::{Config, Engine, Linker, Module, ProgramBlob, Val};
+use polkavm::{Config, Engine, Linker, Module, ProgramBlob};
 
 fn main() {
     env_logger::init();
@@ -28,6 +28,7 @@ fn main() {
 
     println!("Calling into the guest program (through untyped function):");
     let fn_untyped = instance.get_func("add_numbers").unwrap();
-    let result = fn_untyped.call(&mut (), &[Val::I32(1), Val::I32(10)]).unwrap();
-    println!("  1 + 10 + 100 = {}", result.unwrap());
+    let mut return_value = [0];
+    fn_untyped.call(&mut (), &[1, 10], &mut return_value).unwrap();
+    println!("  1 + 10 + 100 = {}", return_value[0]);
 }

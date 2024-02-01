@@ -1,7 +1,7 @@
 use core::mem::MaybeUninit;
 
 #[cfg(feature = "alloc")]
-use alloc::{borrow::Cow, string::String, vec::Vec};
+use alloc::{borrow::Cow, vec::Vec};
 
 use crate::program::Reg;
 
@@ -40,6 +40,12 @@ impl<'a> From<&'a [u8]> for CowBytes<'a> {
     }
 }
 
+impl<'a> From<&'a str> for CowBytes<'a> {
+    fn from(slice: &'a str) -> Self {
+        CowBytes(slice.as_bytes().into())
+    }
+}
+
 #[cfg(feature = "alloc")]
 impl<'a> From<Vec<u8>> for CowBytes<'a> {
     fn from(vec: Vec<u8>) -> Self {
@@ -51,61 +57,6 @@ impl<'a> From<Vec<u8>> for CowBytes<'a> {
 impl<'a> From<Cow<'a, [u8]>> for CowBytes<'a> {
     fn from(cow: Cow<'a, [u8]>) -> Self {
         CowBytes(cow)
-    }
-}
-
-/// A replacement for `alloc::borrow::Cow<str>` which also works in pure no_std.
-#[derive(Clone, PartialEq, Eq, Debug, Default)]
-#[repr(transparent)]
-pub struct CowString<'a>(CowStringImpl<'a>);
-
-#[cfg(feature = "alloc")]
-type CowStringImpl<'a> = Cow<'a, str>;
-
-#[cfg(not(feature = "alloc"))]
-type CowStringImpl<'a> = &'a str;
-
-impl<'a> CowString<'a> {
-    #[cfg(feature = "alloc")]
-    pub fn into_owned(self) -> CowString<'static> {
-        match self.0 {
-            Cow::Borrowed(string) => CowString(Cow::Owned(string.into())),
-            Cow::Owned(string) => CowString(Cow::Owned(string)),
-        }
-    }
-}
-
-impl<'a> core::ops::Deref for CowString<'a> {
-    type Target = str;
-
-    fn deref(&self) -> &Self::Target {
-        &self.0
-    }
-}
-
-impl<'a> From<&'a str> for CowString<'a> {
-    fn from(slice: &'a str) -> Self {
-        CowString(slice.into())
-    }
-}
-
-#[cfg(feature = "alloc")]
-impl<'a> From<String> for CowString<'a> {
-    fn from(string: String) -> Self {
-        CowString(string.into())
-    }
-}
-
-#[cfg(feature = "alloc")]
-impl<'a> From<Cow<'a, str>> for CowString<'a> {
-    fn from(cow: Cow<'a, str>) -> Self {
-        CowString(cow)
-    }
-}
-
-impl<'a> core::fmt::Display for CowString<'a> {
-    fn fmt(&self, fmt: &mut core::fmt::Formatter) -> core::fmt::Result {
-        fmt.write_str(self)
     }
 }
 

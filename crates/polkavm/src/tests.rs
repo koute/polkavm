@@ -1,6 +1,6 @@
 use crate::{
     Caller, CallerRef, Config, Engine, ExecutionConfig, ExecutionError, Gas, GasMeteringKind, Linker, Module, ModuleConfig, ProgramBlob,
-    Reg, Trap, Val,
+    Reg, Trap,
 };
 use core::cell::RefCell;
 use std::collections::HashMap;
@@ -8,10 +8,9 @@ use std::rc::Rc;
 use std::sync::Mutex;
 
 use polkavm_common::abi::{VM_ADDR_USER_MEMORY, VM_PAGE_SIZE};
-use polkavm_common::elf::FnMetadata;
 use polkavm_common::program::asm;
-use polkavm_common::program::ExternTy::*;
 use polkavm_common::program::Reg::*;
+use polkavm_common::program::{ProgramExport, ProgramImport};
 use polkavm_common::writer::ProgramBlobBuilder;
 
 macro_rules! run_tests {
@@ -91,8 +90,8 @@ macro_rules! run_tests {
 fn basic_test_blob() -> ProgramBlob<'static> {
     let mut builder = ProgramBlobBuilder::new();
     builder.set_bss_size(VM_PAGE_SIZE);
-    builder.add_export(0, &FnMetadata::new("main", &[I32, I32], Some(I32)));
-    builder.add_import(0, &FnMetadata::new("hostcall", &[], Some(I32)));
+    builder.add_export(ProgramExport::new(0, "main".into()));
+    builder.add_import(ProgramImport::new("hostcall".into()));
     builder.set_code(&[
         asm::store_imm_u32(0x12345678, VM_ADDR_USER_MEMORY),
         asm::add(S0, A0, A1),
@@ -226,17 +225,42 @@ fn trapping_from_hostcall_handler_works(config: Config) {
         .call(&mut Kind::Trap, (1, 10));
     assert!(matches!(result, Err(ExecutionError::Trap(..))));
 
-    let result = instance
-        .get_func("main")
-        .unwrap()
-        .call(&mut Kind::Ok, &[Val::from(1), Val::from(10)]);
-    assert!(matches!(result, Ok(Some(Val::I32(111)))));
+    let mut return_value = [0];
+    let result = instance.get_func("main").unwrap().call(&mut Kind::Ok, &[1, 10], &mut return_value);
+    assert!(matches!(result, Ok(())));
+    assert_eq!(return_value, [111]);
 
+    return_value = [999];
     let result = instance
         .get_func("main")
         .unwrap()
-        .call(&mut Kind::Trap, &[Val::from(1), Val::from(10)]);
+        .call(&mut Kind::Trap, &[1, 10], &mut return_value);
     assert!(matches!(result, Err(ExecutionError::Trap(..))));
+    assert_eq!(return_value, [999]); // Is unchanged.
+}
+
+fn fallback_hostcall_handler_works(config: Config) {
+    let _ = env_logger::try_init();
+    let blob = basic_test_blob();
+    let engine = Engine::new(&config).unwrap();
+    let module = Module::from_blob(&engine, &Default::default(), &blob).unwrap();
+    let mut linker = Linker::new(&engine);
+
+    linker.func_fallback(move |mut caller: Caller<()>, symbol: &[u8]| -> Result<(), Trap> {
+        assert_eq!(symbol, b"hostcall");
+        caller.set_reg(Reg::A0, 100);
+        Ok(())
+    });
+
+    let instance_pre = linker.instantiate_pre(&module).unwrap();
+    let instance = instance_pre.instantiate().unwrap();
+    let result = instance
+        .get_typed_func::<(u32, u32), u32>("main")
+        .unwrap()
+        .call(&mut (), (1, 10))
+        .unwrap();
+
+    assert_eq!(result, 111);
 }
 
 fn decompress_zstd(mut bytes: &[u8]) -> Vec<u8> {
@@ -462,6 +486,24 @@ impl TestInstance {
             })
             .unwrap();
 
+        linker
+            .func_wrap("identity", |_caller: Caller<()>, value: u32| -> u32 { value })
+            .unwrap();
+
+        linker
+            .func_new("multiply_all_input_registers", |mut caller: Caller<()>| -> Result<(), Trap> {
+                let mut value = 1;
+
+                use Reg as R;
+                for reg in [R::A0, R::A1, R::A2, R::A3, R::A4, R::A5, R::T0, R::T1, R::T2] {
+                    value *= caller.get_reg(reg);
+                }
+
+                caller.set_reg(Reg::A0, value);
+                Ok(())
+            })
+            .unwrap();
+
         let instance_pre = linker.instantiate_pre(&module).unwrap();
         let instance = instance_pre.instantiate().unwrap();
 
@@ -543,11 +585,21 @@ fn test_blob_hostcall(config: Config) {
     assert_eq!(i.call::<(u32,), u32>("test_multiply_by_6", (10,)).unwrap(), 60);
 }
 
+fn test_blob_define_abi(config: Config) {
+    let i = TestInstance::new(&config);
+    assert!(i.call::<(), ()>("test_define_abi", ()).is_ok());
+}
+
+fn test_blob_input_registers(config: Config) {
+    let i = TestInstance::new(&config);
+    assert!(i.call::<(), ()>("test_input_registers", ()).is_ok());
+}
+
 fn basic_gas_metering(config: Config, gas_metering_kind: GasMeteringKind) {
     let _ = env_logger::try_init();
 
     let mut builder = ProgramBlobBuilder::new();
-    builder.add_export(0, &FnMetadata::new("main", &[], Some(I32)));
+    builder.add_export(ProgramExport::new(0, "main".into()));
     builder.set_code(&[asm::add_imm(A0, A0, 666), asm::ret()]);
 
     let blob = ProgramBlob::parse(builder.into_vec()).unwrap();
@@ -618,8 +670,8 @@ fn consume_gas_in_host_function(config: Config, gas_metering_kind: GasMeteringKi
     let _ = env_logger::try_init();
 
     let mut builder = ProgramBlobBuilder::new();
-    builder.add_export(0, &FnMetadata::new("main", &[], Some(I32)));
-    builder.add_import(0, &FnMetadata::new("hostfn", &[], Some(I32)));
+    builder.add_export(ProgramExport::new(0, "main".into()));
+    builder.add_import(ProgramImport::new("hostfn".into()));
     builder.set_code(&[asm::ecalli(0), asm::ret()]);
 
     let blob = ProgramBlob::parse(builder.into_vec()).unwrap();
@@ -680,8 +732,8 @@ fn gas_metering_with_more_than_one_basic_block(config: Config) {
     let _ = env_logger::try_init();
 
     let mut builder = ProgramBlobBuilder::new();
-    builder.add_export(0, &FnMetadata::new("export_1", &[], Some(I32)));
-    builder.add_export(1, &FnMetadata::new("export_2", &[], Some(I32)));
+    builder.add_export(ProgramExport::new(0, "export_1".into()));
+    builder.add_export(ProgramExport::new(1, "export_2".into()));
     builder.set_code(&[
         asm::add_imm(A0, A0, 666),
         asm::ret(),
@@ -723,6 +775,7 @@ run_tests! {
     caller_and_caller_ref_work
     caller_split_works
     trapping_from_hostcall_handler_works
+    fallback_hostcall_handler_works
     doom_o3_dwarf5
     doom_o1_dwarf5
     doom_o3_dwarf2
@@ -733,6 +786,8 @@ run_tests! {
     test_blob_atomic_fetch_swap
     test_blob_atomic_fetch_minmax
     test_blob_hostcall
+    test_blob_define_abi
+    test_blob_input_registers
 
     basic_gas_metering_sync
     basic_gas_metering_async

@@ -141,3 +141,43 @@ mod b {
 extern "C" fn test_multiply_by_6(value: u32) -> u32 {
     unsafe { a::multiply_by_2(value * 3) }
 }
+
+#[polkavm_derive::polkavm_define_abi(allow_extra_input_registers)]
+mod test_abi {}
+
+impl test_abi::FromHost for f32 {
+    type Regs = (u32,);
+    fn from_host((a0,): Self::Regs) -> Self {
+        f32::from_bits(a0)
+    }
+}
+
+impl test_abi::IntoHost for f32 {
+    type Regs = (u32,);
+    type Destructor = ();
+    fn into_host(value: f32) -> (Self::Regs, Self::Destructor) {
+        ((value.to_bits(),), ())
+    }
+}
+
+#[polkavm_derive::polkavm_import(abi = self::test_abi)]
+extern "C" {
+    #[polkavm_import(symbol = "identity")]
+    fn identity_f32(value: f32) -> f32;
+
+    #[allow(clippy::too_many_arguments)]
+    fn multiply_all_input_registers(a0: u32, a1: u32, a2: u32, a3: u32, a4: u32, a5: u32, t0: u32, t1: u32, t2: u32) -> u32;
+}
+
+#[polkavm_derive::polkavm_export]
+fn test_define_abi() {
+    assert_eq!(unsafe { identity_f32(1.23) }, 1.23);
+}
+
+#[polkavm_derive::polkavm_export]
+fn test_input_registers() {
+    assert_eq!(
+        unsafe { multiply_all_input_registers(2, 3, 5, 7, 11, 13, 17, 19, 23) },
+        2 * 3 * 5 * 7 * 11 * 13 * 17 * 19 * 23
+    );
+}

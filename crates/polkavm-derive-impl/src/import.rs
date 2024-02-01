@@ -1,96 +1,139 @@
-use core::fmt::Write;
 use polkavm_common::elf::INSTRUCTION_ECALLI;
 use quote::quote;
 use syn::spanned::Spanned;
 use syn::Token;
 
-use crate::common::{bytes_to_asm, create_fn_prototype, is_cfg, is_doc, is_path_eq, is_rustfmt, Bitness};
+use crate::common::{is_cfg, is_doc, is_path_eq, is_rustfmt};
 
 mod kw {
-    syn::custom_keyword!(index);
+    syn::custom_keyword!(symbol);
+    syn::custom_keyword!(abi);
+}
+
+fn ident_from_pattern_strict(syn::PatType { attrs, pat, .. }: &syn::PatType) -> Result<Option<syn::Ident>, syn::Error> {
+    unsupported_if_some!(attrs.first());
+    match &**pat {
+        syn::Pat::Ident(pat) => {
+            unsupported_if_some!(pat.attrs.first());
+            unsupported_if_some!(pat.by_ref);
+            unsupported_if_some!(pat.mutability);
+            if let Some((_, ref subpat)) = pat.subpat {
+                unsupported!(subpat);
+            }
+
+            Ok(Some(pat.ident.clone()))
+        }
+        syn::Pat::Wild(..) => Ok(None),
+        _ => unsupported!(pat),
+    }
+}
+
+#[derive(Default)]
+pub struct ImportBlockAttributes {
+    abi: Option<syn::Path>,
+}
+
+impl ImportBlockAttributes {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn set_abi(&mut self, abi: Option<syn::Path>) {
+        self.abi = abi;
+    }
+}
+
+impl syn::parse::Parse for ImportBlockAttributes {
+    fn parse(input: syn::parse::ParseStream) -> syn::parse::Result<Self> {
+        let mut attributes = ImportBlockAttributes::new();
+
+        if input.is_empty() {
+            return Ok(attributes);
+        }
+
+        enum ImportBlockAttribute {
+            Abi(syn::Path),
+        }
+
+        let list = input.parse_terminated(
+            |input| {
+                let lookahead = input.lookahead1();
+                if lookahead.peek(kw::abi) {
+                    input.parse::<kw::abi>()?;
+                    let _: Token![=] = input.parse()?;
+                    let path: syn::Path = input.parse()?;
+                    Ok(ImportBlockAttribute::Abi(path))
+                } else {
+                    Err(lookahead.error())
+                }
+            },
+            syn::Token![,],
+        )?;
+
+        for attribute in list {
+            match attribute {
+                ImportBlockAttribute::Abi(path) => {
+                    if attributes.abi.is_some() {
+                        return Err(syn::Error::new(path.span(), "duplicate 'abi' attribute"));
+                    }
+                    attributes.abi = Some(path);
+                }
+            }
+        }
+
+        Ok(attributes)
+    }
 }
 
 enum ImportAttribute {
-    Index(u32),
+    Symbol(syn::LitByteStr),
 }
 
 impl syn::parse::Parse for ImportAttribute {
     fn parse(input: syn::parse::ParseStream) -> syn::parse::Result<Self> {
         let lookahead = input.lookahead1();
-        if lookahead.peek(kw::index) {
-            input.parse::<kw::index>()?;
+        if lookahead.peek(kw::symbol) {
+            input.parse::<kw::symbol>()?;
             let _: Token![=] = input.parse()?;
-            let value: syn::LitInt = input.parse()?;
-            let value = value.base10_parse::<u32>().map_err(|err| syn::Error::new(value.span(), err))?;
-            Ok(ImportAttribute::Index(value))
+            let lookahead = input.lookahead1();
+            if lookahead.peek(syn::LitInt) {
+                let lit: syn::LitInt = input.parse()?;
+                let value = match lit.suffix() {
+                    "u32" => {
+                        let value = lit.base10_parse::<u32>().map_err(|err| syn::Error::new(lit.span(), err))?;
+                        value.to_le_bytes().to_vec()
+                    }
+                    "u16" => {
+                        let value = lit.base10_parse::<u16>().map_err(|err| syn::Error::new(lit.span(), err))?;
+                        value.to_le_bytes().to_vec()
+                    }
+                    "u8" => {
+                        let value = lit.base10_parse::<u8>().map_err(|err| syn::Error::new(lit.span(), err))?;
+                        value.to_le_bytes().to_vec()
+                    }
+                    _ => {
+                        return Err(syn::Error::new(
+                            lit.span(),
+                            "invalid or missing suffix; one of the following suffixes is required: 'u32', 'u16' or 'u8'",
+                        ));
+                    }
+                };
+                let value = syn::LitByteStr::new(&value, lit.span());
+                Ok(ImportAttribute::Symbol(value))
+            } else if lookahead.peek(syn::LitByteStr) {
+                let value: syn::LitByteStr = input.parse()?;
+                Ok(ImportAttribute::Symbol(value))
+            } else if lookahead.peek(syn::LitStr) {
+                let value: syn::LitStr = input.parse()?;
+                let value = syn::LitByteStr::new(value.value().as_bytes(), value.span());
+                Ok(ImportAttribute::Symbol(value))
+            } else {
+                Err(lookahead.error())
+            }
         } else {
             Err(lookahead.error())
         }
     }
-}
-
-fn generate_import_assembly(index: Option<u32>, sig: &syn::Signature, bitness: Bitness) -> Result<proc_macro2::TokenStream, syn::Error> {
-    let prototype = create_fn_prototype(sig, bitness)?;
-    let mut metadata_bytes = Vec::new();
-    prototype.serialize(|slice| metadata_bytes.extend_from_slice(slice));
-
-    let mut assembly = String::new();
-    macro_rules! gen_asm {
-        ($(
-            ($($tok:tt)+)
-        )+) => {
-            $(
-                writeln!(&mut assembly, $($tok)+).unwrap();
-            )+
-        }
-    }
-
-    // A hack to generate a unique ID.
-    let mut unique = String::new();
-    for b in format!("{:?}", sig.ident.span()).bytes() {
-        write!(&mut unique, "{:02x}", b).unwrap();
-    }
-
-    let import_symbol = syn::Ident::new(&format!("__polkavm_import_{}_{}", sig.ident, unique), sig.ident.span());
-    let name = &sig.ident;
-    gen_asm! {
-        (".pushsection .polkavm_imports.{},\"a\",@progbits", name)
-        (".globl {}", import_symbol)
-        (".hidden {}", import_symbol)
-        ("{}:", import_symbol)
-        (".byte 1") // Version.
-    }
-
-    if let Some(index) = index {
-        gen_asm! {
-            (".byte 1")
-            (".4byte 0x{:08x}", index)
-        }
-    } else {
-        gen_asm! {
-            (".byte 0")
-        }
-    }
-
-    assembly.push_str(&bytes_to_asm(&metadata_bytes));
-
-    let unique_name = format!("{name}_{unique}");
-    gen_asm! {
-        (".popsection")
-        (".pushsection .text.{},\"ax\",@progbits", name)
-        (".weak {}", name)
-        (".set {}, {}", name, unique_name)
-        (".balign 4")
-        (".type {},@function", name)
-        ("{}:", unique_name)
-        (".4byte 0x{:08x}", INSTRUCTION_ECALLI)
-        (".4byte {}", import_symbol)
-        ("ret")
-        (".size {}, . - {}", unique_name, unique_name)
-        (".popsection")
-    }
-
-    Ok(quote! { ::core::arch::global_asm!(#assembly); })
 }
 
 fn parse_import_attributes(attr: &syn::Attribute) -> Result<Option<Vec<ImportAttribute>>, syn::Error> {
@@ -107,7 +150,7 @@ fn parse_import_attributes(attr: &syn::Attribute) -> Result<Option<Vec<ImportAtt
     Ok(Some(parsed_attrs.into_iter().collect()))
 }
 
-pub fn polkavm_import(input: syn::ItemForeignMod) -> Result<proc_macro2::TokenStream, syn::Error> {
+pub fn polkavm_import(attributes: ImportBlockAttributes, input: syn::ItemForeignMod) -> Result<proc_macro2::TokenStream, syn::Error> {
     let mut outer_cfg_attributes = Vec::new();
     for attr in input.attrs {
         if is_cfg(&attr) {
@@ -123,13 +166,14 @@ pub fn polkavm_import(input: syn::ItemForeignMod) -> Result<proc_macro2::TokenSt
         }
     }
 
-    let mut output = Vec::new();
+    let mut passthrough_tokens = Vec::new();
+    let mut tokens = Vec::new();
     for item in input.items {
         match item {
             syn::ForeignItem::Fn(syn::ForeignItemFn { attrs, sig, vis, .. }) => {
                 let mut inner_cfg_attributes = Vec::new();
                 let mut inner_doc_attributes = Vec::new();
-                let mut import_index = None;
+                let mut symbol = None;
                 for attr in attrs {
                     if is_rustfmt(&attr) {
                         continue;
@@ -148,8 +192,8 @@ pub fn polkavm_import(input: syn::ItemForeignMod) -> Result<proc_macro2::TokenSt
                     if let Some(attributes) = parse_import_attributes(&attr)? {
                         for attribute in attributes {
                             match attribute {
-                                ImportAttribute::Index(index) => {
-                                    import_index = Some(index);
+                                ImportAttribute::Symbol(bytes) => {
+                                    symbol = Some(bytes);
                                 }
                             }
                         }
@@ -170,29 +214,116 @@ pub fn polkavm_import(input: syn::ItemForeignMod) -> Result<proc_macro2::TokenSt
                 unsupported_if_some!(sig.generics.where_clause);
                 unsupported_if_some!(sig.variadic);
 
-                let assembly_b32 = generate_import_assembly(import_index, &sig, Bitness::B32)?;
-                let assembly_b64 = generate_import_assembly(import_index, &sig, Bitness::B64)?;
-
                 let ident = &sig.ident;
                 let args = &sig.inputs;
-                let return_ty = &sig.output;
+                let output = &sig.output;
+                let return_ty = match output {
+                    syn::ReturnType::Default => syn::Type::Tuple(syn::TypeTuple {
+                        paren_token: Default::default(),
+                        elems: Default::default(),
+                    }),
+                    syn::ReturnType::Type(_, ty) => (**ty).clone(),
+                };
 
-                output.push(quote! {
+                let symbol = symbol.unwrap_or_else(|| syn::LitByteStr::new(ident.to_string().as_bytes(), ident.span()));
+                let abi_path = attributes.abi.clone().unwrap_or_else(crate::common::default_abi_path);
+
+                let mut args_into_host = Vec::new();
+                let mut args_join = Vec::new();
+                let mut args_joined_regs_ty = quote! { () };
+                for arg in args {
+                    let syn::FnArg::Typed(arg) = arg else {
+                        unsupported!(arg);
+                    };
+
+                    unsupported_if_some!(arg.attrs.first());
+                    let Some(arg_ident) = ident_from_pattern_strict(arg)? else {
+                        unsupported!(arg.ty);
+                    };
+
+                    args_into_host.push(quote! {
+                        let (#arg_ident, _destructor) = #abi_path::IntoHost::into_host(#arg_ident);
+                    });
+
+                    let arg_ident = crate::common::expr_from_ident(arg_ident);
+                    let arg_ty = &arg.ty;
+
+                    args_join.push(quote! {
+                        let regs = #abi_path::private::JoinTuple::join_tuple((regs, #arg_ident));
+                    });
+
+                    args_joined_regs_ty = quote! {
+                        <(#args_joined_regs_ty, <#arg_ty as #abi_path::IntoHost>::Regs) as #abi_path::private::JoinTuple>::Out
+                    };
+                }
+
+                let asm_ecalli = format!(".4byte 0x{:08x}\n", INSTRUCTION_ECALLI);
+                let asm_ecalli = syn::LitStr::new(&asm_ecalli, ident.span());
+
+                passthrough_tokens.push(quote! {
+                    #(#inner_doc_attributes)*
+                    #(#inner_cfg_attributes)*
+                    #vis fn #ident(#args) #output;
+                });
+
+                let assert_message = syn::LitStr::new(
+                    &format!("too many registers required by the arguments to the imported function '{ident}'"),
+                    ident.span(),
+                );
+
+                tokens.push(quote! {
                     #(#outer_cfg_attributes)*
                     #(#inner_cfg_attributes)*
-                    #[cfg(target_arch = "riscv32")]
-                    #assembly_b32
+                    #[cfg(all(any(target_arch = "riscv32", target_arch = "riscv64"), target_feature = "e"))]
+                    #[link_section = ".text.polkavm_import"]
+                    #vis unsafe fn #ident(#args) #output {
+                        const _: () = {
+                            assert!(<#args_joined_regs_ty as #abi_path::private::CountTuple>::COUNT <= #abi_path::private::MAXIMUM_INPUT_REGS, #assert_message);
+                        };
 
-                    #(#outer_cfg_attributes)*
-                    #(#inner_cfg_attributes)*
-                    #[cfg(target_arch = "riscv64")]
-                    #assembly_b64
+                        #(#args_into_host)*
+                        let regs = ();
+                        #(#args_join)*
 
-                    #(#outer_cfg_attributes)*
-                    extern "C" {
-                        #(#inner_doc_attributes)*
-                        #(#inner_cfg_attributes)*
-                        #vis fn #ident(#args) #return_ty;
+                        #[link_section = ".polkavm_metadata"]
+                        static METADATA_SYMBOL: &[u8] = #symbol;
+
+                        #[link_section = ".polkavm_metadata"]
+                        static METADATA: #abi_path::private::ExternMetadata = #abi_path::private::ExternMetadata {
+                            version: 1,
+                            flags: 0,
+                            symbol_length: METADATA_SYMBOL.len() as u32,
+                            symbol: #abi_path::private::MetadataPointer(METADATA_SYMBOL.as_ptr()),
+                            input_regs: <#args_joined_regs_ty as #abi_path::private::CountTuple>::COUNT,
+                            output_regs: <<#return_ty as #abi_path::FromHost>::Regs as #abi_path::private::CountTuple>::COUNT,
+                        };
+
+                        struct Sym;
+
+                        #[cfg(target_arch = "riscv32")]
+                        impl #abi_path::private::ImportSymbol for Sym {
+                            extern fn trampoline(a0: u32, a1: u32, a2: u32, a3: u32, a4: u32, a5: u32) {
+                                unsafe {
+                                    core::arch::asm!(
+                                        #asm_ecalli,
+                                        ".4byte {metadata}\n",
+                                        "ret\n",
+                                        in("a0") a0,
+                                        in("a1") a1,
+                                        in("a2") a2,
+                                        in("a3") a3,
+                                        in("a4") a4,
+                                        in("a5") a5,
+                                        options(noreturn),
+                                        metadata = sym METADATA,
+                                    );
+                                }
+                            }
+                        }
+
+                        let result = #abi_path::private::CallImport::call_import::<Sym>(regs);
+                        let result = #abi_path::private::IntoTuple::into_tuple(result.0, result.1);
+                        #abi_path::FromHost::from_host(result)
                     }
                 });
             }
@@ -200,7 +331,15 @@ pub fn polkavm_import(input: syn::ItemForeignMod) -> Result<proc_macro2::TokenSt
         }
     }
 
+    tokens.push(quote! {
+        #[cfg(not(all(any(target_arch = "riscv32", target_arch = "riscv64"), target_feature = "e")))]
+        #(#outer_cfg_attributes)*
+        extern "C" {
+            #(#passthrough_tokens)*
+        }
+    });
+
     Ok(quote! {
-        #(#output)*
+        #(#tokens)*
     })
 }

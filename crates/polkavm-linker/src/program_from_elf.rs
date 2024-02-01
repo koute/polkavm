@@ -1,6 +1,6 @@
 use polkavm_common::abi::{GuestMemoryConfig, VM_ADDR_USER_MEMORY, VM_CODE_ADDRESS_ALIGNMENT, VM_MAX_PAGE_SIZE, VM_PAGE_SIZE};
-use polkavm_common::elf::{FnMetadata, ImportMetadata, INSTRUCTION_ECALLI};
-use polkavm_common::program::{self, FrameKind, Instruction, LineProgramOp, ProgramBlob};
+use polkavm_common::elf::INSTRUCTION_ECALLI;
+use polkavm_common::program::{self, FrameKind, Instruction, LineProgramOp, ProgramBlob, ProgramSymbol};
 use polkavm_common::utils::align_to_next_page_u64;
 use polkavm_common::varint;
 use polkavm_common::writer::{ProgramBlobBuilder, Writer};
@@ -100,8 +100,12 @@ impl Reg {
     };
 
     const FAKE: [Reg; 3] = { [Reg::E0, Reg::E1, Reg::E2] };
-    const ARG_REGS: [Reg; 6] = [Reg::A0, Reg::A1, Reg::A2, Reg::A3, Reg::A4, Reg::A5];
+    const INPUT_REGS: [Reg; 9] = [Reg::A0, Reg::A1, Reg::A2, Reg::A3, Reg::A4, Reg::A5, Reg::T0, Reg::T1, Reg::T2];
+    const OUTPUT_REGS: [Reg; 2] = [Reg::A0, Reg::A1];
 }
+
+polkavm_common::static_assert!(Reg::INPUT_REGS.len() == polkavm_common::program::Reg::MAXIMUM_INPUT_REGS);
+polkavm_common::static_assert!(Reg::OUTPUT_REGS.len() == polkavm_common::program::Reg::MAXIMUM_OUTPUT_REGS);
 
 #[derive(Debug)]
 pub enum ProgramFromElfErrorKind {
@@ -538,7 +542,7 @@ enum BasicInst<T> {
         cond: Reg,
     },
     Ecalli {
-        syscall: u32,
+        nth_import: usize,
     },
     Nop,
 }
@@ -576,11 +580,7 @@ impl<T> BasicInst<T> {
             BasicInst::RegReg { src1, src2, .. } => RegMask::from(src1) | RegMask::from(src2),
             BasicInst::AnyAny { src1, src2, .. } => RegMask::from(src1) | RegMask::from(src2),
             BasicInst::Cmov { src, cond, .. } => RegMask::from(src) | RegMask::from(cond),
-            BasicInst::Ecalli { syscall } => imports
-                .iter()
-                .find(|import| import.metadata.index.unwrap() == syscall)
-                .expect("internal error: import not found")
-                .src_mask(),
+            BasicInst::Ecalli { nth_import } => imports[nth_import].src_mask(),
         }
     }
 
@@ -595,12 +595,7 @@ impl<T> BasicInst<T> {
             | BasicInst::RegReg { dst, .. }
             | BasicInst::Cmov { dst, .. }
             | BasicInst::AnyAny { dst, .. } => RegMask::from(dst),
-
-            BasicInst::Ecalli { syscall } => imports
-                .iter()
-                .find(|import| import.metadata.index.unwrap() == syscall)
-                .expect("internal error: import not found")
-                .dst_mask(),
+            BasicInst::Ecalli { nth_import } => imports[nth_import].dst_mask(),
         }
     }
 
@@ -692,11 +687,8 @@ impl<T> BasicInst<T> {
             .is_none();
 
         if is_special_instruction {
-            let BasicInst::Ecalli { syscall } = *self else { unreachable!() };
-            let import = imports
-                .iter()
-                .find(|import| import.metadata.index.unwrap() == syscall)
-                .expect("internal error: import not found");
+            let BasicInst::Ecalli { nth_import } = *self else { unreachable!() };
+            let import = &imports[nth_import];
 
             for reg in import.src_mask() {
                 list[length] = Some((reg, false));
@@ -736,7 +728,7 @@ impl<T> BasicInst<T> {
             BasicInst::RegReg { kind, dst, src1, src2 } => BasicInst::RegReg { kind, dst, src1, src2 },
             BasicInst::AnyAny { kind, dst, src1, src2 } => BasicInst::AnyAny { kind, dst, src1, src2 },
             BasicInst::Cmov { kind, dst, src, cond } => BasicInst::Cmov { kind, dst, src, cond },
-            BasicInst::Ecalli { syscall } => BasicInst::Ecalli { syscall },
+            BasicInst::Ecalli { nth_import } => BasicInst::Ecalli { nth_import },
             BasicInst::Nop => BasicInst::Nop,
         })
     }
@@ -1174,15 +1166,24 @@ fn extract_memory_config(
 }
 
 #[derive(Clone, PartialEq, Eq, Debug)]
-struct ExportMetadata {
-    location: SectionTarget,
-    prototype: FnMetadata,
+struct ExternMetadata {
+    index: Option<u32>,
+    symbol: Vec<u8>,
+    input_regs: u8,
+    output_regs: u8,
 }
 
-fn extract_export_metadata(
+#[derive(Clone, PartialEq, Eq, Debug)]
+struct Export {
+    location: SectionTarget,
+    metadata: ExternMetadata,
+}
+
+fn extract_exports(
+    elf: &Elf,
     relocations: &BTreeMap<SectionTarget, RelocationKind>,
     section: &Section,
-) -> Result<Vec<ExportMetadata>, ProgramFromElfError> {
+) -> Result<Vec<Export>, ProgramFromElfError> {
     let mut b = polkavm_common::elf::Reader::from(section.data());
     let mut exports = Vec::new();
     loop {
@@ -1195,73 +1196,90 @@ fn extract_export_metadata(
             )));
         }
 
-        let metadata_location = SectionTarget {
+        let metadata = {
+            let location = SectionTarget {
+                section_index: section.index(),
+                offset: b.offset() as u64,
+            };
+
+            // Ignore the address as written; we'll just use the relocations instead.
+            if let Err(error) = b.read_u32() {
+                return Err(ProgramFromElfError::other(format!("failed to parse export metadata: {}", error)));
+            }
+
+            let Some(relocation) = relocations.get(&location) else {
+                return Err(ProgramFromElfError::other(format!(
+                    "found an export without a relocation for a pointer to the metadata at {location}"
+                )));
+            };
+
+            let RelocationKind::Abs {
+                target,
+                size: RelocationSize::U32,
+            } = relocation
+            else {
+                return Err(ProgramFromElfError::other(format!(
+                    "found an export with an unexpected relocation at {location}: {relocation:?}"
+                )));
+            };
+
+            parse_extern_metadata(elf, relocations, *target)?
+        };
+
+        let location = SectionTarget {
             section_index: section.index(),
             offset: b.offset() as u64,
         };
 
-        let Some(relocation) = relocations.get(&metadata_location) else {
+        // Ignore the address as written; we'll just use the relocations instead.
+        if let Err(error) = b.read_u32() {
+            return Err(ProgramFromElfError::other(format!("failed to parse export metadata: {}", error)));
+        }
+
+        let Some(relocation) = relocations.get(&location) else {
             return Err(ProgramFromElfError::other(format!(
-                "found an export without a relocation for a pointer to code at {metadata_location}"
+                "found an export without a relocation for a pointer to the code at {location}"
             )));
         };
 
         let RelocationKind::Abs {
-            target: code_location,
+            target,
             size: RelocationSize::U32,
         } = relocation
         else {
             return Err(ProgramFromElfError::other(format!(
-                "found an export with an unexpected relocation at {metadata_location}: {relocation:?}"
+                "found an export with an unexpected relocation at {location}: {relocation:?}"
             )));
         };
 
-        // Ignore the address as written; later we'll just use the relocations instead.
-        if let Err(error) = b.read_u32() {
-            return Err(ProgramFromElfError::other(format!("failed to parse export metadata: {}", error)));
-        };
-
-        let prototype = match polkavm_common::elf::FnMetadata::try_deserialize(&mut b) {
-            Ok(prototype) => prototype,
-            Err(error) => {
-                return Err(ProgramFromElfError::other(format!("failed to parse export metadata: {}", error)));
-            }
-        };
-
-        exports.push(ExportMetadata {
-            location: *code_location,
-            prototype,
+        exports.push(Export {
+            location: *target,
+            metadata,
         });
     }
 
     Ok(exports)
 }
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 struct Import {
-    metadata_locations: Vec<SectionTarget>,
-    metadata: ImportMetadata,
+    metadata: ExternMetadata,
+}
+
+impl core::ops::Deref for Import {
+    type Target = ExternMetadata;
+    fn deref(&self) -> &Self::Target {
+        &self.metadata
+    }
 }
 
 impl Import {
     fn src(&'_ self) -> impl Iterator<Item = Reg> + '_ {
-        use polkavm_common::program::ExternTy;
-        let arg_regs = [Reg::A0, Reg::A1, Reg::A2, Reg::A3, Reg::A4, Reg::A5];
-        assert_eq!(Reg::ARG_REGS.len(), arg_regs.len()); // TODO: Use ARG_REGS here directly.
-
-        let mut arg_regs = arg_regs.into_iter();
-        self.metadata.args().flat_map(move |arg| {
-            let mut chunk = [None, None];
-            let count = match arg {
-                ExternTy::I32 => 1,
-                ExternTy::I64 => 2,
-            };
-
-            for slot in chunk.iter_mut().take(count) {
-                *slot = Some(arg_regs.next().expect("internal error: import with too many arguments"));
-            }
-            chunk.into_iter().flatten()
-        })
+        assert!(self.metadata.input_regs as usize <= Reg::INPUT_REGS.len());
+        Reg::INPUT_REGS
+            .into_iter()
+            .take(self.metadata.input_regs as usize)
+            .chain(core::iter::once(Reg::SP))
     }
 
     fn src_mask(&self) -> RegMask {
@@ -1273,15 +1291,10 @@ impl Import {
         mask
     }
 
+    #[allow(clippy::unused_self)]
     fn dst(&self) -> impl Iterator<Item = Reg> {
-        use polkavm_common::program::ExternTy;
-        match self.metadata.return_ty() {
-            None => [None, None],
-            Some(ExternTy::I32) => [Some(Reg::A0), None],
-            Some(ExternTy::I64) => [Some(Reg::A0), Some(Reg::A1)],
-        }
-        .into_iter()
-        .flatten()
+        assert!(self.metadata.output_regs as usize <= Reg::OUTPUT_REGS.len());
+        [Reg::T0, Reg::T1, Reg::T2, Reg::A0, Reg::A1, Reg::A2, Reg::A3, Reg::A4, Reg::A5].into_iter()
     }
 
     fn dst_mask(&self) -> RegMask {
@@ -1294,97 +1307,109 @@ impl Import {
     }
 }
 
-fn extract_import_metadata(elf: &Elf, sections: &[SectionIndex]) -> Result<Vec<Import>, ProgramFromElfError> {
-    let mut imports: Vec<Import> = Vec::new();
-    let mut import_by_index: BTreeMap<u32, usize> = BTreeMap::new();
-    let mut import_by_name: HashMap<String, usize> = HashMap::new();
-    let mut indexless: Vec<usize> = Vec::new();
+fn parse_extern_metadata_impl(
+    elf: &Elf,
+    relocations: &BTreeMap<SectionTarget, RelocationKind>,
+    target: SectionTarget,
+) -> Result<ExternMetadata, String> {
+    let section = elf.section_by_index(target.section_index);
+    let mut b = polkavm_common::elf::Reader::from(section.data());
+    let _ = b.read(target.offset as usize)?;
 
-    for &section_index in sections {
-        let section = elf.section_by_index(section_index);
-        let mut offset = 0;
-        while offset < section.data().len() {
-            match ImportMetadata::try_deserialize(&section.data()[offset..]) {
-                Ok((bytes_consumed, metadata)) => {
-                    let location = SectionTarget {
-                        section_index: section.index(),
-                        offset: offset as u64,
-                    };
+    let version = b.read_byte()?;
+    if version != 1 {
+        return Err(format!("unsupported extern metadata version: '{version}' (expected '1')"));
+    }
 
-                    offset += bytes_consumed;
+    let flags = b.read_u32()?;
+    let symbol_length = b.read_u32()?;
+    let Some(symbol_relocation) = relocations.get(&SectionTarget {
+        section_index: section.index(),
+        offset: b.offset() as u64,
+    }) else {
+        return Err("missing relocation for the symbol".into());
+    };
 
-                    if let Some(&old_nth_import) = import_by_name.get(metadata.name()) {
-                        let old_import = &mut imports[old_nth_import];
-                        if metadata == old_import.metadata {
-                            old_import.metadata_locations.push(location);
-                            continue;
-                        }
+    // Ignore the address as written; we'll just use the relocations instead.
+    b.read_u32()?;
 
-                        return Err(ProgramFromElfError::other(format!(
-                            "duplicate imports with the same name yet different prototype: {}",
-                            metadata.name()
-                        )));
-                    }
+    let RelocationKind::Abs {
+        target: symbol_location,
+        size: RelocationSize::U32,
+    } = symbol_relocation
+    else {
+        return Err(format!("unexpected relocation for the symbol: {symbol_relocation:?}"));
+    };
 
-                    let nth_import = imports.len();
-                    if let Some(index) = metadata.index {
-                        if let Some(&old_nth_import) = import_by_index.get(&index) {
-                            let old_import = &mut imports[old_nth_import];
-                            if metadata == old_import.metadata {
-                                old_import.metadata_locations.push(location);
-                                continue;
-                            }
+    let Some(symbol) = elf
+        .section_by_index(symbol_location.section_index)
+        .data()
+        .get(symbol_location.offset as usize..symbol_location.offset.saturating_add(u64::from(symbol_length)) as usize)
+    else {
+        return Err("symbol out of bounds".into());
+    };
 
-                            let old_name = old_import.metadata.name();
-                            let new_name = metadata.name();
-                            return Err(ProgramFromElfError::other(format!(
-                                "duplicate imports with the same index: index = {index}, names = [{old_name:?}, {new_name:?}]"
-                            )));
-                        }
+    let input_regs = b.read_byte()?;
+    if input_regs as usize > Reg::INPUT_REGS.len() {
+        return Err(format!("too many input registers: {input_regs}"));
+    }
 
-                        import_by_index.insert(index, nth_import);
-                    } else {
-                        indexless.push(nth_import);
-                    }
+    let output_regs = b.read_byte()?;
+    if output_regs as usize > Reg::OUTPUT_REGS.len() {
+        return Err(format!("too many output registers: {output_regs}"));
+    }
 
-                    import_by_name.insert(metadata.name().to_owned(), nth_import);
+    if flags != 0 {
+        return Err(format!("found unsupported flags: 0x{flags:x}"));
+    }
 
-                    let import = Import {
-                        metadata_locations: vec![location],
-                        metadata,
-                    };
+    Ok(ExternMetadata {
+        index: None,
+        symbol: symbol.to_owned(),
+        input_regs,
+        output_regs,
+    })
+}
 
-                    imports.push(import);
-                }
-                Err(error) => {
-                    return Err(ProgramFromElfError::other(format!("failed to parse import metadata: {}", error)));
-                }
+fn parse_extern_metadata(
+    elf: &Elf,
+    relocations: &BTreeMap<SectionTarget, RelocationKind>,
+    target: SectionTarget,
+) -> Result<ExternMetadata, ProgramFromElfError> {
+    parse_extern_metadata_impl(elf, relocations, target)
+        .map_err(|error| ProgramFromElfError::other(format!("failed to parse extern metadata: {}", error)))
+}
+
+fn check_imports_and_assign_indexes(imports: &mut [Import], used_imports: &HashSet<usize>) -> Result<(), ProgramFromElfError> {
+    let mut import_by_symbol: HashMap<Vec<u8>, usize> = HashMap::new();
+    for (nth_import, import) in imports.iter().enumerate() {
+        if let Some(&old_nth_import) = import_by_symbol.get(&import.metadata.symbol) {
+            let old_import = &imports[old_nth_import];
+            if import.metadata == old_import.metadata {
+                continue;
             }
-        }
-    }
 
-    indexless.sort_by(|&a, &b| imports[a].metadata.name().cmp(imports[b].metadata.name()));
-    indexless.dedup();
-
-    let mut next_index = 0;
-    for nth_import in indexless {
-        while import_by_index.contains_key(&next_index) {
-            next_index += 1;
+            return Err(ProgramFromElfError::other(format!(
+                "duplicate imports with the same symbol yet different prototype: {}",
+                ProgramSymbol::from(&*import.metadata.symbol)
+            )));
         }
 
-        imports[nth_import].metadata.index = Some(next_index);
-        import_by_index.insert(next_index, nth_import);
-        next_index += 1;
+        import_by_symbol.insert(import.metadata.symbol.clone(), nth_import);
     }
 
-    for import in &imports {
+    let mut ordered: Vec<_> = used_imports.iter().copied().collect();
+    ordered.sort_by(|&a, &b| imports[a].metadata.symbol.cmp(&imports[b].metadata.symbol));
+
+    for (assigned_index, &nth_import) in ordered.iter().enumerate() {
+        imports[nth_import].metadata.index = Some(assigned_index as u32);
+    }
+
+    for import in imports {
         log::trace!("Import: {:?}", import.metadata);
-        for location in &import.metadata_locations {
-            log::trace!("  {}", location);
-        }
     }
 
-    Ok(imports)
+    Ok(())
 }
 
 fn get_relocation_target(elf: &Elf, relocation: &object::read::Relocation) -> Result<Option<SectionTarget>, ProgramFromElfError> {
@@ -1865,9 +1890,10 @@ fn convert_instruction(
 }
 
 fn parse_code_section(
+    elf: &Elf,
     section: &Section,
-    import_by_location: &HashMap<SectionTarget, &Import>,
     relocations: &BTreeMap<SectionTarget, RelocationKind>,
+    imports: &mut Vec<Import>,
     instruction_overrides: &mut HashMap<SectionTarget, InstExt<SectionTarget, SectionTarget>>,
     output: &mut Vec<(Source, InstExt<SectionTarget, SectionTarget>)>,
 ) -> Result<(), ProgramFromElfError> {
@@ -1921,20 +1947,16 @@ fn parse_code_section(
                 )));
             };
 
-            let Some(import) = import_by_location.get(metadata_location) else {
-                return Err(ProgramFromElfError::other(format!(
-                    "found an external call with a relocation to something that isn't import metadata at {current_location}"
-                )));
-            };
+            let metadata = parse_extern_metadata(elf, relocations, *metadata_location)?;
+            let nth_import = imports.len();
+            imports.push(Import { metadata });
 
             output.push((
                 Source {
                     section_index,
                     offset_range: AddressRange::from(initial_offset..relative_offset as u64),
                 },
-                InstExt::Basic(BasicInst::Ecalli {
-                    syscall: import.metadata.index.expect("internal error: no index assigned to import"),
-                }),
+                InstExt::Basic(BasicInst::Ecalli { nth_import }),
             ));
 
             const INST_RET: Inst = Inst::JumpAndLinkRegister {
@@ -1973,11 +1995,6 @@ fn parse_code_section(
 
         relative_offset += 4;
 
-        // Shadow the `relative_offset` to make sure it's not accidentally used again.
-        #[allow(clippy::let_unit_value)]
-        #[allow(unused_variables)]
-        let relative_offset = ();
-
         let Some(original_inst) = Inst::decode(raw_inst) else {
             return Err(ProgramFromElfErrorKind::UnsupportedInstruction {
                 section: section.name().into(),
@@ -1990,6 +2007,47 @@ fn parse_code_section(
         if let Some(inst) = instruction_overrides.remove(&current_location) {
             output.push((source, inst));
         } else {
+            // For some reason (compiler bug?) *very rarely* we have those AUIPC instructions
+            // without any relocation attached to them, so let's deal with them traditionally.
+            if let Inst::AddUpperImmediateToPc {
+                dst: base_upper,
+                value: value_upper,
+            } = original_inst
+            {
+                if relative_offset < text.len() {
+                    let next_inst = Inst::decode(u32::from_le_bytes([
+                        text[relative_offset],
+                        text[relative_offset + 1],
+                        text[relative_offset + 2],
+                        text[relative_offset + 3],
+                    ]));
+
+                    if let Some(Inst::JumpAndLinkRegister { dst: ra_dst, base, value }) = next_inst {
+                        if base == ra_dst && base == base_upper {
+                            if let Some(ra) = cast_reg_non_zero(ra_dst)? {
+                                let offset = (relative_offset as i32 - 4).wrapping_add(value).wrapping_add(value_upper as i32);
+                                if offset >= 0 && offset < section.data().len() as i32 {
+                                    output.push((
+                                        source,
+                                        InstExt::Control(ControlInst::Call {
+                                            ra,
+                                            target: SectionTarget {
+                                                section_index,
+                                                offset: u64::from(offset as u32),
+                                            },
+                                            target_return: current_location.add(8),
+                                        }),
+                                    ));
+
+                                    relative_offset += 4;
+                                    continue;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
             convert_instruction(section, current_location, original_inst, |inst| {
                 output.push((source, inst));
             })?
@@ -4409,6 +4467,7 @@ fn harvest_all_jump_targets(
     code_sections_set: &HashSet<SectionIndex>,
     instructions: &[(Source, InstExt<SectionTarget, SectionTarget>)],
     relocations: &BTreeMap<SectionTarget, RelocationKind>,
+    exports: &[Export],
 ) -> Result<HashSet<SectionTarget>, ProgramFromElfError> {
     let mut all_jump_targets = HashSet::new();
     for (_, instruction) in instructions {
@@ -4466,6 +4525,17 @@ fn harvest_all_jump_targets(
                     );
                 }
             }
+        }
+    }
+
+    for export in exports {
+        let target = export.location;
+        if !code_sections_set.contains(&target.section_index) {
+            return Err(ProgramFromElfError::other("export points to a non-code section"));
+        }
+
+        if all_jump_targets.insert(target) {
+            log::trace!("Adding jump target: {target} (referenced by export)");
         }
     }
 
@@ -4646,7 +4716,7 @@ fn calculate_reachability(
     section_to_block: &HashMap<SectionTarget, BlockTarget>,
     all_blocks: &[BasicBlock<AnyTarget, BlockTarget>],
     data_sections_set: &HashSet<SectionIndex>,
-    export_metadata: &[ExportMetadata],
+    exports: &[Export],
     relocations: &BTreeMap<SectionTarget, RelocationKind>,
 ) -> Result<ReachabilityGraph, ProgramFromElfError> {
     let mut graph = ReachabilityGraph::default();
@@ -4661,7 +4731,7 @@ fn calculate_reachability(
             .push(relocation);
     }
 
-    for export in export_metadata {
+    for export in exports {
         let Some(&block_target) = section_to_block.get(&export.location) else {
             return Err(ProgramFromElfError::other("export points to a non-block"));
         };
@@ -4985,12 +5055,13 @@ fn calculate_whether_can_fallthrough(
 
 #[allow(clippy::too_many_arguments)]
 fn emit_code(
+    imports: &[Import],
     base_address_for_section: &HashMap<SectionIndex, u64>,
     section_got: SectionIndex,
     target_to_got_offset: &HashMap<AnyTarget, u64>,
     all_blocks: &[BasicBlock<AnyTarget, BlockTarget>],
     used_blocks: &[BlockTarget],
-    used_imports: &HashSet<u32>,
+    used_imports: &HashSet<usize>,
     jump_target_for_block: &[Option<JumpTarget>],
     is_optimized: bool,
 ) -> Result<Vec<(SourceStack, Instruction)>, ProgramFromElfError> {
@@ -5281,9 +5352,10 @@ fn emit_code(
                         }
                     }
                 }
-                BasicInst::Ecalli { syscall } => {
-                    assert!(used_imports.contains(&syscall));
-                    Instruction::ecalli(syscall)
+                BasicInst::Ecalli { nth_import } => {
+                    assert!(used_imports.contains(&nth_import));
+                    let import = &imports[nth_import];
+                    Instruction::ecalli(import.metadata.index.expect("internal error: no index was assigned to an ecall"))
                 }
                 BasicInst::Nop => {
                     if is_optimized {
@@ -6273,7 +6345,7 @@ impl Config {
 pub fn program_from_elf(config: Config, data: &[u8]) -> Result<ProgramBlob, ProgramFromElfError> {
     let mut elf = Elf::parse(data)?;
 
-    if elf.section_by_name(".got").is_none() {
+    if elf.section_by_name(".got").next().is_none() {
         elf.add_empty_data_section(".got");
     }
 
@@ -6284,8 +6356,8 @@ pub fn program_from_elf(config: Config, data: &[u8]) -> Result<ProgramBlob, Prog
     let mut sections_rw_data = Vec::new();
     let mut sections_bss = Vec::new();
     let mut sections_code = Vec::new();
-    let mut sections_import_metadata = Vec::new();
-    let mut section_export_metadata = None;
+    let mut section_metadata = None;
+    let mut section_exports = None;
     let mut section_min_stack_size = None;
     let mut sections_other = Vec::new();
 
@@ -6329,11 +6401,20 @@ pub fn program_from_elf(config: Config, data: &[u8]) -> Result<ProgramBlob, Prog
             }
 
             sections_code.push(section.index());
-        } else if name == ".polkavm_imports" || name.starts_with(".polkavm_imports.") {
-            sections_import_metadata.push(section.index());
+        } else if name == ".polkavm_metadata" {
+            if section_metadata.is_some() {
+                return Err(ProgramFromElfError::other("found duplicate '.polkavm_metadata' section"));
+            }
+            section_metadata = Some(section.index());
         } else if name == ".polkavm_exports" {
-            section_export_metadata = Some(section.index());
+            if section_exports.is_some() {
+                return Err(ProgramFromElfError::other("found duplicate '.polkavm_exports' section"));
+            }
+            section_exports = Some(section.index());
         } else if name == ".polkavm_min_stack_size" {
+            if section_min_stack_size.is_some() {
+                return Err(ProgramFromElfError::other("found duplicate '.polkavm_min_stack_size' section"));
+            }
             section_min_stack_size = Some(section.index());
         } else if name == ".eh_frame" || name == ".got" {
             continue;
@@ -6357,9 +6438,9 @@ pub fn program_from_elf(config: Config, data: &[u8]) -> Result<ProgramBlob, Prog
         .iter()
         .chain(sections_rw_data.iter())
         .chain(sections_bss.iter()) // Shouldn't need relocations, but just in case.
-        .chain(sections_import_metadata.iter())
-        .chain(section_export_metadata.iter())
         .chain(sections_other.iter())
+        .chain(section_metadata.iter())
+        .chain(section_exports.iter())
         .copied();
 
     let mut relocations = BTreeMap::new();
@@ -6374,65 +6455,65 @@ pub fn program_from_elf(config: Config, data: &[u8]) -> Result<ProgramBlob, Prog
         harvest_code_relocations(&elf, section, &mut instruction_overrides, &mut relocations)?;
     }
 
-    let import_metadata = extract_import_metadata(&elf, &sections_import_metadata)?;
-    let export_metadata = if let Some(section_index) = section_export_metadata {
+    let exports = if let Some(section_index) = section_exports {
         let section = elf.section_by_index(section_index);
-        extract_export_metadata(&relocations, section)?
+        extract_exports(&elf, &relocations, section)?
     } else {
         Default::default()
     };
 
     let mut instructions = Vec::new();
-    {
-        let import_by_location: HashMap<SectionTarget, &Import> = import_metadata
-            .iter()
-            .flat_map(|import| import.metadata_locations.iter().map(move |&location| (location, import)))
-            .collect();
+    let mut imports = Vec::new();
 
-        for &section_index in &sections_code {
-            let section = elf.section_by_index(section_index);
-            let initial_instruction_count = instructions.len();
-            parse_code_section(
-                section,
-                &import_by_location,
-                &relocations,
-                &mut instruction_overrides,
-                &mut instructions,
-            )?;
+    for &section_index in &sections_code {
+        let section = elf.section_by_index(section_index);
+        let initial_instruction_count = instructions.len();
+        parse_code_section(
+            &elf,
+            section,
+            &relocations,
+            &mut imports,
+            &mut instruction_overrides,
+            &mut instructions,
+        )?;
 
-            if instructions.len() > initial_instruction_count {
-                // Sometimes a section ends with a `call`, which (considering sections can be reordered) would put
-                // the return address out of bounds of the section, so let's inject an `unimp` here to make sure this doesn't happen.
-                //
-                // If it ends up being unnecessary the optimizer will remove it anyway.
-                let last_source = instructions.last().unwrap().0;
-                let source = Source {
-                    section_index: last_source.section_index,
-                    offset_range: (last_source.offset_range.end..last_source.offset_range.end + 4).into(),
-                };
-                instructions.push((source, InstExt::Control(ControlInst::Unimplemented)));
-            }
-        }
-
-        if !instruction_overrides.is_empty() {
-            return Err(ProgramFromElfError::other("internal error: instruction overrides map is not empty"));
+        if instructions.len() > initial_instruction_count {
+            // Sometimes a section ends with a `call`, which (considering sections can be reordered) would put
+            // the return address out of bounds of the section, so let's inject an `unimp` here to make sure this doesn't happen.
+            //
+            // If it ends up being unnecessary the optimizer will remove it anyway.
+            let last_source = instructions.last().unwrap().0;
+            let source = Source {
+                section_index: last_source.section_index,
+                offset_range: (last_source.offset_range.end..last_source.offset_range.end + 4).into(),
+            };
+            instructions.push((source, InstExt::Control(ControlInst::Unimplemented)));
         }
     }
+
+    if !instruction_overrides.is_empty() {
+        return Err(ProgramFromElfError::other("internal error: instruction overrides map is not empty"));
+    }
+
+    core::mem::drop(instruction_overrides);
 
     assert!(instructions
         .iter()
         .all(|(source, _)| source.offset_range.start < source.offset_range.end));
 
+    relocations.retain(|relocation_target, _| {
+        let section_index = relocation_target.section_index;
+        !(section_metadata.map_or(false, |index| index == section_index) || section_exports.map_or(false, |index| index == section_index))
+    });
+
     let data_sections_set: HashSet<SectionIndex> = sections_ro_data
         .iter()
         .chain(sections_rw_data.iter())
         .chain(sections_bss.iter()) // Shouldn't need relocations, but just in case.
-        .chain(sections_import_metadata.iter())
-        .chain(section_export_metadata.iter())
         .copied()
         .collect();
 
-    let all_jump_targets = harvest_all_jump_targets(&elf, &data_sections_set, &code_sections_set, &instructions, &relocations)?;
+    let all_jump_targets = harvest_all_jump_targets(&elf, &data_sections_set, &code_sections_set, &instructions, &relocations, &exports)?;
     let all_blocks = split_code_into_basic_blocks(&all_jump_targets, instructions)?;
     for block in &all_blocks {
         for source in block.next.source.as_slice() {
@@ -6447,23 +6528,23 @@ pub fn program_from_elf(config: Config, data: &[u8]) -> Result<ProgramBlob, Prog
 
     let mut regspill_size = 0;
     if config.optimize {
-        reachability_graph = calculate_reachability(&section_to_block, &all_blocks, &data_sections_set, &export_metadata, &relocations)?;
-        optimize_program(&config, &elf, &import_metadata, &mut all_blocks, &mut reachability_graph);
+        reachability_graph = calculate_reachability(&section_to_block, &all_blocks, &data_sections_set, &exports, &relocations)?;
+        optimize_program(&config, &elf, &imports, &mut all_blocks, &mut reachability_graph);
         used_blocks = collect_used_blocks(&all_blocks, &reachability_graph);
         spill_fake_registers(
             section_regspill,
             &mut all_blocks,
             &mut reachability_graph,
-            &import_metadata,
+            &imports,
             &used_blocks,
             &mut regspill_size,
         );
         used_blocks = add_missing_fallthrough_blocks(&mut all_blocks, &mut reachability_graph, used_blocks);
         merge_consecutive_fallthrough_blocks(&mut all_blocks, &mut reachability_graph, &mut section_to_block, &mut used_blocks);
-        replace_immediates_with_registers(&mut all_blocks, &import_metadata, &used_blocks);
+        replace_immediates_with_registers(&mut all_blocks, &imports, &used_blocks);
 
         let expected_reachability_graph =
-            calculate_reachability(&section_to_block, &all_blocks, &data_sections_set, &export_metadata, &relocations)?;
+            calculate_reachability(&section_to_block, &all_blocks, &data_sections_set, &exports, &relocations)?;
         if reachability_graph != expected_reachability_graph {
             panic!("internal error: inconsistent reachability after optimization; this is a bug, please report it!");
         }
@@ -6488,7 +6569,7 @@ pub fn program_from_elf(config: Config, data: &[u8]) -> Result<ProgramBlob, Prog
             section_regspill,
             &mut all_blocks,
             &mut reachability_graph,
-            &import_metadata,
+            &imports,
             &used_blocks,
             &mut regspill_size,
         );
@@ -6505,7 +6586,7 @@ pub fn program_from_elf(config: Config, data: &[u8]) -> Result<ProgramBlob, Prog
         }
     }
 
-    log::debug!("Exports found: {}", export_metadata.len());
+    log::debug!("Exports found: {}", exports.len());
 
     {
         let mut count_dynamic = 0;
@@ -6563,8 +6644,8 @@ pub fn program_from_elf(config: Config, data: &[u8]) -> Result<ProgramBlob, Prog
                         },
                     );
                 }
-                BasicInst::Ecalli { syscall } => {
-                    used_imports.insert(*syscall);
+                BasicInst::Ecalli { nth_import } => {
+                    used_imports.insert(*nth_import);
                 }
                 _ => {}
             }
@@ -6572,12 +6653,7 @@ pub fn program_from_elf(config: Config, data: &[u8]) -> Result<ProgramBlob, Prog
     }
 
     elf.extend_section_to_at_least(section_got, got_size.try_into().expect("overflow"));
-
-    let import_metadata = {
-        let mut import_metadata = import_metadata;
-        import_metadata.retain(|import| used_imports.contains(&import.metadata.index.unwrap()));
-        import_metadata
-    };
+    check_imports_and_assign_indexes(&mut imports, &used_imports)?;
 
     let mut base_address_for_section = HashMap::new();
     let sections_ro_data: Vec<_> = sections_ro_data
@@ -6601,6 +6677,7 @@ pub fn program_from_elf(config: Config, data: &[u8]) -> Result<ProgramBlob, Prog
 
     let (jump_table, jump_target_for_block) = build_jump_table(all_blocks.len(), &used_blocks, &reachability_graph);
     let code = emit_code(
+        &imports,
         &base_address_for_section,
         section_got,
         &target_to_got_offset,
@@ -6725,11 +6802,6 @@ pub fn program_from_elf(config: Config, data: &[u8]) -> Result<ProgramBlob, Prog
                     let data = elf.section_data_mut(relocation_target.section_index);
                     write_generic(size, data, relocation_target.offset, jump_target.into())?;
                 } else {
-                    if sections_import_metadata.contains(&target.section_index) {
-                        // TODO: Make this check unnecessary by removing these relocations before we get here.
-                        continue;
-                    }
-
                     let Some(section_base) = base_address_for_section.get(&target.section_index) else {
                         if !reachability_graph.is_data_section_reachable(relocation_target.section_index) {
                             let data = elf.section_data_mut(relocation_target.section_index);
@@ -6861,31 +6933,31 @@ pub fn program_from_elf(config: Config, data: &[u8]) -> Result<ProgramBlob, Prog
     builder.set_rw_data(rw_data);
 
     {
-        let mut import_metadata = import_metadata;
-        import_metadata.sort_by(|a, b| {
+        let mut sorted_imports = imports.clone();
+        sorted_imports.sort_by(|a, b| {
             a.metadata
                 .index
                 .cmp(&b.metadata.index)
-                .then_with(|| a.metadata.name().cmp(b.metadata.name()))
+                .then_with(|| a.metadata.symbol.cmp(&b.metadata.symbol))
         });
 
-        for import in import_metadata {
-            builder.add_import(
-                import.metadata.index.expect("internal error: no index assigned to import"),
-                import.metadata.prototype(),
-            );
+        for import in sorted_imports {
+            builder.add_import(polkavm_common::program::ProgramImport::new(import.metadata.symbol.into()));
         }
     }
 
-    for meta in export_metadata {
+    for export in exports {
         let &block_target = section_to_block
-            .get(&meta.location)
+            .get(&export.location)
             .expect("internal error: export metadata has a non-block target location");
 
         let jump_target = jump_target_for_block[block_target.index()]
             .expect("internal error: export metadata points to a block without a jump target assigned");
 
-        builder.add_export(jump_target.static_target, &meta.prototype);
+        builder.add_export(polkavm_common::program::ProgramExport::new(
+            jump_target.static_target,
+            export.metadata.symbol.into(),
+        ));
     }
 
     builder.set_jump_table(&jump_table);

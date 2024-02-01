@@ -179,7 +179,7 @@ impl<'a> Compiler<'a> {
 
         self.export_trampolines.reserve(self.exports.len());
         for export in self.exports {
-            let label = self.export_to_label.get(&export.address()).unwrap();
+            let label = self.export_to_label.get(&export.jump_target()).unwrap();
             let native_address = self.native_code_address
                 .checked_add_signed(self.asm.get_label_origin_offset_or_panic(*label) as i64)
                 .expect("overflow");
