@@ -178,6 +178,14 @@ pub enum RegRegKind {
 }
 
 #[derive(Copy, Clone, PartialEq, Eq, Debug, Hash)]
+pub struct FenceFlags {
+    input: bool,
+    output: bool,
+    read: bool,
+    write: bool,
+}
+
+#[derive(Copy, Clone, PartialEq, Eq, Debug, Hash)]
 #[repr(u32)]
 pub enum Inst {
     LoadUpperImmediate {
@@ -229,6 +237,11 @@ pub enum Inst {
     },
     Ecall,
     Unimplemented,
+    Fence {
+        predecessor: FenceFlags,
+        successor: FenceFlags,
+    },
+    FenceI,
     LoadReserved {
         acquire: bool,
         release: bool,
@@ -540,6 +553,28 @@ impl Inst {
                     None
                 }
             }
+            0b0001111 => {
+                if op == 0x0000100f {
+                    Some(Inst::FenceI)
+                } else if (op & !(0xff << 20)) == 0x0000000f {
+                    Some(Inst::Fence {
+                        predecessor: FenceFlags {
+                            input: ((op >> 27) & 1) != 0,
+                            output: ((op >> 26) & 1) != 0,
+                            read: ((op >> 25) & 1) != 0,
+                            write: ((op >> 24) & 1) != 0,
+                        },
+                        successor: FenceFlags {
+                            input: ((op >> 23) & 1) != 0,
+                            output: ((op >> 22) & 1) != 0,
+                            read: ((op >> 21) & 1) != 0,
+                            write: ((op >> 20) & 1) != 0,
+                        },
+                    })
+                } else {
+                    None
+                }
+            }
             0b0101111 if (op >> 12) & 0b111 == 0b010 => {
                 let dst = Reg::decode(op >> 7);
                 let src1 = Reg::decode(op >> 15);
@@ -684,6 +719,18 @@ impl Inst {
                     | ((src2 as u32) << 20),
             ),
             Inst::Ecall => Some(0x00000073),
+            Inst::FenceI => Some(0x0000100f),
+            Inst::Fence { predecessor, successor } => Some(
+                0b00001111
+                    | (u32::from(predecessor.input) << 27)
+                    | (u32::from(predecessor.output) << 26)
+                    | (u32::from(predecessor.read) << 25)
+                    | (u32::from(predecessor.write) << 24)
+                    | (u32::from(successor.input) << 23)
+                    | (u32::from(successor.output) << 22)
+                    | (u32::from(successor.read) << 21)
+                    | (u32::from(successor.write) << 20),
+            ),
             Inst::Unimplemented => Some(0xc0001073),
             Inst::LoadReserved {
                 acquire,

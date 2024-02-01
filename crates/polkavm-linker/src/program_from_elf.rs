@@ -1588,6 +1588,7 @@ fn convert_instruction(
             emit(InstExt::Control(ControlInst::Unimplemented));
             Ok(())
         }
+        Inst::FenceI | Inst::Fence { .. } => Ok(()),
         Inst::Load { kind, dst, base, offset } => {
             let Some(dst) = cast_reg_non_zero(dst)? else {
                 return Err(ProgramFromElfError::other("found a load with a zero register as the destination"));
