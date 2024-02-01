@@ -2658,7 +2658,12 @@ impl<T> Instance<T> {
             Err(poison) => poison.into_inner(),
         };
 
-        mutable.backend.access().write_memory(address, data)
+        let result = mutable.backend.access().write_memory(address, data);
+        if let Some(ref mut tracer) = mutable.tracer() {
+            tracer.on_memory_write_in_hostcall(address, data, result.is_ok())?;
+        }
+
+        result
     }
 
     pub fn get_reg(&self, reg: Reg) -> u32 {
