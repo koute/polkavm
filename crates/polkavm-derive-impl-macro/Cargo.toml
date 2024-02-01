@@ -1,0 +1,17 @@
+[package]
+name = "polkavm-derive-impl-macro"
+version.workspace = true
+authors.workspace = true
+license.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+documentation = "https://docs.rs/polkavm-derive-impl-macro"
+description = "The derive crate for PolkaVM guest programs (proc-macro)"
+
+[lib]
+proc-macro = true
+
+[dependencies]
+polkavm-derive-impl = { workspace = true }
+syn = { workspace = true, features = ["full"] }
