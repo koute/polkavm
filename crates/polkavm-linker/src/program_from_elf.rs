@@ -1,7 +1,7 @@
 use polkavm_common::abi::{GuestMemoryConfig, VM_ADDR_USER_MEMORY, VM_CODE_ADDRESS_ALIGNMENT, VM_MAX_PAGE_SIZE, VM_PAGE_SIZE};
 use polkavm_common::elf::INSTRUCTION_ECALLI;
 use polkavm_common::program::{self, FrameKind, Instruction, LineProgramOp, ProgramBlob, ProgramSymbol};
-use polkavm_common::utils::align_to_next_page_u64;
+use polkavm_common::utils::{align_to_next_page_u32, align_to_next_page_u64};
 use polkavm_common::varint;
 use polkavm_common::writer::{ProgramBlobBuilder, Writer};
 
@@ -972,7 +972,7 @@ fn extract_memory_config(
     sections_ro_data: &[SectionIndex],
     sections_rw_data: &[SectionIndex],
     sections_bss: &[SectionIndex],
-    section_min_stack_size: Option<SectionIndex>,
+    sections_min_stack_size: &[SectionIndex],
     base_address_for_section: &mut HashMap<SectionIndex, u64>,
 ) -> Result<MemoryConfig, ProgramFromElfError> {
     let mut memory_end = u64::from(VM_ADDR_USER_MEMORY);
@@ -1115,24 +1115,22 @@ fn extract_memory_config(
     bss_size = align_to_next_page_u64(u64::from(VM_PAGE_SIZE), bss_size)
         .ok_or(ProgramFromElfError::other("out of range size for BSS sections"))?;
 
-    let stack_size = if let Some(section_index) = section_min_stack_size {
+    let mut stack_size = VM_PAGE_SIZE;
+    for &section_index in sections_min_stack_size {
         let section = elf.section_by_index(section_index);
         let data = section.data();
         if data.len() % 4 != 0 {
             return Err(ProgramFromElfError::other(format!("section '{}' has invalid size", section.name())));
         }
 
-        let mut stack_size = 0;
         for xs in data.chunks_exact(4) {
             let value = u32::from_le_bytes([xs[0], xs[1], xs[2], xs[3]]);
             stack_size = core::cmp::max(stack_size, value);
         }
+    }
 
-        align_to_next_page_u64(u64::from(VM_PAGE_SIZE), u64::from(stack_size))
-            .ok_or(ProgramFromElfError::other("out of range size for the stack"))?
-    } else {
-        u64::from(VM_PAGE_SIZE)
-    };
+    let stack_size =
+        align_to_next_page_u32(VM_PAGE_SIZE, stack_size).ok_or(ProgramFromElfError::other("out of range size for the stack"))?;
 
     log::trace!("Configured stack size: 0x{stack_size:x}");
 
@@ -1144,7 +1142,7 @@ fn extract_memory_config(
         assert!(ro_data_size_physical <= ro_data_size);
         assert!(rw_data_size_physical <= rw_data_size);
 
-        let config = match GuestMemoryConfig::new(ro_data_size, rw_data_size, bss_size, stack_size) {
+        let config = match GuestMemoryConfig::new(ro_data_size, rw_data_size, bss_size, u64::from(stack_size)) {
             Ok(config) => config,
             Err(error) => {
                 return Err(ProgramFromElfError::other(error));
@@ -1159,7 +1157,7 @@ fn extract_memory_config(
         ro_data,
         rw_data,
         bss_size: bss_size as u32,
-        stack_size: stack_size as u32,
+        stack_size,
     };
 
     Ok(memory_config)
@@ -6356,9 +6354,9 @@ pub fn program_from_elf(config: Config, data: &[u8]) -> Result<ProgramBlob, Prog
     let mut sections_rw_data = Vec::new();
     let mut sections_bss = Vec::new();
     let mut sections_code = Vec::new();
-    let mut section_metadata = None;
-    let mut section_exports = None;
-    let mut section_min_stack_size = None;
+    let mut sections_metadata = Vec::new();
+    let mut sections_exports = Vec::new();
+    let mut sections_min_stack_size = Vec::new();
     let mut sections_other = Vec::new();
 
     for section in elf.sections() {
@@ -6402,20 +6400,11 @@ pub fn program_from_elf(config: Config, data: &[u8]) -> Result<ProgramBlob, Prog
 
             sections_code.push(section.index());
         } else if name == ".polkavm_metadata" {
-            if section_metadata.is_some() {
-                return Err(ProgramFromElfError::other("found duplicate '.polkavm_metadata' section"));
-            }
-            section_metadata = Some(section.index());
+            sections_metadata.push(section.index());
         } else if name == ".polkavm_exports" {
-            if section_exports.is_some() {
-                return Err(ProgramFromElfError::other("found duplicate '.polkavm_exports' section"));
-            }
-            section_exports = Some(section.index());
+            sections_exports.push(section.index());
         } else if name == ".polkavm_min_stack_size" {
-            if section_min_stack_size.is_some() {
-                return Err(ProgramFromElfError::other("found duplicate '.polkavm_min_stack_size' section"));
-            }
-            section_min_stack_size = Some(section.index());
+            sections_min_stack_size.push(section.index());
         } else if name == ".eh_frame" || name == ".got" {
             continue;
         } else if section.is_allocated() {
@@ -6439,8 +6428,8 @@ pub fn program_from_elf(config: Config, data: &[u8]) -> Result<ProgramBlob, Prog
         .chain(sections_rw_data.iter())
         .chain(sections_bss.iter()) // Shouldn't need relocations, but just in case.
         .chain(sections_other.iter())
-        .chain(section_metadata.iter())
-        .chain(section_exports.iter())
+        .chain(sections_metadata.iter())
+        .chain(sections_exports.iter())
         .copied();
 
     let mut relocations = BTreeMap::new();
@@ -6455,12 +6444,14 @@ pub fn program_from_elf(config: Config, data: &[u8]) -> Result<ProgramBlob, Prog
         harvest_code_relocations(&elf, section, &mut instruction_overrides, &mut relocations)?;
     }
 
-    let exports = if let Some(section_index) = section_exports {
-        let section = elf.section_by_index(section_index);
-        extract_exports(&elf, &relocations, section)?
-    } else {
-        Default::default()
-    };
+    let exports = sections_exports
+        .iter()
+        .map(|&section_index| {
+            let section = elf.section_by_index(section_index);
+            extract_exports(&elf, &relocations, section)
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let exports: Vec<_> = exports.into_iter().flatten().collect();
 
     let mut instructions = Vec::new();
     let mut imports = Vec::new();
@@ -6501,10 +6492,12 @@ pub fn program_from_elf(config: Config, data: &[u8]) -> Result<ProgramBlob, Prog
         .iter()
         .all(|(source, _)| source.offset_range.start < source.offset_range.end));
 
-    relocations.retain(|relocation_target, _| {
-        let section_index = relocation_target.section_index;
-        !(section_metadata.map_or(false, |index| index == section_index) || section_exports.map_or(false, |index| index == section_index))
-    });
+    {
+        let strip_relocations_for_sections: HashSet<_> =
+            sections_metadata.iter().copied().chain(sections_exports.iter().copied()).collect();
+
+        relocations.retain(|relocation_target, _| !strip_relocations_for_sections.contains(&relocation_target.section_index));
+    }
 
     let data_sections_set: HashSet<SectionIndex> = sections_ro_data
         .iter()
@@ -6671,7 +6664,7 @@ pub fn program_from_elf(config: Config, data: &[u8]) -> Result<ProgramBlob, Prog
         &sections_ro_data,
         &sections_rw_data,
         &sections_bss,
-        section_min_stack_size,
+        &sections_min_stack_size,
         &mut base_address_for_section,
     )?;
 
