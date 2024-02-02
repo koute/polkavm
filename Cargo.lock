@@ -1631,7 +1631,7 @@ dependencies = [
 
 [[package]]
 name = "polkavm-linker"
-version = "0.8.0"
+version = "0.8.1"
 dependencies = [
  "gimli 0.28.0",
  "hashbrown 0.14.1",
