@@ -2056,6 +2056,7 @@ fn parse_code_section(
 }
 
 fn split_code_into_basic_blocks(
+    elf: &Elf,
     jump_targets: &HashSet<SectionTarget>,
     instructions: Vec<(Source, InstExt<SectionTarget, SectionTarget>)>,
 ) -> Result<Vec<BasicBlock<SectionTarget, SectionTarget>>, ProgramFromElfError> {
@@ -2064,6 +2065,11 @@ fn split_code_into_basic_blocks(
     let mut block_start_opt = None;
     let mut last_source_in_block = None;
     for (source, op) in instructions {
+        log::trace!(
+            "Instruction at {source} (0x{:x}): {op:?}",
+            elf.section_by_index(source.section_index).original_address() + source.offset_range.start
+        );
+
         if let Some(last_source_in_block) = last_source_in_block {
             // Handle the case where we've emitted multiple instructions from a single RISC-V instruction.
             if source == last_source_in_block {
@@ -2228,7 +2234,7 @@ fn resolve_basic_block_references(
         else {
             return Err(ProgramFromElfError::other(format!(
                 "found control instruction at the end of block at {block_source} whose target doesn't resolve to any basic block: {next:?}",
-                block_source = block.source.begin(),
+                block_source = block.source,
                 next = block.next.instruction,
             )));
         };
@@ -6507,7 +6513,7 @@ pub fn program_from_elf(config: Config, data: &[u8]) -> Result<ProgramBlob, Prog
         .collect();
 
     let all_jump_targets = harvest_all_jump_targets(&elf, &data_sections_set, &code_sections_set, &instructions, &relocations, &exports)?;
-    let all_blocks = split_code_into_basic_blocks(&all_jump_targets, instructions)?;
+    let all_blocks = split_code_into_basic_blocks(&elf, &all_jump_targets, instructions)?;
     for block in &all_blocks {
         for source in block.next.source.as_slice() {
             assert!(source.offset_range.start < source.offset_range.end);
