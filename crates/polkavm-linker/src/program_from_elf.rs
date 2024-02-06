@@ -1611,7 +1611,10 @@ fn convert_instruction(
             emit(InstExt::Control(ControlInst::Unimplemented));
             Ok(())
         }
-        Inst::FenceI | Inst::Fence { .. } => Ok(()),
+        Inst::FenceI | Inst::Fence { .. } => {
+            emit(InstExt::Basic(BasicInst::Nop));
+            Ok(())
+        }
         Inst::Load { kind, dst, base, offset } => {
             let Some(dst) = cast_reg_non_zero(dst)? else {
                 return Err(ProgramFromElfError::other("found a load with a zero register as the destination"));
@@ -2046,9 +2049,13 @@ fn parse_code_section(
                 }
             }
 
+            let original_length = output.len();
             convert_instruction(section, current_location, original_inst, |inst| {
                 output.push((source, inst));
-            })?
+            })?;
+
+            // We need to always emit at least one instruction (even if it's a NOP) to handle potential jumps.
+            assert_ne!(output.len(), original_length, "internal error: no instructions were emitted");
         }
     }
 
