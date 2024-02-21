@@ -1,4 +1,3 @@
-use polkavm_common::elf::INSTRUCTION_ECALLI;
 use quote::quote;
 use syn::spanned::Spanned;
 use syn::Token;
@@ -257,9 +256,6 @@ pub fn polkavm_import(attributes: ImportBlockAttributes, input: syn::ItemForeign
                     };
                 }
 
-                let asm_ecalli = format!(".4byte 0x{:08x}\n", INSTRUCTION_ECALLI);
-                let asm_ecalli = syn::LitStr::new(&asm_ecalli, ident.span());
-
                 passthrough_tokens.push(quote! {
                     #(#inner_doc_attributes)*
                     #(#inner_cfg_attributes)*
@@ -305,7 +301,7 @@ pub fn polkavm_import(attributes: ImportBlockAttributes, input: syn::ItemForeign
                             extern fn trampoline(a0: u32, a1: u32, a2: u32, a3: u32, a4: u32, a5: u32) {
                                 unsafe {
                                     core::arch::asm!(
-                                        #asm_ecalli,
+                                        ".insn r 0xb, 0, 0, zero, zero, zero\n",
                                         ".4byte {metadata}\n",
                                         "ret\n",
                                         in("a0") a0,

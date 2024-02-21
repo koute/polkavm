@@ -565,6 +565,21 @@ impl<'a> Compiler<'a> {
         self.push(jmp(TMP_REG));
     }
 
+    pub(crate) fn emit_sbrk_trampoline(&mut self) {
+        log::trace!("Emitting trampoline: sbrk");
+        self.define_label(self.sbrk_label);
+
+        self.push(push(TMP_REG));
+        self.save_registers_to_vmctx();
+        self.push(mov_imm64(TMP_REG, self.address_table.syscall_sbrk));
+        self.push(pop(rdi));
+        self.push(call(TMP_REG));
+        self.push(push(rax));
+        self.restore_registers_from_vmctx();
+        self.push(pop(TMP_REG));
+        self.push(ret());
+    }
+
     #[cold]
     pub(crate) fn trace_execution(&mut self, nth_instruction: usize) {
         self.push(mov_imm(TMP_REG, imm32(nth_instruction as u32)));
@@ -652,6 +667,43 @@ impl<'a> InstructionVisitor for VisitorWrapper<'a, Compiler<'a>> {
     #[inline(always)]
     fn fallthrough(&mut self) -> Self::ReturnTy {
         self.start_new_basic_block();
+    }
+
+    #[inline(always)]
+    fn sbrk(&mut self, dst: Reg, size: Reg) -> Self::ReturnTy {
+        let label_bump_only = self.asm.forward_declare_label();
+        let label_continue = self.asm.forward_declare_label();
+        let sbrk_label = self.sbrk_label;
+
+        let dst = conv_reg(dst);
+        let size = conv_reg(size);
+        if dst != size {
+            self.push(mov(RegSize::R32, dst, size));
+        }
+
+        let offset = self.vmctx_heap_info_offset;
+        let heap_info_base = self.load_vmctx_field_address(offset);
+
+        // Calculate new top-of-the-heap pointer.
+        self.push(add((RegSize::R64, dst, reg_indirect(RegSize::R64, heap_info_base))));
+        // Compare it to the current threshold.
+        self.push(cmp((RegSize::R64, dst, reg_indirect(RegSize::R64, heap_info_base + 8))));
+        // If it was less or equal to the threshold then no extra action is necessary (bump only!).
+        self.push(jcc_label8(Condition::BelowOrEqual, label_bump_only));
+
+        // The new top-of-the-heap pointer crossed the threshold, so more involved handling is necessary.
+        // We'll either allocate new memory, or return a null pointer.
+        self.push(mov(RegSize::R64, TMP_REG, dst));
+        self.push(call_label32(sbrk_label));
+        self.push(mov(RegSize::R32, dst, TMP_REG));
+        // Note: `dst` can be zero here, which is why we do the pointer bump from within the handler.
+        self.push(jmp_label8(label_continue));
+
+        self.define_label(label_bump_only);
+        // Only a bump was necessary, so just updated the pointer and continue.
+        self.push(store(RegSize::R64, reg_indirect(RegSize::R64, heap_info_base), dst));
+
+        self.define_label(label_continue);
     }
 
     #[inline(always)]

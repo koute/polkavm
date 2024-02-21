@@ -400,6 +400,43 @@ fn test_bits() {
     assert_eq!(unbits(5, 10, 2048, 25), 0);
 }
 
+#[derive(Copy, Clone)]
+pub struct R(pub u32);
+
+// See chapter 19 of the RISC-V spec.
+pub const OPCODE_CUSTOM_0: u32 = 0b0001011;
+
+impl R {
+    pub fn opcode(self) -> u32 {
+        self.0 & 0b1111111
+    }
+
+    pub fn func3(self) -> u32 {
+        (self.0 >> 12) & 0b111
+    }
+
+    pub fn func7(self) -> u32 {
+        (self.0 >> 25) & 0b1111111
+    }
+
+    pub fn dst(self) -> Reg {
+        Reg::decode(self.0 >> 7)
+    }
+
+    pub fn src1(self) -> Reg {
+        Reg::decode(self.0 >> 15)
+    }
+
+    pub fn src2(self) -> Reg {
+        Reg::decode(self.0 >> 20)
+    }
+
+    // This matches the order of the `.insn` described here: https://sourceware.org/binutils/docs-2.31/as/RISC_002dV_002dFormats.html
+    pub fn unpack(self) -> (u32, u32, u32, Reg, Reg, Reg) {
+        (self.opcode(), self.func3(), self.func7(), self.dst(), self.src1(), self.src2())
+    }
+}
+
 impl Inst {
     pub fn decode(op: u32) -> Option<Self> {
         // This is mostly unofficial, but it's a defacto standard used by both LLVM and GCC.

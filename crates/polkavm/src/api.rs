@@ -4,10 +4,9 @@ use std::sync::{Arc, Mutex};
 
 use core::marker::PhantomData;
 
-use polkavm_common::abi::{GuestMemoryConfig, VM_MAXIMUM_EXPORT_COUNT, VM_MAXIMUM_IMPORT_COUNT, VM_MAXIMUM_INSTRUCTION_COUNT};
+use polkavm_common::abi::{MemoryMap, VM_MAXIMUM_EXPORT_COUNT, VM_MAXIMUM_IMPORT_COUNT, VM_MAXIMUM_INSTRUCTION_COUNT};
 use polkavm_common::abi::{VM_ADDR_RETURN_TO_HOST, VM_ADDR_USER_STACK_HIGH};
 use polkavm_common::error::Trap;
-use polkavm_common::init::GuestProgramInit;
 use polkavm_common::program::{FrameKind, Instruction, InstructionVisitor, Reg};
 use polkavm_common::program::{ProgramBlob, ProgramExport, ProgramImport, ProgramSymbol};
 use polkavm_common::utils::{Access, AsUninitSliceMut, Gas};
@@ -17,11 +16,12 @@ use crate::config::{BackendKind, Config, GasMeteringKind, ModuleConfig, SandboxK
 use crate::error::{bail, bail_static, Error, ExecutionError};
 use crate::interpreter::{InterpretedAccess, InterpretedInstance, InterpretedModule};
 use crate::tracer::Tracer;
+use crate::utils::GuestInit;
 
 if_compiler_is_supported! {
-    use crate::sandbox::Sandbox;
+    use crate::sandbox::{Sandbox, SandboxInstance};
     use crate::sandbox::generic::Sandbox as SandboxGeneric;
-    use crate::compiler::{CompiledInstance, CompiledModule};
+    use crate::compiler::CompiledModule;
 
     #[cfg(target_os = "linux")]
     use crate::sandbox::linux::Sandbox as SandboxLinux;
@@ -29,154 +29,15 @@ if_compiler_is_supported! {
 
 pub type RegValue = u32;
 
-pub(crate) type OnHostcall<'a> = &'a mut dyn for<'r> FnMut(u32, BackendAccess<'r>) -> Result<(), Trap>;
-
 if_compiler_is_supported! {
     {
-        use core::sync::atomic::{AtomicUsize, Ordering};
-
-        pub(crate) trait SandboxExt: Sandbox {
-            fn as_compiled_module(module: &Module) -> &CompiledModule<Self>;
-            fn as_sandbox_vec(sandbox_vec: &SandboxVec) -> &Mutex<Vec<Self>>;
-            fn reuse_or_spawn_sandbox(engine_state: &EngineState, module: &Module) -> Result<Self, Error> {
-                use crate::sandbox::SandboxConfig;
-
-                let mut sandbox_config = Self::Config::default();
-                sandbox_config.enable_logger(cfg!(test) || module.is_debug_trace_execution_enabled());
-
-                if let Some(sandbox) = engine_state.reuse_sandbox::<Self>() {
-                    Ok(sandbox)
-                } else {
-                    Self::spawn(&sandbox_config)
-                        .map_err(Error::from_display)
-                        .map_err(|error| error.context("instantiation failed: failed to create a sandbox"))
-                }
-            }
-
-            fn recycle_sandbox(engine_state: &EngineState, get_sandbox: impl FnOnce() -> Option<Self>) {
-                let Some(sandbox_cache) = engine_state.sandbox_cache.as_ref() else { return };
-                let sandboxes = Self::as_sandbox_vec(&sandbox_cache.sandboxes);
-
-                let mut count = sandbox_cache.available_workers.load(Ordering::Relaxed);
-                if count >= sandbox_cache.worker_limit {
-                    return;
-                }
-
-                loop {
-                    if let Err(new_count) = sandbox_cache.available_workers.compare_exchange(count, count + 1, Ordering::Relaxed, Ordering::Relaxed) {
-                        if new_count >= sandbox_cache.worker_limit {
-                            return;
-                        }
-
-                        count = new_count;
-                        continue;
-                    }
-
-                    break;
-                }
-
-                if let Some(sandbox) = get_sandbox() {
-                    let mut sandboxes = match sandboxes.lock() {
-                        Ok(sandboxes) => sandboxes,
-                        Err(poison) => poison.into_inner(),
-                    };
-
-                    sandboxes.push(sandbox);
-                } else {
-                    sandbox_cache.available_workers.fetch_sub(1, Ordering::Relaxed);
-                }
-            }
-        }
-
-        #[cfg(target_os = "linux")]
-        impl SandboxExt for SandboxLinux {
-            fn as_compiled_module(module: &Module) -> &CompiledModule<Self> {
-                match module.0.compiled_module {
-                    CompiledModuleKind::Linux(ref module) => module,
-                    _ => unreachable!(),
-                }
-            }
-
-            #[allow(clippy::match_wildcard_for_single_variants)]
-            fn as_sandbox_vec(sandbox_vec: &SandboxVec) -> &Mutex<Vec<Self>> {
-                match sandbox_vec {
-                    SandboxVec::Linux(vec) => vec,
-                    _ => unreachable!(),
-                }
-            }
-        }
-
-        impl SandboxExt for SandboxGeneric {
-            fn as_compiled_module(module: &Module) -> &CompiledModule<Self> {
-                match module.0.compiled_module {
-                    CompiledModuleKind::Generic(ref module) => module,
-                    _ => unreachable!(),
-                }
-            }
-
-            fn as_sandbox_vec(sandbox_vec: &SandboxVec) -> &Mutex<Vec<Self>> {
-                match sandbox_vec {
-                    SandboxVec::Generic(vec) => vec,
-                    #[cfg(target_os = "linux")]
-                    SandboxVec::Linux(..) => unreachable!(),
-                }
-            }
-        }
-
-        pub(crate) enum SandboxVec {
-            #[cfg(target_os = "linux")]
-            Linux(Mutex<Vec<SandboxLinux>>),
-            Generic(Mutex<Vec<SandboxGeneric>>),
-        }
-
-        struct SandboxCache {
-            sandboxes: SandboxVec,
-            available_workers: AtomicUsize,
-            worker_limit: usize,
-        }
-
         impl EngineState {
-            fn reuse_sandbox<S>(&self) -> Option<S> where S: SandboxExt {
-                let sandbox_cache = self.sandbox_cache.as_ref()?;
-                if sandbox_cache.available_workers.load(Ordering::Relaxed) == 0 {
-                    return None;
-                }
-
-                let sandboxes = S::as_sandbox_vec(&sandbox_cache.sandboxes);
-                let mut sandboxes = match sandboxes.lock() {
-                    Ok(sandboxes) => sandboxes,
-                    Err(poison) => poison.into_inner(),
-                };
-
-                let mut sandbox = sandboxes.pop()?;
-                sandbox_cache.available_workers.fetch_sub(1, Ordering::Relaxed);
-
-                if let Err(error) = sandbox.sync() {
-                    log::warn!("Failed to reuse a sandbox: {error}");
-                    None
-                } else {
-                    Some(sandbox)
-                }
+            pub(crate) fn sandbox_cache(&self) -> Option<&SandboxCache> {
+                self.sandbox_cache.as_ref()
             }
         }
 
-        fn spawn_sandboxes<S>(count: usize, debug_trace_execution: bool) -> Result<Vec<S>, Error> where S: Sandbox {
-            use crate::sandbox::SandboxConfig;
-
-            let mut sandbox_config = S::Config::default();
-            sandbox_config.enable_logger(cfg!(test) || debug_trace_execution);
-
-            let mut sandboxes = Vec::with_capacity(count);
-            for nth in 0..count {
-                let sandbox = S::spawn(&sandbox_config)
-                    .map_err(crate::Error::from_display)
-                    .map_err(|error| error.context(format!("failed to create a worker process ({} out of {})", nth + 1, count)))?;
-
-                sandboxes.push(sandbox);
-            }
-
-            Ok(sandboxes)
-        }
+        use crate::sandbox::SandboxCache;
     } else {
         struct SandboxCache;
     }
@@ -238,27 +99,7 @@ impl Engine {
                         bail!("cannot use the '{selected_sandbox}' sandbox: this sandbox is not secure yet, and `set_allow_insecure`/`POLKAVM_ALLOW_INSECURE` is not enabled");
                     }
 
-                    let sandboxes = match selected_sandbox {
-                        SandboxKind::Linux => {
-                            #[cfg(target_os = "linux")]
-                            {
-                                SandboxVec::Linux(Mutex::new(spawn_sandboxes(config.worker_count, debug_trace_execution)?))
-                            }
-
-                            #[cfg(not(target_os = "linux"))]
-                            {
-                                unreachable!()
-                            }
-                        },
-                        SandboxKind::Generic => SandboxVec::Generic(Mutex::new(spawn_sandboxes(config.worker_count, debug_trace_execution)?)),
-                    };
-
-                    let sandbox_cache = SandboxCache {
-                        sandboxes,
-                        available_workers: AtomicUsize::new(config.worker_count),
-                        worker_limit: config.worker_count,
-                    };
-
+                    let sandbox_cache = SandboxCache::new(selected_sandbox, config.worker_count, debug_trace_execution)?;
                     (Some(selected_sandbox), Some(sandbox_cache))
                 } else {
                     Default::default()
@@ -312,7 +153,7 @@ struct ModulePrivate {
     blob: ProgramBlob<'static>,
     compiled_module: CompiledModuleKind,
     interpreted_module: Option<InterpretedModule>,
-    memory_config: GuestMemoryConfig,
+    memory_map: MemoryMap,
     gas_metering: Option<GasMeteringKind>,
 }
 
@@ -330,7 +171,7 @@ pub(crate) trait BackendModule: Sized {
         exports: &'a [ProgramExport],
         basic_block_by_jump_table_index: &'a [u32],
         jump_table_index_by_basic_block: &'a [u32],
-        init: GuestProgramInit<'a>,
+        init: GuestInit<'a>,
         instruction_count: usize,
         basic_block_count: usize,
         debug_trace_execution: bool,
@@ -488,6 +329,13 @@ where
         self.start_new_basic_block()?;
         self.0.before_instruction();
         self.0.fallthrough();
+        Ok(())
+    }
+
+    #[inline(always)]
+    fn sbrk(&mut self, d: Reg, s: Reg) -> Self::ReturnTy {
+        self.0.before_instruction();
+        self.0.sbrk(d, s);
         Ok(())
     }
 
@@ -1126,10 +974,6 @@ impl Module {
         self.0.basic_block_by_jump_table_index.get(jump_table_index as usize).copied()
     }
 
-    pub(crate) fn memory_config(&self) -> &GuestMemoryConfig {
-        &self.0.memory_config
-    }
-
     pub(crate) fn gas_metering(&self) -> Option<GasMeteringKind> {
         self.0.gas_metering
     }
@@ -1151,13 +995,7 @@ impl Module {
         log::debug!("Preparing a module from a blob of length {}...", blob.as_bytes().len());
 
         // Do an early check for memory config validity.
-        GuestMemoryConfig::new(
-            blob.ro_data().len() as u64,
-            blob.rw_data().len() as u64,
-            u64::from(blob.bss_size()),
-            u64::from(blob.stack_size()),
-        )
-        .map_err(Error::from_static_str)?;
+        MemoryMap::new(config.page_size, blob.ro_data_size(), blob.rw_data_size(), blob.stack_size()).map_err(Error::from_static_str)?;
 
         let imports = {
             log::trace!("Parsing imports...");
@@ -1229,11 +1067,14 @@ impl Module {
             (maximum_export_jump_target, exports)
         };
 
-        let init = GuestProgramInit::new()
-            .with_ro_data(blob.ro_data())
-            .with_rw_data(blob.rw_data())
-            .with_bss(blob.bss_size())
-            .with_stack(blob.stack_size());
+        let init = GuestInit {
+            page_size: config.page_size,
+            ro_data: blob.ro_data(),
+            rw_data: blob.rw_data(),
+            ro_data_size: blob.ro_data_size(),
+            rw_data_size: blob.rw_data_size(),
+            stack_size: blob.stack_size(),
+        };
 
         macro_rules! new_common {
             () => {{
@@ -1439,21 +1280,27 @@ impl Module {
         let exports = exports.into_iter().map(|export| export.into_owned()).collect();
         let imports = imports.into_iter().map(|import| import.into_owned()).collect();
 
-        let memory_config = init.memory_config().map_err(Error::from_static_str)?;
+        let memory_map = init.memory_map().map_err(Error::from_static_str)?;
         log::debug!(
-            "  Memory map: RO data: 0x{:08x}..0x{:08x}",
-            memory_config.ro_data_range().start,
-            memory_config.ro_data_range().end
+            "  Memory map: RO data: 0x{:08x}..0x{:08x} ({}/{} bytes)",
+            memory_map.ro_data_range().start,
+            memory_map.ro_data_range().end,
+            blob.ro_data_size(),
+            memory_map.ro_data_range().len(),
         );
         log::debug!(
-            "  Memory map:    Heap: 0x{:08x}..0x{:08x}",
-            memory_config.heap_range().start,
-            memory_config.heap_range().end
+            "  Memory map: RW data: 0x{:08x}..0x{:08x} ({}/{} bytes)",
+            memory_map.rw_data_range().start,
+            memory_map.rw_data_range().end,
+            blob.rw_data_size(),
+            memory_map.rw_data_range().len(),
         );
         log::debug!(
-            "  Memory map:   Stack: 0x{:08x}..0x{:08x}",
-            memory_config.stack_range().start,
-            memory_config.stack_range().end
+            "  Memory map:   Stack: 0x{:08x}..0x{:08x} ({}/{} bytes)",
+            memory_map.stack_range().start,
+            memory_map.stack_range().end,
+            blob.stack_size(),
+            memory_map.stack_range().len(),
         );
 
         Ok(Module(Arc::new(ModulePrivate {
@@ -1470,19 +1317,21 @@ impl Module {
             blob: blob.clone().into_owned(),
             compiled_module,
             interpreted_module,
-            memory_config,
+            memory_map,
             gas_metering: config.gas_metering,
         })))
     }
 
-    /// The address at where the program's stack starts inside of the VM.
-    pub fn stack_address_low(&self) -> u32 {
-        self.0.memory_config.stack_address_low()
+    /// The program's memory map.
+    pub fn memory_map(&self) -> &MemoryMap {
+        &self.0.memory_map
     }
 
-    /// The address at where the program's stack ends inside of the VM.
-    pub fn stack_address_high(&self) -> u32 {
-        self.0.memory_config.stack_address_high()
+    /// Searches for a given symbol exported by the module.
+    pub fn lookup_export(&self, symbol: impl AsRef<[u8]>) -> Option<ExportIndex> {
+        let symbol = symbol.as_ref();
+        let export_index = *self.0.export_index_by_symbol.get(symbol)?;
+        Some(ExportIndex(export_index))
     }
 
     /// The raw machine code of the compiled module.
@@ -2097,11 +1946,11 @@ impl<T> InstancePre<T> {
                 match compiled_module {
                     #[cfg(target_os = "linux")]
                     CompiledModuleKind::Linux(..) => {
-                        let compiled_instance = CompiledInstance::new(Arc::clone(&self.0.engine_state), self.0.module.clone())?;
+                        let compiled_instance = SandboxInstance::<SandboxLinux>::spawn_and_load_module(Arc::clone(&self.0.engine_state), &self.0.module)?;
                         Some(InstanceBackend::CompiledLinux(compiled_instance))
                     },
                     CompiledModuleKind::Generic(..) => {
-                        let compiled_instance = CompiledInstance::new(Arc::clone(&self.0.engine_state), self.0.module.clone())?;
+                        let compiled_instance = SandboxInstance::<SandboxGeneric>::spawn_and_load_module(Arc::clone(&self.0.engine_state), &self.0.module)?;
                         Some(InstanceBackend::CompiledGeneric(compiled_instance))
                     },
                     CompiledModuleKind::Unavailable => None
@@ -2115,14 +1964,11 @@ impl<T> InstancePre<T> {
 
         let backend = match backend {
             Some(backend) => backend,
-            None => {
-                let interpreted_instance = InterpretedInstance::new(self.0.module.clone())?;
-                InstanceBackend::Interpreted(interpreted_instance)
-            }
+            None => InstanceBackend::Interpreted(InterpretedInstance::new_from_module(&self.0.module)?),
         };
 
         let tracer = if self.0.module.0.debug_trace_execution {
-            Some(Tracer::new(self.0.module.clone()))
+            Some(Tracer::new(&self.0.module))
         } else {
             None
         };
@@ -2141,8 +1987,8 @@ if_compiler_is_supported! {
     {
         enum InstanceBackend {
             #[cfg(target_os = "linux")]
-            CompiledLinux(CompiledInstance<SandboxLinux>),
-            CompiledGeneric(CompiledInstance<SandboxGeneric>),
+            CompiledLinux(SandboxInstance<SandboxLinux>),
+            CompiledGeneric(SandboxInstance<SandboxGeneric>),
             Interpreted(InterpretedInstance),
         }
     } else {
@@ -2153,18 +1999,18 @@ if_compiler_is_supported! {
 }
 
 impl InstanceBackend {
-    fn call(&mut self, export_index: usize, on_hostcall: OnHostcall, config: &ExecutionConfig) -> Result<(), ExecutionError> {
+    fn execute(&mut self, args: ExecuteArgs) -> Result<(), ExecutionError> {
         if_compiler_is_supported! {
             {
                 match self {
                     #[cfg(target_os = "linux")]
-                    InstanceBackend::CompiledLinux(ref mut backend) => backend.call(export_index, on_hostcall, config),
-                    InstanceBackend::CompiledGeneric(ref mut backend) => backend.call(export_index, on_hostcall, config),
-                    InstanceBackend::Interpreted(ref mut backend) => backend.call(export_index, on_hostcall, config),
+                    InstanceBackend::CompiledLinux(ref mut backend) => backend.execute(args),
+                    InstanceBackend::CompiledGeneric(ref mut backend) => backend.execute(args),
+                    InstanceBackend::Interpreted(ref mut backend) => backend.execute(args),
                 }
             } else {
                 match self {
-                    InstanceBackend::Interpreted(ref mut backend) => backend.call(export_index, on_hostcall, config),
+                    InstanceBackend::Interpreted(ref mut backend) => backend.execute(args),
                 }
             }
         }
@@ -2298,6 +2144,14 @@ impl<'a> Access<'a> for BackendAccess<'a> {
         access_backend!(self, |access| Ok(access.write_memory(address, data).map_err(map_access_error)?))
     }
 
+    fn sbrk(&mut self, size: u32) -> Option<u32> {
+        access_backend!(self, |access| access.sbrk(size))
+    }
+
+    fn heap_size(&self) -> u32 {
+        access_backend!(self, |access| access.heap_size())
+    }
+
     fn program_counter(&self) -> Option<u32> {
         access_backend!(self, |access| access.program_counter())
     }
@@ -2340,35 +2194,218 @@ impl<T> Clone for Instance<T> {
 }
 
 impl<T> Instance<T> {
-    /// Returns a handle to a function of a given symbol exported by the module.
-    pub fn get_func(&self, symbol: impl AsRef<[u8]>) -> Option<Func<T>> {
-        let symbol = symbol.as_ref();
-        let export_index = *self.0.instance_pre.0.module.0.export_index_by_symbol.get(symbol)?;
-        Some(Func {
-            instance: self.clone(),
-            export_index,
-        })
+    /// Returns the module from which this instance was created.
+    pub fn module(&self) -> &Module {
+        &self.0.instance_pre.0.module
     }
 
-    /// Returns a handle to a function of a given symbol exported by the module.
-    pub fn get_typed_func<FnArgs, FnResult>(&self, symbol: impl AsRef<[u8]>) -> Result<TypedFunc<T, FnArgs, FnResult>, Error>
+    /// Updates the state of the instance according to the `state_args` and calls a given function.
+    pub fn call(&self, state_args: StateArgs, call_args: CallArgs<T>) -> Result<(), ExecutionError> {
+        self.execute(state_args, Some(call_args))
+    }
+
+    /// A conveniance function to call into this particular instance according to the default ABI.
+    ///
+    /// This is equivalent to calling [`Instance::call`] with an appropriately set up [`CallArgs`].
+    pub fn call_typed<FnArgs, FnResult>(
+        &self,
+        user_data: &mut T,
+        symbol: impl AsRef<[u8]>,
+        args: FnArgs,
+    ) -> Result<FnResult, ExecutionError>
     where
         FnArgs: FuncArgs,
         FnResult: FuncResult,
     {
         let symbol = symbol.as_ref();
-        let Some(&export_index) = self.0.instance_pre.0.module.0.export_index_by_symbol.get(symbol) else {
-            return Err(Error::from(format!(
-                "failed to acquire a typed function handle: no such function is exported: {}",
-                ProgramSymbol::from(symbol)
-            )));
+        let Some(export_index) = self.module().lookup_export(symbol) else {
+            return Err(ExecutionError::Error(
+                format!(
+                    "failed to call function {}: the module contains no such export",
+                    ProgramSymbol::new(symbol.into())
+                )
+                .into(),
+            ));
         };
 
-        Ok(TypedFunc {
-            instance: self.clone(),
-            export_index,
-            _phantom: PhantomData,
-        })
+        let mut call_args = CallArgs::new(user_data, export_index);
+        call_args.args_typed::<FnArgs>(args);
+
+        self.call(Default::default(), call_args)?;
+        Ok(self.get_result_typed::<FnResult>())
+    }
+
+    /// Updates the state of this particular instance.
+    pub fn update_state(&self, state_args: StateArgs) -> Result<(), ExecutionError> {
+        self.execute(state_args, None)
+    }
+
+    /// A conveniance function to reset the instance's memory to its initial state from when it was first instantiated.
+    ///
+    /// This is equivalent to calling [`Instance::update_state`] with an appropriately set up [`StateArgs`].
+    pub fn reset_memory(&self) -> Result<(), Error> {
+        let mut args = StateArgs::new();
+        args.reset_memory(true);
+        self.update_state(args).map_err(Error::from_execution_error)
+    }
+
+    /// A conveniance function to increase the size of the program's heap by a given number of bytes, allocating memory if necessary.
+    ///
+    /// If successful returns a pointer to the end of the guest's heap.
+    ///
+    /// This is equivalent to manually checking that the `size` bytes can actually be allocated, calling [`Instance::sbrk`] with an appropriately set up [`StateArgs`],
+    /// and calculating the new address of the end of the guest's heap.
+    pub fn sbrk(&self, size: u32) -> Result<Option<u32>, Error> {
+        let mut mutable = match self.0.mutable.lock() {
+            Ok(mutable) => mutable,
+            Err(poison) => poison.into_inner(),
+        };
+
+        let Some(new_size) = mutable.backend.access().heap_size().checked_add(size) else {
+            return Ok(None);
+        };
+
+        if new_size > self.module().memory_map().max_heap_size() {
+            return Ok(None);
+        };
+
+        let mut args = StateArgs::new();
+        args.sbrk(size);
+        self.execute_impl(&mut mutable, args, None).map_err(Error::from_execution_error)?;
+
+        debug_assert_eq!(mutable.backend.access().heap_size(), new_size);
+        Ok(Some(self.module().memory_map().heap_base() + new_size))
+    }
+
+    fn execute(&self, state_args: StateArgs, call_args: Option<CallArgs<T>>) -> Result<(), ExecutionError> {
+        let mutable = &self.0.mutable;
+        let mut mutable = match mutable.lock() {
+            Ok(mutable) => mutable,
+            Err(poison) => poison.into_inner(),
+        };
+
+        self.execute_impl(&mut mutable, state_args, call_args)
+    }
+
+    fn execute_impl(
+        &self,
+        mutable: &mut InstancePrivateMut,
+        state_args: StateArgs,
+        mut call_args: Option<CallArgs<T>>,
+    ) -> Result<(), ExecutionError> {
+        use polkavm_common::{VM_RPC_FLAG_RESET_MEMORY_AFTER_EXECUTION, VM_RPC_FLAG_RESET_MEMORY_BEFORE_EXECUTION};
+
+        let instance_pre = &self.0.instance_pre;
+        let module = &instance_pre.0.module;
+
+        if state_args.sbrk > 0 {
+            let current_size = if state_args.reset_memory {
+                0
+            } else {
+                mutable.backend.access().heap_size()
+            };
+
+            let new_size = current_size.checked_add(state_args.sbrk);
+            if !new_size.map_or(false, |new_size| new_size <= module.memory_map().max_heap_size()) {
+                return Err(ExecutionError::Error(Error::from_static_str(
+                    "execution failed: cannot grow the heap over the maximum",
+                )));
+            }
+        }
+
+        let mut args = ExecuteArgs::new();
+        if state_args.reset_memory {
+            args.flags |= VM_RPC_FLAG_RESET_MEMORY_BEFORE_EXECUTION;
+        }
+
+        args.gas = state_args.gas;
+        args.sbrk = state_args.sbrk;
+
+        let (result, export) = if let Some(call_args) = call_args.as_mut() {
+            let Some(export) = module.0.exports.get(call_args.export_index) else {
+                return Err(ExecutionError::Error(
+                    format!(
+                        "failed to call export #{}: out of range index; the module doesn't contain this many exports",
+                        call_args.export_index
+                    )
+                    .into(),
+                ));
+            };
+
+            args.entry_point = Some(call_args.export_index);
+            args.regs = Some(&call_args.initial_regs);
+            if call_args.reset_memory_after_call {
+                args.flags |= VM_RPC_FLAG_RESET_MEMORY_AFTER_EXECUTION;
+            }
+
+            log::trace!(
+                "Calling into {}... (gas limit = {:?})",
+                export.symbol(),
+                module.0.gas_metering.and(args.gas)
+            );
+
+            if let Some(ref mut tracer) = mutable.tracer() {
+                tracer.on_before_execute(&args);
+            }
+
+            let result = {
+                let mut on_hostcall = on_hostcall(
+                    call_args.user_data,
+                    &instance_pre.0.host_functions,
+                    &instance_pre.0.module.0.imports,
+                    instance_pre.0.fallback_handler.as_ref(),
+                    &mut mutable.raw,
+                );
+
+                args.hostcall_handler = Some(&mut on_hostcall);
+                mutable.backend.execute(args)
+            };
+
+            (result, Some(export))
+        } else {
+            log::trace!("Updating state...");
+
+            if let Some(ref mut tracer) = mutable.tracer() {
+                tracer.on_before_execute(&args);
+            }
+
+            let result = mutable.backend.execute(args);
+            (result, None)
+        };
+
+        if let Some(ref mut tracer) = mutable.tracer() {
+            tracer.on_after_execute();
+        }
+
+        match result {
+            Ok(()) => {
+                log::trace!(
+                    "...execution finished: success, leftover gas = {:?}",
+                    mutable.backend.access().gas_remaining()
+                );
+            }
+            Err(ExecutionError::Error(error)) => {
+                log::trace!("...execution finished: error: {error}");
+
+                if let Some(export) = export {
+                    return Err(ExecutionError::Error(
+                        format!("failed to call function {}: {}", export.symbol(), error).into(),
+                    ));
+                } else {
+                    return Err(ExecutionError::Error(format!("execution failed: {error}").into()));
+                }
+            }
+            Err(ExecutionError::Trap(trap)) => {
+                log::trace!("...execution finished: trapped");
+                return Err(ExecutionError::Trap(trap));
+            }
+            Err(ExecutionError::OutOfGas) => {
+                log::trace!("...execution finished: ran out of gas");
+                return Err(ExecutionError::OutOfGas);
+            }
+        }
+
+        Ok(())
     }
 
     pub fn read_memory_into_slice<'slice, B>(&self, address: u32, buffer: &'slice mut B) -> Result<&'slice mut [u8], Trap>
@@ -2406,6 +2443,17 @@ impl<T> Instance<T> {
         result
     }
 
+    /// Returns the current size of the program's heap.
+    pub fn heap_size(&self) -> u32 {
+        let mut mutable = match self.0.mutable.lock() {
+            Ok(mutable) => mutable,
+            Err(poison) => poison.into_inner(),
+        };
+
+        mutable.backend.access().heap_size()
+    }
+
+    /// Returns the value of the given register.
     pub fn get_reg(&self, reg: Reg) -> RegValue {
         let mut mutable = match self.0.mutable.lock() {
             Ok(mutable) => mutable,
@@ -2413,6 +2461,27 @@ impl<T> Instance<T> {
         };
 
         mutable.backend.access().get_reg(reg)
+    }
+
+    /// Extracts a return value from the argument registers according to the default ABI.
+    ///
+    /// This is equivalent to manually calling [`Instance::get_reg`].
+    pub fn get_result_typed<FnResult>(&self) -> FnResult
+    where
+        FnResult: FuncResult,
+    {
+        let mut mutable = match self.0.mutable.lock() {
+            Ok(mutable) => mutable,
+            Err(poison) => poison.into_inner(),
+        };
+
+        let mut output_count = 0;
+        FnResult::_get(|| {
+            let access = mutable.backend.access();
+            let value = access.get_reg(Reg::ARG_REGS[output_count]);
+            output_count += 1;
+            value
+        })
     }
 
     /// Gets the amount of gas remaining, or `None` if gas metering is not enabled for this instance.
@@ -2442,60 +2511,150 @@ impl<T> Instance<T> {
     }
 }
 
-pub struct ExecutionConfig {
-    pub(crate) reset_memory_after_execution: bool,
-    pub(crate) clear_program_after_execution: bool,
+/// The index of an exported function to be called.
+#[derive(Copy, Clone, Debug)]
+pub struct ExportIndex(usize);
+
+/// A helper struct used when calling into a function exported by the guest program.
+pub struct CallArgs<'a, T> {
     pub(crate) initial_regs: [RegValue; Reg::ALL.len()],
-    pub(crate) gas: Option<Gas>,
+    pub(crate) user_data: &'a mut T,
+    pub(crate) export_index: usize,
+    pub(crate) reset_memory_after_call: bool,
 }
 
-impl Default for ExecutionConfig {
-    fn default() -> Self {
+impl<'a, T> CallArgs<'a, T> {
+    /// Creates a new `CallArgs`.
+    pub fn new(user_data: &'a mut T, export_index: ExportIndex) -> Self {
         let mut initial_regs = [0; Reg::ALL.len()];
         initial_regs[Reg::SP as usize] = VM_ADDR_USER_STACK_HIGH;
         initial_regs[Reg::RA as usize] = VM_ADDR_RETURN_TO_HOST;
 
-        ExecutionConfig {
-            reset_memory_after_execution: false,
-            clear_program_after_execution: false,
+        Self {
             initial_regs,
-            gas: None,
+            user_data,
+            export_index: export_index.0,
+            reset_memory_after_call: false,
         }
     }
-}
 
-impl ExecutionConfig {
-    pub fn set_reset_memory_after_execution(&mut self, value: bool) -> &mut Self {
-        self.reset_memory_after_execution = value;
+    /// Decides whether the memory of the instance will be reset after the call.
+    ///
+    /// Default: `false`
+    pub fn reset_memory_after_call(&mut self, value: bool) -> &mut Self {
+        self.reset_memory_after_call = value;
         self
     }
 
-    pub fn set_clear_program_after_execution(&mut self, value: bool) -> &mut Self {
-        self.clear_program_after_execution = value;
-        self
-    }
-
-    pub fn set_reg(&mut self, reg: Reg, value: RegValue) -> &mut Self {
+    /// Sets a given register to the given value before the call.
+    ///
+    /// The default value for `SP` and `RA` is 0xffff0000, and for every other register it is zero.
+    pub fn reg(&mut self, reg: Reg, value: RegValue) -> &mut Self {
         self.initial_regs[reg as usize] = value;
         self
     }
 
-    pub fn set_gas(&mut self, gas: Gas) -> &mut Self {
-        self.gas = Some(gas);
+    /// Sets the argument registers to the given values.
+    ///
+    /// A shorthand for successively calling `set_reg` with `Reg::A0`, `Reg::A1`, ..., `Reg::A5`.
+    ///
+    /// Will panic if `args` has more than 6 elements.
+    pub fn args_untyped(&mut self, args: &[RegValue]) -> &mut Self {
+        self.initial_regs[Reg::A0 as usize..Reg::A0 as usize + args.len()].copy_from_slice(args);
+        self
+    }
+
+    /// Sets the argument registers to the given values according to the default ABI.
+    pub fn args_typed<FnArgs>(&mut self, args: FnArgs) -> &mut Self
+    where
+        FnArgs: FuncArgs,
+    {
+        let mut input_count = 0;
+        args._set(|value| {
+            assert!(input_count <= Reg::MAXIMUM_INPUT_REGS);
+            self.initial_regs[Reg::A0 as usize + input_count] = value;
+            input_count += 1;
+        });
+
         self
     }
 }
 
-pub struct Func<T> {
-    instance: Instance<T>,
-    export_index: usize,
+pub struct StateArgs {
+    pub(crate) reset_memory: bool,
+    pub(crate) gas: Option<Gas>,
+    pub(crate) sbrk: u32,
 }
 
-impl<T> Clone for Func<T> {
-    fn clone(&self) -> Self {
+impl Default for StateArgs {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl StateArgs {
+    /// Creates a new `StateArgs`.
+    pub fn new() -> Self {
         Self {
-            instance: self.instance.clone(),
-            export_index: self.export_index,
+            reset_memory: false,
+            gas: None,
+            sbrk: 0,
+        }
+    }
+
+    /// Decides whether the memory of the instance will be reset.
+    ///
+    /// If the memory is already reset this does nothing.
+    ///
+    /// Default: `false`
+    pub fn reset_memory(&mut self, value: bool) -> &mut Self {
+        self.reset_memory = value;
+        self
+    }
+
+    /// Sets the current remaining gas.
+    ///
+    /// Default: unset (the current value will not be changed)
+    pub fn set_gas(&mut self, gas: Gas) -> &mut Self {
+        self.gas = Some(gas);
+        self
+    }
+
+    /// Increments the guest's heap by the given number of bytes.
+    ///
+    /// Has exactly the same semantics as the guest-side `sbrk` instruction.
+    ///
+    /// Default: 0
+    pub fn sbrk(&mut self, bytes: u32) -> &mut Self {
+        self.sbrk = bytes;
+        self
+    }
+}
+
+pub(crate) type HostcallHandler<'a> = &'a mut dyn for<'r> FnMut(u32, BackendAccess<'r>) -> Result<(), Trap>;
+
+pub(crate) struct ExecuteArgs<'a> {
+    pub(crate) entry_point: Option<usize>,
+    pub(crate) regs: Option<&'a [RegValue; Reg::ALL.len()]>,
+    pub(crate) gas: Option<Gas>,
+    pub(crate) sbrk: u32,
+    pub(crate) flags: u32,
+    pub(crate) hostcall_handler: Option<HostcallHandler<'a>>,
+    pub(crate) module: Option<&'a Module>,
+    pub(crate) is_async: bool,
+}
+
+impl<'a> ExecuteArgs<'a> {
+    pub(crate) fn new() -> Self {
+        ExecuteArgs {
+            entry_point: None,
+            regs: None,
+            gas: None,
+            sbrk: 0,
+            flags: 0,
+            hostcall_handler: None,
+            module: None,
+            is_async: false,
         }
     }
 }
@@ -2539,182 +2698,5 @@ fn on_hostcall<'a, T>(
         }
 
         Ok(())
-    }
-}
-
-impl<T> Func<T> {
-    /// Calls the function.
-    pub fn call(&self, user_data: &mut T, args: &[RegValue], return_value: &mut [RegValue]) -> Result<(), ExecutionError> {
-        self.call_ex(user_data, args, return_value, ExecutionConfig::default())
-    }
-
-    /// Calls the function with the given configuration.
-    pub fn call_ex(
-        &self,
-        user_data: &mut T,
-        args: &[RegValue],
-        return_value: &mut [RegValue],
-        mut config: ExecutionConfig,
-    ) -> Result<(), ExecutionError> {
-        let instance_pre = &self.instance.0.instance_pre;
-        let export = &instance_pre.0.module.0.exports[self.export_index];
-
-        config.initial_regs[Reg::A0 as usize..Reg::A0 as usize + args.len()].copy_from_slice(args);
-
-        let mutable = &self.instance.0.mutable;
-        let mut mutable = match mutable.lock() {
-            Ok(mutable) => mutable,
-            Err(poison) => poison.into_inner(),
-        };
-
-        let mutable = &mut *mutable;
-        if let Some(ref mut tracer) = mutable.tracer() {
-            tracer.on_before_call(self.export_index, export, &config);
-        }
-
-        let mut on_hostcall = on_hostcall(
-            user_data,
-            &instance_pre.0.host_functions,
-            &instance_pre.0.module.0.imports,
-            instance_pre.0.fallback_handler.as_ref(),
-            &mut mutable.raw,
-        );
-
-        log::trace!(
-            "Calling into {}... (gas limit = {:?})",
-            export.symbol(),
-            self.instance.0.instance_pre.0.module.0.gas_metering.and(config.gas)
-        );
-        let result = mutable.backend.call(self.export_index, &mut on_hostcall, &config);
-        core::mem::drop(on_hostcall);
-
-        if let Some(ref mut tracer) = mutable.tracer() {
-            tracer.on_after_call();
-        }
-
-        match result {
-            Ok(()) => {
-                log::trace!(
-                    "...execution finished: success, leftover gas = {:?}",
-                    mutable.backend.access().gas_remaining()
-                );
-            }
-            Err(ExecutionError::Error(error)) => {
-                log::trace!("...execution finished: error: {error}");
-
-                return Err(ExecutionError::Error(
-                    format!("failed to call function {}: {}", export.symbol(), error).into(),
-                ));
-            }
-            Err(ExecutionError::Trap(trap)) => {
-                log::trace!("...execution finished: trapped");
-                return Err(ExecutionError::Trap(trap));
-            }
-            Err(ExecutionError::OutOfGas) => {
-                log::trace!("...execution finished: ran out of gas");
-                return Err(ExecutionError::OutOfGas);
-            }
-        }
-
-        for (nth, return_value) in return_value.iter_mut().enumerate() {
-            *return_value = mutable.backend.access().get_reg(Reg::ARG_REGS[nth]);
-        }
-
-        Ok(())
-    }
-}
-
-pub struct TypedFunc<T, FnArgs, FnResult> {
-    instance: Instance<T>,
-    export_index: usize,
-    _phantom: PhantomData<(FnArgs, FnResult)>,
-}
-
-impl<T, FnArgs, FnResult> TypedFunc<T, FnArgs, FnResult>
-where
-    FnArgs: FuncArgs,
-    FnResult: FuncResult,
-{
-    /// Calls the function.
-    pub fn call(&self, user_data: &mut T, args: FnArgs) -> Result<FnResult, ExecutionError> {
-        self.call_ex(user_data, args, ExecutionConfig::default())
-    }
-
-    /// Calls the function with the given configuration.
-    pub fn call_ex(&self, user_data: &mut T, args: FnArgs, mut config: ExecutionConfig) -> Result<FnResult, ExecutionError> {
-        let instance_pre = &self.instance.0.instance_pre;
-        let export = &instance_pre.0.module.0.exports[self.export_index];
-
-        let mut input_count = 0;
-        args._set(|value| {
-            assert!(input_count <= Reg::MAXIMUM_INPUT_REGS);
-            config.initial_regs[Reg::A0 as usize + input_count] = value;
-            input_count += 1;
-        });
-
-        let mutable = &self.instance.0.mutable;
-        let mut mutable = match mutable.lock() {
-            Ok(mutable) => mutable,
-            Err(poison) => poison.into_inner(),
-        };
-
-        let mutable = &mut *mutable;
-        if let Some(ref mut tracer) = mutable.tracer() {
-            tracer.on_before_call(self.export_index, export, &config);
-        }
-
-        let mut on_hostcall = on_hostcall(
-            user_data,
-            &instance_pre.0.host_functions,
-            &instance_pre.0.module.0.imports,
-            instance_pre.0.fallback_handler.as_ref(),
-            &mut mutable.raw,
-        );
-
-        log::trace!(
-            "Calling into {}... (gas limit = {:?})",
-            export.symbol(),
-            self.instance.0.instance_pre.0.module.0.gas_metering.and(config.gas)
-        );
-        let result = mutable.backend.call(self.export_index, &mut on_hostcall, &config);
-        core::mem::drop(on_hostcall);
-
-        if let Some(ref mut tracer) = mutable.tracer() {
-            tracer.on_after_call();
-        }
-
-        match result {
-            Ok(()) => {
-                log::trace!(
-                    "...execution finished: success, leftover gas = {:?}",
-                    mutable.backend.access().gas_remaining()
-                );
-            }
-            Err(ExecutionError::Error(error)) => {
-                log::trace!("...execution finished: error: {error}");
-
-                return Err(ExecutionError::Error(
-                    format!("failed to call function {}: {}", export.symbol(), error).into(),
-                ));
-            }
-            Err(ExecutionError::Trap(trap)) => {
-                log::trace!("...execution finished: trapped");
-                return Err(ExecutionError::Trap(trap));
-            }
-            Err(ExecutionError::OutOfGas) => {
-                log::trace!("...execution finished: ran out of gas");
-                return Err(ExecutionError::OutOfGas);
-            }
-        }
-
-        let mut output_count = 0;
-        let result = FnResult::_get(|| {
-            let access = mutable.backend.access();
-            let value = access.get_reg(Reg::ARG_REGS[output_count]);
-            output_count += 1;
-            value
-        });
-
-        Ok(result)
     }
 }

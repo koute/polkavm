@@ -1,13 +1,16 @@
-use crate::api::{BackendAccess, ExecutionConfig, MemoryAccessError, Module, OnHostcall};
-use crate::error::{bail, Error};
+use crate::api::{BackendAccess, ExecuteArgs, HostcallHandler, MemoryAccessError, Module};
+use crate::error::Error;
+use crate::utils::GuestInit;
 use crate::utils::RegImm;
 use core::mem::MaybeUninit;
 use polkavm_common::abi::{VM_ADDR_RETURN_TO_HOST, VM_CODE_ADDRESS_ALIGNMENT};
 use polkavm_common::error::Trap;
-use polkavm_common::init::GuestProgramInit;
 use polkavm_common::operation::*;
 use polkavm_common::program::{Instruction, InstructionVisitor, Reg};
-use polkavm_common::utils::{byte_slice_init, Access, AsUninitSliceMut, Gas};
+use polkavm_common::utils::{align_to_next_page_usize, byte_slice_init, Access, AsUninitSliceMut, Gas};
+use polkavm_common::{
+    VM_RPC_FLAG_CLEAR_PROGRAM_AFTER_EXECUTION, VM_RPC_FLAG_RESET_MEMORY_AFTER_EXECUTION, VM_RPC_FLAG_RESET_MEMORY_BEFORE_EXECUTION,
+};
 
 type ExecutionError<E = core::convert::Infallible> = polkavm_common::error::ExecutionError<E>;
 
@@ -19,15 +22,15 @@ pub(crate) struct InterpretedModule {
 }
 
 impl InterpretedModule {
-    pub fn new(init: GuestProgramInit, gas_cost_for_basic_block: Vec<u32>, instructions: Vec<Instruction>) -> Result<Self, Error> {
-        let memory_config = init.memory_config().map_err(Error::from_static_str)?;
-        let mut ro_data: Vec<_> = init.ro_data().into();
-        ro_data.resize(memory_config.ro_data_size() as usize, 0);
+    pub fn new(init: GuestInit, gas_cost_for_basic_block: Vec<u32>, instructions: Vec<Instruction>) -> Result<Self, Error> {
+        let memory_map = init.memory_map().map_err(Error::from_static_str)?;
+        let mut ro_data: Vec<_> = init.ro_data.into();
+        ro_data.resize(memory_map.ro_data_size() as usize, 0);
 
         Ok(InterpretedModule {
             instructions,
             ro_data,
-            rw_data: init.rw_data().into(),
+            rw_data: init.rw_data.into(),
             gas_cost_for_basic_block,
         })
     }
@@ -38,13 +41,13 @@ pub(crate) type OnStore<'a> = &'a mut dyn for<'r> FnMut(u32, &'r [u8]) -> Result
 
 #[derive(Default)]
 pub(crate) struct InterpreterContext<'a> {
-    on_hostcall: Option<OnHostcall<'a>>,
+    on_hostcall: Option<HostcallHandler<'a>>,
     on_set_reg: Option<OnSetReg<'a>>,
     on_store: Option<OnStore<'a>>,
 }
 
 impl<'a> InterpreterContext<'a> {
-    pub fn set_on_hostcall(&mut self, on_hostcall: OnHostcall<'a>) {
+    pub fn set_on_hostcall(&mut self, on_hostcall: HostcallHandler<'a>) {
         self.on_hostcall = Some(on_hostcall);
     }
 
@@ -58,8 +61,8 @@ impl<'a> InterpreterContext<'a> {
 }
 
 pub(crate) struct InterpretedInstance {
-    module: Module,
-    heap: Vec<u8>,
+    module: Option<Module>,
+    rw_data: Vec<u8>,
     stack: Vec<u8>,
     regs: [u32; Reg::ALL.len()],
     nth_instruction: u32,
@@ -68,24 +71,16 @@ pub(crate) struct InterpretedInstance {
     cycle_counter: u64,
     gas_remaining: Option<i64>,
     in_new_execution: bool,
+    is_memory_dirty: bool,
+    heap_size: u32,
 }
 
 impl InterpretedInstance {
-    pub fn new(module: Module) -> Result<Self, Error> {
-        if module.interpreted_module().is_none() {
-            bail!("an interpreter cannot be created from the given module")
-        }
-
-        let mut heap = Vec::new();
-        let mut stack = Vec::new();
-
-        heap.reserve_exact(module.memory_config().heap_size() as usize);
-        stack.reserve_exact(module.memory_config().stack_size() as usize);
-
-        let mut interpreter = Self {
-            heap,
-            stack,
-            module,
+    pub fn new() -> Self {
+        Self {
+            module: None,
+            rw_data: Vec::new(),
+            stack: Vec::new(),
             regs: [0; Reg::ALL.len()],
             nth_instruction: VM_ADDR_RETURN_TO_HOST,
             nth_basic_block: 0,
@@ -93,26 +88,31 @@ impl InterpretedInstance {
             cycle_counter: 0,
             gas_remaining: None,
             in_new_execution: false,
-        };
-
-        if interpreter.module.gas_metering().is_some() {
-            interpreter.gas_remaining = Some(0);
+            is_memory_dirty: false,
+            heap_size: 0,
         }
-
-        interpreter.reset_memory();
-        Ok(interpreter)
     }
 
-    pub fn call(&mut self, export_index: usize, on_hostcall: OnHostcall, config: &ExecutionConfig) -> Result<(), ExecutionError<Error>> {
-        let mut ctx = InterpreterContext::default();
-        ctx.set_on_hostcall(on_hostcall);
-        self.prepare_for_call(export_index, config);
+    pub fn new_from_module(module: &Module) -> Result<Self, Error> {
+        let mut instance = InterpretedInstance::new();
+        let mut args = ExecuteArgs::new();
+        args.module = Some(module);
+        instance.execute(args).map_err(Error::from_execution_error)?;
 
-        let result = self.run(ctx);
-        if config.reset_memory_after_execution {
-            self.reset_memory();
+        Ok(instance)
+    }
+
+    pub fn execute(&mut self, mut args: ExecuteArgs) -> Result<(), ExecutionError<Error>> {
+        self.prepare_for_execution(&args);
+
+        let mut ctx = InterpreterContext::default();
+        if let Some(hostcall_handler) = args.hostcall_handler.take() {
+            ctx.set_on_hostcall(hostcall_handler);
         }
 
+        let result = if args.entry_point.is_some() { self.run(ctx) } else { Ok(()) };
+
+        self.finish_execution(args.flags);
         result
     }
 
@@ -125,21 +125,22 @@ impl InterpretedInstance {
             })
         }
 
+        self.is_memory_dirty = true;
+
         if self.in_new_execution {
             self.in_new_execution = false;
             translate_error(self.on_start_new_basic_block())?;
         }
 
+        let Some(module) = self.module.as_ref() else {
+            return Err(ExecutionError::Error(Error::from_static_str("no module loaded")));
+        };
+
+        let module = module.clone();
         let mut visitor = Visitor { inner: self, ctx };
         loop {
             visitor.inner.cycle_counter += 1;
-            let Some(instruction) = visitor
-                .inner
-                .module
-                .instructions()
-                .get(visitor.inner.nth_instruction as usize)
-                .copied()
-            else {
+            let Some(instruction) = module.instructions().get(visitor.inner.nth_instruction as usize).copied() else {
                 return Err(ExecutionError::Trap(Default::default()));
             };
 
@@ -152,43 +153,6 @@ impl InterpretedInstance {
         Ok(())
     }
 
-    pub fn reset_memory(&mut self) {
-        let interpreted_module = self.module.interpreted_module().unwrap();
-        self.heap.clear();
-        self.heap.extend_from_slice(&interpreted_module.rw_data);
-        self.heap.resize(self.module.memory_config().heap_size() as usize, 0);
-        self.stack.clear();
-        self.stack.resize(self.module.memory_config().stack_size() as usize, 0);
-    }
-
-    pub fn prepare_for_call(&mut self, export_index: usize, config: &ExecutionConfig) {
-        // TODO: If this function becomes public then this needs to return an error.
-        let nth_basic_block = self
-            .module
-            .get_export(export_index)
-            .expect("internal error: invalid export index")
-            .jump_target();
-
-        let nth_instruction = self
-            .module
-            .instruction_by_basic_block(nth_basic_block)
-            .expect("internal error: invalid export address");
-
-        self.return_to_host = false;
-        self.regs.copy_from_slice(&config.initial_regs);
-        self.nth_instruction = nth_instruction;
-        self.nth_basic_block = nth_basic_block;
-        if self.module.gas_metering().is_some() {
-            if let Some(gas) = config.gas {
-                self.gas_remaining = Some(gas.get() as i64);
-            }
-        } else {
-            self.gas_remaining = None;
-        }
-
-        self.in_new_execution = true;
-    }
-
     pub fn step_once(&mut self, ctx: InterpreterContext) -> Result<(), ExecutionError> {
         if self.in_new_execution {
             self.in_new_execution = false;
@@ -196,13 +160,132 @@ impl InterpretedInstance {
         }
 
         self.cycle_counter += 1;
-        let Some(instruction) = self.module.instructions().get(self.nth_instruction as usize).copied() else {
+        let module = self.module.as_ref().expect("no module loaded");
+        let Some(instruction) = module.instructions().get(self.nth_instruction as usize).copied() else {
             return Err(ExecutionError::Trap(Default::default()));
         };
 
         let mut visitor = Visitor { inner: self, ctx };
-
         instruction.visit(&mut visitor)
+    }
+
+    fn reset_instance(&mut self) {
+        self.rw_data.clear();
+        self.stack.clear();
+
+        *self = Self {
+            rw_data: core::mem::take(&mut self.rw_data),
+            stack: core::mem::take(&mut self.stack),
+            ..Self::new()
+        };
+    }
+
+    pub fn reset_memory(&mut self) {
+        if self.is_memory_dirty {
+            self.force_reset_memory();
+        }
+    }
+
+    fn force_reset_memory(&mut self) {
+        self.rw_data.clear();
+        self.stack.clear();
+        self.heap_size = 0;
+        self.is_memory_dirty = false;
+
+        if let Some(module) = self.module.as_ref() {
+            let interpreted_module = module.interpreted_module().unwrap();
+            self.rw_data.extend_from_slice(&interpreted_module.rw_data);
+            self.rw_data.resize(module.memory_map().rw_data_size() as usize, 0);
+            self.stack.resize(module.memory_map().stack_size() as usize, 0);
+        }
+    }
+
+    pub fn sbrk(&mut self, size: u32) -> Option<u32> {
+        let module = self.module.as_ref()?;
+        let new_heap_size = self.heap_size.checked_add(size)?;
+        let memory_map = module.memory_map();
+        if new_heap_size > memory_map.max_heap_size() {
+            return None;
+        }
+
+        log::trace!("sbrk: +{} (heap size: {} -> {})", size, self.heap_size, new_heap_size);
+
+        self.heap_size = new_heap_size;
+        let heap_top = memory_map.heap_base() + new_heap_size;
+        if heap_top as usize > memory_map.rw_data_address() as usize + self.rw_data.len() {
+            let new_size = align_to_next_page_usize(memory_map.page_size() as usize, heap_top as usize).unwrap()
+                - memory_map.rw_data_address() as usize;
+            log::trace!("sbrk: growing memory: {} -> {}", self.rw_data.len(), new_size);
+            self.rw_data.resize(new_size, 0);
+        }
+
+        Some(heap_top)
+    }
+
+    pub fn prepare_for_execution(&mut self, args: &ExecuteArgs) {
+        if let Some(module) = args.module {
+            if module.interpreted_module().is_none() {
+                panic!("internal_error: an interpreter cannot be created from the given module");
+            }
+
+            self.reset_instance();
+            self.module = Some(module.clone());
+            if module.gas_metering().is_some() {
+                self.gas_remaining = Some(0);
+            }
+
+            self.force_reset_memory();
+        }
+
+        if let Some(regs) = args.regs {
+            self.regs.copy_from_slice(regs);
+        }
+
+        if self.module.as_ref().and_then(|module| module.gas_metering()).is_some() {
+            if let Some(gas) = args.gas {
+                self.gas_remaining = Some(gas.get() as i64);
+            }
+        } else {
+            self.gas_remaining = None;
+        }
+
+        if let Some(entry_point) = args.entry_point {
+            let module = self
+                .module
+                .as_ref()
+                .expect("internal error: tried to call into an instance without a loaded module");
+
+            let nth_basic_block = module
+                .get_export(entry_point)
+                .expect("internal error: invalid export index")
+                .jump_target();
+
+            let nth_instruction = module
+                .instruction_by_basic_block(nth_basic_block)
+                .expect("internal error: invalid export address");
+
+            self.nth_instruction = nth_instruction;
+            self.nth_basic_block = nth_basic_block;
+        }
+
+        if args.flags & VM_RPC_FLAG_RESET_MEMORY_BEFORE_EXECUTION != 0 {
+            self.reset_memory();
+        }
+
+        if args.sbrk > 0 {
+            self.sbrk(args.sbrk).expect("internal error: sbrk failed");
+        }
+
+        self.return_to_host = false;
+        self.in_new_execution = true;
+    }
+
+    pub fn finish_execution(&mut self, flags: u32) {
+        if flags & VM_RPC_FLAG_CLEAR_PROGRAM_AFTER_EXECUTION != 0 {
+            self.reset_instance();
+        } else if flags & VM_RPC_FLAG_RESET_MEMORY_AFTER_EXECUTION != 0 {
+            self.reset_memory();
+        }
     }
 
     pub fn access(&mut self) -> InterpretedAccess {
@@ -210,39 +293,40 @@ impl InterpretedInstance {
     }
 
     fn get_memory_slice(&self, address: u32, length: u32) -> Option<&[u8]> {
-        let memory_config = self.module.memory_config();
-        let (range, memory) = if memory_config.ro_data_range().contains(&address) {
-            let module = self.module.interpreted_module().unwrap();
-            (memory_config.ro_data_range(), &module.ro_data)
-        } else if memory_config.heap_range().contains(&address) {
-            (memory_config.heap_range(), &self.heap)
-        } else if memory_config.stack_range().contains(&address) {
-            (memory_config.stack_range(), &self.stack)
+        let module = self.module.as_ref()?;
+        let memory_map = module.memory_map();
+        let (start, memory_slice) = if address >= memory_map.stack_address_low() {
+            (memory_map.stack_address_low(), &self.stack)
+        } else if address >= memory_map.rw_data_address() {
+            (memory_map.rw_data_address(), &self.rw_data)
+        } else if address >= memory_map.ro_data_address() {
+            let module = module.interpreted_module().unwrap();
+            (memory_map.ro_data_address(), &module.ro_data)
         } else {
             return None;
         };
 
-        let offset = address - range.start;
-        memory.get(offset as usize..offset as usize + length as usize)
+        let offset = address - start;
+        memory_slice.get(offset as usize..offset as usize + length as usize)
     }
 
     fn get_memory_slice_mut(&mut self, address: u32, length: u32) -> Option<&mut [u8]> {
-        let memory_config = self.module.memory_config();
-        let (range, memory_slice) = if memory_config.heap_range().contains(&address) {
-            (memory_config.heap_range(), &mut self.heap)
-        } else if memory_config.stack_range().contains(&address) {
-            (memory_config.stack_range(), &mut self.stack)
+        let memory_map = self.module.as_ref()?.memory_map();
+        let (start, memory_slice) = if address >= memory_map.stack_address_low() {
+            (memory_map.stack_address_low(), &mut self.stack)
+        } else if address >= memory_map.rw_data_address() {
+            (memory_map.rw_data_address(), &mut self.rw_data)
         } else {
             return None;
         };
 
-        let offset = (address - range.start) as usize;
+        let offset = (address - start) as usize;
         memory_slice.get_mut(offset..offset + length as usize)
     }
 
     fn on_start_new_basic_block(&mut self) -> Result<(), ExecutionError> {
         if let Some(ref mut gas_remaining) = self.gas_remaining {
-            let module = self.module.interpreted_module().unwrap();
+            let module = self.module.as_ref().unwrap().interpreted_module().unwrap();
             let gas_cost = i64::from(module.gas_cost_for_basic_block[self.nth_basic_block as usize]);
 
             log::trace!(
@@ -305,6 +389,8 @@ impl<'a> Access<'a> for InterpretedAccess<'a> {
     }
 
     fn write_memory(&mut self, address: u32, data: &[u8]) -> Result<(), Self::Error> {
+        self.instance.is_memory_dirty = true;
+
         let Some(slice) = self.instance.get_memory_slice_mut(address, data.len() as u32) else {
             return Err(MemoryAccessError {
                 address,
@@ -315,6 +401,14 @@ impl<'a> Access<'a> for InterpretedAccess<'a> {
 
         slice.copy_from_slice(data);
         Ok(())
+    }
+
+    fn sbrk(&mut self, size: u32) -> Option<u32> {
+        self.instance.sbrk(size)
+    }
+
+    fn heap_size(&self) -> u32 {
+        self.instance.heap_size
     }
 
     fn program_counter(&self) -> Option<u32> {
@@ -392,6 +486,8 @@ impl<'a, 'b> Visitor<'a, 'b> {
             self.inner.nth_instruction = self
                 .inner
                 .module
+                .as_ref()
+                .unwrap()
                 .instruction_by_basic_block(target)
                 .expect("internal error: couldn't fetch the instruction index for a branch");
             self.inner.nth_basic_block = target;
@@ -414,8 +510,11 @@ impl<'a, 'b> Visitor<'a, 'b> {
                 pc = self.inner.nth_instruction,
                 cycle = self.inner.cycle_counter
             );
+
             self.inner
                 .module
+                .as_ref()
+                .unwrap()
                 .debug_print_location(log::Level::Debug, self.inner.nth_instruction);
             return Err(ExecutionError::Trap(Default::default()));
         };
@@ -430,6 +529,7 @@ impl<'a, 'b> Visitor<'a, 'b> {
 
     fn store<T: StoreTy>(&mut self, src: impl Into<RegImm>, base: Option<Reg>, offset: u32) -> Result<(), ExecutionError> {
         assert!(core::mem::size_of::<T>() >= 1);
+        self.inner.is_memory_dirty = true;
 
         let address = base.map_or(0, |base| self.inner.regs[base as usize]).wrapping_add(offset);
         let value = match src.into() {
@@ -453,6 +553,8 @@ impl<'a, 'b> Visitor<'a, 'b> {
             );
             self.inner
                 .module
+                .as_ref()
+                .unwrap()
                 .debug_print_location(log::Level::Debug, self.inner.nth_instruction);
             return Err(ExecutionError::Trap(Default::default()));
         };
@@ -471,6 +573,8 @@ impl<'a, 'b> Visitor<'a, 'b> {
     fn get_return_address(&self) -> u32 {
         self.inner
             .module
+            .as_ref()
+            .unwrap()
             .jump_table_index_by_basic_block(self.inner.nth_basic_block + 1)
             .expect("internal error: couldn't fetch the jump table index for the return basic block")
             * VM_CODE_ADDRESS_ALIGNMENT
@@ -509,6 +613,8 @@ impl<'a, 'b> Visitor<'a, 'b> {
         let Some(nth_basic_block) = self
             .inner
             .module
+            .as_ref()
+            .unwrap()
             .basic_block_by_jump_table_index(target / VM_CODE_ADDRESS_ALIGNMENT)
         else {
             return Err(ExecutionError::Trap(Default::default()));
@@ -517,6 +623,8 @@ impl<'a, 'b> Visitor<'a, 'b> {
         let nth_instruction = self
             .inner
             .module
+            .as_ref()
+            .unwrap()
             .instruction_by_basic_block(nth_basic_block)
             .expect("internal error: couldn't fetch the instruction index for a dynamic jump");
 
@@ -603,6 +711,14 @@ impl<'a, 'b> InstructionVisitor for Visitor<'a, 'b> {
         self.inner.nth_instruction += 1;
         self.inner.nth_basic_block += 1;
         self.inner.on_start_new_basic_block()
+    }
+
+    fn sbrk(&mut self, dst: Reg, size: Reg) -> Self::ReturnTy {
+        let size = self.get(size);
+        let result = self.inner.sbrk(size).unwrap_or(0);
+        self.set(dst, result)?;
+        self.inner.nth_instruction += 1;
+        Ok(())
     }
 
     fn ecalli(&mut self, imm: u32) -> Self::ReturnTy {
@@ -939,6 +1055,8 @@ impl<'a, 'b> InstructionVisitor for Visitor<'a, 'b> {
         let nth_instruction = self
             .inner
             .module
+            .as_ref()
+            .unwrap()
             .instruction_by_basic_block(target)
             .expect("internal error: couldn't fetch the instruction index for a jump");
 

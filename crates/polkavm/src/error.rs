@@ -52,6 +52,18 @@ impl Error {
     }
 
     #[cold]
+    pub(crate) fn from_execution_error<E>(error: ExecutionError<E>) -> Self
+    where
+        E: core::fmt::Display,
+    {
+        match error {
+            ExecutionError::Error(error) => Error::from_display(error),
+            ExecutionError::Trap(_) => Error::from_display("unexpected trap"),
+            ExecutionError::OutOfGas => Error::from_display("unexpected out-of-gas"),
+        }
+    }
+
+    #[cold]
     pub(crate) fn context(self, message: impl core::fmt::Display) -> Self {
         let string = match self.0 {
             ErrorKind::Owned(mut buffer) => {

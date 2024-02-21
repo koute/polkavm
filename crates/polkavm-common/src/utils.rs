@@ -215,6 +215,12 @@ pub trait Access<'a> {
     where
         T: ?Sized + AsUninitSliceMut;
     fn write_memory(&mut self, address: u32, data: &[u8]) -> Result<(), Self::Error>;
+
+    fn sbrk(&mut self, size: u32) -> Option<u32>;
+
+    /// Returns the current size of the program's heap.
+    fn heap_size(&self) -> u32;
+
     fn program_counter(&self) -> Option<u32>;
     fn native_program_counter(&self) -> Option<u64>;
 

@@ -55,12 +55,13 @@ if_compiler_is_supported! {
 }
 
 pub use polkavm_common::{
+    abi::MemoryMap,
     error::{ExecutionError, Trap},
     program::{ProgramBlob, ProgramParseError, Reg},
     utils::{AsUninitSliceMut, Gas},
 };
 
-pub use crate::api::{Engine, ExecutionConfig, Func, Instance, InstancePre, Linker, Module, TypedFunc};
+pub use crate::api::{CallArgs, Engine, ExportIndex, Instance, InstancePre, Linker, Module, StateArgs};
 pub use crate::caller::{Caller, CallerRef};
 pub use crate::config::{BackendKind, Config, GasMeteringKind, ModuleConfig, SandboxKind};
 pub use crate::error::Error;

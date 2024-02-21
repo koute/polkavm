@@ -1,16 +1,16 @@
 use crate::{
-    Caller, CallerRef, Config, Engine, ExecutionConfig, ExecutionError, Gas, GasMeteringKind, Linker, Module, ModuleConfig, ProgramBlob,
-    Reg, Trap,
+    CallArgs, Caller, CallerRef, Config, Engine, ExecutionError, Gas, GasMeteringKind, Linker, MemoryMap, Module, ModuleConfig,
+    ProgramBlob, Reg, StateArgs, Trap,
 };
 use core::cell::RefCell;
 use std::collections::HashMap;
 use std::rc::Rc;
 use std::sync::Mutex;
 
-use polkavm_common::abi::{VM_ADDR_USER_MEMORY, VM_PAGE_SIZE};
 use polkavm_common::program::asm;
 use polkavm_common::program::Reg::*;
 use polkavm_common::program::{ProgramExport, ProgramImport};
+use polkavm_common::utils::align_to_next_page_u32;
 use polkavm_common::writer::ProgramBlobBuilder;
 
 macro_rules! run_tests {
@@ -88,12 +88,13 @@ macro_rules! run_tests {
 }
 
 fn basic_test_blob() -> ProgramBlob<'static> {
+    let memory_map = MemoryMap::new(0x4000, 0, 0x4000, 0).unwrap();
     let mut builder = ProgramBlobBuilder::new();
-    builder.set_bss_size(VM_PAGE_SIZE);
+    builder.set_rw_data_size(0x4000);
     builder.add_export(ProgramExport::new(0, "main".into()));
     builder.add_import(ProgramImport::new("hostcall".into()));
     builder.set_code(&[
-        asm::store_imm_u32(0x12345678, VM_ADDR_USER_MEMORY),
+        asm::store_imm_u32(0x12345678, memory_map.rw_data_address()),
         asm::add(S0, A0, A1),
         asm::ecalli(0),
         asm::add(A0, A0, S0),
@@ -114,15 +115,16 @@ fn caller_and_caller_ref_work(config: Config) {
         illegal_contraband: Rc<RefCell<Option<CallerRef<State>>>>,
     }
 
+    let address = module.memory_map().rw_data_address();
     linker
         .func_wrap("hostcall", move |caller: Caller<State>| -> Result<u32, Trap> {
             {
-                let value = caller.read_u32(VM_ADDR_USER_MEMORY)?;
+                let value = caller.read_u32(address)?;
                 assert_eq!(value, 0x12345678);
             }
             {
                 let caller = caller.into_ref();
-                let value = caller.read_u32(VM_ADDR_USER_MEMORY)?;
+                let value = caller.read_u32(address)?;
                 assert_eq!(value, 0x12345678);
 
                 let illegal_contraband = Rc::clone(&caller.data().illegal_contraband);
@@ -136,11 +138,7 @@ fn caller_and_caller_ref_work(config: Config) {
     let instance_pre = linker.instantiate_pre(&module).unwrap();
     let instance = instance_pre.instantiate().unwrap();
     let mut state = State::default();
-    let result = instance
-        .get_typed_func::<(u32, u32), u32>("main")
-        .unwrap()
-        .call(&mut state, (1, 10))
-        .unwrap();
+    let result = instance.call_typed::<(u32, u32), u32>(&mut state, "main", (1, 10)).unwrap();
 
     assert_eq!(result, 111);
 
@@ -161,15 +159,16 @@ fn caller_split_works(config: Config) {
         value: u32,
     }
 
+    let address = module.memory_map().rw_data_address();
     linker
         .func_wrap("hostcall", move |caller: Caller<State>| -> Result<u32, Trap> {
             {
-                let value = caller.read_u32(VM_ADDR_USER_MEMORY)?;
+                let value = caller.read_u32(address)?;
                 assert_eq!(value, 0x12345678);
             }
             {
                 let (caller, state) = caller.split();
-                state.value = caller.read_u32(VM_ADDR_USER_MEMORY)?;
+                state.value = caller.read_u32(address)?;
             }
 
             Ok(100)
@@ -179,11 +178,7 @@ fn caller_split_works(config: Config) {
     let instance_pre = linker.instantiate_pre(&module).unwrap();
     let instance = instance_pre.instantiate().unwrap();
     let mut state = State::default();
-    let result = instance
-        .get_typed_func::<(u32, u32), u32>("main")
-        .unwrap()
-        .call(&mut state, (1, 10))
-        .unwrap();
+    let result = instance.call_typed::<(u32, u32), u32>(&mut state, "main", (1, 10)).unwrap();
 
     assert_eq!(result, 111);
     assert_eq!(state.value, 0x12345678);
@@ -213,30 +208,11 @@ fn trapping_from_hostcall_handler_works(config: Config) {
     let instance_pre = linker.instantiate_pre(&module).unwrap();
     let instance = instance_pre.instantiate().unwrap();
 
-    let result = instance
-        .get_typed_func::<(u32, u32), u32>("main")
-        .unwrap()
-        .call(&mut Kind::Ok, (1, 10));
+    let result = instance.call_typed::<(u32, u32), u32>(&mut Kind::Ok, "main", (1, 10));
     assert!(matches!(result, Ok(111)));
 
-    let result = instance
-        .get_typed_func::<(u32, u32), u32>("main")
-        .unwrap()
-        .call(&mut Kind::Trap, (1, 10));
+    let result = instance.call_typed::<(u32, u32), u32>(&mut Kind::Trap, "main", (1, 10));
     assert!(matches!(result, Err(ExecutionError::Trap(..))));
-
-    let mut return_value = [0];
-    let result = instance.get_func("main").unwrap().call(&mut Kind::Ok, &[1, 10], &mut return_value);
-    assert!(matches!(result, Ok(())));
-    assert_eq!(return_value, [111]);
-
-    return_value = [999];
-    let result = instance
-        .get_func("main")
-        .unwrap()
-        .call(&mut Kind::Trap, &[1, 10], &mut return_value);
-    assert!(matches!(result, Err(ExecutionError::Trap(..))));
-    assert_eq!(return_value, [999]); // Is unchanged.
 }
 
 fn fallback_hostcall_handler_works(config: Config) {
@@ -254,11 +230,7 @@ fn fallback_hostcall_handler_works(config: Config) {
 
     let instance_pre = linker.instantiate_pre(&module).unwrap();
     let instance = instance_pre.instantiate().unwrap();
-    let result = instance
-        .get_typed_func::<(u32, u32), u32>("main")
-        .unwrap()
-        .call(&mut (), (1, 10))
-        .unwrap();
+    let result = instance.call_typed::<(u32, u32), u32>(&mut (), "main", (1, 10)).unwrap();
 
     assert_eq!(result, 111);
 }
@@ -371,8 +343,8 @@ fn doom(config: Config, elf: &'static [u8]) {
 
     let instance_pre = linker.instantiate_pre(&module).unwrap();
     let instance = instance_pre.instantiate().unwrap();
-    let ext_initialize = instance.get_typed_func::<(), ()>("ext_initialize").unwrap();
-    let ext_tick = instance.get_typed_func::<(), ()>("ext_tick").unwrap();
+    let ext_initialize = instance.module().lookup_export("ext_initialize").unwrap();
+    let ext_tick = instance.module().lookup_export("ext_tick").unwrap();
 
     let mut state = State {
         frame: Vec::new(),
@@ -380,9 +352,11 @@ fn doom(config: Config, elf: &'static [u8]) {
         frame_height: 0,
     };
 
-    ext_initialize.call(&mut state, ()).unwrap();
+    instance
+        .call(Default::default(), CallArgs::new(&mut state, ext_initialize))
+        .unwrap();
     for nth_frame in 0..=10440 {
-        ext_tick.call(&mut state, ()).unwrap();
+        instance.call(Default::default(), CallArgs::new(&mut state, ext_tick)).unwrap();
 
         let expected_frame_raw = match nth_frame {
             120 => decompress_zstd(include_bytes!("../../../test-data/doom_00120.tga.zst")),
@@ -446,16 +420,19 @@ fn pinky(config: Config) {
     let linker = Linker::new(&engine);
     let instance_pre = linker.instantiate_pre(&module).unwrap();
     let instance = instance_pre.instantiate().unwrap();
-    let ext_initialize = instance.get_typed_func::<(), ()>("initialize").unwrap();
-    let ext_run = instance.get_typed_func::<(), ()>("run").unwrap();
-    let ext_get_framebuffer = instance.get_typed_func::<(), u32>("get_framebuffer").unwrap();
+    let ext_initialize = instance.module().lookup_export("initialize").unwrap();
+    let ext_run = instance.module().lookup_export("run").unwrap();
+    let ext_get_framebuffer = instance.module().lookup_export("get_framebuffer").unwrap();
 
-    ext_initialize.call(&mut (), ()).unwrap();
+    instance.call(Default::default(), CallArgs::new(&mut (), ext_initialize)).unwrap();
     for _ in 0..256 {
-        ext_run.call(&mut (), ()).unwrap();
+        instance.call(Default::default(), CallArgs::new(&mut (), ext_run)).unwrap();
     }
 
-    let address = ext_get_framebuffer.call(&mut (), ()).unwrap();
+    instance
+        .call(Default::default(), CallArgs::new(&mut (), ext_get_framebuffer))
+        .unwrap();
+    let address = instance.get_result_typed::<u32>();
     let framebuffer = instance.read_memory_into_new_vec(address, 256 * 240 * 4).unwrap();
 
     let expected_frame_raw = decompress_zstd(include_bytes!("../../../test-data/pinky_00256.tga.zst"));
@@ -469,6 +446,7 @@ fn pinky(config: Config) {
 }
 
 struct TestInstance {
+    module: crate::Module,
     instance: crate::Instance<()>,
 }
 
@@ -504,10 +482,16 @@ impl TestInstance {
             })
             .unwrap();
 
+        linker
+            .func_wrap("call_sbrk_indirectly_impl", |mut caller: Caller<()>, size: u32| -> u32 {
+                caller.sbrk(size).unwrap_or(0)
+            })
+            .unwrap();
+
         let instance_pre = linker.instantiate_pre(&module).unwrap();
         let instance = instance_pre.instantiate().unwrap();
 
-        TestInstance { instance }
+        TestInstance { module, instance }
     }
 
     pub fn call<FnArgs, FnResult>(&self, name: &str, args: FnArgs) -> Result<FnResult, crate::ExecutionError<crate::Error>>
@@ -515,11 +499,8 @@ impl TestInstance {
         FnArgs: crate::api::FuncArgs,
         FnResult: crate::api::FuncResult,
     {
-        let function = self
-            .instance
-            .get_typed_func::<FnArgs, FnResult>(name)
-            .expect("function doesn't exist");
-        function.call(&mut (), args)
+        self.instance.call_typed::<FnArgs, FnResult>(&mut (), name, args)?;
+        Ok(self.instance.get_result_typed::<FnResult>())
     }
 }
 
@@ -572,9 +553,9 @@ fn test_blob_atomic_fetch_minmax(config: Config) {
         for a in [-10, 0, 10] {
             for b in [-10, 0, 10] {
                 let new_value = cb(a, b);
-                i.call::<(i32,), ()>("set_atomic_global", (a,)).unwrap();
+                i.call::<(i32,), ()>("set_global", (a,)).unwrap();
                 assert_eq!(i.call::<(i32,), i32>(name, (b,)).unwrap(), a);
-                assert_eq!(i.call::<(), i32>("get_atomic_global", ()).unwrap(), new_value);
+                assert_eq!(i.call::<(), i32>("get_global", ()).unwrap(), new_value);
             }
         }
     }
@@ -595,6 +576,129 @@ fn test_blob_input_registers(config: Config) {
     assert!(i.call::<(), ()>("test_input_registers", ()).is_ok());
 }
 
+fn test_blob_call_sbrk_from_guest(config: Config) {
+    test_blob_call_sbrk_impl(config, |i, size| i.call::<(u32,), u32>("call_sbrk", (size,)).unwrap())
+}
+
+fn test_blob_call_sbrk_from_host_instance(config: Config) {
+    test_blob_call_sbrk_impl(config, |i, size| i.instance.sbrk(size).unwrap().unwrap_or(0))
+}
+
+fn test_blob_call_sbrk_from_host_function(config: Config) {
+    test_blob_call_sbrk_impl(config, |i, size| i.call::<(u32,), u32>("call_sbrk_indirectly", (size,)).unwrap())
+}
+
+fn test_blob_program_memory_can_be_reused_and_cleared(config: Config) {
+    let i = TestInstance::new(&config);
+    let address = i.call::<(), u32>("get_global_address", ()).unwrap();
+
+    assert_eq!(i.instance.read_memory_into_new_vec(address, 4).unwrap(), [0x00, 0x00, 0x00, 0x00]);
+
+    i.call::<(), ()>("increment_global", ()).unwrap();
+    assert_eq!(i.instance.read_memory_into_new_vec(address, 4).unwrap(), [0x01, 0x00, 0x00, 0x00]);
+
+    i.call::<(), ()>("increment_global", ()).unwrap();
+    assert_eq!(i.instance.read_memory_into_new_vec(address, 4).unwrap(), [0x02, 0x00, 0x00, 0x00]);
+
+    let ext_increment_global = i.instance.module().lookup_export("increment_global").unwrap();
+    {
+        let mut state = ();
+        let mut call_args = CallArgs::new(&mut state, ext_increment_global);
+        call_args.reset_memory_after_call(true);
+        i.instance.call(Default::default(), call_args).unwrap();
+    }
+    assert_eq!(i.instance.read_memory_into_new_vec(address, 4).unwrap(), [0x00, 0x00, 0x00, 0x00]);
+
+    i.call::<(), ()>("increment_global", ()).unwrap();
+    assert_eq!(i.instance.read_memory_into_new_vec(address, 4).unwrap(), [0x01, 0x00, 0x00, 0x00]);
+
+    i.call::<(), ()>("increment_global", ()).unwrap();
+    assert_eq!(i.instance.read_memory_into_new_vec(address, 4).unwrap(), [0x02, 0x00, 0x00, 0x00]);
+
+    {
+        let mut state_args = StateArgs::new();
+        state_args.reset_memory(true);
+        i.instance.call(state_args, CallArgs::new(&mut (), ext_increment_global)).unwrap();
+    }
+    assert_eq!(i.instance.read_memory_into_new_vec(address, 4).unwrap(), [0x01, 0x00, 0x00, 0x00]);
+}
+
+fn test_blob_out_of_bounds_memory_access_generates_a_trap(config: Config) {
+    let i = TestInstance::new(&config);
+    let address = i.call::<(), u32>("get_global_address", ()).unwrap();
+    assert_eq!(i.call::<(u32,), u32>("read_u32", (address,)).unwrap(), 0);
+    i.call::<(), ()>("increment_global", ()).unwrap();
+    assert_eq!(i.call::<(u32,), u32>("read_u32", (address,)).unwrap(), 1);
+    assert!(matches!(i.call::<(u32,), u32>("read_u32", (4,)), Err(ExecutionError::Trap(..))));
+
+    assert_eq!(i.call::<(u32,), u32>("read_u32", (address,)).unwrap(), 1);
+    i.call::<(), ()>("increment_global", ()).unwrap();
+    assert_eq!(i.call::<(u32,), u32>("read_u32", (address,)).unwrap(), 2);
+}
+
+fn test_blob_call_sbrk_impl(config: Config, mut call_sbrk: impl FnMut(&mut TestInstance, u32) -> u32) {
+    let mut i = TestInstance::new(&config);
+    let memory_map = i.module.memory_map().clone();
+    let heap_base = memory_map.heap_base();
+    let page_size = memory_map.page_size();
+
+    assert_eq!(
+        i.instance.read_memory_into_new_vec(memory_map.rw_data_range().end - 1, 1).unwrap(),
+        vec![0]
+    );
+    assert!(i.instance.read_memory_into_new_vec(memory_map.rw_data_range().end, 1).is_err());
+    assert!(i
+        .instance
+        .read_memory_into_new_vec(heap_base, memory_map.rw_data_range().end - heap_base)
+        .unwrap()
+        .iter()
+        .all(|&byte| byte == 0));
+    assert_eq!(i.instance.heap_size(), 0);
+
+    log::error!("AAA");
+    assert_eq!(call_sbrk(&mut i, 0), heap_base);
+    log::error!("BBB");
+    assert_eq!(i.instance.heap_size(), 0);
+    assert_eq!(call_sbrk(&mut i, 0), heap_base);
+    assert_eq!(call_sbrk(&mut i, 1), heap_base + 1);
+    assert_eq!(i.instance.heap_size(), 1);
+    assert_eq!(call_sbrk(&mut i, 0), heap_base + 1);
+    assert_eq!(call_sbrk(&mut i, 0xffffffff), 0);
+    assert_eq!(call_sbrk(&mut i, 0), heap_base + 1);
+
+    i.instance.write_memory(heap_base, &[0x33]).unwrap();
+    assert_eq!(i.instance.read_memory_into_new_vec(heap_base, 1).unwrap(), vec![0x33]);
+
+    let new_origin = align_to_next_page_u32(memory_map.page_size(), heap_base + i.instance.heap_size()).unwrap();
+    {
+        let until_next_page = new_origin - (heap_base + i.instance.heap_size());
+        assert_eq!(call_sbrk(&mut i, until_next_page), new_origin);
+    }
+
+    assert_eq!(i.instance.read_memory_into_new_vec(new_origin - 1, 1).unwrap(), vec![0]);
+    assert!(i.instance.read_memory_into_new_vec(new_origin, 1).is_err());
+    assert!(i.instance.write_memory(new_origin, &[0x34]).is_err());
+
+    assert_eq!(call_sbrk(&mut i, 1), new_origin + 1);
+    assert_eq!(
+        i.instance.read_memory_into_new_vec(new_origin, page_size).unwrap().len(),
+        page_size as usize
+    );
+    assert!(i.instance.read_memory_into_new_vec(new_origin, page_size + 1).is_err());
+    assert!(i.instance.write_memory(new_origin, &[0x35]).is_ok());
+
+    assert_eq!(call_sbrk(&mut i, page_size - 1), new_origin + page_size);
+    assert!(i.instance.read_memory_into_new_vec(new_origin, page_size + 1).is_err());
+
+    i.instance.reset_memory().unwrap();
+    assert_eq!(call_sbrk(&mut i, 0), heap_base);
+    assert_eq!(i.instance.heap_size(), 0);
+    assert!(i.instance.read_memory_into_new_vec(memory_map.rw_data_range().end, 1).is_err());
+
+    assert_eq!(call_sbrk(&mut i, 1), heap_base + 1);
+    assert_eq!(i.instance.read_memory_into_new_vec(heap_base, 1).unwrap(), vec![0]);
+}
+
 fn basic_gas_metering(config: Config, gas_metering_kind: GasMeteringKind) {
     let _ = env_logger::try_init();
 
@@ -611,38 +715,39 @@ fn basic_gas_metering(config: Config, gas_metering_kind: GasMeteringKind) {
     let linker = Linker::new(&engine);
     let instance_pre = linker.instantiate_pre(&module).unwrap();
     let instance = instance_pre.instantiate().unwrap();
+    let ext_main = instance.module().lookup_export("main").unwrap();
 
     {
-        let mut config = ExecutionConfig::default();
-        config.set_gas(Gas::new(2).unwrap());
+        let mut state_args = StateArgs::default();
+        state_args.set_gas(Gas::new(2).unwrap());
 
-        let result = instance.get_typed_func::<(), i32>("main").unwrap().call_ex(&mut (), (), config);
-        assert!(matches!(result, Ok(666)), "unexpected result: {result:?}");
+        instance.call(state_args, CallArgs::new(&mut (), ext_main)).unwrap();
+        assert_eq!(instance.get_result_typed::<i32>(), 666);
         assert_eq!(instance.gas_remaining().unwrap(), Gas::new(0).unwrap());
     }
 
     {
-        let mut config = ExecutionConfig::default();
-        config.set_gas(Gas::new(1).unwrap());
+        let mut state_args = StateArgs::default();
+        state_args.set_gas(Gas::new(1).unwrap());
 
-        let result = instance.get_typed_func::<(), i32>("main").unwrap().call_ex(&mut (), (), config);
+        let result = instance.call(state_args, CallArgs::new(&mut (), ext_main));
         assert!(matches!(result, Err(ExecutionError::OutOfGas)), "unexpected result: {result:?}");
         assert_eq!(instance.gas_remaining().unwrap(), Gas::new(0).unwrap());
     }
 
     {
-        let mut config = ExecutionConfig::default();
-        config.set_gas(Gas::new(4).unwrap());
+        let mut state_args = StateArgs::default();
+        state_args.set_gas(Gas::new(4).unwrap());
 
-        let result = instance.get_typed_func::<(), i32>("main").unwrap().call_ex(&mut (), (), config);
-        assert!(matches!(result, Ok(666)), "unexpected result: {result:?}");
+        instance.call(state_args, CallArgs::new(&mut (), ext_main)).unwrap();
+        assert_eq!(instance.get_result_typed::<i32>(), 666);
         assert_eq!(instance.gas_remaining().unwrap(), Gas::new(2).unwrap());
 
-        let result = instance.get_typed_func::<(), i32>("main").unwrap().call(&mut (), ());
-        assert!(matches!(result, Ok(666)), "unexpected result: {result:?}");
+        instance.call(StateArgs::default(), CallArgs::new(&mut (), ext_main)).unwrap();
+        assert_eq!(instance.get_result_typed::<i32>(), 666);
         assert_eq!(instance.gas_remaining().unwrap(), Gas::new(0).unwrap());
 
-        let result = instance.get_typed_func::<(), i32>("main").unwrap().call(&mut (), ());
+        let result = instance.call(StateArgs::default(), CallArgs::new(&mut (), ext_main));
         assert_eq!(instance.gas_remaining().unwrap(), Gas::new(0).unwrap());
         assert!(matches!(result, Err(ExecutionError::OutOfGas)), "unexpected result: {result:?}");
     }
@@ -652,7 +757,7 @@ fn basic_gas_metering(config: Config, gas_metering_kind: GasMeteringKind) {
         let instance = instance_pre.instantiate().unwrap();
         assert_eq!(instance.gas_remaining().unwrap(), Gas::new(0).unwrap());
 
-        let result = instance.get_typed_func::<(), i32>("main").unwrap().call(&mut (), ());
+        let result = instance.call(StateArgs::default(), CallArgs::new(&mut (), ext_main));
         assert!(matches!(result, Err(ExecutionError::OutOfGas)), "unexpected result: {result:?}");
         assert_eq!(instance.gas_remaining().unwrap(), Gas::new(0).unwrap());
     }
@@ -691,30 +796,31 @@ fn consume_gas_in_host_function(config: Config, gas_metering_kind: GasMeteringKi
 
     let instance_pre = linker.instantiate_pre(&module).unwrap();
     let instance = instance_pre.instantiate().unwrap();
+    let ext_main = instance.module().lookup_export("main").unwrap();
 
     {
-        let mut config = ExecutionConfig::default();
-        config.set_gas(Gas::new(3).unwrap());
+        let mut state_args = StateArgs::default();
+        state_args.set_gas(Gas::new(3).unwrap());
 
-        let result = instance.get_typed_func::<(), i32>("main").unwrap().call_ex(&mut 0, (), config);
-        assert!(matches!(result, Ok(666)), "unexpected result: {result:?}");
+        instance.call(state_args, CallArgs::new(&mut 0, ext_main)).unwrap();
+        assert_eq!(instance.get_result_typed::<i32>(), 666);
         assert_eq!(instance.gas_remaining().unwrap(), Gas::new(1).unwrap());
     }
 
     {
-        let mut config = ExecutionConfig::default();
-        config.set_gas(Gas::new(3).unwrap());
+        let mut state_args = StateArgs::default();
+        state_args.set_gas(Gas::new(3).unwrap());
 
-        let result = instance.get_typed_func::<(), i32>("main").unwrap().call_ex(&mut 1, (), config);
-        assert!(matches!(result, Ok(666)), "unexpected result: {result:?}");
+        instance.call(state_args, CallArgs::new(&mut 1, ext_main)).unwrap();
+        assert_eq!(instance.get_result_typed::<i32>(), 666);
         assert_eq!(instance.gas_remaining().unwrap(), Gas::new(0).unwrap());
     }
 
     {
-        let mut config = ExecutionConfig::default();
-        config.set_gas(Gas::new(3).unwrap());
+        let mut state_args = StateArgs::default();
+        state_args.set_gas(Gas::new(3).unwrap());
 
-        let result = instance.get_typed_func::<(), i32>("main").unwrap().call_ex(&mut 2, (), config);
+        let result = instance.call(state_args, CallArgs::new(&mut 2, ext_main));
         assert_eq!(instance.gas_remaining().unwrap(), Gas::new(0).unwrap());
         assert!(matches!(result, Err(ExecutionError::OutOfGas)), "unexpected result: {result:?}");
     }
@@ -751,23 +857,74 @@ fn gas_metering_with_more_than_one_basic_block(config: Config) {
     let linker = Linker::new(&engine);
     let instance_pre = linker.instantiate_pre(&module).unwrap();
     let instance = instance_pre.instantiate().unwrap();
+    let ext_1 = instance.module().lookup_export("export_1").unwrap();
+    let ext_2 = instance.module().lookup_export("export_2").unwrap();
 
     {
-        let mut config = ExecutionConfig::default();
-        config.set_gas(Gas::new(10).unwrap());
+        let mut state_args = StateArgs::default();
+        state_args.set_gas(Gas::new(10).unwrap());
 
-        let result = instance.get_typed_func::<(), i32>("export_1").unwrap().call_ex(&mut (), (), config);
-        assert!(matches!(result, Ok(666)), "unexpected result: {result:?}");
+        instance.call(state_args, CallArgs::new(&mut (), ext_1)).unwrap();
+        assert_eq!(instance.get_result_typed::<i32>(), 666);
         assert_eq!(instance.gas_remaining().unwrap(), Gas::new(8).unwrap());
     }
 
     {
-        let mut config = ExecutionConfig::default();
-        config.set_gas(Gas::new(10).unwrap());
+        let mut state_args = StateArgs::default();
+        state_args.set_gas(Gas::new(10).unwrap());
 
-        let result = instance.get_typed_func::<(), i32>("export_2").unwrap().call_ex(&mut (), (), config);
-        assert!(matches!(result, Ok(766)), "unexpected result: {result:?}");
+        instance.call(state_args, CallArgs::new(&mut (), ext_2)).unwrap();
+        assert_eq!(instance.get_result_typed::<i32>(), 766);
         assert_eq!(instance.gas_remaining().unwrap(), Gas::new(7).unwrap());
+    }
+}
+
+fn spawn_stress_test(mut config: Config) {
+    let _ = env_logger::try_init();
+
+    let mut builder = ProgramBlobBuilder::new();
+    builder.add_export(ProgramExport::new(0, "main".into()));
+    builder.set_ro_data_size(1);
+    builder.set_rw_data_size(1);
+    builder.set_ro_data(vec![0x00]);
+    builder.set_code(&[asm::ret()]);
+
+    let blob = ProgramBlob::parse(builder.into_vec()).unwrap();
+
+    for worker_count in [0, 1] {
+        config.set_worker_count(worker_count);
+        let engine = Engine::new(&config).unwrap();
+
+        let module = Module::from_blob(&engine, &ModuleConfig::default(), &blob).unwrap();
+        let ext_main = module.lookup_export("main").unwrap();
+        let linker = Linker::new(&engine);
+        let instance_pre = linker.instantiate_pre(&module).unwrap();
+
+        const THREAD_COUNT: usize = 32;
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(THREAD_COUNT));
+
+        let mut threads = Vec::new();
+        for _ in 0..THREAD_COUNT {
+            let instance_pre = instance_pre.clone();
+            let barrier = std::sync::Arc::clone(&barrier);
+            let thread = std::thread::spawn(move || {
+                barrier.wait();
+                for _ in 0..64 {
+                    let instance = instance_pre.instantiate().unwrap();
+                    instance.call(Default::default(), CallArgs::new(&mut (), ext_main)).unwrap();
+                }
+            });
+            threads.push(thread);
+        }
+
+        let mut results = Vec::new();
+        for thread in threads {
+            results.push(thread.join());
+        }
+
+        for result in results {
+            result.unwrap();
+        }
     }
 }
 
@@ -788,12 +945,19 @@ run_tests! {
     test_blob_hostcall
     test_blob_define_abi
     test_blob_input_registers
+    test_blob_call_sbrk_from_guest
+    test_blob_call_sbrk_from_host_instance
+    test_blob_call_sbrk_from_host_function
+    test_blob_program_memory_can_be_reused_and_cleared
+    test_blob_out_of_bounds_memory_access_generates_a_trap
 
     basic_gas_metering_sync
     basic_gas_metering_async
     consume_gas_in_host_function_sync
     consume_gas_in_host_function_async
     gas_metering_with_more_than_one_basic_block
+
+    spawn_stress_test
 }
 
 // Source: https://users.rust-lang.org/t/a-macro-to-assert-that-a-type-does-not-implement-trait-bounds/31179
@@ -829,11 +993,10 @@ macro_rules! assert_send_sync {
 }
 
 assert_send_sync! {
+    crate::CallArgs<'static, ()>,
     crate::Config,
     crate::Engine,
     crate::Error,
-    crate::ExecutionConfig,
-    crate::Func<()>,
     crate::Gas,
     crate::Instance<()>,
     crate::InstancePre<()>,
@@ -841,8 +1004,8 @@ assert_send_sync! {
     crate::Module,
     crate::ModuleConfig,
     crate::ProgramBlob<'static>,
+    crate::StateArgs,
     crate::Trap,
-    crate::TypedFunc<(), (), ()>,
 }
 
 assert_not_impl!(crate::Caller<'static, ()>, Send);

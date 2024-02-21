@@ -1,5 +1,5 @@
 use core::mem::MaybeUninit;
-use polkavm::{Caller, Config, Engine, ExecutionError, Linker, Module, ProgramBlob, Trap, TypedFunc};
+use polkavm::{Caller, Config, Engine, ExecutionError, Instance, Linker, Module, ProgramBlob, Trap};
 
 struct State {
     rom: Vec<u8>,
@@ -13,9 +13,7 @@ struct State {
 
 pub struct Vm {
     state: State,
-    ext_initialize: TypedFunc<State, (), ()>,
-    ext_tick: TypedFunc<State, (), ()>,
-    ext_on_keychange: TypedFunc<State, (u32, u32), ()>,
+    instance: Instance<State>,
 }
 
 impl Vm {
@@ -108,9 +106,6 @@ impl Vm {
 
         let instance_pre = linker.instantiate_pre(&module)?;
         let instance = instance_pre.instantiate()?;
-        let ext_initialize = instance.get_typed_func::<(), ()>("ext_initialize")?;
-        let ext_tick = instance.get_typed_func::<(), ()>("ext_tick")?;
-        let ext_on_keychange = instance.get_typed_func::<(u32, u32), ()>("ext_on_keychange")?;
 
         Ok(Self {
             state: State {
@@ -121,9 +116,7 @@ impl Vm {
                 audio_buffer: Default::default(),
                 on_audio_frame: None,
             },
-            ext_initialize,
-            ext_tick,
-            ext_on_keychange,
+            instance,
         })
     }
 
@@ -133,15 +126,16 @@ impl Vm {
 
     pub fn initialize(&mut self, rom: impl Into<Vec<u8>>) -> Result<(), ExecutionError<polkavm::Error>> {
         self.state.rom = rom.into();
-        self.ext_initialize.call(&mut self.state, ())
+        self.instance.call_typed(&mut self.state, "ext_initialize", ())
     }
 
     pub fn run_for_a_frame(&mut self) -> Result<(u32, u32, &[u8]), ExecutionError<polkavm::Error>> {
-        self.ext_tick.call(&mut self.state, ())?;
+        self.instance.call_typed(&mut self.state, "ext_tick", ())?;
         Ok((self.state.frame_width, self.state.frame_height, &self.state.frame))
     }
 
     pub fn on_keychange(&mut self, key: u8, is_pressed: bool) -> Result<(), ExecutionError<polkavm::Error>> {
-        self.ext_on_keychange.call(&mut self.state, (key as u32, is_pressed as u32))
+        self.instance
+            .call_typed(&mut self.state, "ext_on_keychange", (key as u32, is_pressed as u32))
     }
 }
