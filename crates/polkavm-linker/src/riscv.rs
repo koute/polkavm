@@ -286,8 +286,8 @@ pub enum AtomicKind {
 
 #[derive(Copy, Clone, PartialEq, Eq, Debug, Hash)]
 pub enum CmovKind {
-    EqZero = 0b101,
-    NotEqZero = 0b111,
+    EqZero = 0b111,
+    NotEqZero = 0b101,
 }
 
 impl Reg {
@@ -563,7 +563,7 @@ impl Inst {
 
                     0b0000111_00000_00000_101_00000_0000000 => {
                         return Some(Inst::Cmov {
-                            kind: CmovKind::EqZero,
+                            kind: CmovKind::NotEqZero,
                             dst,
                             src: src1,
                             cond: src2,
@@ -571,7 +571,7 @@ impl Inst {
                     }
                     0b0000111_00000_00000_111_00000_0000000 => {
                         return Some(Inst::Cmov {
-                            kind: CmovKind::NotEqZero,
+                            kind: CmovKind::EqZero,
                             dst,
                             src: src1,
                             cond: src2,
@@ -898,7 +898,7 @@ fn test_decode_cmov() {
     assert_eq!(
         Inst::decode(0xec5f5b3).unwrap(),
         Inst::Cmov {
-            kind: CmovKind::NotEqZero,
+            kind: CmovKind::EqZero,
             dst: Reg::A1,
             src: Reg::A1,
             cond: Reg::A2
@@ -908,7 +908,7 @@ fn test_decode_cmov() {
     assert_eq!(
         Inst::decode(0xec55533).unwrap(),
         Inst::Cmov {
-            kind: CmovKind::EqZero,
+            kind: CmovKind::NotEqZero,
             dst: Reg::A0,
             src: Reg::A0,
             cond: Reg::A2
