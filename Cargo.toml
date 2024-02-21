@@ -59,6 +59,7 @@ syn = "2.0.25"
 unwrap_or_default = "allow"
 get_first = "allow"
 manual_range_contains = "allow"
+let_unit_value = "allow"
 
 # These are are 'allow' by default.
 alloc_instead_of_core = "warn"
