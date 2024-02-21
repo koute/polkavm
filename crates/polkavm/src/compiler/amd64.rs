@@ -358,15 +358,32 @@ impl<'a> Compiler<'a> {
 
     #[cfg_attr(not(debug_assertions), inline(always))]
     fn cmov(&mut self, d: Reg, s: Reg, c: Reg, condition: Condition) {
-        if d != c && d != s {
-            self.clear_reg(d);
-            self.push(test((self.reg_size(), conv_reg(c), conv_reg(c))));
-            self.push(cmov(condition, self.reg_size(), conv_reg(d), conv_reg(s)));
-        } else {
+        let d = conv_reg(d);
+        let s = conv_reg(s);
+        let c = conv_reg(c);
+
+        if d == s {
+            let condition = match condition {
+                Condition::Equal => Condition::NotEqual,
+                Condition::NotEqual => Condition::Equal,
+                _ => unreachable!()
+            };
+
             self.push(xor((RegSize::R32, TMP_REG, TMP_REG)));
-            self.push(test((self.reg_size(), conv_reg(c), conv_reg(c))));
-            self.push(cmov(condition, self.reg_size(), TMP_REG, conv_reg(s)));
-            self.push(mov(self.reg_size(), conv_reg(d), TMP_REG))
+            self.push(test((self.reg_size(), c, c)));
+            self.push(cmov(condition, self.reg_size(), d, TMP_REG));
+        } else if d != c {
+            debug_assert_ne!(d, s);
+            self.push(xor((RegSize::R32, d, d)));
+            self.push(test((self.reg_size(), c, c)));
+            self.push(cmov(condition, self.reg_size(), d, s));
+        } else {
+            debug_assert_ne!(d, s);
+            debug_assert_eq!(d, c);
+            self.push(xor((RegSize::R32, TMP_REG, TMP_REG)));
+            self.push(test((self.reg_size(), c, c)));
+            self.push(mov(self.reg_size(), d, TMP_REG));
+            self.push(cmov(condition, self.reg_size(), d, s));
         }
     }
 
