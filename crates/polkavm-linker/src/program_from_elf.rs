@@ -1677,7 +1677,11 @@ fn convert_instruction(
             "found a bare ecall instruction; those are not supported",
         )),
         Inst::Cmov { kind, dst, src, cond, .. } => {
-            let Some(dst) = cast_reg_non_zero(dst)? else { return Ok(()) };
+            let Some(dst) = cast_reg_non_zero(dst)? else {
+                emit(InstExt::Basic(BasicInst::Nop));
+                return Ok(());
+            };
+
             let Some(cond) = cast_reg_non_zero(cond)? else {
                 return Err(ProgramFromElfError::other(
                     "found a conditional move with a zero register as the condition",
@@ -1686,10 +1690,11 @@ fn convert_instruction(
 
             if let Some(src) = cast_reg_non_zero(src)? {
                 emit(InstExt::Basic(BasicInst::Cmov { kind, dst, src, cond }));
-
                 Ok(())
             } else {
-                todo!();
+                Err(ProgramFromElfError::other(
+                    "unimplemented: found a conditional move with a zero register as the source",
+                ))
             }
         }
         Inst::LoadReserved { dst, src, .. } => {
