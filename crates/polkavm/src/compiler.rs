@@ -1,21 +1,19 @@
 use std::borrow::Cow;
 use std::collections::HashMap;
-use std::sync::Arc;
 
 use polkavm_assembler::{Assembler, Label};
-use polkavm_common::error::{ExecutionError, Trap};
-use polkavm_common::init::GuestProgramInit;
 use polkavm_common::program::{ProgramExport, Instruction};
 use polkavm_common::zygote::{
     AddressTable, VM_COMPILER_MAXIMUM_EPILOGUE_LENGTH, VM_COMPILER_MAXIMUM_INSTRUCTION_LENGTH,
 };
 use polkavm_common::abi::VM_CODE_ADDRESS_ALIGNMENT;
 
-use crate::api::{BackendAccess, EngineState, ExecutionConfig, Module, OnHostcall, SandboxExt, VisitorWrapper};
+use crate::api::VisitorWrapper;
 use crate::error::{bail, Error};
 
-use crate::sandbox::{Sandbox, SandboxProgram, SandboxProgramInit, ExecuteArgs};
+use crate::sandbox::{Sandbox, SandboxProgram, SandboxInit};
 use crate::config::{GasMeteringKind, ModuleConfig, SandboxKind};
+use crate::utils::GuestInit;
 
 #[cfg(target_arch = "x86_64")]
 mod amd64;
@@ -37,14 +35,16 @@ pub(crate) struct Compiler<'a> {
     trap_label: Label,
     trace_label: Label,
     jump_table_label: Label,
+    sbrk_label: Label,
     sandbox_kind: SandboxKind,
     gas_metering: Option<GasMeteringKind>,
     native_code_address: u64,
     address_table: AddressTable,
     vmctx_regs_offset: usize,
     vmctx_gas_offset: usize,
+    vmctx_heap_info_offset: usize,
     nth_instruction_to_code_offset_map: Vec<u32>,
-    init: GuestProgramInit<'a>,
+    init: GuestInit<'a>,
     is_last_instruction: bool,
 }
 
@@ -54,7 +54,7 @@ struct CompilationResult<'a> {
     export_trampolines: Vec<u64>,
     sysreturn_address: u64,
     nth_instruction_to_code_offset_map: Vec<u32>,
-    init: GuestProgramInit<'a>,
+    init: GuestInit<'a>,
 }
 
 impl<'a> Compiler<'a> {
@@ -68,17 +68,19 @@ impl<'a> Compiler<'a> {
         address_table: AddressTable,
         vmctx_regs_offset: usize,
         vmctx_gas_offset: usize,
+        vmctx_heap_info_offset: usize,
         debug_trace_execution: bool,
         native_code_address: u64,
         instruction_count: usize,
         basic_block_count: usize,
-        init: GuestProgramInit<'a>,
+        init: GuestInit<'a>,
     ) -> Self {
         let mut asm = Assembler::new();
         let ecall_label = asm.forward_declare_label();
         let trap_label = asm.forward_declare_label();
         let trace_label = asm.forward_declare_label();
         let jump_table_label = asm.forward_declare_label();
+        let sbrk_label = asm.forward_declare_label();
 
         let nth_basic_block_to_label = Vec::with_capacity(basic_block_count);
         let mut nth_basic_block_to_machine_code_offset = Vec::new();
@@ -113,6 +115,7 @@ impl<'a> Compiler<'a> {
             trap_label,
             trace_label,
             jump_table_label,
+            sbrk_label,
             sandbox_kind,
             gas_metering: config.gas_metering,
             native_code_address,
@@ -120,6 +123,7 @@ impl<'a> Compiler<'a> {
             address_table,
             vmctx_regs_offset,
             vmctx_gas_offset,
+            vmctx_heap_info_offset,
             nth_instruction_to_code_offset_map,
             init,
             is_last_instruction: instruction_count == 0,
@@ -150,6 +154,7 @@ impl<'a> Compiler<'a> {
 
         self.emit_trap_trampoline();
         self.emit_ecall_trampoline();
+        self.emit_sbrk_trampoline();
         self.emit_export_trampolines();
 
         let label_sysreturn = self.emit_sysreturn();
@@ -337,12 +342,15 @@ impl<S> crate::api::BackendModule for CompiledModule<S> where S: Sandbox {
         exports: &'a [ProgramExport],
         basic_block_by_jump_table_index: &'a [u32],
         jump_table_index_by_basic_block: &'a [u32],
-        init: GuestProgramInit<'a>,
+        init: GuestInit<'a>,
         instruction_count: usize,
         basic_block_count: usize,
         debug_trace_execution: bool,
     ) -> Result<(Self::BackendVisitor<'a>, Self::Aux), Error> {
-        crate::sandbox::assert_native_page_size();
+        let native_page_size = crate::sandbox::get_native_page_size();
+        if native_page_size > config.page_size as usize || config.page_size as usize % native_page_size != 0 {
+            return Err(format!("configured page size of {} is incompatible with the native page size of {}", config.page_size, native_page_size).into());
+        }
 
         let address_space = S::reserve_address_space().map_err(Error::from_display)?;
         let native_code_address = crate::sandbox::SandboxAddressSpace::native_code_address(&address_space);
@@ -355,6 +363,7 @@ impl<S> crate::api::BackendModule for CompiledModule<S> where S: Sandbox {
             S::address_table(),
             S::vmctx_regs_offset(),
             S::vmctx_gas_offset(),
+            S::vmctx_heap_info_offset(),
             debug_trace_execution,
             native_code_address,
             instruction_count,
@@ -366,15 +375,16 @@ impl<S> crate::api::BackendModule for CompiledModule<S> where S: Sandbox {
     }
 
     fn finish_compilation<'a>(wrapper: VisitorWrapper<'a, Self::BackendVisitor<'a>>, address_space: Self::Aux) -> Result<(crate::api::Common<'a>, Self), Error> {
-        let gas_metering = wrapper.visitor.gas_metering;
         let result = wrapper.visitor.finalize(&wrapper.common.gas_cost_for_basic_block)?;
 
-        let init = SandboxProgramInit::new(result.init)
-            .with_code(&result.code)
-            .with_jump_table(&result.jump_table)
-            .with_sysreturn_address(result.sysreturn_address);
+        let init = SandboxInit {
+            guest_init: result.init,
+            code: &result.code,
+            jump_table: &result.jump_table,
+            sysreturn_address: result.sysreturn_address
+        };
 
-        let sandbox_program = S::prepare_program(init, address_space, gas_metering).map_err(Error::from_display)?;
+        let sandbox_program = S::prepare_program(init, address_space).map_err(Error::from_display)?;
         let export_trampolines = result.export_trampolines;
 
         let module = CompiledModule {
@@ -388,8 +398,8 @@ impl<S> crate::api::BackendModule for CompiledModule<S> where S: Sandbox {
 }
 
 pub(crate) struct CompiledModule<S> where S: Sandbox {
-    sandbox_program: S::Program,
-    export_trampolines: Vec<u64>,
+    pub(crate) sandbox_program: S::Program,
+    pub(crate) export_trampolines: Vec<u64>,
     nth_instruction_to_code_offset_map: Vec<u32>,
 }
 
@@ -400,97 +410,5 @@ impl<S> CompiledModule<S> where S: Sandbox {
 
     pub fn nth_instruction_to_code_offset_map(&self) -> &[u32] {
         &self.nth_instruction_to_code_offset_map
-    }
-}
-
-pub(crate) struct CompiledInstance<S> where S: SandboxExt {
-    engine_state: Arc<EngineState>,
-    module: Module,
-    sandbox: Option<S>,
-}
-
-impl<S> CompiledInstance<S> where S: SandboxExt {
-    pub fn new(engine_state: Arc<EngineState>, module: Module) -> Result<CompiledInstance<S>, Error> {
-        let mut args = ExecuteArgs::new();
-        args.set_program(&S::as_compiled_module(&module).sandbox_program);
-
-        let mut sandbox = S::reuse_or_spawn_sandbox(&engine_state, &module)?;
-        sandbox
-            .execute(args)
-            .map_err(Error::from_display)
-            .map_err(|error| error.context("instantiation failed: failed to upload the program into the sandbox"))?;
-
-        Ok(CompiledInstance { engine_state, module, sandbox: Some(sandbox) })
-    }
-
-    pub fn call(&mut self, export_index: usize, on_hostcall: OnHostcall, config: &ExecutionConfig) -> Result<(), ExecutionError<Error>> {
-        let address = S::as_compiled_module(&self.module).export_trampolines[export_index];
-        let mut exec_args = ExecuteArgs::<S>::new();
-
-        if config.reset_memory_after_execution {
-            exec_args.set_reset_memory_after_execution();
-        }
-
-        if config.clear_program_after_execution {
-            exec_args.set_clear_program_after_execution();
-        }
-
-        exec_args.set_call(address);
-        exec_args.set_initial_regs(&config.initial_regs);
-        if self.module.gas_metering().is_some() {
-            if let Some(gas) = config.gas {
-                exec_args.set_gas(gas);
-            }
-        }
-
-        fn wrap_on_hostcall<S>(on_hostcall: OnHostcall<'_>) -> impl for <'r> FnMut(u32, S::Access<'r>) -> Result<(), Trap> + '_ where S: Sandbox {
-            move |hostcall, access| {
-                let access: BackendAccess = access.into();
-                on_hostcall(hostcall, access)
-            }
-        }
-
-        let mut on_hostcall = wrap_on_hostcall::<S>(on_hostcall);
-        exec_args.set_on_hostcall(&mut on_hostcall);
-
-        let sandbox = self.sandbox.as_mut().unwrap();
-        let result = match sandbox.execute(exec_args) {
-            Ok(()) => Ok(()),
-            Err(ExecutionError::Trap(trap)) => Err(ExecutionError::Trap(trap)),
-            Err(ExecutionError::Error(error)) => return Err(ExecutionError::Error(Error::from_display(error))),
-            Err(ExecutionError::OutOfGas) => return Err(ExecutionError::OutOfGas),
-        };
-
-        if self.module.gas_metering().is_some() && sandbox.gas_remaining_impl().is_err() {
-            return Err(ExecutionError::OutOfGas);
-        }
-
-        result
-    }
-
-    pub fn access(&'_ mut self) -> S::Access<'_> {
-        self.sandbox.as_mut().unwrap().access()
-    }
-
-    pub fn sandbox(&self) -> &S {
-        self.sandbox.as_ref().unwrap()
-    }
-}
-
-impl<S> Drop for CompiledInstance<S> where S: SandboxExt {
-    fn drop(&mut self) {
-        S::recycle_sandbox(&self.engine_state, || {
-            let mut sandbox = self.sandbox.take()?;
-            let mut exec_args = ExecuteArgs::<S>::new();
-            exec_args.set_clear_program_after_execution();
-            exec_args.set_gas(polkavm_common::utils::Gas::MIN);
-            exec_args.set_async(true);
-            if let Err(error) = sandbox.execute(exec_args) {
-                log::warn!("Failed to cache a sandbox worker process due to an error: {error}");
-                None
-            } else {
-                Some(sandbox)
-            }
-        })
     }
 }

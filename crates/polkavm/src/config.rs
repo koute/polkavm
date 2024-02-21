@@ -252,6 +252,7 @@ pub enum GasMeteringKind {
 /// The configuration for a module.
 #[derive(Clone)]
 pub struct ModuleConfig {
+    pub(crate) page_size: u32,
     pub(crate) gas_metering: Option<GasMeteringKind>,
 }
 
@@ -264,7 +265,18 @@ impl Default for ModuleConfig {
 impl ModuleConfig {
     /// Creates a new default module configuration.
     pub fn new() -> Self {
-        ModuleConfig { gas_metering: None }
+        ModuleConfig {
+            page_size: 0x4000,
+            gas_metering: None,
+        }
+    }
+
+    /// Sets the page size used for the module.
+    ///
+    /// Default: `16384` (16k)
+    pub fn set_page_size(&mut self, page_size: u32) -> &mut Self {
+        self.page_size = page_size;
+        self
     }
 
     /// Sets the type of gas metering to enable for this module.

@@ -4,7 +4,8 @@ use core::ops::Range;
 
 #[derive(Default)]
 pub struct ProgramBlobBuilder {
-    bss_size: u32,
+    ro_data_size: u32,
+    rw_data_size: u32,
     stack_size: u32,
     ro_data: Vec<u8>,
     rw_data: Vec<u8>,
@@ -22,8 +23,12 @@ impl ProgramBlobBuilder {
         Self::default()
     }
 
-    pub fn set_bss_size(&mut self, size: u32) {
-        self.bss_size = size;
+    pub fn set_ro_data_size(&mut self, size: u32) {
+        self.ro_data_size = size;
+    }
+
+    pub fn set_rw_data_size(&mut self, size: u32) {
+        self.rw_data_size = size;
     }
 
     pub fn set_stack_size(&mut self, size: u32) {
@@ -80,9 +85,10 @@ impl ProgramBlobBuilder {
         writer.push_raw_bytes(&program::BLOB_MAGIC);
         writer.push_byte(program::BLOB_VERSION_V1);
 
-        if self.bss_size > 0 || self.stack_size > 0 {
+        if self.ro_data_size > 0 || self.rw_data_size > 0 || self.stack_size > 0 {
             writer.push_section_inplace(program::SECTION_MEMORY_CONFIG, |writer| {
-                writer.push_varint(self.bss_size);
+                writer.push_varint(self.ro_data_size);
+                writer.push_varint(self.rw_data_size);
                 writer.push_varint(self.stack_size);
             });
         }

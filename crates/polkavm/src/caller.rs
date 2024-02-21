@@ -125,6 +125,11 @@ impl CallerRaw {
         result
     }
 
+    unsafe fn sbrk(&mut self, size: u32) -> Option<u32> {
+        // SAFETY: The caller will make sure that the invariants hold.
+        unsafe { self.access_mut() }.sbrk(size)
+    }
+
     unsafe fn gas_remaining(&self) -> Option<Gas> {
         // SAFETY: The caller will make sure that the invariants hold.
         unsafe { self.access() }.gas_remaining()
@@ -245,6 +250,11 @@ impl<'a, T> Caller<'a, T> {
     pub fn write_memory(&mut self, address: u32, data: &[u8]) -> Result<(), Trap> {
         // SAFETY: This can only be called from inside of `Caller::wrap` so this is always valid.
         unsafe { self.raw.write_memory(address, data) }
+    }
+
+    pub fn sbrk(&mut self, size: u32) -> Option<u32> {
+        // SAFETY: This can only be called from inside of `Caller::wrap` so this is always valid.
+        unsafe { self.raw.sbrk(size) }
     }
 
     pub fn gas_remaining(&self) -> Option<Gas> {

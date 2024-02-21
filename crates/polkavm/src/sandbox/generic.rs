@@ -1,21 +1,23 @@
 #![allow(clippy::manual_range_contains)]
 
 use polkavm_common::{
+    abi::MemoryMap,
     error::{ExecutionError, Trap},
     program::Reg,
-    utils::{byte_slice_init, Access, AsUninitSliceMut, Gas},
+    utils::{align_to_next_page_usize, byte_slice_init, Access, AsUninitSliceMut, Gas},
     zygote::{
         AddressTable,
         AddressTableRaw,
         CacheAligned,
         SandboxMemoryConfig,
-        VM_RPC_FLAG_CLEAR_PROGRAM_AFTER_EXECUTION,
-        VM_RPC_FLAG_RESET_MEMORY_AFTER_EXECUTION,
         VM_ADDR_JUMP_TABLE,
         VM_ADDR_JUMP_TABLE_RETURN_TO_HOST,
         VM_SANDBOX_MAXIMUM_NATIVE_CODE_SIZE,
         VM_SANDBOX_MAXIMUM_JUMP_TABLE_VIRTUAL_SIZE,
     },
+    VM_RPC_FLAG_CLEAR_PROGRAM_AFTER_EXECUTION,
+    VM_RPC_FLAG_RESET_MEMORY_AFTER_EXECUTION,
+    VM_RPC_FLAG_RESET_MEMORY_BEFORE_EXECUTION,
 };
 
 use super::ExecuteArgs;
@@ -25,11 +27,11 @@ use core::cell::UnsafeCell;
 use core::sync::atomic::{AtomicUsize, Ordering};
 use core::mem::MaybeUninit;
 use std::borrow::Cow;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
-use super::{OnHostcall, SandboxKind, SandboxProgramInit, get_native_page_size};
-use crate::api::{BackendAccess, MemoryAccessError};
-use crate::config::GasMeteringKind;
+use super::{SandboxKind, SandboxInit, SandboxVec, get_native_page_size};
+use crate::api::{BackendAccess, CompiledModuleKind, MemoryAccessError, Module, HostcallHandler};
+use crate::compiler::CompiledModule;
 
 // On Linux don't depend on the `libc` crate to lower the number of dependencies.
 #[cfg(target_os = "linux")]
@@ -413,12 +415,30 @@ unsafe fn sysreturn(vmctx: &mut VmCtx) -> ! {
     }
 }
 
+#[repr(C)]
+enum TrapKind {
+    None,
+    Trap,
+    Error,
+}
+
 unsafe fn trigger_trap(vmctx: &mut VmCtx) -> ! {
-    vmctx.trap_triggered = true;
+    vmctx.trap_kind = TrapKind::Trap;
+    sysreturn(vmctx);
+}
+
+unsafe fn trigger_error(vmctx: &mut VmCtx) -> ! {
+    vmctx.trap_kind = TrapKind::Error;
     sysreturn(vmctx);
 }
 
 const REG_COUNT: usize = polkavm_common::program::Reg::ALL.len();
+
+#[repr(C)]
+struct HeapInfo {
+    heap_top: u64,
+    heap_threshold: u64,
+}
 
 #[repr(C)]
 struct VmCtx {
@@ -428,11 +448,14 @@ struct VmCtx {
 
     gas: i64,
 
+    heap_info: HeapInfo,
+    memory_map: MemoryMap,
+
     program_range: Range<u64>,
-    trap_triggered: bool,
+    trap_kind: TrapKind,
 
     regs: CacheAligned<[u32; REG_COUNT]>,
-    on_hostcall: Option<OnHostcall<'static, Sandbox>>,
+    hostcall_handler: Option<HostcallHandler<'static>>,
     sandbox: *mut Sandbox,
     instruction_number: Option<u32>,
     native_program_counter: Option<u64>,
@@ -444,12 +467,16 @@ impl VmCtx {
         VmCtx {
             return_address: 0,
             return_stack_pointer: 0,
-            trap_triggered: false,
+            trap_kind: TrapKind::None,
             program_range: 0..0,
-
+            heap_info: HeapInfo {
+                heap_top: 0,
+                heap_threshold: 0,
+            },
+            memory_map: MemoryMap::empty(),
             gas: 0,
             regs: CacheAligned([0; REG_COUNT]),
-            on_hostcall: None,
+            hostcall_handler: None,
             sandbox: core::ptr::null_mut(),
             instruction_number: None,
             native_program_counter: None,
@@ -491,8 +518,8 @@ unsafe extern "C" fn syscall_hostcall(hostcall: u32) {
     // SAFETY: We were called from the inside of the guest program, so vmctx must be valid.
     let vmctx = unsafe { conjure_vmctx() };
 
-    let Some(on_hostcall) = vmctx.on_hostcall.as_mut().take() else {
-        trigger_trap(vmctx);
+    let Some(hostcall_handler) = vmctx.hostcall_handler.as_mut().take() else {
+        trigger_error(vmctx);
     };
 
     // SAFETY: We were called from the inside of the guest program, so no other
@@ -501,7 +528,7 @@ unsafe extern "C" fn syscall_hostcall(hostcall: u32) {
         &mut *vmctx.sandbox
     };
 
-    match on_hostcall(hostcall, super::Sandbox::access(sandbox)) {
+    match hostcall_handler(hostcall, super::Sandbox::access(sandbox).into()) {
         Ok(()) => {}
         Err(_) => trigger_trap(vmctx)
     }
@@ -514,7 +541,7 @@ unsafe extern "C" fn syscall_trace(instruction_number: u32, rip: u64) {
     vmctx.instruction_number = Some(instruction_number);
     vmctx.native_program_counter = Some(rip);
 
-    let Some(on_hostcall) = vmctx.on_hostcall.as_mut().take() else {
+    let Some(hostcall_handler) = vmctx.hostcall_handler.as_mut().take() else {
         return;
     };
 
@@ -524,7 +551,7 @@ unsafe extern "C" fn syscall_trace(instruction_number: u32, rip: u64) {
         &mut *vmctx.sandbox
     };
 
-    match on_hostcall(polkavm_common::HOSTCALL_TRACE, super::Sandbox::access(sandbox)) {
+    match hostcall_handler(polkavm_common::HOSTCALL_TRACE, super::Sandbox::access(sandbox).into()) {
         Ok(()) => {}
         Err(_) => trigger_trap(vmctx)
     }
@@ -546,6 +573,52 @@ unsafe extern "C" fn syscall_return() -> ! {
     sysreturn(vmctx);
 }
 
+unsafe fn sbrk(vmctx: &mut VmCtx, pending_heap_top: u64) -> Result<Option<u32>, ()> {
+    if pending_heap_top > u64::from(vmctx.memory_map.heap_base() + vmctx.memory_map.max_heap_size()) {
+        return Ok(None);
+    }
+
+    let Some(start) = align_to_next_page_usize(vmctx.memory_map.page_size() as usize, vmctx.heap_info.heap_top as usize) else { return Err(()); };
+    let Some(end) = align_to_next_page_usize(vmctx.memory_map.page_size() as usize, pending_heap_top as usize) else { return Err(()); };
+
+    let size = end - start;
+    if size > 0 {
+        let guest_memory_base = (vmctx as *mut VmCtx).cast::<u8>().offset(-GUEST_MEMORY_TO_VMCTX_OFFSET);
+        let pointer = sys::mmap(
+            guest_memory_base.add(start).cast::<core::ffi::c_void>(),
+            end - start,
+            sys::PROT_READ | sys::PROT_WRITE,
+            sys::MAP_FIXED | sys::MAP_PRIVATE | sys::MAP_ANONYMOUS,
+            -1,
+            0,
+        );
+
+        if pointer == sys::MAP_FAILED {
+            log::error!("sbrk mmap failed!");
+            return Err(());
+        }
+    }
+
+    vmctx.heap_info.heap_top = pending_heap_top;
+    vmctx.heap_info.heap_threshold = end as u64;
+
+    Ok(Some(pending_heap_top as u32))
+}
+
+unsafe extern "C" fn syscall_sbrk(pending_heap_top: u64) -> u32 {
+    // SAFETY: We were called from the inside of the guest program, so vmctx must be valid.
+    let vmctx = unsafe { conjure_vmctx() };
+
+    // SAFETY: `vmctx` is valid and was allocated along with the guest memory.
+    match sbrk(vmctx, pending_heap_top) {
+        Ok(Some(new_heap_top)) => new_heap_top,
+        Ok(None) => 0,
+        Err(()) => {
+            trigger_error(vmctx);
+        }
+    }
+}
+
 #[derive(Clone)]
 pub struct SandboxProgram(Arc<SandboxProgramInner>);
 
@@ -556,8 +629,6 @@ struct SandboxProgramInner {
 
     code_memory: Mmap,
     code_length: usize,
-
-    gas_metering: Option<GasMeteringKind>,
 }
 
 impl super::SandboxProgram for SandboxProgram {
@@ -576,8 +647,8 @@ pub struct Sandbox {
     poison: Poison,
     program: Option<SandboxProgram>,
     memory: Mmap,
-    memory_config: SandboxMemoryConfig,
     guest_memory_offset: usize,
+    module: Option<Module>,
 }
 
 impl Drop for Sandbox {
@@ -603,97 +674,110 @@ impl Sandbox {
     }
 
     fn clear_program(&mut self) -> Result<(), ExecutionError<Error>> {
-        let user_memory_region_size = self.memory_config.user_memory_region_size();
-        if user_memory_region_size > 0 {
-            self.memory.mmap_within(
-                self.guest_memory_offset + self.memory_config.user_memory_region_address() as usize,
-                self.memory_config.user_memory_region_size() as usize,
-                0
-            )?;
+        let length = self.memory.len() - self.guest_memory_offset;
+        let program = self.program.take();
 
-            self.memory_config.clear_user_memory_sizes();
-        }
+        self.memory.mmap_within(
+            self.guest_memory_offset,
+            length,
+            0
+        )?;
 
-        if self.memory_config.stack_size() > 0 {
-            self.memory.mmap_within(
-                self.guest_memory_offset + self.memory_config.stack_address_low() as usize,
-                self.memory_config.stack_size() as usize,
-                0
-            )?;
-
-            self.memory_config.clear_stack_size();
-        }
-
-        self.memory_config.clear_code_size();
-        self.memory_config.clear_jump_table_size();
-        if let Some(program) = self.program.take() {
+        if let Some(program) = program {
             if let Some(program) = Arc::into_inner(program.0) {
                 program.code_memory.unmap()?;
             }
         }
 
+        self.vmctx_mut().heap_info.heap_top = 0;
+        self.vmctx_mut().heap_info.heap_threshold = 0;
+        self.vmctx_mut().memory_map = MemoryMap::empty();
+
         Ok(())
     }
 
-    fn reset_memory(&mut self) -> Result<(), ExecutionError<Error>> {
-        if let Some(ref program) = self.program {
-            let program = &program.0;
-            let rw_data_size = self.memory_config.rw_data_size() as usize;
-            if rw_data_size > 0 {
-                let offset = self.guest_memory_offset + self.memory_config.rw_data_address() as usize;
-                assert!(program.rw_data.len() <= rw_data_size);
+    fn force_reset_memory(&mut self) -> Result<(), Error> {
+        let Some(ref program) = self.program else { return Ok(()) };
+        let program = &program.0;
+        let memory_map = program.memory_config.memory_map.clone();
 
-                self.memory.as_slice_mut()[offset..offset + program.rw_data.len()].copy_from_slice(&program.rw_data);
-                self.memory.as_slice_mut()[offset + program.rw_data.len()..offset + self.memory_config.rw_data_size() as usize].fill(0);
-            }
+        log::trace!("Resetting memory");
+        log::trace!("  Read-write data: 0x{:x}..0x{:x}", memory_map.rw_data_address(), memory_map.rw_data_range().end);
 
-            let bss_size = self.memory_config.bss_size() as usize;
+        let rw_data_size = memory_map.rw_data_size() as usize;
+        if rw_data_size > 0 {
+            let offset = self.guest_memory_offset + memory_map.rw_data_address() as usize;
+            assert!(program.rw_data.len() <= rw_data_size);
+
+            let copy_range = offset..offset + program.rw_data.len();
+            self.memory.as_slice_mut()[copy_range.clone()].copy_from_slice(&program.rw_data);
+            log::trace!("    ...copy: 0x{:x}..0x{:x}", copy_range.start - self.guest_memory_offset, copy_range.end - self.guest_memory_offset);
+
+            let native_page_size = get_native_page_size();
+            let offset_to_next_native_page = align_to_next_page_usize(native_page_size, offset + program.rw_data.len()).unwrap();
+
+            let fill_range = offset + program.rw_data.len()..offset_to_next_native_page;
+            self.memory.as_slice_mut()[fill_range.clone()].fill(0);
+            log::trace!("    ...fill: 0x{:x}..0x{:x}", fill_range.start - self.guest_memory_offset, fill_range.end - self.guest_memory_offset);
+
+            let bss_size = memory_map.rw_data_size() as usize - (offset_to_next_native_page - offset);
             if bss_size > 0 {
+                log::trace!("    ...mmap: 0x{:x}..0x{:x}", offset_to_next_native_page - self.guest_memory_offset, offset_to_next_native_page + bss_size - self.guest_memory_offset);
                 self.memory.mmap_within(
-                    self.guest_memory_offset + self.memory_config.bss_address() as usize,
+                    offset_to_next_native_page,
                     bss_size,
                     PROT_READ | PROT_WRITE
                 )?;
             }
-
-            let stack_size = self.memory_config.stack_size() as usize;
-            if stack_size > 0 {
-                self.memory.mmap_within(
-                    self.guest_memory_offset + self.memory_config.stack_address_low() as usize,
-                    stack_size,
-                    PROT_READ | PROT_WRITE
-                )?;
-            }
-        } else {
-            assert_eq!(self.memory_config.ro_data_size(), 0);
-            assert_eq!(self.memory_config.rw_data_size(), 0);
-            assert_eq!(self.memory_config.stack_size(), 0);
         }
+
+        let stack_size = memory_map.stack_size() as usize;
+        if stack_size > 0 {
+            self.memory.mmap_within(
+                self.guest_memory_offset + memory_map.stack_address_low() as usize,
+                stack_size,
+                PROT_READ | PROT_WRITE
+            )?;
+        }
+
+        let initial_heap_threshold = u64::from(memory_map.rw_data_range().end);
+        let heap_top = self.vmctx().heap_info.heap_top;
+        log::trace!("  Heap: 0x{:x}..0x{:x}", memory_map.heap_base(), heap_top);
+        if heap_top > initial_heap_threshold {
+            log::trace!("    ..mmap:: 0x{:x}..0x{:x}", initial_heap_threshold, heap_top);
+            self.memory.mmap_within(
+                self.guest_memory_offset + initial_heap_threshold as usize,
+                heap_top as usize - initial_heap_threshold as usize,
+                0
+            )?;
+        }
+
+        self.vmctx_mut().heap_info.heap_top = u64::from(program.memory_config.memory_map.heap_base());
+        self.vmctx_mut().heap_info.heap_threshold = initial_heap_threshold;
 
         Ok(())
     }
 
     fn bound_check_access(&self, address: u32, length: u32) -> Result<(), ()> {
-        use core::ops::Range;
+        let memory_map = self.vmctx().memory_map.clone();
 
-        #[inline]
-        fn check(range: Range<u32>, access_range: Range<u64>) -> Result<bool, ()> {
-            let range = u64::from(range.start)..u64::from(range.end);
-            if access_range.end <= range.start || access_range.start >= range.end {
-                // No overlap.
-                Ok(false)
+        let (start, region_length) = if address >= memory_map.stack_address_low() {
+            (memory_map.stack_address_low(), memory_map.stack_size())
+        } else if address >= memory_map.rw_data_address() {
+            let heap_threshold = self.vmctx().heap_info.heap_threshold as u32;
+            if heap_threshold == 0 {
+                (memory_map.rw_data_address(), memory_map.rw_data_size())
             } else {
-                // There is overlap.
-                if access_range.start >= range.start && access_range.end <= range.end {
-                    Ok(true)
-                } else {
-                    Err(())
-                }
+                (memory_map.rw_data_address(), heap_threshold - memory_map.rw_data_address())
             }
-        }
+        } else if address >= memory_map.ro_data_address() {
+            (memory_map.ro_data_address(), memory_map.ro_data_size())
+        } else {
+            return Err(());
+        };
 
-        let range = u64::from(address)..u64::from(address) + u64::from(length);
-        if check(self.memory_config.ro_data_range(), range.clone())? || check(self.memory_config.heap_range(), range.clone())? || check(self.memory_config.stack_range(), range)? {
+        let Some(address_end) = address.checked_add(length) else { return Err(()) };
+        if address_end <= (start + region_length) {
             Ok(())
         } else {
             Err(())
@@ -712,16 +796,18 @@ impl Sandbox {
         Some(&mut self.memory.as_slice_mut()[range])
     }
 
-    fn execute_impl(&mut self, mut args: ExecuteArgs<Self>) -> Result<(), ExecutionError<Error>> {
-        if let Some(SandboxProgram(program)) = args.program {
+    fn execute_impl(&mut self, mut args: ExecuteArgs) -> Result<(), ExecutionError<Error>> {
+        if let Some(module) = args.module {
+            let compiled_module = <Self as crate::sandbox::Sandbox>::as_compiled_module(module);
+            let program = &compiled_module.sandbox_program.0;
+
             log::trace!("Reconfiguring sandbox...");
             self.clear_program()?;
 
-            let current = &mut self.memory_config;
-            let new = program.memory_config;
-            if new.ro_data_size() > 0 {
-                let offset = self.guest_memory_offset + new.ro_data_address() as usize;
-                let length = new.ro_data_size() as usize;
+            let new = &program.memory_config;
+            if new.memory_map.ro_data_size() > 0 {
+                let offset = self.guest_memory_offset + new.memory_map.ro_data_address() as usize;
+                let length = new.memory_map.ro_data_size() as usize;
                 assert!(program.ro_data.len() <= length);
 
                 self.memory.modify_and_protect(offset, length, PROT_READ, |slice| {
@@ -733,17 +819,15 @@ impl Sandbox {
                     "  New rodata range: 0x{:x}-0x{:x} (0x{:x}-0x{:x}) (0x{:x})",
                     memory_address,
                     memory_address + length,
-                    new.ro_data_address(),
-                    new.ro_data_address() + new.ro_data_size(),
-                    new.ro_data_size()
+                    new.memory_map.ro_data_address(),
+                    new.memory_map.ro_data_address() + new.memory_map.ro_data_size(),
+                    new.memory_map.ro_data_size()
                 );
-
-                current.set_ro_data_size(new.ro_data_size()).unwrap();
             }
 
-            if new.rw_data_size() > 0 {
-                let offset = self.guest_memory_offset + new.rw_data_address() as usize;
-                let length = new.rw_data_size() as usize;
+            if new.memory_map.rw_data_size() > 0 {
+                let offset = self.guest_memory_offset + new.memory_map.rw_data_address() as usize;
+                let length = new.memory_map.rw_data_size() as usize;
                 assert!(program.rw_data.len() <= length);
 
                 self.memory.modify_and_protect(offset, length, PROT_READ | PROT_WRITE, |slice| {
@@ -755,36 +839,15 @@ impl Sandbox {
                     "  New rwdata range: 0x{:x}-0x{:x} (0x{:x}-0x{:x}) (0x{:x})",
                     memory_address,
                     memory_address + length,
-                    new.rw_data_address(),
-                    new.rw_data_address() + new.rw_data_size(),
-                    new.rw_data_size()
+                    new.memory_map.rw_data_address(),
+                    new.memory_map.rw_data_address() + new.memory_map.rw_data_size(),
+                    new.memory_map.rw_data_size()
                 );
-
-                current.set_rw_data_size(new.rw_data_size()).unwrap();
             }
 
-            if new.bss_size() > 0 {
-                let offset = self.guest_memory_offset + new.bss_address() as usize;
-                let length = new.bss_size() as usize;
-
-                self.memory.mprotect(offset, length, PROT_READ | PROT_WRITE)?;
-
-                let memory_address = self.memory.as_ptr() as usize + offset;
-                log::trace!(
-                    "  New bss range: 0x{:x}-0x{:x} (0x{:x}-0x{:x}) (0x{:x})",
-                    memory_address,
-                    memory_address + length,
-                    new.bss_address(),
-                    new.bss_address() + new.bss_size(),
-                    new.bss_size()
-                );
-
-                current.set_bss_size(new.bss_size()).unwrap();
-            }
-
-            if new.stack_size() > 0 {
-                let offset = self.guest_memory_offset + new.stack_address_low() as usize;
-                let length = new.stack_size() as usize;
+            if new.memory_map.stack_size() > 0 {
+                let offset = self.guest_memory_offset + new.memory_map.stack_address_low() as usize;
+                let length = new.memory_map.stack_size() as usize;
 
                 self.memory.mprotect(offset, length, PROT_READ | PROT_WRITE)?;
 
@@ -793,31 +856,48 @@ impl Sandbox {
                     "  New stack range: 0x{:x}-0x{:x} (0x{:x}-0x{:x}) (0x{:x})",
                     memory_address,
                     memory_address + length,
-                    new.stack_address_low(),
-                    new.stack_address_low() + new.stack_size(),
-                    new.stack_size()
+                    new.memory_map.stack_address_low(),
+                    new.memory_map.stack_address_low() + new.memory_map.stack_size(),
+                    new.memory_map.stack_size()
                 );
-
-                current.set_stack_size(new.stack_size()).unwrap();
             }
 
-            let native_page_size = get_native_page_size();
-            current.set_code_size(native_page_size, new.code_size()).unwrap();
-            current.set_jump_table_size(native_page_size, new.jump_table_size()).unwrap();
+            self.vmctx_mut().heap_info.heap_top = u64::from(program.memory_config.memory_map.heap_base());
+            self.vmctx_mut().heap_info.heap_threshold = u64::from(new.memory_map.rw_data_range().end);
+            self.vmctx_mut().memory_map = new.memory_map.clone();
+
             self.program = Some(SandboxProgram(Arc::clone(program)));
-
-            if *current != new {
-                panic!("internal error: failed to fully update memory configuration");
-            }
+            self.module = Some(module.clone());
         }
 
-        self.vmctx_mut().regs.copy_from_slice(args.initial_regs);
-        if let Some(gas) = args.get_gas(self.program.as_ref().and_then(|program| program.0.gas_metering)) {
+        if let Some(regs) = args.regs {
+            self.vmctx_mut().regs.copy_from_slice(regs);
+        }
+
+        if let Some(gas) = crate::sandbox::get_gas(&args, self.module.as_ref().and_then(|module| module.gas_metering())) {
             self.vmctx_mut().gas = gas;
         }
 
-        let mut trap_triggered = false;
-        if args.rpc_address != 0 {
+        if args.flags & VM_RPC_FLAG_RESET_MEMORY_BEFORE_EXECUTION != 0 {
+            // TODO: Do this only if the memory is dirty.
+            self.force_reset_memory()?;
+        }
+
+        if args.sbrk > 0 {
+            let new_heap_top = self.vmctx().heap_info.heap_top + u64::from(args.sbrk);
+
+            // SAFETY: `vmctx` is valid and was allocated along with the guest memory.
+            match unsafe { sbrk(self.vmctx_mut(), new_heap_top) } {
+                Ok(Some(_)) => {},
+                Ok(None) => return Err(ExecutionError::Error("initial sbrk failed: cannot grow the heap over the maximum".into())),
+                Err(()) => return Err(ExecutionError::Error("initial sbrk failed".into()))
+            }
+        }
+
+        let mut trap_kind = TrapKind::None;
+        if let Some(entry_point) = args.entry_point {
+            let entry_point = <Self as crate::sandbox::Sandbox>::as_compiled_module(self.module.as_ref().unwrap()).export_trampolines[entry_point] as usize;
+
             {
                 let Some(program) = self.program.as_ref() else {
                     return Err(ExecutionError::Trap(Trap::default()));
@@ -827,15 +907,19 @@ impl Sandbox {
                 let address = code.as_ptr() as u64;
                 self.vmctx_mut().program_range = address..address + code.len() as u64;
             }
-            log::trace!("Jumping to: 0x{:x}", args.rpc_address);
+            log::trace!("Jumping to: 0x{:x}", entry_point);
 
-            let on_hostcall: Option<OnHostcall<Sandbox>> = args.on_hostcall.take();
+            let hostcall_handler: Option<HostcallHandler> = match args.hostcall_handler {
+                Some(ref mut hostcall_handler) => Some(&mut *hostcall_handler),
+                None => None,
+            };
+
             // SAFETY: Transmuting an arbitrary lifetime into a 'static lifetime is safe as long as the invariants
             // that the shorter lifetime requires are still upheld.
-            let on_hostcall: Option<OnHostcall<'static, Sandbox>> = unsafe { core::mem::transmute(on_hostcall) };
-            self.vmctx_mut().on_hostcall = on_hostcall;
+            let hostcall_handler: Option<HostcallHandler<'static>> = unsafe { core::mem::transmute(hostcall_handler) };
+            self.vmctx_mut().hostcall_handler = hostcall_handler;
             self.vmctx_mut().sandbox = self;
-            self.vmctx_mut().trap_triggered = false;
+            self.vmctx_mut().trap_kind = TrapKind::None;
 
             #[allow(clippy::undocumented_unsafe_blocks)]
             unsafe {
@@ -867,7 +951,7 @@ impl Sandbox {
                     pop rbx
                     pop rbp
                 "#,
-                    entry_point = in(reg) args.rpc_address,
+                    entry_point = in(reg) entry_point,
                     // Mark all of the clobbered registers.
                     //
                     // We need to save and restore rbp and rbx manually since
@@ -891,25 +975,25 @@ impl Sandbox {
                 THREAD_VMCTX.with(|thread_ctx| core::ptr::write(thread_ctx.get(), core::ptr::null_mut()));
             }
 
-            trap_triggered = core::mem::replace(&mut self.vmctx_mut().trap_triggered, false);
+            trap_kind = core::mem::replace(&mut self.vmctx_mut().trap_kind, TrapKind::None);
             self.vmctx_mut().sandbox = core::ptr::null_mut();
-            self.vmctx_mut().on_hostcall = None;
+            self.vmctx_mut().hostcall_handler = None;
             self.vmctx_mut().return_address = 0;
             self.vmctx_mut().return_stack_pointer = 0;
             self.vmctx_mut().program_range = 0..0;
         };
 
-        if args.rpc_flags & VM_RPC_FLAG_CLEAR_PROGRAM_AFTER_EXECUTION != 0 {
+        if args.flags & VM_RPC_FLAG_CLEAR_PROGRAM_AFTER_EXECUTION != 0 {
             self.clear_program()?;
-        } else if args.rpc_flags & VM_RPC_FLAG_RESET_MEMORY_AFTER_EXECUTION != 0 {
-            self.reset_memory()?;
+        } else if args.flags & VM_RPC_FLAG_RESET_MEMORY_AFTER_EXECUTION != 0 {
+            self.force_reset_memory()?;
         }
 
-        if trap_triggered {
-            return Err(ExecutionError::Trap(Trap::default()));
+        match trap_kind {
+            TrapKind::None => Ok(()),
+            TrapKind::Trap => Err(ExecutionError::Trap(Trap::default())),
+            TrapKind::Error => Err(ExecutionError::Error("fatal error".into())),
         }
-
-        Ok(())
     }
 }
 
@@ -928,25 +1012,37 @@ impl super::Sandbox for Sandbox {
     type Program = SandboxProgram;
     type AddressSpace = Mmap;
 
+    fn as_sandbox_vec(vec: &SandboxVec) -> &Mutex<Vec<Self>> {
+        #[allow(clippy::match_wildcard_for_single_variants)]
+        match vec {
+            SandboxVec::Generic(ref vec) => vec,
+            _ => unreachable!(),
+        }
+    }
+
+    fn as_compiled_module(module: &Module) -> &CompiledModule<Self> {
+        match module.compiled_module() {
+            CompiledModuleKind::Generic(ref module) => module,
+            _ => unreachable!(),
+        }
+    }
+
     fn reserve_address_space() -> Result<Self::AddressSpace, Self::Error> {
         Mmap::reserve_address_space(VM_SANDBOX_MAXIMUM_NATIVE_CODE_SIZE as usize + VM_SANDBOX_MAXIMUM_JUMP_TABLE_VIRTUAL_SIZE as usize)
     }
 
-    fn prepare_program(init: SandboxProgramInit, mut map: Self::AddressSpace, gas_metering: Option<GasMeteringKind>) -> Result<Self::Program, Self::Error> {
+    fn prepare_program(init: SandboxInit, mut map: Self::AddressSpace) -> Result<Self::Program, Self::Error> {
         let native_page_size = get_native_page_size();
         let cfg = init.memory_config(native_page_size)?;
 
-        assert_eq!(cfg.code_size() % native_page_size, 0);
-        assert!(init.code.len() <= cfg.code_size());
-
-        let jump_table_offset = cfg.code_size();
+        let jump_table_offset = cfg.code_size as usize;
         let sysreturn_offset = jump_table_offset + (VM_ADDR_JUMP_TABLE_RETURN_TO_HOST - VM_ADDR_JUMP_TABLE) as usize;
 
-        map.modify_and_protect(0, cfg.code_size(), PROT_EXEC, |slice| {
+        map.modify_and_protect(0, cfg.code_size as usize, PROT_EXEC, |slice| {
             slice[..init.code.len()].copy_from_slice(init.code);
         })?;
 
-        map.modify_and_protect(jump_table_offset, cfg.jump_table_size(), PROT_READ, |slice| {
+        map.modify_and_protect(jump_table_offset, cfg.jump_table_size as usize, PROT_READ, |slice| {
             slice[..init.jump_table.len()].copy_from_slice(init.jump_table);
         })?;
 
@@ -957,15 +1053,15 @@ impl super::Sandbox for Sandbox {
         log::trace!(
             "New code range: 0x{:x}-0x{:x} (0x{:x})",
             map.as_ptr() as u64,
-            map.as_ptr() as u64 + cfg.code_size() as u64,
-            cfg.code_size()
+            map.as_ptr() as u64 + u64::from(cfg.code_size),
+            cfg.code_size
         );
 
         log::trace!(
             "New jump table range: 0x{:x}-0x{:x} (0x{:x})",
             map.as_ptr() as u64 + jump_table_offset as u64,
-            map.as_ptr() as u64 + jump_table_offset as u64 + cfg.jump_table_size() as u64,
-            cfg.jump_table_size()
+            map.as_ptr() as u64 + jump_table_offset as u64 + u64::from(cfg.jump_table_size),
+            cfg.jump_table_size
         );
 
         log::trace!(
@@ -976,11 +1072,10 @@ impl super::Sandbox for Sandbox {
 
         Ok(SandboxProgram(Arc::new(SandboxProgramInner {
             memory_config: cfg,
-            ro_data: init.ro_data().to_vec(),
-            rw_data: init.rw_data().to_vec(),
+            ro_data: init.guest_init.ro_data.to_vec(),
+            rw_data: init.guest_init.rw_data.to_vec(),
             code_memory: map,
             code_length: init.code.len(),
-            gas_metering,
         })))
     }
 
@@ -1003,12 +1098,12 @@ impl super::Sandbox for Sandbox {
             poison: Poison::None,
             program: None,
             memory,
-            memory_config: SandboxMemoryConfig::empty(),
             guest_memory_offset,
+            module: None,
         })
     }
 
-    fn execute(&mut self, args: ExecuteArgs<Self>) -> Result<(), ExecutionError<Error>> {
+    fn execute(&mut self, args: ExecuteArgs) -> Result<(), ExecutionError<Self::Error>> {
         if !matches!(self.poison, Poison::None) {
             return Err(ExecutionError::Error("sandbox has been poisoned".into()));
         }
@@ -1041,6 +1136,7 @@ impl super::Sandbox for Sandbox {
             syscall_trap,
             syscall_return,
             syscall_trace,
+            syscall_sbrk,
         })
     }
 
@@ -1052,9 +1148,13 @@ impl super::Sandbox for Sandbox {
         get_field_offset!(VmCtx::new(), |base| &base.gas)
     }
 
+    fn vmctx_heap_info_offset() -> usize {
+        get_field_offset!(VmCtx::new(), |base| &base.heap_info)
+    }
+
     fn gas_remaining_impl(&self) -> Result<Option<Gas>, super::OutOfGas> {
-        let Some(program) = self.program.as_ref() else { return Ok(None) };
-        if program.0.gas_metering.is_none() { return Ok(None) };
+        let Some(module) = self.module.as_ref() else { return Ok(None) };
+        if module.gas_metering().is_none() { return Ok(None) };
         let raw_gas = self.vmctx().gas;
         Gas::from_i64(raw_gas).ok_or(super::OutOfGas).map(Some)
     }
@@ -1146,6 +1246,23 @@ impl<'a> Access<'a> for SandboxAccess<'a> {
         Ok(())
     }
 
+    fn sbrk(&mut self, size: u32) -> Option<u32> {
+        let new_heap_top = self.sandbox.vmctx().heap_info.heap_top + u64::from(size);
+
+        // SAFETY: `vmctx` is valid and was allocated along with the guest memory.
+        match unsafe { sbrk(self.sandbox.vmctx_mut(), new_heap_top) } {
+            Ok(result) => result,
+            Err(()) => panic!("sbrk failed")
+        }
+    }
+
+    fn heap_size(&self) -> u32 {
+        let Some(program) = self.sandbox.program.as_ref() else { return 0 };
+        let heap_base = program.0.memory_config.memory_map.heap_base();
+        let heap_top = self.sandbox.vmctx().heap_info.heap_top;
+        (heap_top - u64::from(heap_base)) as u32
+    }
+
     fn program_counter(&self) -> Option<u32> {
         self.sandbox.vmctx().instruction_number
     }
@@ -1160,7 +1277,7 @@ impl<'a> Access<'a> for SandboxAccess<'a> {
     }
 
     fn consume_gas(&mut self, gas: u64) {
-        if self.sandbox.program.as_ref().and_then(|program| program.0.gas_metering).is_none() {
+        if self.sandbox.module.as_ref().and_then(|module| module.gas_metering()).is_none() {
             return;
         }
 

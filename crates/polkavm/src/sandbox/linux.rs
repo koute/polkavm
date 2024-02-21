@@ -4,7 +4,7 @@
 extern crate polkavm_linux_raw as linux_raw;
 
 use polkavm_common::{
-    abi::VM_PAGE_SIZE,
+    abi::VM_MAX_PAGE_SIZE,
     error::{ExecutionError, Trap},
     program::Reg,
     utils::{align_to_next_page_usize, slice_assume_init_mut, Access, AsUninitSliceMut, Gas},
@@ -22,13 +22,15 @@ pub use linux_raw::Error;
 use core::ffi::{c_int, c_uint};
 use core::ops::Range;
 use core::sync::atomic::Ordering;
+use core::time::Duration;
 use linux_raw::{abort, cstr, syscall_readonly, Fd, Mmap, STDERR_FILENO, STDIN_FILENO};
 use std::borrow::Cow;
 use std::time::Instant;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
-use super::{OnHostcall, SandboxKind, SandboxProgramInit, get_native_page_size};
-use crate::api::{BackendAccess, MemoryAccessError};
+use super::{SandboxKind, SandboxInit, SandboxVec, get_native_page_size};
+use crate::api::{BackendAccess, CompiledModuleKind, MemoryAccessError, Module, HostcallHandler};
+use crate::compiler::CompiledModule;
 use crate::config::GasMeteringKind;
 
 pub struct SandboxConfig {
@@ -725,9 +727,7 @@ pub struct SandboxProgram(Arc<SandboxProgramInner>);
 struct SandboxProgramInner {
     memfd: Fd,
     memory_config: SandboxMemoryConfig,
-    sysreturn_address: u64,
     code_range: Range<usize>,
-    gas_metering: Option<GasMeteringKind>,
 }
 
 impl super::SandboxProgram for SandboxProgram {
@@ -890,6 +890,7 @@ pub struct Sandbox {
     count_wait_loop_start: u64,
     count_futex_wait: u64,
 
+    module: Option<Module>,
     gas_metering: Option<GasMeteringKind>,
 }
 
@@ -928,26 +929,41 @@ impl super::Sandbox for Sandbox {
     type Program = SandboxProgram;
     type AddressSpace = ();
 
+    fn as_sandbox_vec(vec: &SandboxVec) -> &Mutex<Vec<Self>> {
+        #[allow(clippy::match_wildcard_for_single_variants)]
+        match vec {
+            SandboxVec::Linux(ref vec) => vec,
+            _ => unreachable!(),
+        }
+    }
+
+    fn as_compiled_module(module: &Module) -> &CompiledModule<Self> {
+        match module.compiled_module() {
+            CompiledModuleKind::Linux(ref module) => module,
+            _ => unreachable!(),
+        }
+    }
+
     fn reserve_address_space() -> Result<Self::AddressSpace, Self::Error> {
         Ok(())
     }
 
-    fn prepare_program(init: SandboxProgramInit, (): Self::AddressSpace, gas_metering: Option<GasMeteringKind>) -> Result<Self::Program, Self::Error> {
-        static PADDING: [u8; VM_PAGE_SIZE as usize] = [0; VM_PAGE_SIZE as usize];
+    fn prepare_program(init: SandboxInit, (): Self::AddressSpace) -> Result<Self::Program, Self::Error> {
+        static PADDING: [u8; VM_MAX_PAGE_SIZE as usize] = [0; VM_MAX_PAGE_SIZE as usize];
 
         let native_page_size = get_native_page_size();
         let cfg = init.memory_config(native_page_size)?;
-        let ro_data_padding = &PADDING[..cfg.ro_data_size() as usize - init.ro_data().len()];
-        let rw_data_padding = &PADDING[..cfg.rw_data_size() as usize - init.rw_data().len()];
-        let code_padding = &PADDING[..cfg.code_size() - init.code.len()];
+        let ro_data_padding = &PADDING[..cfg.ro_data_fd_size as usize - init.guest_init.ro_data.len()];
+        let rw_data_padding = &PADDING[..cfg.rw_data_fd_size as usize - init.guest_init.rw_data.len()];
+        let code_padding = &PADDING[..cfg.code_size as usize - init.code.len()];
 
         let memfd = prepare_sealed_memfd(
             create_program_memfd()?,
-            cfg.ro_data_size() as usize + cfg.rw_data_size() as usize + cfg.code_size() + cfg.jump_table_size(),
+            cfg.ro_data_fd_size as usize + cfg.rw_data_fd_size as usize + cfg.code_size as usize + cfg.jump_table_size as usize,
             [
-                init.ro_data(),
+                init.guest_init.ro_data,
                 ro_data_padding,
-                init.rw_data(),
+                init.guest_init.rw_data,
                 rw_data_padding,
                 init.code,
                 code_padding,
@@ -955,15 +971,13 @@ impl super::Sandbox for Sandbox {
             ]
         )?;
 
-        let offset = cfg.ro_data_size() as usize + cfg.rw_data_size() as usize;
-        let code_range = offset..offset + init.code.len();
+        let code_offset = cfg.ro_data_fd_size as usize + cfg.rw_data_fd_size as usize;
+        let code_range = code_offset..code_offset + init.code.len();
 
         Ok(SandboxProgram(Arc::new(SandboxProgramInner {
             memfd,
             memory_config: cfg,
-            sysreturn_address: init.sysreturn_address,
             code_range,
-            gas_metering,
         })))
     }
 
@@ -1271,46 +1285,64 @@ impl super::Sandbox for Sandbox {
             count_wait_loop_start: 0,
             count_futex_wait: 0,
 
+            module: None,
             gas_metering: None,
         })
     }
 
-    fn execute(&mut self, mut args: ExecuteArgs<Self>) -> Result<(), ExecutionError<Error>> {
-        self.wait_if_necessary(match args.on_hostcall {
-            Some(ref mut on_hostcall) => Some(&mut *on_hostcall),
+    fn execute(&mut self, mut args: ExecuteArgs) -> Result<(), ExecutionError<Self::Error>> {
+        self.wait_if_necessary(match args.hostcall_handler {
+            Some(ref mut hostcall_handler) => Some(&mut *hostcall_handler),
             None => None,
         }, true)?;
 
-        if args.is_async && args.on_hostcall.is_some() {
+        if args.is_async && args.hostcall_handler.is_some() {
             return Err(Error::from_str("requested asynchronous execution with a borrowed hostcall handler").into());
         }
 
         unsafe {
-            if let Some(program) = args.program {
-                *self.vmctx().new_memory_config.get() = program.0.memory_config;
-                *self.vmctx().new_sysreturn_address.get() = program.0.sysreturn_address;
-                self.gas_metering = program.0.gas_metering;
+            if let Some(module) = args.module {
+                args.flags |= polkavm_common::zygote::VM_RPC_FLAG_RECONFIGURE;
+
+                let compiled_module = Self::as_compiled_module(module);
+                let program = &compiled_module.sandbox_program;
+                *self.vmctx().memory_config.get() = program.0.memory_config.clone();
+                *self.vmctx().heap_info.heap_top.get() = u64::from(module.memory_map().heap_base());
+                *self.vmctx().heap_info.heap_threshold.get() = u64::from(module.memory_map().rw_data_range().end);
+                self.gas_metering = module.gas_metering();
+                self.module = Some(module.clone());
             }
 
-            if let Some(gas) = args.get_gas(self.gas_metering) {
+            if let Some(gas) = crate::sandbox::get_gas(&args, self.gas_metering) {
                 *self.vmctx().gas().get() = gas;
             }
 
-            *self.vmctx().rpc_address.get() = args.rpc_address;
-            *self.vmctx().rpc_flags.get() = args.rpc_flags;
+            *self.vmctx().rpc_address.get() = args.entry_point.map_or(0, |entry_point|
+                Self::as_compiled_module(self.module.as_ref().unwrap()).export_trampolines[entry_point] as usize
+            ) as u64;
 
-            (*self.vmctx().regs().get()).copy_from_slice(args.initial_regs);
+            *self.vmctx().rpc_flags.get() = args.flags;
+            *self.vmctx().rpc_sbrk.get() = args.sbrk;
+
+            if let Some(regs) = args.regs {
+                (*self.vmctx().regs().get()).copy_from_slice(regs);
+            }
+
             self.vmctx().futex.store(VMCTX_FUTEX_BUSY, Ordering::Release);
             linux_raw::sys_futex_wake_one(&self.vmctx().futex)?;
 
-            if let Some(program) = args.program {
+            if let Some(module) = args.module {
+                let compiled_module = Self::as_compiled_module(module);
                 // TODO: This can block forever.
-                linux_raw::sendfd(self.socket.borrow(), program.0.memfd.borrow())?;
+                linux_raw::sendfd(self.socket.borrow(), compiled_module.sandbox_program.0.memfd.borrow())?;
             }
         }
 
         if !args.is_async {
-            self.wait_if_necessary(args.on_hostcall, args.rpc_address == 0)?;
+            self.wait_if_necessary(match args.hostcall_handler {
+                Some(ref mut hostcall_handler) => Some(&mut *hostcall_handler),
+                None => None,
+            }, args.entry_point.is_none())?;
         }
 
         Ok(())
@@ -1335,6 +1367,10 @@ impl super::Sandbox for Sandbox {
 
     fn vmctx_gas_offset() -> usize {
         get_field_offset!(VmCtx::new(), |base| base.gas().get())
+    }
+
+    fn vmctx_heap_info_offset() -> usize {
+        get_field_offset!(VmCtx::new(), |base| base.heap_info())
     }
 
     fn gas_remaining_impl(&self) -> Result<Option<Gas>, super::OutOfGas> {
@@ -1362,7 +1398,7 @@ impl Sandbox {
 
     #[inline(never)]
     #[cold]
-    fn wait(&mut self, mut on_hostcall: Option<OnHostcall<Self>>, low_latency: bool) -> Result<(), ExecutionError<Error>> {
+    fn wait(&mut self, mut hostcall_handler: Option<HostcallHandler>, low_latency: bool) -> Result<(), ExecutionError<Error>> {
         let mut spin_target = 0;
         let mut yield_target = 0;
         if low_latency {
@@ -1390,8 +1426,8 @@ impl Sandbox {
             if state == VMCTX_FUTEX_HOSTCALL {
                 core::sync::atomic::fence(Ordering::Acquire);
 
-                let on_hostcall = match on_hostcall {
-                    Some(ref mut on_hostcall) => &mut *on_hostcall,
+                let hostcall_handler = match hostcall_handler {
+                    Some(ref mut hostcall_handler) => &mut *hostcall_handler,
                     None => {
                         unsafe {
                             *self.vmctx().hostcall().get() = polkavm_common::zygote::HOSTCALL_ABORT_EXECUTION;
@@ -1409,7 +1445,7 @@ impl Sandbox {
                     spin_target = 512;
                 }
 
-                match on_hostcall(hostcall, super::Sandbox::access(self)) {
+                match hostcall_handler(hostcall, super::Sandbox::access(self).into()) {
                     Ok(()) => {
                         self.vmctx().futex.store(VMCTX_FUTEX_BUSY, Ordering::Release);
                         linux_raw::sys_futex_wake_one(&self.vmctx().futex)?;
@@ -1454,26 +1490,32 @@ impl Sandbox {
                 Err(error) if error.errno() == linux_raw::EAGAIN || error.errno() == linux_raw::EINTR => continue,
                 Err(error) if error.errno() == linux_raw::ETIMEDOUT => {
                     log::trace!("Timeout expired while waiting for child #{}...", self.child.pid);
-                    let status = self.child.check_status(true)?;
-                    if !status.is_running() {
-                        log::trace!("Child #{} is not running anymore: {status}", self.child.pid);
-                        let message = get_message(self.vmctx());
-                        if let Some(message) = message {
-                            return Err(Error::from(format!("{status}: {message}")).into());
-                        } else {
-                            return Err(Error::from(format!("worker process unexpectedly quit: {status}")).into());
-                        }
-                    }
+                    self.check_child_status()?;
                 }
                 Err(error) => return Err(error.into()),
             }
         }
     }
 
+    fn check_child_status(&mut self) -> Result<(), Error> {
+        let status = self.child.check_status(true)?;
+        if status.is_running() {
+            return Ok(());
+        }
+
+        log::trace!("Child #{} is not running anymore: {status}", self.child.pid);
+        let message = get_message(self.vmctx());
+        if let Some(message) = message {
+            Err(Error::from(format!("{status}: {message}")))
+        } else {
+            Err(Error::from(format!("worker process unexpectedly quit: {status}")))
+        }
+    }
+
     #[inline]
-    fn wait_if_necessary(&mut self, on_hostcall: Option<OnHostcall<Self>>, low_latency: bool) -> Result<(), ExecutionError<Error>> {
+    fn wait_if_necessary(&mut self, hostcall_handler: Option<HostcallHandler>, low_latency: bool) -> Result<(), ExecutionError<Error>> {
         if self.vmctx().futex.load(Ordering::Relaxed) != VMCTX_FUTEX_IDLE {
-            self.wait(on_hostcall, low_latency)?;
+            self.wait(hostcall_handler, low_latency)?;
         }
 
         Ok(())
@@ -1562,6 +1604,8 @@ impl<'a> Access<'a> for SandboxAccess<'a> {
             });
         }
 
+        self.sandbox.vmctx().is_memory_dirty.store(true, Ordering::Relaxed);
+
         let length = data.len();
         match linux_raw::vm_write_memory(self.sandbox.child.pid, [data], [(address as usize, length)]) {
             Ok(actual_length) if actual_length == length => {
@@ -1582,6 +1626,54 @@ impl<'a> Access<'a> for SandboxAccess<'a> {
                 })
             }
         }
+    }
+
+    fn sbrk(&mut self, size: u32) -> Option<u32> {
+        debug_assert_eq!(self.sandbox.vmctx().futex.load(Ordering::Relaxed), VMCTX_FUTEX_HOSTCALL);
+
+        unsafe {
+            *self.sandbox.vmctx().rpc_sbrk.get() = size;
+            *self.sandbox.vmctx().hostcall().get() = polkavm_common::zygote::HOSTCALL_SBRK;
+        }
+
+        self.sandbox.vmctx().futex.store(VMCTX_FUTEX_BUSY, Ordering::Release);
+        if let Err(error) = linux_raw::sys_futex_wake_one(&self.sandbox.vmctx().futex) {
+            panic!("sbrk failed: {error}");
+        }
+
+        let mut timestamp = Instant::now();
+        loop {
+            let _ = linux_raw::sys_sched_yield();
+            if self.sandbox.vmctx().futex.load(Ordering::Relaxed) == VMCTX_FUTEX_BUSY {
+                let new_timestamp = Instant::now();
+                let elapsed = new_timestamp - timestamp;
+                if elapsed >= Duration::from_millis(100) {
+                    timestamp = new_timestamp;
+                    if let Err(error) = self.sandbox.check_child_status() {
+                        panic!("sbrk failed: {error}");
+                    }
+                }
+                continue;
+            }
+
+            core::sync::atomic::fence(Ordering::Acquire);
+            break;
+        }
+
+        debug_assert_eq!(self.sandbox.vmctx().futex.load(Ordering::Relaxed), VMCTX_FUTEX_HOSTCALL);
+
+        let result = unsafe { *self.sandbox.vmctx().rpc_sbrk.get() };
+        if result == 0 {
+            None
+        } else {
+            Some(result)
+        }
+    }
+
+    fn heap_size(&self) -> u32 {
+        let heap_base = unsafe { (*self.sandbox.vmctx().memory_config.get()).memory_map.heap_base() };
+        let heap_top = unsafe { *self.sandbox.vmctx().heap_info().heap_top.get() };
+        (heap_top - u64::from(heap_base)) as u32
     }
 
     fn program_counter(&self) -> Option<u32> {

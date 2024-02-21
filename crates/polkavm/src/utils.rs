@@ -19,3 +19,19 @@ impl From<u32> for RegImm {
         RegImm::Imm(value)
     }
 }
+
+#[derive(Copy, Clone, Default)]
+pub struct GuestInit<'a> {
+    pub page_size: u32,
+    pub ro_data: &'a [u8],
+    pub rw_data: &'a [u8],
+    pub ro_data_size: u32,
+    pub rw_data_size: u32,
+    pub stack_size: u32,
+}
+
+impl<'a> GuestInit<'a> {
+    pub fn memory_map(&self) -> Result<polkavm_common::abi::MemoryMap, &'static str> {
+        polkavm_common::abi::MemoryMap::new(self.page_size, self.ro_data_size, self.rw_data_size, self.stack_size)
+    }
+}

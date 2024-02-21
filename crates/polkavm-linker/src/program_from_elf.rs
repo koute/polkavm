@@ -1,5 +1,4 @@
-use polkavm_common::abi::{GuestMemoryConfig, VM_ADDR_USER_MEMORY, VM_CODE_ADDRESS_ALIGNMENT, VM_MAX_PAGE_SIZE, VM_PAGE_SIZE};
-use polkavm_common::elf::INSTRUCTION_ECALLI;
+use polkavm_common::abi::{MemoryMap, VM_CODE_ADDRESS_ALIGNMENT, VM_MAX_PAGE_SIZE, VM_MIN_PAGE_SIZE};
 use polkavm_common::program::{self, FrameKind, Instruction, LineProgramOp, ProgramBlob, ProgramSymbol};
 use polkavm_common::utils::{align_to_next_page_u32, align_to_next_page_u64};
 use polkavm_common::varint;
@@ -544,6 +543,10 @@ enum BasicInst<T> {
     Ecalli {
         nth_import: usize,
     },
+    Sbrk {
+        dst: Reg,
+        size: Reg,
+    },
     Nop,
 }
 
@@ -581,6 +584,7 @@ impl<T> BasicInst<T> {
             BasicInst::AnyAny { src1, src2, .. } => RegMask::from(src1) | RegMask::from(src2),
             BasicInst::Cmov { src, cond, .. } => RegMask::from(src) | RegMask::from(cond),
             BasicInst::Ecalli { nth_import } => imports[nth_import].src_mask(),
+            BasicInst::Sbrk { size, .. } => RegMask::from(size),
         }
     }
 
@@ -596,12 +600,13 @@ impl<T> BasicInst<T> {
             | BasicInst::Cmov { dst, .. }
             | BasicInst::AnyAny { dst, .. } => RegMask::from(dst),
             BasicInst::Ecalli { nth_import } => imports[nth_import].dst_mask(),
+            BasicInst::Sbrk { dst, .. } => RegMask::from(dst),
         }
     }
 
     fn has_side_effects(&self, config: &Config) -> bool {
         match *self {
-            BasicInst::Ecalli { .. } | BasicInst::StoreAbsolute { .. } | BasicInst::StoreIndirect { .. } => true,
+            BasicInst::Sbrk { .. } | BasicInst::Ecalli { .. } | BasicInst::StoreAbsolute { .. } | BasicInst::StoreIndirect { .. } => true,
             BasicInst::LoadAbsolute { .. } | BasicInst::LoadIndirect { .. } => !config.elide_unnecessary_loads,
             BasicInst::Nop
             | BasicInst::LoadImmediate { .. }
@@ -666,6 +671,10 @@ impl<T> BasicInst<T> {
                 dst: map(dst, true),
             }),
             BasicInst::Ecalli { .. } => None,
+            BasicInst::Sbrk { dst, size } => Some(BasicInst::Sbrk {
+                size: map(size, false),
+                dst: map(dst, true),
+            }),
             BasicInst::Nop => Some(BasicInst::Nop),
         }
     }
@@ -729,6 +738,7 @@ impl<T> BasicInst<T> {
             BasicInst::AnyAny { kind, dst, src1, src2 } => BasicInst::AnyAny { kind, dst, src1, src2 },
             BasicInst::Cmov { kind, dst, src, cond } => BasicInst::Cmov { kind, dst, src, cond },
             BasicInst::Ecalli { nth_import } => BasicInst::Ecalli { nth_import },
+            BasicInst::Sbrk { dst, size } => BasicInst::Sbrk { dst, size },
             BasicInst::Nop => BasicInst::Nop,
         })
     }
@@ -747,6 +757,7 @@ impl<T> BasicInst<T> {
             | BasicInst::RegReg { .. }
             | BasicInst::AnyAny { .. }
             | BasicInst::Cmov { .. }
+            | BasicInst::Sbrk { .. }
             | BasicInst::Ecalli { .. } => (None, None),
         }
     }
@@ -953,8 +964,9 @@ impl DataRef {
 struct MemoryConfig {
     ro_data: Vec<DataRef>,
     rw_data: Vec<DataRef>,
-    bss_size: u32,
-    stack_size: u32,
+    ro_data_size: u32,
+    rw_data_size: u32,
+    min_stack_size: u32,
 }
 
 fn get_padding(memory_end: u64, align: u64) -> Option<u64> {
@@ -966,6 +978,61 @@ fn get_padding(memory_end: u64, align: u64) -> Option<u64> {
     }
 }
 
+fn process_sections(
+    elf: &Elf,
+    current_address: &mut u64,
+    chunks: &mut Vec<DataRef>,
+    base_address_for_section: &mut HashMap<SectionIndex, u64>,
+    sections: impl IntoIterator<Item = SectionIndex>,
+) -> u64 {
+    for section_index in sections {
+        let section = elf.section_by_index(section_index);
+        assert!(section.size() >= section.data().len() as u64);
+
+        if let Some(padding) = get_padding(*current_address, section.align()) {
+            *current_address += padding;
+            chunks.push(DataRef::Padding(padding as usize));
+        }
+
+        let section_name = section.name();
+        let section_base_address = *current_address;
+        base_address_for_section.insert(section.index(), section_base_address);
+
+        *current_address += section.size();
+        chunks.push(DataRef::Section {
+            section_index: section.index(),
+            range: 0..section.data().len(),
+        });
+
+        let padding = section.size() - section.data().len() as u64;
+        if padding > 0 {
+            chunks.push(DataRef::Padding(padding.try_into().expect("overflow")))
+        }
+
+        log::trace!(
+            "Found section: '{}', original range = 0x{:x}..0x{:x} (relocated to: 0x{:x}..0x{:x}), size = 0x{:x}/0x{:x}",
+            section_name,
+            section.original_address(),
+            section.original_address() + section.size(),
+            section_base_address,
+            section_base_address + section.size(),
+            section.data().len(),
+            section.size(),
+        );
+    }
+
+    let size_in_memory: u64 = chunks.iter().map(|chunk| chunk.size() as u64).sum();
+    while let Some(DataRef::Padding(..)) = chunks.last() {
+        chunks.pop();
+    }
+
+    *current_address = align_to_next_page_u64(u64::from(VM_MAX_PAGE_SIZE), *current_address).expect("overflow");
+    // Add a guard page between this section and the next one.
+    *current_address += u64::from(VM_MAX_PAGE_SIZE);
+
+    size_in_memory
+}
+
 #[allow(clippy::too_many_arguments)]
 fn extract_memory_config(
     elf: &Elf,
@@ -975,147 +1042,28 @@ fn extract_memory_config(
     sections_min_stack_size: &[SectionIndex],
     base_address_for_section: &mut HashMap<SectionIndex, u64>,
 ) -> Result<MemoryConfig, ProgramFromElfError> {
-    let mut memory_end = u64::from(VM_ADDR_USER_MEMORY);
+    let mut current_address = u64::from(VM_MAX_PAGE_SIZE);
+
     let mut ro_data = Vec::new();
-    let mut ro_data_size = 0;
-
-    fn align_if_necessary(memory_end: &mut u64, output_size: &mut u64, output_chunks: &mut Vec<DataRef>, section: &Section) {
-        if let Some(padding) = get_padding(*memory_end, section.align()) {
-            *memory_end += padding;
-            *output_size += padding;
-            output_chunks.push(DataRef::Padding(padding as usize));
-        }
-    }
-
-    assert_eq!(memory_end % u64::from(VM_MAX_PAGE_SIZE), 0);
-
-    let ro_data_address = memory_end;
-    for &section_index in sections_ro_data {
-        let section = elf.section_by_index(section_index);
-        align_if_necessary(&mut memory_end, &mut ro_data_size, &mut ro_data, section);
-
-        let section_name = section.name();
-        let base_address = memory_end;
-        base_address_for_section.insert(section.index(), base_address);
-
-        memory_end += section.size();
-        ro_data.push(DataRef::Section {
-            section_index: section.index(),
-            range: 0..section.data().len(),
-        });
-
-        ro_data_size += section.data().len() as u64;
-        let padding = section.size() - section.data().len() as u64;
-        if padding > 0 {
-            ro_data.push(DataRef::Padding(padding.try_into().expect("overflow")))
-        }
-
-        log::trace!(
-            "Found read-only section: '{}', original range = 0x{:x}..0x{:x} (relocated to: 0x{:x}..0x{:x}), size = 0x{:x}",
-            section_name,
-            section.original_address(),
-            section.original_address() + section.size(),
-            base_address,
-            base_address + section.size(),
-            section.size(),
-        );
-    }
-
-    {
-        let ro_data_size_unaligned = ro_data_size;
-
-        assert_eq!(ro_data_address % u64::from(VM_PAGE_SIZE), 0);
-        ro_data_size = align_to_next_page_u64(u64::from(VM_PAGE_SIZE), ro_data_size)
-            .ok_or(ProgramFromElfError::other("out of range size for read-only sections"))?;
-
-        memory_end += ro_data_size - ro_data_size_unaligned;
-    }
-
-    assert_eq!(memory_end % u64::from(VM_PAGE_SIZE), 0);
-    memory_end = align_to_next_page_u64(u64::from(VM_MAX_PAGE_SIZE), memory_end).unwrap();
-
-    if ro_data_size > 0 {
-        // Add a guard page between read-only data and read-write data.
-        memory_end += u64::from(VM_MAX_PAGE_SIZE);
-    }
-
     let mut rw_data = Vec::new();
-    let mut rw_data_size = 0;
-    let rw_data_address = memory_end;
-    for &section_index in sections_rw_data {
-        let section = elf.section_by_index(section_index);
-        align_if_necessary(&mut memory_end, &mut rw_data_size, &mut rw_data, section);
+    let ro_data_address = current_address;
+    let ro_data_size = process_sections(
+        elf,
+        &mut current_address,
+        &mut ro_data,
+        base_address_for_section,
+        sections_ro_data.iter().copied(),
+    );
+    let rw_data_address = current_address;
+    let rw_data_size = process_sections(
+        elf,
+        &mut current_address,
+        &mut rw_data,
+        base_address_for_section,
+        sections_rw_data.iter().copied().chain(sections_bss.iter().copied()),
+    );
 
-        let section_name = section.name();
-        let base_address = memory_end;
-        base_address_for_section.insert(section.index(), memory_end);
-
-        memory_end += section.size();
-        rw_data.push(DataRef::Section {
-            section_index: section.index(),
-            range: 0..section.data().len(),
-        });
-
-        rw_data_size += section.data().len() as u64;
-        let padding = section.size() - section.data().len() as u64;
-        if padding > 0 {
-            rw_data.push(DataRef::Padding(padding.try_into().expect("overflow")))
-        }
-
-        log::trace!(
-            "Found read-write section: '{}', original range = 0x{:x}..0x{:x} (relocated to: 0x{:x}..0x{:x}), size = 0x{:x}",
-            section_name,
-            section.original_address(),
-            section.original_address() + section.size(),
-            base_address,
-            base_address + section.size(),
-            section.size(),
-        );
-    }
-
-    let bss_explicit_address = {
-        let rw_data_size_unaligned = rw_data_size;
-
-        assert_eq!(rw_data_address % u64::from(VM_PAGE_SIZE), 0);
-        rw_data_size = align_to_next_page_u64(u64::from(VM_PAGE_SIZE), rw_data_size)
-            .ok_or(ProgramFromElfError::other("out of range size for read-write sections"))?;
-
-        memory_end + (rw_data_size - rw_data_size_unaligned)
-    };
-
-    for &section_index in sections_bss {
-        let section = elf.section_by_index(section_index);
-        if let Some(padding) = get_padding(memory_end, section.align()) {
-            memory_end += padding;
-        }
-
-        let section_name = section.name();
-        let base_address = memory_end;
-        base_address_for_section.insert(section.index(), memory_end);
-
-        memory_end += section.size();
-
-        log::trace!(
-            "Found BSS section: '{}', original range = 0x{:x}..0x{:x} (relocated to: 0x{:x}..0x{:x}), size = 0x{:x}",
-            section_name,
-            section.original_address(),
-            section.original_address() + section.size(),
-            base_address,
-            base_address + section.size(),
-            section.size(),
-        );
-    }
-
-    let mut bss_size = if memory_end > bss_explicit_address {
-        memory_end - bss_explicit_address
-    } else {
-        0
-    };
-
-    bss_size = align_to_next_page_u64(u64::from(VM_PAGE_SIZE), bss_size)
-        .ok_or(ProgramFromElfError::other("out of range size for BSS sections"))?;
-
-    let mut stack_size = VM_PAGE_SIZE;
+    let mut min_stack_size = VM_MIN_PAGE_SIZE;
     for &section_index in sections_min_stack_size {
         let section = elf.section_by_index(section_index);
         let data = section.data();
@@ -1125,24 +1073,25 @@ fn extract_memory_config(
 
         for xs in data.chunks_exact(4) {
             let value = u32::from_le_bytes([xs[0], xs[1], xs[2], xs[3]]);
-            stack_size = core::cmp::max(stack_size, value);
+            min_stack_size = core::cmp::max(min_stack_size, value);
         }
     }
 
-    let stack_size =
-        align_to_next_page_u32(VM_PAGE_SIZE, stack_size).ok_or(ProgramFromElfError::other("out of range size for the stack"))?;
+    let min_stack_size =
+        align_to_next_page_u32(VM_MIN_PAGE_SIZE, min_stack_size).ok_or(ProgramFromElfError::other("out of range size for the stack"))?;
 
-    log::trace!("Configured stack size: 0x{stack_size:x}");
+    log::trace!("Configured minimum stack size: 0x{min_stack_size:x}");
+
+    let ro_data_size = u32::try_from(ro_data_size).expect("overflow");
+    let rw_data_size = u32::try_from(rw_data_size).expect("overflow");
 
     // Sanity check that the memory configuration is actually valid.
     {
-        let ro_data_size_physical: u64 = ro_data.iter().map(|x| x.size() as u64).sum();
         let rw_data_size_physical: u64 = rw_data.iter().map(|x| x.size() as u64).sum();
-
-        assert!(ro_data_size_physical <= ro_data_size);
+        let rw_data_size_physical = u32::try_from(rw_data_size_physical).expect("overflow");
         assert!(rw_data_size_physical <= rw_data_size);
 
-        let config = match GuestMemoryConfig::new(ro_data_size, rw_data_size, bss_size, u64::from(stack_size)) {
+        let config = match MemoryMap::new(VM_MAX_PAGE_SIZE, ro_data_size, rw_data_size, min_stack_size) {
             Ok(config) => config,
             Err(error) => {
                 return Err(ProgramFromElfError::other(error));
@@ -1156,8 +1105,9 @@ fn extract_memory_config(
     let memory_config = MemoryConfig {
         ro_data,
         rw_data,
-        bss_size: bss_size as u32,
-        stack_size,
+        ro_data_size,
+        rw_data_size,
+        min_stack_size,
     };
 
     Ok(memory_config)
@@ -1923,7 +1873,10 @@ fn parse_code_section(
             text[relative_offset + 3],
         ]);
 
-        if raw_inst == INSTRUCTION_ECALLI {
+        const FUNC3_ECALLI: u32 = 0b000;
+        const FUNC3_SBRK: u32 = 0b001;
+
+        if crate::riscv::R(raw_inst).unpack() == (crate::riscv::OPCODE_CUSTOM_0, FUNC3_ECALLI, 0, RReg::Zero, RReg::Zero, RReg::Zero) {
             let initial_offset = relative_offset as u64;
             if relative_offset + 12 > text.len() {
                 return Err(ProgramFromElfError::other("truncated ecalli instruction"));
@@ -1983,6 +1936,31 @@ fn parse_code_section(
                     offset_range: AddressRange::from(relative_offset as u64..relative_offset as u64 + 4),
                 },
                 InstExt::Control(ControlInst::JumpIndirect { base: Reg::RA, offset: 0 }),
+            ));
+
+            relative_offset += 4;
+            continue;
+        }
+
+        if let (crate::riscv::OPCODE_CUSTOM_0, FUNC3_SBRK, 0, dst, size, RReg::Zero) = crate::riscv::R(raw_inst).unpack() {
+            let Some(dst) = cast_reg_non_zero(dst)? else {
+                return Err(ProgramFromElfError::other(
+                    "found an 'sbrk' instruction with the zero register as the destination",
+                ));
+            };
+
+            let Some(size) = cast_reg_non_zero(size)? else {
+                return Err(ProgramFromElfError::other(
+                    "found an 'sbrk' instruction with the zero register as the size",
+                ));
+            };
+
+            output.push((
+                Source {
+                    section_index,
+                    offset_range: (relative_offset as u64..relative_offset as u64 + 4).into(),
+                },
+                InstExt::Basic(BasicInst::Sbrk { dst, size }),
             ));
 
             relative_offset += 4;
@@ -5368,6 +5346,7 @@ fn emit_code(
                     let import = &imports[nth_import];
                     Instruction::ecalli(import.metadata.index.expect("internal error: no index was assigned to an ecall"))
                 }
+                BasicInst::Sbrk { dst, size } => Instruction::sbrk(conv_reg(dst), conv_reg(size)),
                 BasicInst::Nop => {
                     if is_optimized {
                         unreachable!("internal error: a nop instruction was not removed")
@@ -6913,8 +6892,9 @@ pub fn program_from_elf(config: Config, data: &[u8]) -> Result<ProgramBlob, Prog
 
     let mut builder = ProgramBlobBuilder::new();
 
-    builder.set_bss_size(memory_config.bss_size);
-    builder.set_stack_size(memory_config.stack_size);
+    builder.set_ro_data_size(memory_config.ro_data_size);
+    builder.set_rw_data_size(memory_config.rw_data_size);
+    builder.set_stack_size(memory_config.min_stack_size);
 
     let [ro_data, rw_data] = {
         [memory_config.ro_data, memory_config.rw_data].map(|ranges| {

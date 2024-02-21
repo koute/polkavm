@@ -1,8 +1,3 @@
-/// Custom instruction used to make an external function call.
-///
-/// These are processed when relinking the ELf file and will *not* end up in the final payload.
-pub const INSTRUCTION_ECALLI: u32 = 0x0000000b;
-
 pub struct Reader<'a> {
     pub buffer: &'a [u8],
     pub bytes_consumed: usize,

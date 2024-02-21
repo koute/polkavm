@@ -5,15 +5,32 @@
 use core::ptr::addr_of_mut;
 use core::sync::atomic::Ordering;
 use core::sync::atomic::{AtomicBool, AtomicUsize};
+
+#[rustfmt::skip]
 use polkavm_common::{
-    abi::{VM_ADDR_USER_MEMORY, VM_ADDR_USER_STACK_HIGH, VM_MAXIMUM_MEMORY_SIZE},
+    abi::VM_ADDR_USER_STACK_HIGH,
     utils::align_to_next_page_usize,
     zygote::{
-        AddressTableRaw, VmCtx as VmCtxInner, SANDBOX_EMPTY_NATIVE_PROGRAM_COUNTER, SANDBOX_EMPTY_NTH_INSTRUCTION, VMCTX_FUTEX_BUSY,
-        VMCTX_FUTEX_HOSTCALL, VMCTX_FUTEX_IDLE, VMCTX_FUTEX_INIT, VMCTX_FUTEX_TRAP, VM_ADDR_JUMP_TABLE, VM_ADDR_JUMP_TABLE_RETURN_TO_HOST,
-        VM_ADDR_NATIVE_CODE, VM_ADDR_SIGSTACK, VM_RPC_FLAG_CLEAR_PROGRAM_AFTER_EXECUTION, VM_RPC_FLAG_RECONFIGURE,
-        VM_RPC_FLAG_RESET_MEMORY_AFTER_EXECUTION, VM_SANDBOX_MAXIMUM_JUMP_TABLE_VIRTUAL_SIZE, VM_SANDBOX_MAXIMUM_NATIVE_CODE_SIZE,
+        AddressTableRaw, VmCtx as VmCtxInner,
+        SANDBOX_EMPTY_NATIVE_PROGRAM_COUNTER,
+        SANDBOX_EMPTY_NTH_INSTRUCTION,
+        VM_ADDR_JUMP_TABLE_RETURN_TO_HOST,
+        VM_ADDR_JUMP_TABLE,
+        VM_ADDR_NATIVE_CODE,
+        VM_ADDR_SIGSTACK,
+        VM_RPC_FLAG_RECONFIGURE,
+        VM_SANDBOX_MAXIMUM_JUMP_TABLE_SIZE,
+        VM_SANDBOX_MAXIMUM_JUMP_TABLE_VIRTUAL_SIZE,
+        VM_SANDBOX_MAXIMUM_NATIVE_CODE_SIZE,
+        VMCTX_FUTEX_BUSY,
+        VMCTX_FUTEX_HOSTCALL,
+        VMCTX_FUTEX_IDLE,
+        VMCTX_FUTEX_INIT,
+        VMCTX_FUTEX_TRAP,
     },
+    VM_RPC_FLAG_CLEAR_PROGRAM_AFTER_EXECUTION,
+    VM_RPC_FLAG_RESET_MEMORY_AFTER_EXECUTION,
+    VM_RPC_FLAG_RESET_MEMORY_BEFORE_EXECUTION,
 };
 use polkavm_linux_raw as linux_raw;
 
@@ -222,6 +239,7 @@ unsafe extern "C" fn entry_point(stack: *mut usize) -> ! {
 
 static IN_SIGNAL_HANDLER: AtomicBool = AtomicBool::new(false);
 static NATIVE_PAGE_SIZE: AtomicUsize = AtomicUsize::new(!0);
+static IS_PROGRAM_DIRTY: AtomicBool = AtomicBool::new(false);
 
 unsafe extern "C" fn signal_handler(signal: u32, _info: &linux_raw::siginfo_t, context: &linux_raw::ucontext) {
     if IN_SIGNAL_HANDLER.load(Ordering::Relaxed) || signal == linux_raw::SIGIO {
@@ -276,7 +294,7 @@ unsafe extern "C" fn signal_handler(signal: u32, _info: &linux_raw::siginfo_t, c
     let user_code = VM_ADDR_NATIVE_CODE;
 
     #[allow(clippy::needless_borrow)]
-    if rip >= user_code && rip < user_code + (&*VMCTX.memory_config.get()).code_size() as u64 {
+    if rip >= user_code && rip < user_code + (&*VMCTX.memory_config.get()).code_size as u64 {
         signal_host(VMCTX_FUTEX_TRAP, SignalHostKind::Normal)
             .unwrap_or_else(|error| abort_with_error("failed to wait for the host process (trap)", error));
 
@@ -456,17 +474,8 @@ unsafe fn initialize(mut stack: *mut usize) -> linux_raw::Fd {
 
     // These are technically unnecessary, but let's do it anyway as a just-in-case
     // failsafe in case there's actually something in memory over there.
-    linux_raw::sys_munmap(
-        VM_ADDR_USER_MEMORY as *mut core::ffi::c_void,
-        align_to_next_page_usize(page_size, VM_MAXIMUM_MEMORY_SIZE as usize).unwrap_or_else(|| abort_with_message("overflow")),
-    )
-    .unwrap_or_else(|error| abort_with_error("failed to make sure the user memory address space is unmapped", error));
-
-    linux_raw::sys_munmap(
-        VM_ADDR_NATIVE_CODE as *mut core::ffi::c_void,
-        align_to_next_page_usize(page_size, VM_SANDBOX_MAXIMUM_NATIVE_CODE_SIZE as usize).unwrap_or_else(|| abort_with_message("overflow")),
-    )
-    .unwrap_or_else(|error| abort_with_error("failed to make sure the native code address space is unmapped", error));
+    linux_raw::sys_munmap(core::ptr::null_mut(), 0x200000000)
+        .unwrap_or_else(|error| abort_with_error("failed to make sure the address space is unmapped", error));
 
     linux_raw::sys_munmap(
         VM_ADDR_JUMP_TABLE as *mut core::ffi::c_void,
@@ -643,13 +652,25 @@ unsafe fn main_loop(socket: linux_raw::Fd) -> ! {
 
     let rpc_flags = *VMCTX.rpc_flags.get();
     let rpc_address = *VMCTX.rpc_address.get().cast::<Option<extern "C" fn() -> !>>();
+    let rpc_sbrk = *VMCTX.rpc_sbrk.get();
 
     if rpc_flags & VM_RPC_FLAG_RECONFIGURE != 0 {
-        reconfigure(socket.borrow());
+        load_program(socket.borrow());
+    } else if rpc_flags & VM_RPC_FLAG_RESET_MEMORY_BEFORE_EXECUTION != 0 {
+        reset_memory();
+    }
+
+    if rpc_sbrk > 0 {
+        let new_heap_top = *VMCTX.heap_info.heap_top.get() + rpc_sbrk as u64;
+        if syscall_sbrk(new_heap_top) == 0 {
+            abort_with_message("sbrk failed");
+        }
     }
 
     if let Some(rpc_address) = rpc_address {
         trace!("jumping to: ", Hex(rpc_address as usize));
+
+        VMCTX.is_memory_dirty.store(true, Ordering::Relaxed);
         rpc_address();
     } else {
         longjmp(addr_of_mut!(RESUME_IDLE_LOOP_JMPBUF), 1);
@@ -658,19 +679,36 @@ unsafe fn main_loop(socket: linux_raw::Fd) -> ! {
 
 #[link_section = ".text_hot"]
 unsafe fn reset_memory() {
-    trace!("resetting memory...");
-    let current = &mut *VMCTX.memory_config.get();
-    let heap_size = current.heap_size();
-    if heap_size > 0 {
-        linux_raw::sys_madvise(
-            current.heap_address() as *mut core::ffi::c_void,
-            heap_size as usize,
-            linux_raw::MADV_DONTNEED,
-        )
-        .unwrap_or_else(|error| abort_with_error("failed to clear user heap", error));
+    if !VMCTX.is_memory_dirty.load(Ordering::Relaxed) {
+        return;
     }
 
-    let stack_size = current.stack_size() as usize;
+    trace!("resetting memory...");
+    let cfg = &mut *VMCTX.memory_config.get();
+    let rw_data_size = cfg.memory_map.rw_data_size();
+    if rw_data_size > 0 {
+        linux_raw::sys_madvise(
+            cfg.memory_map.rw_data_address() as *mut core::ffi::c_void,
+            rw_data_size as usize,
+            linux_raw::MADV_DONTNEED,
+        )
+        .unwrap_or_else(|error| abort_with_error("failed to clear user read/write memory", error));
+    }
+
+    let initial_heap_threshold = u64::from(cfg.memory_map.rw_data_range().end);
+    let heap_top = *VMCTX.heap_info.heap_top.get();
+    if heap_top > initial_heap_threshold {
+        linux_raw::sys_munmap(
+            initial_heap_threshold as *mut core::ffi::c_void,
+            heap_top as usize - initial_heap_threshold as usize,
+        )
+        .unwrap_or_else(|error| abort_with_error("failed to unmap the heap", error));
+    }
+
+    *VMCTX.heap_info.heap_top.get() = u64::from(cfg.memory_map.heap_base());
+    *VMCTX.heap_info.heap_threshold.get() = initial_heap_threshold;
+
+    let stack_size = cfg.memory_map.stack_size() as usize;
     if stack_size > 0 {
         linux_raw::sys_madvise(
             (VM_ADDR_USER_STACK_HIGH as usize - stack_size) as *mut core::ffi::c_void,
@@ -679,6 +717,8 @@ unsafe fn reset_memory() {
         )
         .unwrap_or_else(|error| abort_with_error("failed to clear user stack", error));
     }
+
+    VMCTX.is_memory_dirty.store(false, Ordering::Relaxed);
 }
 
 #[inline(never)]
@@ -687,11 +727,20 @@ pub unsafe extern "C" fn syscall_hostcall(hostcall: u32) {
     trace!("syscall: hostcall triggered");
 
     *VMCTX.hostcall().get() = hostcall;
-    signal_host(VMCTX_FUTEX_HOSTCALL, SignalHostKind::Normal)
-        .unwrap_or_else(|error| abort_with_error("failed to wait for the host process (hostcall)", error));
 
-    if *VMCTX.hostcall().get() == polkavm_common::zygote::HOSTCALL_ABORT_EXECUTION {
-        longjmp(addr_of_mut!(RESUME_IDLE_LOOP_JMPBUF), 1);
+    loop {
+        signal_host(VMCTX_FUTEX_HOSTCALL, SignalHostKind::Normal)
+            .unwrap_or_else(|error| abort_with_error("failed to wait for the host process (hostcall)", error));
+
+        match *VMCTX.hostcall().get() {
+            polkavm_common::zygote::HOSTCALL_ABORT_EXECUTION => longjmp(addr_of_mut!(RESUME_IDLE_LOOP_JMPBUF), 1),
+            polkavm_common::zygote::HOSTCALL_SBRK => {
+                let new_heap_top = *VMCTX.heap_info.heap_top.get() + *VMCTX.rpc_sbrk.get() as u64;
+                *VMCTX.rpc_sbrk.get() = syscall_sbrk(new_heap_top);
+                *VMCTX.hostcall().get() = hostcall;
+            }
+            _ => break,
+        }
     }
 }
 
@@ -731,6 +780,42 @@ pub unsafe extern "C" fn syscall_trace(nth_instruction: u32, rip: u64) {
     }
 }
 
+#[inline(never)]
+#[no_mangle]
+pub unsafe extern "C" fn syscall_sbrk(pending_heap_top: u64) -> u32 {
+    trace!("syscall: sbrk triggered");
+    let memory_map = &(*VMCTX.memory_config.get()).memory_map;
+    if pending_heap_top > u64::from(memory_map.heap_base() + memory_map.max_heap_size()) {
+        return 0;
+    }
+
+    let Some(start) = align_to_next_page_usize(memory_map.page_size() as usize, *VMCTX.heap_info.heap_top.get() as usize) else {
+        abort_with_message("unreachable")
+    };
+
+    let Some(end) = align_to_next_page_usize(memory_map.page_size() as usize, pending_heap_top as usize) else {
+        abort_with_message("unreachable")
+    };
+
+    let size = end - start;
+    if size > 0 {
+        linux_raw::sys_mmap(
+            start as *mut core::ffi::c_void,
+            end - start,
+            linux_raw::PROT_READ | linux_raw::PROT_WRITE,
+            linux_raw::MAP_FIXED | linux_raw::MAP_PRIVATE | linux_raw::MAP_ANONYMOUS,
+            None,
+            0,
+        )
+        .unwrap_or_else(|error| abort_with_error("failed to mmap sbrk increase", error));
+    }
+
+    *VMCTX.heap_info.heap_top.get() = pending_heap_top;
+    *VMCTX.heap_info.heap_threshold.get() = end as u64;
+
+    pending_heap_top as u32
+}
+
 #[link_section = ".address_table"]
 #[no_mangle]
 pub static ADDRESS_TABLE: AddressTableRaw = AddressTableRaw {
@@ -738,6 +823,7 @@ pub static ADDRESS_TABLE: AddressTableRaw = AddressTableRaw {
     syscall_trap,
     syscall_return,
     syscall_trace,
+    syscall_sbrk,
 };
 
 enum SignalHostKind {
@@ -799,103 +885,120 @@ fn signal_host(futex_value_to_set: u32, kind: SignalHostKind) -> Result<(), linu
 
 #[cold]
 #[inline(never)]
-unsafe fn reconfigure(socket: linux_raw::FdRef) {
+unsafe fn load_program(socket: linux_raw::FdRef) {
     trace!("reconfiguring...");
     if NATIVE_PAGE_SIZE.load(Ordering::Relaxed) == 0 {
         abort_with_message("assertion failed: native page size is zero");
     }
 
-    let fd = linux_raw::recvfd(socket).unwrap_or_else(|_| abort_with_message("failed to receive reconfiguration fd"));
+    let fd = linux_raw::recvfd(socket).unwrap_or_else(|_| abort_with_message("failed to receive program memory fd"));
 
     clear_program();
+    IS_PROGRAM_DIRTY.store(true, Ordering::Relaxed);
 
-    let current = &mut *VMCTX.memory_config.get();
-    let new = *VMCTX.new_memory_config.get();
-    if new.ro_data_size() + new.rw_data_size() > 0 {
-        if new.ro_data_size() > 0 {
+    let config = &mut *VMCTX.memory_config.get();
+    if config.memory_map.ro_data_size() > 0 {
+        if config.ro_data_fd_size > 0 {
             linux_raw::sys_mmap(
-                new.ro_data_address() as *mut core::ffi::c_void,
-                new.ro_data_size() as usize,
+                config.memory_map.ro_data_address() as *mut core::ffi::c_void,
+                config.ro_data_fd_size as usize,
                 linux_raw::PROT_READ,
                 linux_raw::MAP_FIXED | linux_raw::MAP_PRIVATE,
                 Some(fd.borrow()),
                 0,
             )
-            .unwrap_or_else(|error| abort_with_error("failed to mmap user memory (ro data)", error));
-
-            trace!(
-                "new rodata range: ",
-                Hex(new.ro_data_address()),
-                "-",
-                Hex(new.ro_data_address() + new.ro_data_size()),
-                " (",
-                Hex(new.ro_data_size()),
-                ")"
-            );
-            if let Err(error) = current.set_ro_data_size(new.ro_data_size()) {
-                abort_with_message(error);
-            }
+            .unwrap_or_else(|error| abort_with_error("failed to mmap read-only data", error));
         }
 
-        if new.rw_data_size() > 0 {
+        if config.memory_map.ro_data_size() > config.ro_data_fd_size {
             linux_raw::sys_mmap(
-                new.rw_data_address() as *mut core::ffi::c_void,
-                new.rw_data_size() as usize,
+                (config.memory_map.ro_data_address() + config.ro_data_fd_size) as *mut core::ffi::c_void,
+                (config.memory_map.ro_data_size() - config.ro_data_fd_size) as usize,
+                linux_raw::PROT_READ,
+                linux_raw::MAP_FIXED | linux_raw::MAP_PRIVATE | linux_raw::MAP_ANONYMOUS,
+                None,
+                0,
+            )
+            .unwrap_or_else(|error| abort_with_error("failed to mmap read-only data (trailing zeros)", error));
+        }
+
+        trace!(
+            "new rodata range: ",
+            Hex(config.memory_map.ro_data_address()),
+            "-",
+            Hex(config.memory_map.ro_data_address() + config.memory_map.ro_data_size()),
+            " (",
+            Hex(config.memory_map.ro_data_size()),
+            ")"
+        );
+    }
+
+    if config.memory_map.rw_data_size() > 0 {
+        if config.rw_data_fd_size > 0 {
+            linux_raw::sys_mmap(
+                config.memory_map.rw_data_address() as *mut core::ffi::c_void,
+                config.rw_data_fd_size as usize,
                 linux_raw::PROT_READ | linux_raw::PROT_WRITE,
                 linux_raw::MAP_FIXED | linux_raw::MAP_PRIVATE,
                 Some(fd.borrow()),
-                new.ro_data_size().into(),
+                u64::from(config.ro_data_fd_size),
             )
-            .unwrap_or_else(|error| abort_with_error("failed to mmap user memory (rw data)", error));
-
-            trace!(
-                "new rwdata range: ",
-                Hex(new.rw_data_address()),
-                "-",
-                Hex(new.rw_data_address() + new.rw_data_size()),
-                " (",
-                Hex(new.rw_data_size()),
-                ")"
-            );
-            if let Err(error) = current.set_rw_data_size(new.rw_data_size()) {
-                abort_with_message(error);
-            }
+            .unwrap_or_else(|error| abort_with_error("failed to mmap read-write data", error));
         }
+
+        if config.memory_map.rw_data_size() > config.rw_data_fd_size {
+            linux_raw::sys_mmap(
+                (config.memory_map.rw_data_address() + config.rw_data_fd_size) as *mut core::ffi::c_void,
+                (config.memory_map.rw_data_size() - config.rw_data_fd_size) as usize,
+                linux_raw::PROT_READ | linux_raw::PROT_WRITE,
+                linux_raw::MAP_FIXED | linux_raw::MAP_PRIVATE | linux_raw::MAP_ANONYMOUS,
+                None,
+                0,
+            )
+            .unwrap_or_else(|error| abort_with_error("failed to mmap read-write data (trailing zeros)", error));
+        }
+
+        trace!(
+            "new rwdata range: ",
+            Hex(config.memory_map.rw_data_address()),
+            "-",
+            Hex(config.memory_map.rw_data_address() + config.memory_map.rw_data_size()),
+            " (",
+            Hex(config.memory_map.rw_data_size()),
+            ")"
+        );
     }
 
-    if new.code_size() > 0 {
+    if config.code_size > 0 {
         linux_raw::sys_mmap(
             VM_ADDR_NATIVE_CODE as *mut core::ffi::c_void,
-            new.code_size(),
+            config.code_size as usize,
             linux_raw::PROT_EXEC,
             linux_raw::MAP_FIXED | linux_raw::MAP_PRIVATE,
             Some(fd.borrow()),
-            (new.ro_data_size() + new.rw_data_size()).into(),
+            (config.ro_data_fd_size + config.rw_data_fd_size).into(),
         )
-        .unwrap_or_else(|error| abort_with_error("failed to mmap user code", error));
+        .unwrap_or_else(|error| abort_with_error("failed to mmap code", error));
 
         trace!(
             "new code range: ",
             Hex(VM_ADDR_NATIVE_CODE),
             "-",
-            Hex(VM_ADDR_NATIVE_CODE + new.code_size() as u64),
+            Hex(VM_ADDR_NATIVE_CODE + config.code_size as u64),
             " (",
-            Hex(new.code_size()),
+            Hex(config.code_size),
             ")"
         );
-        if let Err(error) = current.set_code_size(NATIVE_PAGE_SIZE.load(Ordering::Relaxed), new.code_size()) {
-            abort_with_message(error);
-        }
     }
 
-    if new.jump_table_size() > 0 {
+    if config.jump_table_size > 0 {
         linux_raw::sys_mmap(
             VM_ADDR_JUMP_TABLE as *mut core::ffi::c_void,
-            new.jump_table_size(),
+            config.jump_table_size as usize,
             linux_raw::PROT_READ,
             linux_raw::MAP_FIXED | linux_raw::MAP_PRIVATE,
             Some(fd.borrow()),
-            (new.ro_data_size() as usize + new.rw_data_size() as usize + new.code_size()) as linux_raw::c_ulong,
+            (config.ro_data_fd_size + config.rw_data_fd_size + config.code_size) as linux_raw::c_ulong,
         )
         .unwrap_or_else(|error| abort_with_error("failed to mmap jump table", error));
 
@@ -903,104 +1006,67 @@ unsafe fn reconfigure(socket: linux_raw::FdRef) {
             "new jump table range: ",
             Hex(VM_ADDR_JUMP_TABLE),
             "-",
-            Hex(VM_ADDR_JUMP_TABLE + new.jump_table_size() as u64),
+            Hex(VM_ADDR_JUMP_TABLE + config.jump_table_size as u64),
             " (",
-            Hex(new.jump_table_size()),
+            Hex(config.jump_table_size),
             ")"
         );
-        if let Err(error) = current.set_jump_table_size(NATIVE_PAGE_SIZE.load(Ordering::Relaxed), new.jump_table_size()) {
-            abort_with_message(error);
-        }
     }
 
     fd.close()
-        .unwrap_or_else(|error| abort_with_error("failed to close user memory fd", error));
+        .unwrap_or_else(|error| abort_with_error("failed to close program memory fd", error));
 
-    if new.bss_size() > 0 {
+    if config.memory_map.stack_size() > 0 {
         linux_raw::sys_mmap(
-            new.bss_address() as *mut core::ffi::c_void,
-            new.bss_size() as usize,
+            config.memory_map.stack_address_low() as *mut core::ffi::c_void,
+            config.memory_map.stack_size() as usize,
             linux_raw::PROT_READ | linux_raw::PROT_WRITE,
             linux_raw::MAP_FIXED | linux_raw::MAP_PRIVATE | linux_raw::MAP_ANONYMOUS,
             None,
             0,
         )
-        .unwrap_or_else(|error| abort_with_error("failed to mmap user memory (bss)", error));
-
-        trace!(
-            "new bss range: ",
-            Hex(new.bss_address()),
-            "-",
-            Hex(new.bss_address() + new.bss_size()),
-            " (",
-            Hex(new.bss_size()),
-            ")"
-        );
-        if let Err(error) = current.set_bss_size(new.bss_size()) {
-            abort_with_message(error);
-        }
-    }
-
-    if new.stack_size() > 0 {
-        linux_raw::sys_mmap(
-            new.stack_address_low() as *mut core::ffi::c_void,
-            new.stack_size() as usize,
-            linux_raw::PROT_READ | linux_raw::PROT_WRITE,
-            linux_raw::MAP_FIXED | linux_raw::MAP_PRIVATE | linux_raw::MAP_ANONYMOUS,
-            None,
-            0,
-        )
-        .unwrap_or_else(|error| abort_with_error("failed to mmap user memory (stack)", error));
+        .unwrap_or_else(|error| abort_with_error("failed to mmap stack", error));
 
         trace!(
             "new stack range: ",
-            Hex(new.stack_address_low()),
+            Hex(config.memory_map.stack_address_low()),
             "-",
-            Hex(new.stack_address_low() + new.stack_size()),
+            Hex(config.memory_map.stack_address_low() + config.memory_map.stack_size()),
             " (",
-            Hex(new.stack_size()),
+            Hex(config.memory_map.stack_size()),
             ")"
         );
-        if let Err(error) = current.set_stack_size(new.stack_size()) {
-            abort_with_message(error);
-        }
     }
 
-    if *current != new {
-        // This should never happen, but let's check it just in case.
-        abort_with_message("internal error: failed to fully update memory configuration");
-    }
-
-    let sysreturn = *VMCTX.new_sysreturn_address.get() as usize;
     trace!(
         "new sysreturn address: ",
-        Hex(sysreturn),
+        Hex(config.sysreturn_address),
         " (set at ",
         Hex(VM_ADDR_JUMP_TABLE_RETURN_TO_HOST),
         ")"
     );
-    *(VM_ADDR_JUMP_TABLE_RETURN_TO_HOST as *mut usize) = sysreturn;
+    *(VM_ADDR_JUMP_TABLE_RETURN_TO_HOST as *mut u64) = config.sysreturn_address;
+    VMCTX.is_memory_dirty.store(false, Ordering::Relaxed);
 }
 
 #[inline(never)]
 unsafe fn clear_program() {
-    let current = &mut *VMCTX.memory_config.get();
-    if current.user_memory_region_size() > 0 || current.stack_size() > 0 || current.code_size() > 0 {
-        polkavm_common::static_assert!(VM_ADDR_NATIVE_CODE + (VM_SANDBOX_MAXIMUM_NATIVE_CODE_SIZE as u64) < 0x200000000);
-        linux_raw::sys_munmap(core::ptr::null_mut(), 0x200000000)
-            .unwrap_or_else(|error| abort_with_error("failed to unmap user accessible memory", error));
-
-        current.clear_user_memory_sizes();
-        current.clear_stack_size();
-        current.clear_code_size();
+    if !IS_PROGRAM_DIRTY.load(Ordering::Relaxed) {
+        return;
     }
 
-    if current.jump_table_size() > 0 {
-        linux_raw::sys_munmap(VM_ADDR_JUMP_TABLE as *mut core::ffi::c_void, current.jump_table_size())
-            .unwrap_or_else(|error| abort_with_error("failed to unmap jump table", error));
+    polkavm_common::static_assert!(VM_ADDR_NATIVE_CODE + (VM_SANDBOX_MAXIMUM_NATIVE_CODE_SIZE as u64) < 0x200000000);
 
-        current.clear_jump_table_size();
-    }
+    linux_raw::sys_munmap(core::ptr::null_mut(), 0x200000000)
+        .unwrap_or_else(|error| abort_with_error("failed to unmap user accessible memory", error));
 
-    *(VM_ADDR_JUMP_TABLE_RETURN_TO_HOST as *mut usize) = 0;
+    linux_raw::sys_munmap(
+        VM_ADDR_JUMP_TABLE as *mut core::ffi::c_void,
+        VM_SANDBOX_MAXIMUM_JUMP_TABLE_SIZE as usize,
+    )
+    .unwrap_or_else(|error| abort_with_error("failed to unmap jump table", error));
+
+    *(VM_ADDR_JUMP_TABLE_RETURN_TO_HOST as *mut u64) = 0;
+    VMCTX.is_memory_dirty.store(false, Ordering::Relaxed);
+    IS_PROGRAM_DIRTY.store(false, Ordering::Relaxed);
 }

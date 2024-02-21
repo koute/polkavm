@@ -716,6 +716,7 @@ define_opcodes! {
     // Instructions with args: reg, reg
     [
         move_reg                                 = 82,
+        sbrk                                     = 87,
     ]
 }
 
@@ -822,6 +823,10 @@ impl<'a> InstructionVisitor for core::fmt::Formatter<'a> {
 
     fn fallthrough(&mut self) -> Self::ReturnTy {
         write!(self, "@:")
+    }
+
+    fn sbrk(&mut self, d: Reg, s: Reg) -> Self::ReturnTy {
+        write!(self, "{d} = sbrk {s}")
     }
 
     fn ecalli(&mut self, nth_import: u32) -> Self::ReturnTy {
@@ -1448,7 +1453,8 @@ impl<'a> core::fmt::Display for ProgramSymbol<'a> {
 pub struct ProgramBlob<'a> {
     blob: CowBytes<'a>,
 
-    bss_size: u32,
+    ro_data_size: u32,
+    rw_data_size: u32,
     stack_size: u32,
 
     ro_data: Range<usize>,
@@ -1636,7 +1642,8 @@ impl<'a> ProgramBlob<'a> {
         if section == SECTION_MEMORY_CONFIG {
             let section_length = reader.read_varint()?;
             let position = reader.position;
-            program.bss_size = reader.read_varint()?;
+            program.ro_data_size = reader.read_varint()?;
+            program.rw_data_size = reader.read_varint()?;
             program.stack_size = reader.read_varint()?;
             if position + section_length as usize != reader.position {
                 return Err(ProgramParseError(ProgramParseErrorKind::Other(
@@ -1651,6 +1658,18 @@ impl<'a> ProgramBlob<'a> {
         reader.read_section_range_into(&mut section, &mut program.imports, SECTION_IMPORTS)?;
         reader.read_section_range_into(&mut section, &mut program.exports, SECTION_EXPORTS)?;
         reader.read_section_range_into(&mut section, &mut program.jump_table, SECTION_JUMP_TABLE)?;
+
+        if program.ro_data.len() > program.ro_data_size as usize {
+            return Err(ProgramParseError(ProgramParseErrorKind::Other(
+                "size of the read-only data payload exceeds the declared size of the section",
+            )));
+        }
+
+        if program.rw_data.len() > program.rw_data_size as usize {
+            return Err(ProgramParseError(ProgramParseErrorKind::Other(
+                "size of the read-write data payload exceeds the declared size of the section",
+            )));
+        }
 
         if section == SECTION_CODE {
             let section_length = reader.read_varint()?;
@@ -1705,18 +1724,31 @@ impl<'a> ProgramBlob<'a> {
     }
 
     /// Returns the contents of the read-only data section.
+    ///
+    /// This only covers the initial non-zero portion of the section; use `ro_data_size` to get the full size.
     pub fn ro_data(&self) -> &[u8] {
         &self.blob[self.ro_data.clone()]
     }
 
+    /// Returns the size of the read-only data section.
+    ///
+    /// This can be larger than the length of `ro_data`, in which case the rest of the space is assumed to be filled with zeros.
+    pub fn ro_data_size(&self) -> u32 {
+        self.ro_data_size
+    }
+
     /// Returns the contents of the read-write data section.
+    ///
+    /// This only covers the initial non-zero portion of the section; use `rw_data_size` to get the full size.
     pub fn rw_data(&self) -> &[u8] {
         &self.blob[self.rw_data.clone()]
     }
 
-    /// Returns the initial size of the BSS section.
-    pub fn bss_size(&self) -> u32 {
-        self.bss_size
+    /// Returns the size of the read-write data section.
+    ///
+    /// This can be larger than the length of `rw_data`, in which case the rest of the space is assumed to be filled with zeros.
+    pub fn rw_data_size(&self) -> u32 {
+        self.rw_data_size
     }
 
     /// Returns the initial size of the stack.
@@ -2011,7 +2043,8 @@ impl<'a> ProgramBlob<'a> {
         ProgramBlob {
             blob: self.blob.into_owned(),
 
-            bss_size: self.bss_size,
+            ro_data_size: self.ro_data_size,
+            rw_data_size: self.rw_data_size,
             stack_size: self.stack_size,
 
             ro_data: self.ro_data,

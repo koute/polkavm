@@ -1,4 +1,4 @@
-use polkavm::{Config, Engine, Linker, Module, ProgramBlob};
+use polkavm::{CallArgs, Config, Engine, Linker, Module, ProgramBlob, Reg, StateArgs};
 
 fn main() {
     env_logger::init();
@@ -21,14 +21,19 @@ fn main() {
     let instance = instance_pre.instantiate().unwrap();
 
     // Grab the function and call it.
-    println!("Calling into the guest program (through typed function):");
-    let fn_typed = instance.get_typed_func::<(u32, u32), u32>("add_numbers").unwrap();
-    let result = fn_typed.call(&mut (), (1, 10)).unwrap();
+    println!("Calling into the guest program (simple):");
+    let result = instance.call_typed::<(u32, u32), u32>(&mut (), "add_numbers", (1, 10)).unwrap();
     println!("  1 + 10 + 100 = {}", result);
 
-    println!("Calling into the guest program (through untyped function):");
-    let fn_untyped = instance.get_func("add_numbers").unwrap();
-    let mut return_value = [0];
-    fn_untyped.call(&mut (), &[1, 10], &mut return_value).unwrap();
-    println!("  1 + 10 + 100 = {}", return_value[0]);
+    println!("Calling into the guest program (full):");
+    let export_index = instance.module().lookup_export("add_numbers").unwrap();
+
+    #[allow(clippy::let_unit_value)]
+    let mut user_data = ();
+    let mut call_args = CallArgs::new(&mut user_data, export_index);
+    call_args.args_untyped(&[1, 10]);
+
+    instance.call(StateArgs::new(), call_args).unwrap();
+    let return_value = instance.get_reg(Reg::A0);
+    println!("  1 + 10 + 100 = {}", return_value);
 }

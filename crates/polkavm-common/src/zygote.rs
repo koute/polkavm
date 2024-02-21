@@ -3,10 +3,9 @@
 //! In general everything here can be modified at will, provided the zygote
 //! is recompiled.
 
-use crate::abi::GuestMemoryConfig;
-use crate::utils::align_to_next_page_usize;
+use crate::abi::MemoryMap;
 use core::cell::UnsafeCell;
-use core::sync::atomic::{AtomicU32, AtomicU64};
+use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64};
 
 // Due to the limitations of Rust's compile time constant evaluation machinery
 // we need to define this struct multiple times.
@@ -58,6 +57,7 @@ define_address_table! {
     syscall_trap: unsafe extern "C" fn() -> !,
     syscall_return: unsafe extern "C" fn() -> !,
     syscall_trace: unsafe extern "C" fn(u32, u64),
+    syscall_sbrk: unsafe extern "C" fn(u64) -> u32,
 }
 
 /// The address where the native code starts inside of the VM.
@@ -75,6 +75,9 @@ pub const VM_ADDR_JUMP_TABLE_RETURN_TO_HOST: u64 = VM_ADDR_JUMP_TABLE + ((crate:
 
 /// A special hostcall number set by the *host* to signal that the guest should stop executing the program.
 pub const HOSTCALL_ABORT_EXECUTION: u32 = !0;
+
+/// A special hostcall number set by the *host* to signal that the guest should execute `sbrk`.
+pub const HOSTCALL_SBRK: u32 = !0 - 1;
 
 /// A sentinel value to indicate that the instruction counter is not available.
 pub const SANDBOX_EMPTY_NTH_INSTRUCTION: u32 = !0;
@@ -110,7 +113,7 @@ pub const VM_COMPILER_MAXIMUM_INSTRUCTION_LENGTH: u32 = 53;
 pub const VM_COMPILER_MAXIMUM_EPILOGUE_LENGTH: u32 = 1024 * 1024;
 
 /// The maximum number of bytes the jump table can be.
-const VM_SANDBOX_MAXIMUM_JUMP_TABLE_SIZE: u64 = (crate::abi::VM_MAXIMUM_INSTRUCTION_COUNT as u64 + 1)
+pub const VM_SANDBOX_MAXIMUM_JUMP_TABLE_SIZE: u64 = (crate::abi::VM_MAXIMUM_INSTRUCTION_COUNT as u64 + 1)
     * core::mem::size_of::<u64>() as u64
     * crate::abi::VM_CODE_ADDRESS_ALIGNMENT as u64;
 
@@ -121,100 +124,19 @@ pub const VM_SANDBOX_MAXIMUM_JUMP_TABLE_VIRTUAL_SIZE: u64 = 0x100000000 * core::
 pub const VM_SANDBOX_MAXIMUM_NATIVE_CODE_SIZE: u32 = 512 * 1024 * 1024 - 1;
 
 /// The memory configuration used by a given program and/or sandbox instance.
-#[derive(Copy, Clone, PartialEq, Eq)]
+#[derive(Clone)]
 #[repr(C)]
 pub struct SandboxMemoryConfig {
-    guest_config: GuestMemoryConfig,
-    code_size: u32,
-    jump_table_size: u32,
-}
-
-impl core::ops::Deref for SandboxMemoryConfig {
-    type Target = GuestMemoryConfig;
-
-    #[inline]
-    fn deref(&self) -> &Self::Target {
-        &self.guest_config
-    }
-}
-
-impl core::ops::DerefMut for SandboxMemoryConfig {
-    #[inline]
-    fn deref_mut(&mut self) -> &mut Self::Target {
-        &mut self.guest_config
-    }
-}
-
-impl SandboxMemoryConfig {
-    #[inline]
-    pub const fn empty() -> Self {
-        Self {
-            guest_config: GuestMemoryConfig::empty(),
-            code_size: 0,
-            jump_table_size: 0,
-        }
-    }
-
-    #[inline]
-    pub fn set_guest_config(&mut self, guest_config: GuestMemoryConfig) {
-        self.guest_config = guest_config;
-    }
-
-    #[inline]
-    pub const fn code_size(&self) -> usize {
-        self.code_size as usize
-    }
-
-    #[inline]
-    pub fn clear_code_size(&mut self) {
-        self.code_size = 0;
-    }
-
-    pub fn set_code_size(&mut self, native_page_size: usize, code_size: usize) -> Result<(), &'static str> {
-        if code_size > VM_SANDBOX_MAXIMUM_NATIVE_CODE_SIZE as usize {
-            return Err("size of the native code exceeded the maximum code size");
-        }
-
-        let Some(code_size) = align_to_next_page_usize(native_page_size, code_size) else {
-            unreachable!()
-        };
-        self.code_size = code_size as u32;
-
-        Ok(())
-    }
-
-    #[inline]
-    pub const fn jump_table_size(&self) -> usize {
-        self.jump_table_size as usize
-    }
-
-    #[inline]
-    pub fn clear_jump_table_size(&mut self) {
-        self.jump_table_size = 0;
-    }
-
-    pub fn set_jump_table_size(&mut self, native_page_size: usize, jump_table_size: usize) -> Result<(), &'static str> {
-        if jump_table_size > VM_SANDBOX_MAXIMUM_JUMP_TABLE_SIZE as usize {
-            return Err("size of the jump table exceeded te maximum size");
-        }
-
-        let Some(jump_table_size) = align_to_next_page_usize(native_page_size, jump_table_size) else {
-            unreachable!()
-        };
-        self.jump_table_size = jump_table_size as u32;
-
-        Ok(())
-    }
+    pub memory_map: MemoryMap,
+    pub ro_data_fd_size: u32,
+    pub rw_data_fd_size: u32,
+    pub code_size: u32,
+    pub jump_table_size: u32,
+    pub sysreturn_address: u64,
 }
 
 /// A flag which will trigger the sandbox to reload its program before execution.
 pub const VM_RPC_FLAG_RECONFIGURE: u32 = 1 << 0;
-
-/// A flag which will trigger the sandbox to reset its memory after execution.
-pub const VM_RPC_FLAG_RESET_MEMORY_AFTER_EXECUTION: u32 = 1 << 1;
-
-/// A flag which will trigger the sandbox to unload its program after execution.
-pub const VM_RPC_FLAG_CLEAR_PROGRAM_AFTER_EXECUTION: u32 = 1 << 2;
 
 #[repr(C)]
 pub struct VmInit {
@@ -244,6 +166,12 @@ impl<T> core::ops::DerefMut for CacheAligned<T> {
     fn deref_mut(&mut self) -> &mut Self::Target {
         &mut self.0
     }
+}
+
+#[repr(C)]
+pub struct VmCtxHeapInfo {
+    pub heap_top: UnsafeCell<u64>,
+    pub heap_threshold: UnsafeCell<u64>,
 }
 
 const REG_COUNT: usize = crate::program::Reg::ALL.len();
@@ -284,6 +212,9 @@ pub struct VmCtx {
     /// Fields used when making syscalls from the VM into the host.
     syscall_ffi: CacheAligned<VmCtxSyscall>,
 
+    /// The state of the program's heap.
+    pub heap_info: VmCtxHeapInfo,
+
     /// The futex used to synchronize the sandbox with the host process.
     pub futex: CacheAligned<AtomicU32>,
 
@@ -291,12 +222,12 @@ pub struct VmCtx {
     pub rpc_address: UnsafeCell<u64>,
     /// Flags specifying what exactly the sandbox should do.
     pub rpc_flags: UnsafeCell<u32>,
-    /// The current memory configuration of the sandbox.
+    /// The amount of memory to allocate.
+    pub rpc_sbrk: UnsafeCell<u32>,
+    /// The memory configuration of the sandbox.
     pub memory_config: UnsafeCell<SandboxMemoryConfig>,
-    /// The new memory configuration of the sandbox. Will be applied if the appropriate flag is set.
-    pub new_memory_config: UnsafeCell<SandboxMemoryConfig>,
-    /// The new sysreturn trampoline address. Will be applied if the appropriate flag is set.
-    pub new_sysreturn_address: UnsafeCell<u64>,
+    /// Whether the memory of the sandbox is dirty.
+    pub is_memory_dirty: AtomicBool,
 
     /// Performance counters. Only for debugging.
     pub counters: CacheAligned<VmCtxCounters>,
@@ -336,9 +267,16 @@ impl VmCtx {
 
             rpc_address: UnsafeCell::new(0),
             rpc_flags: UnsafeCell::new(0),
-            memory_config: UnsafeCell::new(SandboxMemoryConfig::empty()),
-            new_memory_config: UnsafeCell::new(SandboxMemoryConfig::empty()),
-            new_sysreturn_address: UnsafeCell::new(0),
+            rpc_sbrk: UnsafeCell::new(0),
+            memory_config: UnsafeCell::new(SandboxMemoryConfig {
+                memory_map: MemoryMap::empty(),
+                ro_data_fd_size: 0,
+                rw_data_fd_size: 0,
+                code_size: 0,
+                jump_table_size: 0,
+                sysreturn_address: 0,
+            }),
+            is_memory_dirty: AtomicBool::new(false),
 
             syscall_ffi: CacheAligned(VmCtxSyscall {
                 gas: UnsafeCell::new(0),
@@ -347,6 +285,11 @@ impl VmCtx {
                 rip: UnsafeCell::new(0),
                 nth_instruction: UnsafeCell::new(0),
             }),
+
+            heap_info: VmCtxHeapInfo {
+                heap_top: UnsafeCell::new(0),
+                heap_threshold: UnsafeCell::new(0),
+            },
 
             counters: CacheAligned(VmCtxCounters {
                 syscall_wait_loop_start: UnsafeCell::new(0),
@@ -380,6 +323,11 @@ impl VmCtx {
     #[inline(always)]
     pub const fn gas(&self) -> &UnsafeCell<i64> {
         &self.syscall_ffi.0.gas
+    }
+
+    #[inline(always)]
+    pub const fn heap_info(&self) -> &VmCtxHeapInfo {
+        &self.heap_info
     }
 
     #[inline(always)]

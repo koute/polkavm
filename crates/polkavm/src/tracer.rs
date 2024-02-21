@@ -1,11 +1,11 @@
 use crate::api::BackendAccess;
-use crate::api::ExecutionConfig;
+use crate::api::ExecuteArgs;
 use crate::api::Module;
 use crate::interpreter::{InterpretedInstance, InterpreterContext};
 use crate::source_cache::SourceCache;
 use core::mem::MaybeUninit;
 use polkavm_common::error::Trap;
-use polkavm_common::program::{FrameKind, Opcode, ProgramExport, Reg};
+use polkavm_common::program::{FrameKind, Opcode, Reg};
 use polkavm_common::utils::Access;
 
 pub(crate) struct Tracer {
@@ -17,7 +17,7 @@ pub(crate) struct Tracer {
     crosscheck_reg: Option<(Reg, u32)>,
     crosscheck_store: Option<(u32, u32)>,
     crosscheck_store_bytes: [u8; 8],
-    crosscheck_reset_memory_after_execution: bool,
+    crosscheck_execution_flags: u32,
     current_line_program_position: Option<(usize, usize)>,
     current_source_location: Option<(u32, u32)>,
 
@@ -25,21 +25,21 @@ pub(crate) struct Tracer {
 }
 
 impl Tracer {
-    pub fn new(module: Module) -> Self {
+    pub fn new(module: &Module) -> Self {
         Tracer {
             program_counter_history: [!0; 8],
             program_counter_history_position: 0,
             crosscheck_interpreter: if module.compiled_module().is_some() {
-                InterpretedInstance::new(module.clone()).ok()
+                InterpretedInstance::new_from_module(module).ok()
             } else {
                 None
             },
-            module,
+            module: module.clone(),
             source_cache: SourceCache::default(),
             crosscheck_reg: None,
             crosscheck_store: None,
             crosscheck_store_bytes: Default::default(),
-            crosscheck_reset_memory_after_execution: false,
+            crosscheck_execution_flags: 0,
             current_line_program_position: None,
             current_source_location: None,
 
@@ -48,24 +48,16 @@ impl Tracer {
         }
     }
 
-    pub fn on_before_call(&mut self, export_index: usize, export: &ProgramExport, config: &ExecutionConfig) {
-        let target = self
-            .module
-            .instruction_by_basic_block(export.jump_target())
-            .expect("internal error: invalid export address");
-        log::trace!("Calling export: {} (at #{})", export.symbol(), target);
-
+    pub fn on_before_execute(&mut self, args: &ExecuteArgs) {
         if let Some(ref mut interpreter) = self.crosscheck_interpreter {
-            self.crosscheck_reset_memory_after_execution = config.reset_memory_after_execution;
-            interpreter.prepare_for_call(export_index, config);
+            self.crosscheck_execution_flags = args.flags;
+            interpreter.prepare_for_execution(args);
         }
     }
 
-    pub fn on_after_call(&mut self) {
+    pub fn on_after_execute(&mut self) {
         if let Some(ref mut interpreter) = self.crosscheck_interpreter {
-            if self.crosscheck_reset_memory_after_execution {
-                interpreter.reset_memory();
-            }
+            interpreter.finish_execution(self.crosscheck_execution_flags);
         }
     }
 
