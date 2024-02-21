@@ -888,11 +888,41 @@ impl<'a, 'b> InstructionVisitor for Visitor<'a, 'b> {
     }
 
     fn cmov_if_zero(&mut self, d: Reg, s: Reg, c: Reg) -> Self::ReturnTy {
-        self.set3(d, s, c, |s, c| if c == 0 { s } else { 0 })
+        if self.get(c) == 0 {
+            let value = self.get(s);
+            self.set(d, value)?;
+        }
+
+        self.inner.nth_instruction += 1;
+        Ok(())
+    }
+
+    fn cmov_if_zero_imm(&mut self, d: Reg, c: Reg, s: u32) -> Self::ReturnTy {
+        if self.get(c) == 0 {
+            self.set(d, s)?;
+        }
+
+        self.inner.nth_instruction += 1;
+        Ok(())
     }
 
     fn cmov_if_not_zero(&mut self, d: Reg, s: Reg, c: Reg) -> Self::ReturnTy {
-        self.set3(d, s, c, |s, c| if c != 0 { s } else { 0 })
+        if self.get(c) != 0 {
+            let value = self.get(s);
+            self.set(d, value)?;
+        }
+
+        self.inner.nth_instruction += 1;
+        Ok(())
+    }
+
+    fn cmov_if_not_zero_imm(&mut self, d: Reg, c: Reg, s: u32) -> Self::ReturnTy {
+        if self.get(c) != 0 {
+            self.set(d, s)?;
+        }
+
+        self.inner.nth_instruction += 1;
+        Ok(())
     }
 
     fn add_imm(&mut self, d: Reg, s1: Reg, s2: u32) -> Self::ReturnTy {

@@ -286,8 +286,8 @@ pub enum AtomicKind {
 
 #[derive(Copy, Clone, PartialEq, Eq, Debug, Hash)]
 pub enum CmovKind {
-    EqZero = 0b111,
-    NotEqZero = 0b101,
+    EqZero = 0,
+    NotEqZero = 1,
 }
 
 impl Reg {
@@ -561,23 +561,6 @@ impl Inst {
                     0b0000001_00000_00000_110_00000_0000000 => RegRegKind::Rem,
                     0b0000001_00000_00000_111_00000_0000000 => RegRegKind::RemUnsigned,
 
-                    0b0000111_00000_00000_101_00000_0000000 => {
-                        return Some(Inst::Cmov {
-                            kind: CmovKind::NotEqZero,
-                            dst,
-                            src: src1,
-                            cond: src2,
-                        });
-                    }
-                    0b0000111_00000_00000_111_00000_0000000 => {
-                        return Some(Inst::Cmov {
-                            kind: CmovKind::EqZero,
-                            dst,
-                            src: src1,
-                            cond: src2,
-                        });
-                    }
-
                     _ => return None,
                 };
 
@@ -657,6 +640,34 @@ impl Inst {
                         })
                     }
                 }
+            }
+            0b0001011 => {
+                let dst = Reg::decode(op >> 7);
+                let src1 = Reg::decode(op >> 15);
+                let src2 = Reg::decode(op >> 20);
+                let hi = op >> 25;
+                let lo = (op >> 12) & 0b111;
+                if lo == 0b001 {
+                    if hi == 0b0100000 {
+                        //  th.mveqz
+                        return Some(Inst::Cmov {
+                            kind: CmovKind::EqZero,
+                            dst,
+                            src: src1,
+                            cond: src2,
+                        });
+                    } else if hi == 0b0100001 {
+                        //  th.mvnez
+                        return Some(Inst::Cmov {
+                            kind: CmovKind::NotEqZero,
+                            dst,
+                            src: src1,
+                            cond: src2,
+                        });
+                    }
+                }
+
+                None
             }
             _ => None,
         }
@@ -816,9 +827,15 @@ impl Inst {
                     | (u32::from(acquire) << 26)
                     | ((kind as u32) << 27),
             ),
-            Inst::Cmov { kind, dst, src, cond } => {
-                Some(0b0110011 | ((kind as u32) << 12) | ((dst as u32) << 7) | ((src as u32) << 15) | ((cond as u32) << 20) | (0b111 << 25))
-            }
+            Inst::Cmov { kind, dst, src, cond } => Some(
+                0b0001011
+                    | (0b001 << 12)
+                    | ((dst as u32) << 7)
+                    | ((src as u32) << 15)
+                    | ((cond as u32) << 20)
+                    | ((kind as u32) << 25)
+                    | (1 << 30),
+            ),
         }
     }
 }
@@ -896,22 +913,12 @@ fn test_decode_multiply() {
 #[test]
 fn test_decode_cmov() {
     assert_eq!(
-        Inst::decode(0xec5f5b3).unwrap(),
-        Inst::Cmov {
-            kind: CmovKind::EqZero,
-            dst: Reg::A1,
-            src: Reg::A1,
-            cond: Reg::A2
-        }
-    );
-
-    assert_eq!(
-        Inst::decode(0xec55533).unwrap(),
+        Inst::decode(0x42a6158b).unwrap(),
         Inst::Cmov {
             kind: CmovKind::NotEqZero,
-            dst: Reg::A0,
-            src: Reg::A0,
-            cond: Reg::A2
+            dst: Reg::A1,
+            src: Reg::A2,
+            cond: Reg::A0
         }
     );
 }

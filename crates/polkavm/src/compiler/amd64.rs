@@ -358,33 +358,26 @@ impl<'a> Compiler<'a> {
 
     #[cfg_attr(not(debug_assertions), inline(always))]
     fn cmov(&mut self, d: Reg, s: Reg, c: Reg, condition: Condition) {
+        if d == s {
+            return;
+        }
+
         let d = conv_reg(d);
         let s = conv_reg(s);
         let c = conv_reg(c);
 
-        if d == s {
-            let condition = match condition {
-                Condition::Equal => Condition::NotEqual,
-                Condition::NotEqual => Condition::Equal,
-                _ => unreachable!()
-            };
+        self.push(test((self.reg_size(), c, c)));
+        self.push(cmov(condition, self.reg_size(), d, s));
+    }
 
-            self.push(xor((RegSize::R32, TMP_REG, TMP_REG)));
-            self.push(test((self.reg_size(), c, c)));
-            self.push(cmov(condition, self.reg_size(), d, TMP_REG));
-        } else if d != c {
-            debug_assert_ne!(d, s);
-            self.push(xor((RegSize::R32, d, d)));
-            self.push(test((self.reg_size(), c, c)));
-            self.push(cmov(condition, self.reg_size(), d, s));
-        } else {
-            debug_assert_ne!(d, s);
-            debug_assert_eq!(d, c);
-            self.push(xor((RegSize::R32, TMP_REG, TMP_REG)));
-            self.push(test((self.reg_size(), c, c)));
-            self.push(mov(self.reg_size(), d, TMP_REG));
-            self.push(cmov(condition, self.reg_size(), d, s));
-        }
+    #[cfg_attr(not(debug_assertions), inline(always))]
+    fn cmov_imm(&mut self, d: Reg, s: u32, c: Reg, condition: Condition) {
+        let d = conv_reg(d);
+        let c = conv_reg(c);
+
+        self.push(test((self.reg_size(), c, c)));
+        self.push(mov_imm(TMP_REG, imm32(s)));
+        self.push(cmov(condition, self.reg_size(), d, TMP_REG));
     }
 
     fn div_rem(&mut self, d: Reg, s1: Reg, s2: Reg, div_rem: DivRem, kind: Signedness) {
@@ -1078,6 +1071,16 @@ impl<'a> InstructionVisitor for VisitorWrapper<'a, Compiler<'a>> {
     #[inline(always)]
     fn cmov_if_not_zero(&mut self, d: Reg, s: Reg, c: Reg) -> Self::ReturnTy {
         self.cmov(d, s, c, Condition::NotEqual);
+    }
+
+    #[inline(always)]
+    fn cmov_if_zero_imm(&mut self, d: Reg, c: Reg, s: u32) -> Self::ReturnTy {
+        self.cmov_imm(d, s, c, Condition::Equal);
+    }
+
+    #[inline(always)]
+    fn cmov_if_not_zero_imm(&mut self, d: Reg, c: Reg, s: u32) -> Self::ReturnTy {
+        self.cmov_imm(d, s, c, Condition::NotEqual);
     }
 
     #[inline(always)]

@@ -673,6 +673,9 @@ define_opcodes! {
         branch_less_signed                       = 48,
         branch_greater_or_equal_unsigned         = 41,
         branch_greater_or_equal_signed           = 43,
+
+        cmov_if_zero_imm                         = 85,
+        cmov_if_not_zero_imm                     = 86,
     ]
 
     // Instructions with args: reg, reg, reg
@@ -978,11 +981,19 @@ impl<'a> InstructionVisitor for core::fmt::Formatter<'a> {
     }
 
     fn cmov_if_zero(&mut self, d: Reg, s: Reg, c: Reg) -> Self::ReturnTy {
-        write!(self, "{d} = ({c} == 0) ? {s} : 0")
+        write!(self, "{d} = {s} if {c} == 0")
     }
 
     fn cmov_if_not_zero(&mut self, d: Reg, s: Reg, c: Reg) -> Self::ReturnTy {
-        write!(self, "{d} = ({c} != 0) ? {s} : 0")
+        write!(self, "{d} = {s} if {c} != 0")
+    }
+
+    fn cmov_if_zero_imm(&mut self, d: Reg, c: Reg, s: u32) -> Self::ReturnTy {
+        write!(self, "{d} = {s} if {c} == 0")
+    }
+
+    fn cmov_if_not_zero_imm(&mut self, d: Reg, c: Reg, s: u32) -> Self::ReturnTy {
+        write!(self, "{d} = {s} if {c} != 0")
     }
 
     fn add_imm(&mut self, d: Reg, s1: Reg, s2: u32) -> Self::ReturnTy {

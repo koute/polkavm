@@ -537,7 +537,7 @@ enum BasicInst<T> {
     Cmov {
         kind: CmovKind,
         dst: Reg,
-        src: Reg,
+        src: RegImm,
         cond: Reg,
     },
     Ecalli {
@@ -548,6 +548,13 @@ enum BasicInst<T> {
         size: Reg,
     },
     Nop,
+}
+
+#[derive(Copy, Clone)]
+enum OpKind {
+    Read,
+    Write,
+    ReadWrite,
 }
 
 impl<T> BasicInst<T> {
@@ -582,7 +589,7 @@ impl<T> BasicInst<T> {
             BasicInst::StoreIndirect { src, base, .. } => RegMask::from(src) | RegMask::from(base),
             BasicInst::RegReg { src1, src2, .. } => RegMask::from(src1) | RegMask::from(src2),
             BasicInst::AnyAny { src1, src2, .. } => RegMask::from(src1) | RegMask::from(src2),
-            BasicInst::Cmov { src, cond, .. } => RegMask::from(src) | RegMask::from(cond),
+            BasicInst::Cmov { dst, src, cond, .. } => RegMask::from(dst) | RegMask::from(src) | RegMask::from(cond),
             BasicInst::Ecalli { nth_import } => imports[nth_import].src_mask(),
             BasicInst::Sbrk { size, .. } => RegMask::from(size),
         }
@@ -618,68 +625,71 @@ impl<T> BasicInst<T> {
         }
     }
 
-    fn map_register(self, mut map: impl FnMut(Reg, bool) -> Reg) -> Option<Self> {
+    fn map_register(self, mut map: impl FnMut(Reg, OpKind) -> Reg) -> Option<Self> {
         // Note: ALWAYS map the inputs first; otherwise `regalloc2` might break!
         match self {
-            BasicInst::LoadImmediate { dst, imm } => Some(BasicInst::LoadImmediate { dst: map(dst, true), imm }),
+            BasicInst::LoadImmediate { dst, imm } => Some(BasicInst::LoadImmediate {
+                dst: map(dst, OpKind::Write),
+                imm,
+            }),
             BasicInst::LoadAbsolute { kind, dst, target } => Some(BasicInst::LoadAbsolute {
                 kind,
-                dst: map(dst, true),
+                dst: map(dst, OpKind::Write),
                 target,
             }),
             BasicInst::StoreAbsolute { kind, src, target } => Some(BasicInst::StoreAbsolute {
                 kind,
-                src: src.map_register(|reg| map(reg, false)),
+                src: src.map_register(|reg| map(reg, OpKind::Read)),
                 target,
             }),
             BasicInst::LoadAddress { dst, target } => Some(BasicInst::LoadAddress {
-                dst: map(dst, true),
+                dst: map(dst, OpKind::Write),
                 target,
             }),
             BasicInst::LoadAddressIndirect { dst, target } => Some(BasicInst::LoadAddressIndirect {
-                dst: map(dst, true),
+                dst: map(dst, OpKind::Write),
                 target,
             }),
             BasicInst::LoadIndirect { kind, dst, base, offset } => Some(BasicInst::LoadIndirect {
                 kind,
-                base: map(base, false),
-                dst: map(dst, true),
+                base: map(base, OpKind::Read),
+                dst: map(dst, OpKind::Write),
                 offset,
             }),
             BasicInst::StoreIndirect { kind, src, base, offset } => Some(BasicInst::StoreIndirect {
                 kind,
-                src: src.map_register(|reg| map(reg, false)),
-                base: map(base, false),
+                src: src.map_register(|reg| map(reg, OpKind::Read)),
+                base: map(base, OpKind::Read),
                 offset,
             }),
             BasicInst::RegReg { kind, dst, src1, src2 } => Some(BasicInst::RegReg {
                 kind,
-                src1: map(src1, false),
-                src2: map(src2, false),
-                dst: map(dst, true),
+                src1: map(src1, OpKind::Read),
+                src2: map(src2, OpKind::Read),
+                dst: map(dst, OpKind::Write),
             }),
             BasicInst::AnyAny { kind, dst, src1, src2 } => Some(BasicInst::AnyAny {
                 kind,
-                src1: src1.map_register(|reg| map(reg, false)),
-                src2: src2.map_register(|reg| map(reg, false)),
-                dst: map(dst, true),
+                src1: src1.map_register(|reg| map(reg, OpKind::Read)),
+                src2: src2.map_register(|reg| map(reg, OpKind::Read)),
+                dst: map(dst, OpKind::Write),
             }),
             BasicInst::Cmov { kind, dst, src, cond } => Some(BasicInst::Cmov {
                 kind,
-                src: map(src, false),
-                cond: map(cond, false),
-                dst: map(dst, true),
+                src: src.map_register(|reg| map(reg, OpKind::Read)),
+                cond: map(cond, OpKind::Read),
+                dst: map(dst, OpKind::ReadWrite),
             }),
             BasicInst::Ecalli { .. } => None,
             BasicInst::Sbrk { dst, size } => Some(BasicInst::Sbrk {
-                size: map(size, false),
-                dst: map(dst, true),
+                size: map(size, OpKind::Read),
+                dst: map(dst, OpKind::Write),
             }),
             BasicInst::Nop => Some(BasicInst::Nop),
         }
     }
 
-    fn operands(&self, imports: &[Import]) -> impl Iterator<Item = (Reg, bool)>
+    fn operands(&self, imports: &[Import]) -> impl Iterator<Item = (Reg, OpKind)>
     where
         T: Clone,
     {
@@ -688,8 +698,8 @@ impl<T> BasicInst<T> {
         // Abuse the `map_register` to avoid matching on everything again.
         let is_special_instruction = self
             .clone()
-            .map_register(|reg, is_dst| {
-                list[length] = Some((reg, is_dst));
+            .map_register(|reg, kind| {
+                list[length] = Some((reg, kind));
                 length += 1;
                 reg
             })
@@ -700,29 +710,28 @@ impl<T> BasicInst<T> {
             let import = &imports[nth_import];
 
             for reg in import.src_mask() {
-                list[length] = Some((reg, false));
+                list[length] = Some((reg, OpKind::Read));
                 length += 1;
             }
 
             for reg in import.dst_mask() {
-                list[length] = Some((reg, true));
+                list[length] = Some((reg, OpKind::Write));
                 length += 1;
             }
         };
 
         let mut seen_dst = false;
-        list.into_iter()
-            .take_while(|reg| reg.is_some())
-            .flatten()
-            .map(move |(reg, is_dst)| {
-                // Sanity check to make sure inputs always come before outputs, so that `regalloc2` doesn't break.
-                if seen_dst {
-                    assert!(is_dst);
-                }
-                seen_dst |= is_dst;
+        list.into_iter().take_while(|reg| reg.is_some()).flatten().map(move |(reg, kind)| {
+            let is_dst = matches!(kind, OpKind::Write | OpKind::ReadWrite);
 
-                (reg, is_dst)
-            })
+            // Sanity check to make sure inputs always come before outputs, so that `regalloc2` doesn't break.
+            if seen_dst {
+                assert!(is_dst);
+            }
+            seen_dst |= is_dst;
+
+            (reg, kind)
+        })
     }
 
     fn map_target<U, E>(self, map: impl Fn(T) -> Result<U, E>) -> Result<BasicInst<U>, E> {
@@ -1424,15 +1433,14 @@ fn emit_minmax(
     mut emit: impl FnMut(InstExt<SectionTarget, SectionTarget>),
 ) {
     // This is supposed to emit something like this:
-    //   dst = src1 ? src2
-    //   tmp = (dst != 0) ? src1 : 0
-    //   dst = (dst == 0) ? src2 : 0
-    //   dst = dst | tmp
+    //   tmp = src1 ? src2
+    //   dst = src1
+    //   dst = src2 if tmp == 0
 
     assert_ne!(dst, tmp);
-    assert_ne!(Some(dst), src1);
-    assert_ne!(Some(dst), src2);
+    assert_ne!(Some(tmp), src1);
     assert_ne!(Some(tmp), src2);
+    assert_ne!(Some(dst), src2);
 
     let (cmp_src1, cmp_src2, cmp_kind) = match kind {
         MinMax::MinUnsigned => (src1, src2, AnyAnyKind::SetLessThanUnsigned),
@@ -1443,36 +1451,28 @@ fn emit_minmax(
 
     emit(InstExt::Basic(BasicInst::AnyAny {
         kind: cmp_kind,
-        dst,
+        dst: tmp,
         src1: cmp_src1.map_or(RegImm::Imm(0), RegImm::Reg),
         src2: cmp_src2.map_or(RegImm::Imm(0), RegImm::Reg),
     }));
+
     if let Some(src1) = src1 {
-        emit(InstExt::Basic(BasicInst::Cmov {
-            kind: CmovKind::NotEqZero,
-            dst: tmp,
-            src: src1,
-            cond: dst,
+        emit(InstExt::Basic(BasicInst::AnyAny {
+            kind: AnyAnyKind::Add,
+            dst,
+            src1: RegImm::Reg(src1),
+            src2: RegImm::Imm(0),
         }));
     } else {
         emit(InstExt::Basic(BasicInst::LoadImmediate { dst: tmp, imm: 0 }));
     }
-    if let Some(src2) = src2 {
-        emit(InstExt::Basic(BasicInst::Cmov {
-            kind: CmovKind::EqZero,
-            dst,
-            src: src2,
-            cond: dst,
-        }));
-    } else {
-        emit(InstExt::Basic(BasicInst::LoadImmediate { dst, imm: 0 }));
-    }
-    emit(InstExt::Basic(BasicInst::AnyAny {
-        kind: AnyAnyKind::Or,
+
+    emit(InstExt::Basic(BasicInst::Cmov {
+        kind: CmovKind::EqZero,
         dst,
-        src1: dst.into(),
-        src2: tmp.into(),
-    }))
+        src: src2.map_or(RegImm::Imm(0), RegImm::Reg),
+        cond: tmp,
+    }));
 }
 
 fn convert_instruction(
@@ -1688,14 +1688,13 @@ fn convert_instruction(
                 ));
             };
 
-            if let Some(src) = cast_reg_non_zero(src)? {
-                emit(InstExt::Basic(BasicInst::Cmov { kind, dst, src, cond }));
-                Ok(())
-            } else {
-                Err(ProgramFromElfError::other(
-                    "unimplemented: found a conditional move with a zero register as the source",
-                ))
-            }
+            emit(InstExt::Basic(BasicInst::Cmov {
+                kind,
+                dst,
+                src: cast_reg_any(src)?,
+                cond,
+            }));
+            Ok(())
         }
         Inst::LoadReserved { dst, src, .. } => {
             let Some(dst) = cast_reg_non_zero(dst)? else {
@@ -3334,6 +3333,21 @@ impl BlockRegs {
                     });
                 }
             }
+            BasicInst::Cmov {
+                kind,
+                dst,
+                src: RegImm::Reg(src),
+                cond,
+            } => {
+                if let RegValue::Constant(src_value) = self.get_reg(src) {
+                    return Some(BasicInst::Cmov {
+                        kind,
+                        dst,
+                        src: RegImm::Imm(src_value as u32),
+                        cond,
+                    });
+                }
+            }
             BasicInst::LoadIndirect { kind, dst, base, offset } => {
                 if let RegValue::DataAddress(base) = self.get_reg(base) {
                     return Some(BasicInst::LoadAbsolute {
@@ -4175,33 +4189,60 @@ fn spill_fake_registers(
             let (_, instruction) = &block.ops[nth_instruction];
             let mut operands = Vec::new();
 
-            for (reg, is_dst) in instruction.operands(imports) {
-                if is_dst {
-                    let value_index = counter;
-                    counter += 1;
-                    reg_to_value_index[reg as usize] = value_index;
-                    operands.push(regalloc2::Operand::new(
-                        regalloc2::VReg::new(value_index, regalloc2::RegClass::Int),
-                        if reg.fake_register_index().is_none() {
-                            regalloc2::OperandConstraint::FixedReg(regalloc2::PReg::new(reg as usize, regalloc2::RegClass::Int))
-                        } else {
-                            regalloc2::OperandConstraint::Reg
-                        },
-                        regalloc2::OperandKind::Def,
-                        regalloc2::OperandPos::Late,
-                    ));
-                } else {
-                    let value_index = reg_to_value_index[reg as usize];
-                    operands.push(regalloc2::Operand::new(
-                        regalloc2::VReg::new(value_index, regalloc2::RegClass::Int),
-                        if reg.fake_register_index().is_none() {
-                            regalloc2::OperandConstraint::FixedReg(regalloc2::PReg::new(reg as usize, regalloc2::RegClass::Int))
-                        } else {
-                            regalloc2::OperandConstraint::Reg
-                        },
-                        regalloc2::OperandKind::Use,
-                        regalloc2::OperandPos::Early,
-                    ));
+            for (reg, kind) in instruction.operands(imports) {
+                match kind {
+                    OpKind::Write => {
+                        let value_index = counter;
+                        counter += 1;
+                        reg_to_value_index[reg as usize] = value_index;
+                        operands.push(regalloc2::Operand::new(
+                            regalloc2::VReg::new(value_index, regalloc2::RegClass::Int),
+                            if reg.fake_register_index().is_none() {
+                                regalloc2::OperandConstraint::FixedReg(regalloc2::PReg::new(reg as usize, regalloc2::RegClass::Int))
+                            } else {
+                                regalloc2::OperandConstraint::Reg
+                            },
+                            regalloc2::OperandKind::Def,
+                            regalloc2::OperandPos::Late,
+                        ));
+                    }
+                    OpKind::Read => {
+                        let value_index = reg_to_value_index[reg as usize];
+                        operands.push(regalloc2::Operand::new(
+                            regalloc2::VReg::new(value_index, regalloc2::RegClass::Int),
+                            if reg.fake_register_index().is_none() {
+                                regalloc2::OperandConstraint::FixedReg(regalloc2::PReg::new(reg as usize, regalloc2::RegClass::Int))
+                            } else {
+                                regalloc2::OperandConstraint::Reg
+                            },
+                            regalloc2::OperandKind::Use,
+                            regalloc2::OperandPos::Early,
+                        ));
+                    }
+                    OpKind::ReadWrite => {
+                        let value_index_read = reg_to_value_index[reg as usize];
+                        operands.push(regalloc2::Operand::new(
+                            regalloc2::VReg::new(value_index_read, regalloc2::RegClass::Int),
+                            if reg.fake_register_index().is_none() {
+                                regalloc2::OperandConstraint::FixedReg(regalloc2::PReg::new(reg as usize, regalloc2::RegClass::Int))
+                            } else {
+                                regalloc2::OperandConstraint::Reg
+                            },
+                            regalloc2::OperandKind::Use,
+                            regalloc2::OperandPos::Early,
+                        ));
+
+                        let value_index_write = counter;
+                        counter += 1;
+
+                        reg_to_value_index[reg as usize] = value_index_write;
+                        operands.push(regalloc2::Operand::new(
+                            regalloc2::VReg::new(value_index_write, regalloc2::RegClass::Int),
+                            regalloc2::OperandConstraint::Reuse(operands.len() - 1),
+                            regalloc2::OperandKind::Def,
+                            regalloc2::OperandPos::Late,
+                        ));
+                    }
                 }
             }
 
@@ -4431,6 +4472,9 @@ fn replace_immediates_with_registers(
                     replace!(src);
                 }
                 BasicInst::StoreIndirect { src, .. } => {
+                    replace!(src);
+                }
+                BasicInst::Cmov { src, .. } => {
                     replace!(src);
                 }
                 _ => {}
@@ -5336,16 +5380,28 @@ fn emit_code(
                         }
                     }
                 }
-                BasicInst::Cmov { kind, dst, src, cond } => {
-                    codegen! {
-                        args = (conv_reg(dst), conv_reg(src), conv_reg(cond)),
-                        kind = kind,
-                        {
-                            CmovKind::EqZero => cmov_if_zero,
-                            CmovKind::NotEqZero => cmov_if_not_zero,
+                BasicInst::Cmov { kind, dst, src, cond } => match src {
+                    RegImm::Reg(src) => {
+                        codegen! {
+                            args = (conv_reg(dst), conv_reg(src), conv_reg(cond)),
+                            kind = kind,
+                            {
+                                CmovKind::EqZero => cmov_if_zero,
+                                CmovKind::NotEqZero => cmov_if_not_zero,
+                            }
                         }
                     }
-                }
+                    RegImm::Imm(imm) => {
+                        codegen! {
+                            args = (conv_reg(dst), conv_reg(cond), imm),
+                            kind = kind,
+                            {
+                                CmovKind::EqZero => cmov_if_zero_imm,
+                                CmovKind::NotEqZero => cmov_if_not_zero_imm,
+                            }
+                        }
+                    }
+                },
                 BasicInst::Ecalli { nth_import } => {
                     assert!(used_imports.contains(&nth_import));
                     let import = &imports[nth_import];
