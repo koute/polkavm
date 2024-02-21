@@ -615,6 +615,20 @@ where
     }
 
     #[inline(always)]
+    fn cmov_if_zero_imm(&mut self, d: Reg, c: Reg, s: u32) -> Self::ReturnTy {
+        self.0.before_instruction();
+        self.0.cmov_if_zero_imm(d, c, s);
+        Ok(())
+    }
+
+    #[inline(always)]
+    fn cmov_if_not_zero_imm(&mut self, d: Reg, c: Reg, s: u32) -> Self::ReturnTy {
+        self.0.before_instruction();
+        self.0.cmov_if_not_zero_imm(d, c, s);
+        Ok(())
+    }
+
+    #[inline(always)]
     fn add_imm(&mut self, d: Reg, s: Reg, imm: u32) -> Self::ReturnTy {
         self.0.before_instruction();
         self.0.add_imm(d, s, imm);
