@@ -356,7 +356,7 @@ fn disassemble_into(
         let export = match export {
             Ok(export) => export,
             Err(error) => {
-                bail!("failed to parse instruction export: {error}");
+                bail!("failed to parse export: {error}");
             }
         };
 
@@ -364,6 +364,18 @@ fn disassemble_into(
             .entry(export.jump_target())
             .or_insert_with(Vec::new)
             .push((nth_export, export));
+    }
+
+    let mut imports = Vec::new();
+    for import in blob.imports() {
+        let import = match import {
+            Ok(import) => import,
+            Err(error) => {
+                bail!("failed to parse import: {error}");
+            }
+        };
+
+        imports.push(import);
     }
 
     let mut jump_table_map = HashMap::new();
@@ -399,6 +411,12 @@ fn disassemble_into(
             }
         }
 
+        if let Some(exports) = exports_for_jump_target.get(&jump_target_counter) {
+            for (nth_export, export) in exports {
+                write!(&mut buf, " [export #{}: {}]", nth_export, export.symbol()).unwrap()
+            }
+        }
+
         if let Some(ref map) = gas_cost_map {
             write!(&mut buf, " (gas: {})", map[jump_target_counter as usize]).unwrap();
         }
@@ -414,6 +432,8 @@ fn disassemble_into(
     for (nth_instruction, instruction) in instructions.iter().enumerate() {
         let instruction_s = if instruction.opcode() == polkavm_common::program::Opcode::fallthrough {
             format_jump_target(jump_target_counter + 1)
+        } else if let polkavm_common::program::Instruction::ecalli(nth_import) = instruction {
+            format!("{instruction} // {}", imports[*nth_import as usize].symbol())
         } else {
             instruction.to_string()
         };
