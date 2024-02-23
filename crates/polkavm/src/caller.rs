@@ -86,7 +86,7 @@ impl CallerRaw {
         access.read_memory_into_slice(address, buffer)
     }
 
-    unsafe fn read_memory_into_new_vec(&self, address: u32, length: u32) -> Result<Vec<u8>, Trap> {
+    unsafe fn read_memory_into_vec(&self, address: u32, length: u32) -> Result<Vec<u8>, Trap> {
         log::trace!(
             "Reading memory (during hostcall): 0x{:x}-0x{:x} ({} bytes)",
             address,
@@ -95,7 +95,7 @@ impl CallerRaw {
         );
 
         // SAFETY: The caller will make sure that the invariants hold.
-        unsafe { self.access() }.read_memory_into_new_vec(address, length)
+        unsafe { self.access() }.read_memory_into_vec(address, length)
     }
 
     unsafe fn read_u32(&self, address: u32) -> Result<u32, Trap> {
@@ -237,9 +237,9 @@ impl<'a, T> Caller<'a, T> {
         unsafe { self.raw.read_memory_into_slice(address, buffer) }
     }
 
-    pub fn read_memory_into_new_vec(&self, address: u32, length: u32) -> Result<Vec<u8>, Trap> {
+    pub fn read_memory_into_vec(&self, address: u32, length: u32) -> Result<Vec<u8>, Trap> {
         // SAFETY: This can only be called from inside of `Caller::wrap` so this is always valid.
-        unsafe { self.raw.read_memory_into_new_vec(address, length) }
+        unsafe { self.raw.read_memory_into_vec(address, length) }
     }
 
     pub fn read_u32(&self, address: u32) -> Result<u32, Trap> {
@@ -321,11 +321,11 @@ impl<T> CallerRef<T> {
         unsafe { (*self.raw).read_memory_into_slice(address, buffer) }
     }
 
-    pub fn read_memory_into_new_vec(&self, address: u32, length: u32) -> Result<Vec<u8>, Trap> {
+    pub fn read_memory_into_vec(&self, address: u32, length: u32) -> Result<Vec<u8>, Trap> {
         self.check_lifetime_or_panic();
 
         // SAFETY: We've made sure the lifetime is valid.
-        unsafe { (*self.raw).read_memory_into_new_vec(address, length) }
+        unsafe { (*self.raw).read_memory_into_vec(address, length) }
     }
 
     pub fn read_u32(&self, address: u32) -> Result<u32, Trap> {

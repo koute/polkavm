@@ -233,7 +233,7 @@ pub trait Access<'a> {
     fn consume_gas(&mut self, gas: u64);
 
     #[cfg(feature = "alloc")]
-    fn read_memory_into_new_vec(&self, address: u32, length: u32) -> Result<Vec<u8>, Self::Error> {
+    fn read_memory_into_vec(&self, address: u32, length: u32) -> Result<Vec<u8>, Self::Error> {
         let mut buffer = Vec::new();
         buffer.reserve_exact(length as usize);
 

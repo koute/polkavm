@@ -2434,13 +2434,13 @@ impl<T> Instance<T> {
         mutable.backend.access().read_memory_into_slice(address, buffer)
     }
 
-    pub fn read_memory_into_new_vec(&self, address: u32, length: u32) -> Result<Vec<u8>, Trap> {
+    pub fn read_memory_into_vec(&self, address: u32, length: u32) -> Result<Vec<u8>, Trap> {
         let mut mutable = match self.0.mutable.lock() {
             Ok(mutable) => mutable,
             Err(poison) => poison.into_inner(),
         };
 
-        mutable.backend.access().read_memory_into_new_vec(address, length)
+        mutable.backend.access().read_memory_into_vec(address, length)
     }
 
     pub fn write_memory(&self, address: u32, data: &[u8]) -> Result<(), Trap> {

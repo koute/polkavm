@@ -93,7 +93,7 @@ impl Vm {
                 }
 
                 use std::io::Write;
-                let buffer = caller.read_memory_into_new_vec(buffer, length)?;
+                let buffer = caller.read_memory_into_vec(buffer, length)?;
                 let stdout = std::io::stdout();
                 let mut stdout = stdout.lock();
                 if stdout.write_all(&buffer).is_ok() {

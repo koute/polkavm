@@ -433,7 +433,7 @@ fn pinky(config: Config) {
         .call(Default::default(), CallArgs::new(&mut (), ext_get_framebuffer))
         .unwrap();
     let address = instance.get_result_typed::<u32>();
-    let framebuffer = instance.read_memory_into_new_vec(address, 256 * 240 * 4).unwrap();
+    let framebuffer = instance.read_memory_into_vec(address, 256 * 240 * 4).unwrap();
 
     let expected_frame_raw = decompress_zstd(include_bytes!("../../../test-data/pinky_00256.tga.zst"));
     let expected_frame = image::load_from_memory_with_format(&expected_frame_raw, image::ImageFormat::Tga)
@@ -592,13 +592,13 @@ fn test_blob_program_memory_can_be_reused_and_cleared(config: Config) {
     let i = TestInstance::new(&config);
     let address = i.call::<(), u32>("get_global_address", ()).unwrap();
 
-    assert_eq!(i.instance.read_memory_into_new_vec(address, 4).unwrap(), [0x00, 0x00, 0x00, 0x00]);
+    assert_eq!(i.instance.read_memory_into_vec(address, 4).unwrap(), [0x00, 0x00, 0x00, 0x00]);
 
     i.call::<(), ()>("increment_global", ()).unwrap();
-    assert_eq!(i.instance.read_memory_into_new_vec(address, 4).unwrap(), [0x01, 0x00, 0x00, 0x00]);
+    assert_eq!(i.instance.read_memory_into_vec(address, 4).unwrap(), [0x01, 0x00, 0x00, 0x00]);
 
     i.call::<(), ()>("increment_global", ()).unwrap();
-    assert_eq!(i.instance.read_memory_into_new_vec(address, 4).unwrap(), [0x02, 0x00, 0x00, 0x00]);
+    assert_eq!(i.instance.read_memory_into_vec(address, 4).unwrap(), [0x02, 0x00, 0x00, 0x00]);
 
     let ext_increment_global = i.instance.module().lookup_export("increment_global").unwrap();
     {
@@ -607,20 +607,20 @@ fn test_blob_program_memory_can_be_reused_and_cleared(config: Config) {
         call_args.reset_memory_after_call(true);
         i.instance.call(Default::default(), call_args).unwrap();
     }
-    assert_eq!(i.instance.read_memory_into_new_vec(address, 4).unwrap(), [0x00, 0x00, 0x00, 0x00]);
+    assert_eq!(i.instance.read_memory_into_vec(address, 4).unwrap(), [0x00, 0x00, 0x00, 0x00]);
 
     i.call::<(), ()>("increment_global", ()).unwrap();
-    assert_eq!(i.instance.read_memory_into_new_vec(address, 4).unwrap(), [0x01, 0x00, 0x00, 0x00]);
+    assert_eq!(i.instance.read_memory_into_vec(address, 4).unwrap(), [0x01, 0x00, 0x00, 0x00]);
 
     i.call::<(), ()>("increment_global", ()).unwrap();
-    assert_eq!(i.instance.read_memory_into_new_vec(address, 4).unwrap(), [0x02, 0x00, 0x00, 0x00]);
+    assert_eq!(i.instance.read_memory_into_vec(address, 4).unwrap(), [0x02, 0x00, 0x00, 0x00]);
 
     {
         let mut state_args = StateArgs::new();
         state_args.reset_memory(true);
         i.instance.call(state_args, CallArgs::new(&mut (), ext_increment_global)).unwrap();
     }
-    assert_eq!(i.instance.read_memory_into_new_vec(address, 4).unwrap(), [0x01, 0x00, 0x00, 0x00]);
+    assert_eq!(i.instance.read_memory_into_vec(address, 4).unwrap(), [0x01, 0x00, 0x00, 0x00]);
 }
 
 fn test_blob_out_of_bounds_memory_access_generates_a_trap(config: Config) {
@@ -643,13 +643,13 @@ fn test_blob_call_sbrk_impl(config: Config, mut call_sbrk: impl FnMut(&mut TestI
     let page_size = memory_map.page_size();
 
     assert_eq!(
-        i.instance.read_memory_into_new_vec(memory_map.rw_data_range().end - 1, 1).unwrap(),
+        i.instance.read_memory_into_vec(memory_map.rw_data_range().end - 1, 1).unwrap(),
         vec![0]
     );
-    assert!(i.instance.read_memory_into_new_vec(memory_map.rw_data_range().end, 1).is_err());
+    assert!(i.instance.read_memory_into_vec(memory_map.rw_data_range().end, 1).is_err());
     assert!(i
         .instance
-        .read_memory_into_new_vec(heap_base, memory_map.rw_data_range().end - heap_base)
+        .read_memory_into_vec(heap_base, memory_map.rw_data_range().end - heap_base)
         .unwrap()
         .iter()
         .all(|&byte| byte == 0));
@@ -667,7 +667,7 @@ fn test_blob_call_sbrk_impl(config: Config, mut call_sbrk: impl FnMut(&mut TestI
     assert_eq!(call_sbrk(&mut i, 0), heap_base + 1);
 
     i.instance.write_memory(heap_base, &[0x33]).unwrap();
-    assert_eq!(i.instance.read_memory_into_new_vec(heap_base, 1).unwrap(), vec![0x33]);
+    assert_eq!(i.instance.read_memory_into_vec(heap_base, 1).unwrap(), vec![0x33]);
 
     let new_origin = align_to_next_page_u32(memory_map.page_size(), heap_base + i.instance.heap_size()).unwrap();
     {
@@ -675,28 +675,28 @@ fn test_blob_call_sbrk_impl(config: Config, mut call_sbrk: impl FnMut(&mut TestI
         assert_eq!(call_sbrk(&mut i, until_next_page), new_origin);
     }
 
-    assert_eq!(i.instance.read_memory_into_new_vec(new_origin - 1, 1).unwrap(), vec![0]);
-    assert!(i.instance.read_memory_into_new_vec(new_origin, 1).is_err());
+    assert_eq!(i.instance.read_memory_into_vec(new_origin - 1, 1).unwrap(), vec![0]);
+    assert!(i.instance.read_memory_into_vec(new_origin, 1).is_err());
     assert!(i.instance.write_memory(new_origin, &[0x34]).is_err());
 
     assert_eq!(call_sbrk(&mut i, 1), new_origin + 1);
     assert_eq!(
-        i.instance.read_memory_into_new_vec(new_origin, page_size).unwrap().len(),
+        i.instance.read_memory_into_vec(new_origin, page_size).unwrap().len(),
         page_size as usize
     );
-    assert!(i.instance.read_memory_into_new_vec(new_origin, page_size + 1).is_err());
+    assert!(i.instance.read_memory_into_vec(new_origin, page_size + 1).is_err());
     assert!(i.instance.write_memory(new_origin, &[0x35]).is_ok());
 
     assert_eq!(call_sbrk(&mut i, page_size - 1), new_origin + page_size);
-    assert!(i.instance.read_memory_into_new_vec(new_origin, page_size + 1).is_err());
+    assert!(i.instance.read_memory_into_vec(new_origin, page_size + 1).is_err());
 
     i.instance.reset_memory().unwrap();
     assert_eq!(call_sbrk(&mut i, 0), heap_base);
     assert_eq!(i.instance.heap_size(), 0);
-    assert!(i.instance.read_memory_into_new_vec(memory_map.rw_data_range().end, 1).is_err());
+    assert!(i.instance.read_memory_into_vec(memory_map.rw_data_range().end, 1).is_err());
 
     assert_eq!(call_sbrk(&mut i, 1), heap_base + 1);
-    assert_eq!(i.instance.read_memory_into_new_vec(heap_base, 1).unwrap(), vec![0]);
+    assert_eq!(i.instance.read_memory_into_vec(heap_base, 1).unwrap(), vec![0]);
 }
 
 fn basic_gas_metering(config: Config, gas_metering_kind: GasMeteringKind) {
