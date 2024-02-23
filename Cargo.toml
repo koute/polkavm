@@ -32,7 +32,7 @@ repository = "https://github.com/koute/polkavm"
 polkavm                   = { version = "0.9.0", path = "crates/polkavm" }
 polkavm-assembler         = { version = "0.9.0", path = "crates/polkavm-assembler" }
 polkavm-common            = { version = "0.9.0", path = "crates/polkavm-common" }
-polkavm-derive            = { version = "0.9.0", path = "crates/polkavm-derive" }
+polkavm-derive            = { version = "0.9.1", path = "crates/polkavm-derive" }
 polkavm-derive-impl       = { version = "0.9.0", path = "crates/polkavm-derive-impl" }
 polkavm-derive-impl-macro = { version = "0.9.0", path = "crates/polkavm-derive-impl-macro" }
 polkavm-linker            = { version = "0.9.0", path = "crates/polkavm-linker" }
