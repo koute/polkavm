@@ -38,7 +38,7 @@ unsafe impl core::alloc::GlobalAlloc for LeakingAllocator {
     #[inline]
     unsafe fn alloc(&self, layout: core::alloc::Layout) -> *mut u8 {
         let pointer = crate::sbrk(0);
-        let padding = !(pointer as usize) & (layout.align() - 1);
+        let padding = (-(pointer as isize)) as usize & (layout.align() - 1);
         let size = layout.size().wrapping_add(padding);
         if crate::sbrk(size).is_null() {
             return core::ptr::null_mut();
