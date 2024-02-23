@@ -783,7 +783,16 @@ pub unsafe extern "C" fn syscall_trace(nth_instruction: u32, rip: u64) {
 #[inline(never)]
 #[no_mangle]
 pub unsafe extern "C" fn syscall_sbrk(pending_heap_top: u64) -> u32 {
-    trace!("syscall: sbrk triggered");
+    trace!(
+        "syscall: sbrk triggered: ",
+        Hex(*VMCTX.heap_info.heap_top.get()),
+        " -> ",
+        Hex(pending_heap_top),
+        " (",
+        Hex(pending_heap_top - *VMCTX.heap_info.heap_top.get()),
+        ")"
+    );
+
     let memory_map = &(*VMCTX.memory_config.get()).memory_map;
     if pending_heap_top > u64::from(memory_map.heap_base() + memory_map.max_heap_size()) {
         return 0;
@@ -809,6 +818,16 @@ pub unsafe extern "C" fn syscall_sbrk(pending_heap_top: u64) -> u32 {
         )
         .unwrap_or_else(|error| abort_with_error("failed to mmap sbrk increase", error));
     }
+
+    trace!(
+        "new rwdata range: ",
+        Hex(memory_map.rw_data_address()),
+        "-",
+        Hex(end),
+        " (",
+        Hex(end - memory_map.rw_data_address() as usize),
+        ")"
+    );
 
     *VMCTX.heap_info.heap_top.get() = pending_heap_top;
     *VMCTX.heap_info.heap_threshold.get() = end as u64;
