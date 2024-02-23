@@ -1629,6 +1629,10 @@ impl<'a> Access<'a> for SandboxAccess<'a> {
     }
 
     fn sbrk(&mut self, size: u32) -> Option<u32> {
+        if size == 0 {
+            return Some(unsafe { *self.sandbox.vmctx().heap_info().heap_top.get() as u32 });
+        }
+
         debug_assert_eq!(self.sandbox.vmctx().futex.load(Ordering::Relaxed), VMCTX_FUTEX_HOSTCALL);
 
         unsafe {
