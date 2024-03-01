@@ -265,11 +265,15 @@ impl SandboxCache {
     }
 }
 
+fn is_sandbox_logging_enabled() -> bool {
+    cfg!(test) || log::log_enabled!(target: "polkavm", log::Level::Trace) || log::log_enabled!(target: "polkavm::zygote", log::Level::Trace)
+}
+
 fn spawn_sandboxes<S>(count: usize, debug_trace_execution: bool) -> Result<Vec<S>, Error> where S: Sandbox {
     use crate::sandbox::SandboxConfig;
 
     let mut sandbox_config = S::Config::default();
-    sandbox_config.enable_logger(cfg!(test) || debug_trace_execution);
+    sandbox_config.enable_logger(is_sandbox_logging_enabled() || debug_trace_execution);
 
     let mut sandboxes = Vec::with_capacity(count);
     for nth in 0..count {
@@ -287,7 +291,7 @@ fn reuse_or_spawn_sandbox<S>(engine_state: &EngineState, module: &Module) -> Res
     use crate::sandbox::SandboxConfig;
 
     let mut sandbox_config = S::Config::default();
-    sandbox_config.enable_logger(cfg!(test) || module.is_debug_trace_execution_enabled());
+    sandbox_config.enable_logger(is_sandbox_logging_enabled() || module.is_debug_trace_execution_enabled());
 
     if let Some(sandbox) = engine_state.sandbox_cache().and_then(|cache| cache.reuse_sandbox::<S>()) {
         Ok(sandbox)
