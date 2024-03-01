@@ -1091,7 +1091,7 @@ impl super::Sandbox for Sandbox {
                                         buffer.extend_from_slice(&tmp[..index]);
                                         tmp = &tmp[index + 1..];
 
-                                        log::trace!(target: "polkavm_zygote", "Child #{}: {}", child_pid, String::from_utf8_lossy(&buffer));
+                                        log::trace!(target: "polkavm::zygote", "Child #{}: {}", child_pid, String::from_utf8_lossy(&buffer));
                                         buffer.clear();
                                     } else {
                                         buffer.extend_from_slice(tmp);
