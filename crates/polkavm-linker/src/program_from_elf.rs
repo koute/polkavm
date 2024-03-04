@@ -6988,7 +6988,15 @@ pub fn program_from_elf(config: Config, data: &[u8]) -> Result<ProgramBlob, Prog
                 .then_with(|| a.metadata.symbol.cmp(&b.metadata.symbol))
         });
 
+        let mut next_index = 0;
         for import in sorted_imports {
+            let Some(index) = import.index else {
+                continue;
+            };
+
+            assert_eq!(index, next_index);
+            next_index += 1;
+
             builder.add_import(polkavm_common::program::ProgramImport::new(import.metadata.symbol.into()));
         }
     }
