@@ -1,6 +1,6 @@
 [package]
 name = "polkavm-linker"
-version.workspace = true
+version = "0.9.2"
 authors.workspace = true
 license.workspace = true
 edition.workspace = true
