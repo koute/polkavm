@@ -1910,20 +1910,22 @@ impl<T> Linker<T> {
 
     /// Pre-instantiates a new module, linking it with the external functions previously defined on this object.
     pub fn instantiate_pre(&self, module: &Module) -> Result<InstancePre<T>, Error> {
-        let mut host_functions: Vec<CallFnArc<T>> = Vec::with_capacity(module.0.imports.len());
+        let mut host_functions: Vec<Option<CallFnArc<T>>> = Vec::with_capacity(module.0.imports.len());
         for import in &module.0.imports {
             let symbol_bytes: &[u8] = import.symbol();
             let Some(host_fn) = self.host_functions.get(symbol_bytes) else {
                 if self.fallback_handler.is_some() {
+                    host_functions.push(None);
                     continue;
+                } else {
+                    bail!("failed to instantiate module: missing host function: {}", import.symbol());
                 }
-
-                bail!("failed to instantiate module: missing host function: {}", import.symbol());
             };
 
-            host_functions.push(host_fn.clone());
+            host_functions.push(Some(host_fn.clone()));
         }
 
+        assert_eq!(host_functions.len(), module.0.imports.len());
         Ok(InstancePre(Arc::new(InstancePrePrivate {
             engine_state: Arc::clone(&self.engine_state),
             module: module.clone(),
@@ -1938,7 +1940,7 @@ struct InstancePrePrivate<T> {
     #[allow(dead_code)]
     engine_state: Arc<EngineState>,
     module: Module,
-    host_functions: Vec<CallFnArc<T>>,
+    host_functions: Vec<Option<CallFnArc<T>>>,
     fallback_handler: Option<FallbackHandlerArc<T>>,
     _private: PhantomData<T>,
 }
@@ -2675,7 +2677,7 @@ impl<'a> ExecuteArgs<'a> {
 
 fn on_hostcall<'a, T>(
     user_data: &'a mut T,
-    host_functions: &'a [CallFnArc<T>],
+    host_functions: &'a [Option<CallFnArc<T>>],
     imports: &'a [ProgramImport<'a>],
     fallback_handler: Option<&'a FallbackHandlerArc<T>>,
     raw: &'a mut CallerRaw,
@@ -2695,7 +2697,7 @@ fn on_hostcall<'a, T>(
             return Err(Trap::default());
         }
 
-        let Some(host_fn) = host_functions.get(hostcall as usize) else {
+        let Some(host_fn) = host_functions.get(hostcall as usize).and_then(|func| func.as_ref()) else {
             if let Some(fallback_handler) = fallback_handler {
                 let import = &imports[hostcall as usize];
                 return Caller::wrap(user_data, &mut access, raw, move |caller| fallback_handler(caller, import.symbol()));
