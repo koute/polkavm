@@ -29,7 +29,7 @@ rust-version = "1.70.0"
 repository = "https://github.com/koute/polkavm"
 
 [workspace.dependencies]
-polkavm                   = { version = "0.9.0", path = "crates/polkavm" }
+polkavm                   = { version = "0.9.3", path = "crates/polkavm" }
 polkavm-assembler         = { version = "0.9.0", path = "crates/polkavm-assembler" }
 polkavm-common            = { version = "0.9.0", path = "crates/polkavm-common" }
 polkavm-derive            = { version = "0.9.1", path = "crates/polkavm-derive" }
