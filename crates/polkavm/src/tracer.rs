@@ -72,11 +72,9 @@ impl Tracer {
 
         self.trace_current_instruction_source(program_counter);
 
-        let instruction = self.module.instructions()[program_counter as usize];
         if let Some(native_address) = access.native_program_counter() {
+            let instruction = self.module.instructions()[program_counter as usize];
             log::trace!("0x{native_address:x}: #{program_counter}: {instruction}");
-        } else {
-            log::trace!("#{program_counter}: {instruction}");
         }
 
         self.step_crosscheck_interpreter(program_counter)?;

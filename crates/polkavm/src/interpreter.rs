@@ -144,6 +144,7 @@ impl InterpretedInstance {
                 return Err(ExecutionError::Trap(Default::default()));
             };
 
+            visitor.trace_current_instruction(&instruction);
             translate_error(instruction.visit(&mut visitor))?;
             if visitor.inner.return_to_host {
                 break;
@@ -166,6 +167,7 @@ impl InterpretedInstance {
         };
 
         let mut visitor = Visitor { inner: self, ctx };
+        visitor.trace_current_instruction(&instruction);
         instruction.visit(&mut visitor)
     }
 
@@ -632,6 +634,12 @@ impl<'a, 'b> Visitor<'a, 'b> {
         self.inner.nth_basic_block = nth_basic_block;
         self.inner.nth_instruction = nth_instruction;
         self.inner.on_start_new_basic_block()
+    }
+
+    #[inline(always)]
+    fn trace_current_instruction(&self, instruction: &Instruction) {
+        let program_counter = self.inner.nth_instruction;
+        log::trace!("#{program_counter}: {instruction}");
     }
 }
 
