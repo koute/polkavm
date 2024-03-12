@@ -14,6 +14,25 @@ use polkavm_common::{
 
 type ExecutionError<E = core::convert::Infallible> = polkavm_common::error::ExecutionError<E>;
 
+// Define a custom trait instead of just using `Into<RegImm>` to make sure this is always inlined.
+trait IntoRegImm {
+    fn into(self) -> RegImm;
+}
+
+impl IntoRegImm for Reg {
+    #[inline(always)]
+    fn into(self) -> RegImm {
+        RegImm::Reg(self)
+    }
+}
+
+impl IntoRegImm for u32 {
+    #[inline(always)]
+    fn into(self) -> RegImm {
+        RegImm::Imm(self)
+    }
+}
+
 pub(crate) struct InterpretedModule {
     pub(crate) instructions: Vec<Instruction>,
     ro_data: Vec<u8>,
@@ -117,6 +136,14 @@ impl InterpretedInstance {
     }
 
     pub fn run(&mut self, ctx: InterpreterContext) -> Result<(), ExecutionError<Error>> {
+        if log::log_enabled!(target: "polkavm", log::Level::Debug) || log::log_enabled!(target: "polkavm::interpreter", log::Level::Debug) {
+            self.run_impl::<true>(ctx)
+        } else {
+            self.run_impl::<false>(ctx)
+        }
+    }
+
+    fn run_impl<const DEBUG: bool>(&mut self, ctx: InterpreterContext) -> Result<(), ExecutionError<Error>> {
         #[cold]
         fn translate_error(error: ExecutionError) -> ExecutionError<Error> {
             match error {
@@ -135,7 +162,7 @@ impl InterpretedInstance {
 
         if self.in_new_execution {
             self.in_new_execution = false;
-            if let Err(error) = self.on_start_new_basic_block() {
+            if let Err(error) = self.on_start_new_basic_block::<DEBUG>() {
                 return Err(translate_error(error));
             }
         }
@@ -146,7 +173,7 @@ impl InterpretedInstance {
 
         let module = module.clone();
         let instructions = module.instructions();
-        let mut visitor = Visitor { inner: self, ctx };
+        let mut visitor = Visitor::<DEBUG> { inner: self, ctx };
         loop {
             visitor.inner.cycle_counter += 1;
             let Some(instruction) = instructions.get(visitor.inner.nth_instruction as usize) else {
@@ -169,7 +196,7 @@ impl InterpretedInstance {
     pub fn step_once(&mut self, ctx: InterpreterContext) -> Result<(), ExecutionError> {
         if self.in_new_execution {
             self.in_new_execution = false;
-            self.on_start_new_basic_block()?;
+            self.on_start_new_basic_block::<true>()?;
         }
 
         self.cycle_counter += 1;
@@ -178,7 +205,7 @@ impl InterpretedInstance {
             return Err(ExecutionError::Trap(Default::default()));
         };
 
-        let mut visitor = Visitor { inner: self, ctx };
+        let mut visitor = Visitor::<true> { inner: self, ctx };
         visitor.trace_current_instruction(&instruction);
         instruction.visit(&mut visitor)
     }
@@ -338,18 +365,20 @@ impl InterpretedInstance {
         memory_slice.get_mut(offset..offset + length as usize)
     }
 
-    fn on_start_new_basic_block(&mut self) -> Result<(), ExecutionError> {
+    fn on_start_new_basic_block<const DEBUG: bool>(&mut self) -> Result<(), ExecutionError> {
         if let Some(ref mut gas_remaining) = self.gas_remaining {
             let module = self.module.as_ref().unwrap().interpreted_module().unwrap();
             let gas_cost = i64::from(module.gas_cost_for_basic_block[self.nth_basic_block as usize]);
 
-            log::trace!(
-                "Consume gas at @{:x}: {} ({} -> {})",
-                self.nth_basic_block,
-                gas_cost,
-                *gas_remaining,
-                *gas_remaining - gas_cost
-            );
+            if DEBUG {
+                log::trace!(
+                    "Consume gas at @{:x}: {} ({} -> {})",
+                    self.nth_basic_block,
+                    gas_cost,
+                    *gas_remaining,
+                    *gas_remaining - gas_cost
+                );
+            }
 
             *gas_remaining -= gas_cost;
             if *gas_remaining < 0 {
@@ -445,14 +474,14 @@ impl<'a> Access<'a> for InterpretedAccess<'a> {
     }
 }
 
-struct Visitor<'a, 'b> {
+struct Visitor<'a, 'b, const DEBUG: bool> {
     inner: &'a mut InterpretedInstance,
     ctx: InterpreterContext<'b>,
 }
 
-impl<'a, 'b> Visitor<'a, 'b> {
+impl<'a, 'b, const DEBUG: bool> Visitor<'a, 'b, DEBUG> {
     #[inline(always)]
-    fn get(&self, regimm: impl Into<RegImm>) -> u32 {
+    fn get(&self, regimm: impl IntoRegImm) -> u32 {
         match regimm.into() {
             RegImm::Reg(reg) => self.inner.regs[reg as usize],
             RegImm::Imm(value) => value,
@@ -462,7 +491,10 @@ impl<'a, 'b> Visitor<'a, 'b> {
     #[inline(always)]
     fn set(&mut self, dst: Reg, value: u32) -> Result<(), ExecutionError> {
         self.inner.regs[dst as usize] = value;
-        log::trace!("{dst} = 0x{value:x}");
+
+        if DEBUG {
+            log::trace!("{dst} = 0x{value:x}");
+        }
 
         if let Some(on_set_reg) = self.ctx.on_set_reg.as_mut() {
             let result = (on_set_reg)(dst, value);
@@ -476,8 +508,8 @@ impl<'a, 'b> Visitor<'a, 'b> {
     fn set3(
         &mut self,
         dst: Reg,
-        s1: impl Into<RegImm>,
-        s2: impl Into<RegImm>,
+        s1: impl IntoRegImm,
+        s2: impl IntoRegImm,
         callback: impl Fn(u32, u32) -> u32,
     ) -> Result<(), ExecutionError> {
         let s1 = self.get(s1);
@@ -489,8 +521,8 @@ impl<'a, 'b> Visitor<'a, 'b> {
 
     fn branch(
         &mut self,
-        s1: impl Into<RegImm>,
-        s2: impl Into<RegImm>,
+        s1: impl IntoRegImm,
+        s2: impl IntoRegImm,
         target: u32,
         callback: impl Fn(u32, u32) -> bool,
     ) -> Result<(), ExecutionError> {
@@ -510,7 +542,7 @@ impl<'a, 'b> Visitor<'a, 'b> {
             self.inner.nth_basic_block += 1;
         }
 
-        self.inner.on_start_new_basic_block()
+        self.inner.on_start_new_basic_block::<DEBUG>()
     }
 
     fn load<T: LoadTy>(&mut self, dst: Reg, base: Option<Reg>, offset: u32) -> Result<(), ExecutionError> {
@@ -519,21 +551,26 @@ impl<'a, 'b> Visitor<'a, 'b> {
         let address = base.map_or(0, |base| self.inner.regs[base as usize]).wrapping_add(offset);
         let length = core::mem::size_of::<T>() as u32;
         let Some(slice) = self.inner.get_memory_slice(address, length) else {
-            log::debug!(
-                "Load of {length} bytes from 0x{address:x} failed! (pc = #{pc}, cycle = {cycle})",
-                pc = self.inner.nth_instruction,
-                cycle = self.inner.cycle_counter
-            );
+            if DEBUG {
+                log::debug!(
+                    "Load of {length} bytes from 0x{address:x} failed! (pc = #{pc}, cycle = {cycle})",
+                    pc = self.inner.nth_instruction,
+                    cycle = self.inner.cycle_counter
+                );
 
-            self.inner
-                .module
-                .as_ref()
-                .unwrap()
-                .debug_print_location(log::Level::Debug, self.inner.nth_instruction);
+                self.inner
+                    .module
+                    .as_ref()
+                    .unwrap()
+                    .debug_print_location(log::Level::Debug, self.inner.nth_instruction);
+            }
+
             return Err(ExecutionError::Trap(Default::default()));
         };
 
-        log::trace!("{dst} = {kind} [0x{address:x}]", kind = core::any::type_name::<T>());
+        if DEBUG {
+            log::trace!("{dst} = {kind} [0x{address:x}]", kind = core::any::type_name::<T>());
+        }
 
         let value = T::from_slice(slice);
         self.set(dst, value)?;
@@ -541,7 +578,7 @@ impl<'a, 'b> Visitor<'a, 'b> {
         Ok(())
     }
 
-    fn store<T: StoreTy>(&mut self, src: impl Into<RegImm>, base: Option<Reg>, offset: u32) -> Result<(), ExecutionError> {
+    fn store<T: StoreTy>(&mut self, src: impl IntoRegImm, base: Option<Reg>, offset: u32) -> Result<(), ExecutionError> {
         assert!(core::mem::size_of::<T>() >= 1);
         self.inner.is_memory_dirty = true;
 
@@ -549,27 +586,37 @@ impl<'a, 'b> Visitor<'a, 'b> {
         let value = match src.into() {
             RegImm::Reg(src) => {
                 let value = self.inner.regs[src as usize];
-                log::trace!("{kind} [0x{address:x}] = {src} = 0x{value:x}", kind = core::any::type_name::<T>());
+                if DEBUG {
+                    log::trace!("{kind} [0x{address:x}] = {src} = 0x{value:x}", kind = core::any::type_name::<T>());
+                }
+
                 value
             }
             RegImm::Imm(value) => {
-                log::trace!("{kind} [0x{address:x}] = 0x{value:x}", kind = core::any::type_name::<T>());
+                if DEBUG {
+                    log::trace!("{kind} [0x{address:x}] = 0x{value:x}", kind = core::any::type_name::<T>());
+                }
+
                 value
             }
         };
 
         let length = core::mem::size_of::<T>() as u32;
         let Some(slice) = self.inner.get_memory_slice_mut(address, length) else {
-            log::debug!(
-                "Store of {length} bytes to 0x{address:x} failed! (pc = #{pc}, cycle = {cycle})",
-                pc = self.inner.nth_instruction,
-                cycle = self.inner.cycle_counter
-            );
-            self.inner
-                .module
-                .as_ref()
-                .unwrap()
-                .debug_print_location(log::Level::Debug, self.inner.nth_instruction);
+            if DEBUG {
+                log::debug!(
+                    "Store of {length} bytes to 0x{address:x} failed! (pc = #{pc}, cycle = {cycle})",
+                    pc = self.inner.nth_instruction,
+                    cycle = self.inner.cycle_counter
+                );
+
+                self.inner
+                    .module
+                    .as_ref()
+                    .unwrap()
+                    .debug_print_location(log::Level::Debug, self.inner.nth_instruction);
+            }
+
             return Err(ExecutionError::Trap(Default::default()));
         };
 
@@ -595,11 +642,13 @@ impl<'a, 'b> Visitor<'a, 'b> {
     }
 
     fn set_return_address(&mut self, ra: Reg, return_address: u32) -> Result<(), ExecutionError> {
-        log::trace!(
-            "Setting a call's return address: {ra} = @dyn {:x} (@{:x})",
-            return_address / VM_CODE_ADDRESS_ALIGNMENT,
-            self.inner.nth_basic_block + 1
-        );
+        if DEBUG {
+            log::trace!(
+                "Setting a call's return address: {ra} = @dyn {:x} (@{:x})",
+                return_address / VM_CODE_ADDRESS_ALIGNMENT,
+                self.inner.nth_basic_block + 1
+            );
+        }
 
         self.set(ra, return_address)
     }
@@ -642,16 +691,21 @@ impl<'a, 'b> Visitor<'a, 'b> {
             .instruction_by_basic_block(nth_basic_block)
             .expect("internal error: couldn't fetch the instruction index for a dynamic jump");
 
-        log::trace!("Dynamic jump to: #{nth_instruction}: @{nth_basic_block:x}");
+        if DEBUG {
+            log::trace!("Dynamic jump to: #{nth_instruction}: @{nth_basic_block:x}");
+        }
+
         self.inner.nth_basic_block = nth_basic_block;
         self.inner.nth_instruction = nth_instruction;
-        self.inner.on_start_new_basic_block()
+        self.inner.on_start_new_basic_block::<DEBUG>()
     }
 
     #[inline(always)]
     fn trace_current_instruction(&self, instruction: &Instruction) {
-        let program_counter = self.inner.nth_instruction;
-        log::trace!("#{program_counter}: {instruction}");
+        if DEBUG {
+            let program_counter = self.inner.nth_instruction;
+            log::trace!("#{program_counter}: {instruction}");
+        }
     }
 }
 
@@ -696,6 +750,8 @@ trait StoreTy: Sized {
 
 impl StoreTy for u8 {
     type Array = [u8; 1];
+
+    #[inline(always)]
     fn into_bytes(value: u32) -> Self::Array {
         (value as u8).to_le_bytes()
     }
@@ -703,6 +759,8 @@ impl StoreTy for u8 {
 
 impl StoreTy for u16 {
     type Array = [u8; 2];
+
+    #[inline(always)]
     fn into_bytes(value: u32) -> Self::Array {
         (value as u16).to_le_bytes()
     }
@@ -710,12 +768,14 @@ impl StoreTy for u16 {
 
 impl StoreTy for u32 {
     type Array = [u8; 4];
+
+    #[inline(always)]
     fn into_bytes(value: u32) -> Self::Array {
         value.to_le_bytes()
     }
 }
 
-impl<'a, 'b> InstructionVisitor for Visitor<'a, 'b> {
+impl<'a, 'b, const DEBUG: bool> InstructionVisitor for Visitor<'a, 'b, DEBUG> {
     type ReturnTy = Result<(), ExecutionError>;
 
     fn trap(&mut self) -> Self::ReturnTy {
@@ -730,7 +790,7 @@ impl<'a, 'b> InstructionVisitor for Visitor<'a, 'b> {
     fn fallthrough(&mut self) -> Self::ReturnTy {
         self.inner.nth_instruction += 1;
         self.inner.nth_basic_block += 1;
-        self.inner.on_start_new_basic_block()
+        self.inner.on_start_new_basic_block::<DEBUG>()
     }
 
     fn sbrk(&mut self, dst: Reg, size: Reg) -> Self::ReturnTy {
@@ -1110,10 +1170,13 @@ impl<'a, 'b> InstructionVisitor for Visitor<'a, 'b> {
             .instruction_by_basic_block(target)
             .expect("internal error: couldn't fetch the instruction index for a jump");
 
-        log::trace!("Static jump to: #{nth_instruction}: @{target:x}");
+        if DEBUG {
+            log::trace!("Static jump to: #{nth_instruction}: @{target:x}");
+        }
+
         self.inner.nth_basic_block = target;
         self.inner.nth_instruction = nth_instruction;
-        self.inner.on_start_new_basic_block()
+        self.inner.on_start_new_basic_block::<DEBUG>()
     }
 
     fn jump_indirect(&mut self, base: Reg, offset: u32) -> Self::ReturnTy {
