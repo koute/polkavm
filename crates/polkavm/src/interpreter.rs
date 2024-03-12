@@ -117,19 +117,27 @@ impl InterpretedInstance {
     }
 
     pub fn run(&mut self, ctx: InterpreterContext) -> Result<(), ExecutionError<Error>> {
-        fn translate_error(error: Result<(), ExecutionError>) -> Result<(), ExecutionError<Error>> {
-            error.map_err(|error| match error {
+        #[cold]
+        fn translate_error(error: ExecutionError) -> ExecutionError<Error> {
+            match error {
                 ExecutionError::Trap(trap) => ExecutionError::Trap(trap),
                 ExecutionError::OutOfGas => ExecutionError::OutOfGas,
                 ExecutionError::Error(_) => unreachable!(),
-            })
+            }
+        }
+
+        #[cold]
+        fn trap() -> ExecutionError<Error> {
+            ExecutionError::Trap(Default::default())
         }
 
         self.is_memory_dirty = true;
 
         if self.in_new_execution {
             self.in_new_execution = false;
-            translate_error(self.on_start_new_basic_block())?;
+            if let Err(error) = self.on_start_new_basic_block() {
+                return Err(translate_error(error));
+            }
         }
 
         let Some(module) = self.module.as_ref() else {
@@ -137,15 +145,19 @@ impl InterpretedInstance {
         };
 
         let module = module.clone();
+        let instructions = module.instructions();
         let mut visitor = Visitor { inner: self, ctx };
         loop {
             visitor.inner.cycle_counter += 1;
-            let Some(instruction) = module.instructions().get(visitor.inner.nth_instruction as usize).copied() else {
-                return Err(ExecutionError::Trap(Default::default()));
+            let Some(instruction) = instructions.get(visitor.inner.nth_instruction as usize) else {
+                return Err(trap());
             };
 
-            visitor.trace_current_instruction(&instruction);
-            translate_error(instruction.visit(&mut visitor))?;
+            visitor.trace_current_instruction(instruction);
+            if let Err(error) = instruction.visit(&mut visitor) {
+                return Err(translate_error(error));
+            }
+
             if visitor.inner.return_to_host {
                 break;
             }
