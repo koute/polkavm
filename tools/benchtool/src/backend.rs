@@ -228,11 +228,14 @@ macro_rules! define_backends {
 
 define_backends! {
     #[cfg(target_arch = "x86_64")]
-    PolkaVM_NoGas => backend_polkavm::PolkaVM(None),
+    PolkaVM_Compiler_NoGas => backend_polkavm::PolkaVM(polkavm::BackendKind::Compiler, None),
     #[cfg(target_arch = "x86_64")]
-    PolkaVM_AsyncGas => backend_polkavm::PolkaVM(Some(polkavm::GasMeteringKind::Async)),
+    PolkaVM_Compiler_AsyncGas => backend_polkavm::PolkaVM(polkavm::BackendKind::Compiler, Some(polkavm::GasMeteringKind::Async)),
     #[cfg(target_arch = "x86_64")]
-    PolkaVM_SyncGas => backend_polkavm::PolkaVM(Some(polkavm::GasMeteringKind::Sync)),
+    PolkaVM_Compiler_SyncGas => backend_polkavm::PolkaVM(polkavm::BackendKind::Compiler, Some(polkavm::GasMeteringKind::Sync)),
+
+    #[cfg(not(dummy))] // A dummy cfg since the macro requires it.
+    PolkaVM_Interpreter => backend_polkavm::PolkaVM(polkavm::BackendKind::Interpreter, None),
 
     #[cfg(all(feature = "wasmtime", any(target_arch = "x86_64", target_arch = "aarch64")))]
     Wasmtime_Cranelift =>
@@ -286,13 +289,15 @@ impl BenchmarkKind {
         match self {
             BenchmarkKind::PolkaVM => {
                 #[cfg(target_arch = "x86_64")]
-                {
+                if polkavm::BackendKind::Compiler.is_supported() {
                     output.extend([
-                        BackendKind::PolkaVM_NoGas,
-                        BackendKind::PolkaVM_AsyncGas,
-                        BackendKind::PolkaVM_SyncGas,
+                        BackendKind::PolkaVM_Compiler_NoGas,
+                        BackendKind::PolkaVM_Compiler_AsyncGas,
+                        BackendKind::PolkaVM_Compiler_SyncGas,
                     ]);
                 }
+
+                output.push(BackendKind::PolkaVM_Interpreter);
             }
             BenchmarkKind::WebAssembly => {
                 #[cfg(feature = "wasmi")]
