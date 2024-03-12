@@ -424,7 +424,7 @@ fn main() {
     if std::env::var_os("TRUST_ME_BRO_I_KNOW_WHAT_I_AM_DOING").is_none() {
         // We have interpreters in the benchmark suite, so it's important to compile
         // with full optimizations and with full fat LTO to keep things fair.
-        eprintln!("Not compiled with `--profile benchmark`; refusing to run! Please recompile and try again!");
+        eprintln!("Not compiled with `--release`; refusing to run! Please recompile and try again!");
         eprintln!("(...alternatively you can set the `TRUST_ME_BRO_I_KNOW_WHAT_I_AM_DOING` environment variable, if you know what you're doing...)");
         std::process::exit(1);
     }

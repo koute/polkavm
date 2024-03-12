@@ -172,8 +172,7 @@ ruzstd = { opt-level = 3 }
 # To speed up the tests.
 polkavm-assembler = { opt-level = 3 }
 
-[profile.benchmark]
-inherits = "release"
+[profile.release]
 lto = true
 codegen-units = 1
 debug = true
