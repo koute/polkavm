@@ -314,8 +314,7 @@ impl BenchmarkKind {
                             BackendKind::Wasmtime_Cranelift,
                             BackendKind::Wasmtime_CraneliftConsumeFuel,
                             BackendKind::Wasmtime_CraneliftEpochInterruption,
-                            // TODO: Enable once it doesn't crash with a 'not yet implemented' error.
-                            // BackendKind::Wasmtime_Winch,
+                            BackendKind::Wasmtime_Winch,
                         ]);
                     }
 
