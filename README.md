@@ -4,6 +4,8 @@ PolkaVM is a general purpose user-level RISC-V based virtual machine.
 
 **This project is still unfinished and is a very heavy work-in-progress! Do not use it in production!**
 
+[See current benchmark results here](./BENCHMARKS.md).
+
 ## Design goals
 
 (**Note: not all of these are currently true!**)
