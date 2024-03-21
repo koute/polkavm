@@ -75,11 +75,6 @@ fn criterion_main(c: &mut Criterion, benches: &[Benchmark]) {
         let mut group = c.benchmark_group(format!("runtime/{}", name));
         for bench in variants {
             for backend in bench.kind.matching_backends() {
-                if backend.is_slow() {
-                    // These are too slow for criterion; skip them.
-                    continue;
-                }
-
                 group.bench_function(backend.name(), |b| {
                     b.iter_custom(|count| benchmark_execution(count, FAST_INNER_COUNT, backend, &bench.path));
                 });
