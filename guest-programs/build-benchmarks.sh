@@ -49,7 +49,7 @@ if [ "${SOLANA_PLATFORM_TOOLS_DIR:-}" == "" ]; then
     case "$OSTYPE" in
         linux*)
             echo "      You can set it up like this:"
-            echo "        $ curl -Lo platform-tools-linux-x86_64.tar.bz2 'https://github.com/solana-labs/platform-tools/releases/download/v1.39/platform-tools-linux-x86_64.tar.bz2'"
+            echo "        $ curl -Lo platform-tools-linux-x86_64.tar.bz2 'https://github.com/anza-xyz/platform-tools/releases/download/v1.39/platform-tools-linux-x86_64.tar.bz2'"
             echo "        $ mkdir -p /tmp/solana-platform-tools"
             echo "        $ tar -C /tmp/solana-platform-tools -xf platform-tools-linux-x86_64.tar.bz2"
             echo "        $ export SOLANA_PLATFORM_TOOLS_DIR='/tmp/solana-platform-tools'"
