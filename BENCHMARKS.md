@@ -29,7 +29,7 @@ These benchmarks measure the end-to-end time that it takes to run the program a 
 
 ## Execution time (for pinky)
 
-These benchmarks measure the execution time of the benchmark, *without* time it takes to compile or initialize it.
+These benchmarks measure the execution time of the benchmark, *without* the time it takes to compile or initialize it.
 
 | VM                                       |                 Time | vs fastest |
 |------------------------------------------|----------------------|------------|
@@ -105,7 +105,7 @@ These benchmarks measure the end-to-end time that it takes to run the program a 
 
 ## Execution time (for prime-sieve)
 
-These benchmarks measure the execution time of the benchmark, *without* time it takes to compile or initialize it.
+These benchmarks measure the execution time of the benchmark, *without* the time it takes to compile or initialize it.
 
 | VM                                       |                 Time | vs fastest |
 |------------------------------------------|----------------------|------------|
@@ -181,7 +181,7 @@ These benchmarks measure the end-to-end time that it takes to run the program a 
 
 ## Execution time (for minimal)
 
-These benchmarks measure the execution time of the benchmark, *without* time it takes to compile or initialize it.
+These benchmarks measure the execution time of the benchmark, *without* the time it takes to compile or initialize it.
 
 | VM                                       |                 Time | vs fastest |
 |------------------------------------------|----------------------|------------|

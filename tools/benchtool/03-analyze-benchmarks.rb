@@ -121,7 +121,7 @@ PROGRAM_DESCRIPTIONS = {
 
 KIND_DESCRIPTIONS = {
     "oneshot" => "These benchmarks measure the end-to-end time that it takes to run the program a single time, including compilation and initialization.",
-    "runtime" => "These benchmarks measure the execution time of the benchmark, *without* time it takes to compile or initialize it.",
+    "runtime" => "These benchmarks measure the execution time of the benchmark, *without* the time it takes to compile or initialize it.",
     "compilation" => "These benchmarks measure the time it takes to compile a given program by the VM.",
 }
 
