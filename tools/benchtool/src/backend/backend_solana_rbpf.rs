@@ -145,7 +145,9 @@ impl Backend for SolanaRbpf {
     fn initialize(&self, instance: &mut Self::Instance) {
         instance.vm.memory_mapping.store(0_u8, ebpf::MM_INPUT_START);
         let (_, result) = instance.vm.execute_program(&instance.executable, false);
-        assert!(result.is_ok());
+        if let solana_rbpf::error::StableResult::Err(error) = result {
+            panic!("failed to initialize benchmark: {error:?}");
+        }
     }
 
     fn run(&self, instance: &mut Self::Instance) {
