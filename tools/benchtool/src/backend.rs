@@ -278,6 +278,8 @@ define_backends! {
     Wasmi_Eager => backend_wasmi::Wasmi(wasmi::CompilationMode::Eager),
     #[cfg(feature = "wasmi")]
     Wasmi_Lazy => backend_wasmi::Wasmi(wasmi::CompilationMode::Lazy),
+    #[cfg(feature = "wasmi")]
+    Wasmi_LazyTranslation => backend_wasmi::Wasmi(wasmi::CompilationMode::LazyTranslation),
 
     #[cfg(feature = "native")]
     Native => backend_native::Native()
@@ -304,6 +306,7 @@ impl BenchmarkKind {
                 {
                     output.push(BackendKind::Wasmi_Eager);
                     output.push(BackendKind::Wasmi_Lazy);
+                    output.push(BackendKind::Wasmi_LazyTranslation);
                 }
 
                 #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
