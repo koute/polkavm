@@ -16,6 +16,19 @@ BUILD_CKBVM=0
 BUILD_NATIVE_X86_64=0
 BUILD_NATIVE_X86=0
 
+if [ "${BUILD_BENCHMARKS_INSTALL_ALL_TOOLCHAINS:-}" == "1" ]; then
+    rustup run $TOOLCHAIN_VERSION rustup target add wasm32-unknown-unknown
+    rustup run $TOOLCHAIN_VERSION rustup target add riscv64imac-unknown-none-elf
+    if [ ! -d "/tmp/solana-platform-tools-1.39" ]; then
+        echo "Downloading Solana platform tools..."
+        curl -Lo /tmp/platform-tools-linux-x86_64-1.39.tar.bz2 'https://github.com/anza-xyz/platform-tools/releases/download/v1.39/platform-tools-linux-x86_64.tar.bz2'
+        mkdir -p /tmp/solana-platform-tools-1.39
+        tar -C /tmp/solana-platform-tools-1.39 -xf /tmp/platform-tools-linux-x86_64-1.39.tar.bz2
+    fi
+
+    export SOLANA_PLATFORM_TOOLS_DIR='/tmp/solana-platform-tools-1.39'
+fi
+
 if [[ "$(rustup toolchain list)" =~ "$TOOLCHAIN_VERSION" ]]; then
     if [[ "$(rustup run $TOOLCHAIN_VERSION rustup target list --installed)" =~ "wasm32-unknown-unknown" ]]; then
         BUILD_WASM=1
