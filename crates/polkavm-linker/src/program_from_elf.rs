@@ -6469,7 +6469,9 @@ pub fn program_from_elf(config: Config, data: &[u8]) -> Result<ProgramBlob, Prog
     }
 
     if sections_code.is_empty() {
-        return Err(ProgramFromElfError::other("missing '.text' section"));
+        return Err(ProgramFromElfError::other(
+            "the program contains no code (linking empty programs is not supported!)",
+        ));
     }
 
     let section_regspill = elf.add_empty_data_section(".regspill");
