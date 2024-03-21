@@ -98,7 +98,7 @@ NAME_MAP = {
 }
 
 if File.exist?("target/criterion/commit.txt")
-    commit = `git rev-parse HEAD`.strip
+    commit = File.read("target/criterion/commit.txt")
     commit_known = true
 else
     commit = "master"
