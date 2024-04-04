@@ -649,8 +649,8 @@ unsafe fn child_main(zygote_memfd: Fd, child_socket: Fd, uid_map: &str, gid_map:
     if !cfg!(polkavm_dev_debug_zygote) {
         // Hide the host filesystem.
         let mount_flags = linux_raw::MS_REC | linux_raw::MS_NODEV | linux_raw::MS_NOEXEC | linux_raw::MS_NOSUID | linux_raw::MS_RDONLY;
-        linux_raw::sys_mount(cstr!("none"), cstr!("/mnt"), cstr!("tmpfs"), mount_flags, Some(cstr!("size=0")))?;
-        linux_raw::sys_chdir(cstr!("/mnt"))?;
+        linux_raw::sys_mount(cstr!("none"), cstr!("/tmp"), cstr!("tmpfs"), mount_flags, Some(cstr!("size=0")))?;
+        linux_raw::sys_chdir(cstr!("/tmp"))?;
         linux_raw::sys_pivot_root(cstr!("."), cstr!("."))?;
         linux_raw::sys_umount2(cstr!("."), linux_raw::MNT_DETACH)?;
     }
