@@ -79,10 +79,118 @@ impl<'a> InterpreterContext<'a> {
     }
 }
 
-pub(crate) struct InterpretedInstance {
-    module: Module,
+pub(crate) struct BasicMemory {
     rw_data: Vec<u8>,
     stack: Vec<u8>,
+    is_memory_dirty: bool,
+    heap_size: u32,
+}
+
+impl BasicMemory {
+    fn new() -> Self {
+        Self {
+            rw_data: Vec::new(),
+            stack: Vec::new(),
+            is_memory_dirty: false,
+            heap_size: 0,
+        }
+    }
+
+    fn new_reusing(memory: &mut BasicMemory) -> Self {
+        let mut new_memory = Self::new();
+        memory.rw_data.clear();
+        memory.stack.clear();
+        new_memory.rw_data = core::mem::take(&mut memory.rw_data);
+        new_memory.stack = core::mem::take(&mut memory.stack);
+        new_memory
+    }
+
+    fn heap_size(&self) -> u32 {
+        self.heap_size
+    }
+
+    fn mark_dirty(&mut self) {
+        self.is_memory_dirty = true;
+    }
+
+    fn reset(&mut self, module: &Module) {
+        if self.is_memory_dirty {
+            self.force_reset(module);
+        }
+    }
+
+    fn force_reset(&mut self, module: &Module) {
+        self.rw_data.clear();
+        self.stack.clear();
+        self.heap_size = 0;
+        self.is_memory_dirty = false;
+
+        if let Some(interpreted_module) = module.interpreted_module().as_ref() {
+            self.rw_data.extend_from_slice(&interpreted_module.rw_data);
+            self.rw_data.resize(module.memory_map().rw_data_size() as usize, 0);
+            self.stack.resize(module.memory_map().stack_size() as usize, 0);
+        }
+    }
+
+    #[inline]
+    fn get_memory_slice<'a>(&'a self, module: &'a Module, address: u32, length: u32) -> Option<&'a [u8]> {
+        let memory_map = module.memory_map();
+        let (start, memory_slice) = if address >= memory_map.stack_address_low() {
+            (memory_map.stack_address_low(), &self.stack)
+        } else if address >= memory_map.rw_data_address() {
+            (memory_map.rw_data_address(), &self.rw_data)
+        } else if address >= memory_map.ro_data_address() {
+            let module = module.interpreted_module().unwrap();
+            (memory_map.ro_data_address(), &module.ro_data)
+        } else {
+            return None;
+        };
+
+        let offset = address - start;
+        memory_slice.get(offset as usize..offset as usize + length as usize)
+    }
+
+    #[inline]
+    fn get_memory_slice_mut(&mut self, module: &Module, address: u32, length: u32) -> Option<&mut [u8]> {
+        let memory_map = module.memory_map();
+        let (start, memory_slice) = if address >= memory_map.stack_address_low() {
+            (memory_map.stack_address_low(), &mut self.stack)
+        } else if address >= memory_map.rw_data_address() {
+            (memory_map.rw_data_address(), &mut self.rw_data)
+        } else {
+            return None;
+        };
+
+        self.is_memory_dirty = true;
+        let offset = (address - start) as usize;
+        memory_slice.get_mut(offset..offset + length as usize)
+    }
+
+    fn sbrk(&mut self, module: &Module, size: u32) -> Option<u32> {
+        let new_heap_size = self.heap_size.checked_add(size)?;
+        let memory_map = module.memory_map();
+        if new_heap_size > memory_map.max_heap_size() {
+            return None;
+        }
+
+        log::trace!("sbrk: +{} (heap size: {} -> {})", size, self.heap_size, new_heap_size);
+
+        self.heap_size = new_heap_size;
+        let heap_top = memory_map.heap_base() + new_heap_size;
+        if heap_top as usize > memory_map.rw_data_address() as usize + self.rw_data.len() {
+            let new_size = align_to_next_page_usize(memory_map.page_size() as usize, heap_top as usize).unwrap()
+                - memory_map.rw_data_address() as usize;
+            log::trace!("sbrk: growing memory: {} -> {}", self.rw_data.len(), new_size);
+            self.rw_data.resize(new_size, 0);
+        }
+
+        Some(heap_top)
+    }
+}
+
+pub(crate) struct InterpretedInstance {
+    module: Module,
+    memory: BasicMemory,
     regs: [u32; Reg::ALL.len()],
     nth_instruction: u32,
     nth_basic_block: u32,
@@ -90,16 +198,13 @@ pub(crate) struct InterpretedInstance {
     cycle_counter: u64,
     gas_remaining: Option<i64>,
     in_new_execution: bool,
-    is_memory_dirty: bool,
-    heap_size: u32,
 }
 
 impl InterpretedInstance {
     pub fn new_from_module(module: Module) -> Self {
         let mut instance = Self {
             module,
-            rw_data: Vec::new(),
-            stack: Vec::new(),
+            memory: BasicMemory::new(),
             regs: [0; Reg::ALL.len()],
             nth_instruction: VM_ADDR_RETURN_TO_HOST,
             nth_basic_block: 0,
@@ -107,8 +212,6 @@ impl InterpretedInstance {
             cycle_counter: 0,
             gas_remaining: None,
             in_new_execution: false,
-            is_memory_dirty: false,
-            heap_size: 0,
         };
 
         instance.initialize_module();
@@ -152,7 +255,7 @@ impl InterpretedInstance {
             ExecutionError::Trap(Default::default())
         }
 
-        self.is_memory_dirty = true;
+        self.memory.mark_dirty();
 
         if self.in_new_execution {
             self.in_new_execution = false;
@@ -200,54 +303,18 @@ impl InterpretedInstance {
     }
 
     fn clear_instance(&mut self) {
-        self.rw_data.clear();
-        self.stack.clear();
-
         *self = Self {
-            rw_data: core::mem::take(&mut self.rw_data),
-            stack: core::mem::take(&mut self.stack),
+            memory: BasicMemory::new_reusing(&mut self.memory),
             ..Self::new_from_module(Module::empty())
         };
     }
 
     pub fn reset_memory(&mut self) {
-        if self.is_memory_dirty {
-            self.force_reset_memory();
-        }
-    }
-
-    fn force_reset_memory(&mut self) {
-        self.rw_data.clear();
-        self.stack.clear();
-        self.heap_size = 0;
-        self.is_memory_dirty = false;
-
-        if let Some(interpreted_module) = self.module.interpreted_module().as_ref() {
-            self.rw_data.extend_from_slice(&interpreted_module.rw_data);
-            self.rw_data.resize(self.module.memory_map().rw_data_size() as usize, 0);
-            self.stack.resize(self.module.memory_map().stack_size() as usize, 0);
-        }
+        self.memory.reset(&self.module);
     }
 
     pub fn sbrk(&mut self, size: u32) -> Option<u32> {
-        let new_heap_size = self.heap_size.checked_add(size)?;
-        let memory_map = self.module.memory_map();
-        if new_heap_size > memory_map.max_heap_size() {
-            return None;
-        }
-
-        log::trace!("sbrk: +{} (heap size: {} -> {})", size, self.heap_size, new_heap_size);
-
-        self.heap_size = new_heap_size;
-        let heap_top = memory_map.heap_base() + new_heap_size;
-        if heap_top as usize > memory_map.rw_data_address() as usize + self.rw_data.len() {
-            let new_size = align_to_next_page_usize(memory_map.page_size() as usize, heap_top as usize).unwrap()
-                - memory_map.rw_data_address() as usize;
-            log::trace!("sbrk: growing memory: {} -> {}", self.rw_data.len(), new_size);
-            self.rw_data.resize(new_size, 0);
-        }
-
-        Some(heap_top)
+        self.memory.sbrk(&self.module, size)
     }
 
     fn initialize_module(&mut self) {
@@ -255,7 +322,7 @@ impl InterpretedInstance {
             self.gas_remaining = Some(0);
         }
 
-        self.force_reset_memory();
+        self.memory.force_reset(&self.module);
     }
 
     pub fn prepare_for_execution(&mut self, args: &ExecuteArgs) {
@@ -321,37 +388,6 @@ impl InterpretedInstance {
         InterpretedAccess { instance: self }
     }
 
-    fn get_memory_slice(&self, address: u32, length: u32) -> Option<&[u8]> {
-        let memory_map = self.module.memory_map();
-        let (start, memory_slice) = if address >= memory_map.stack_address_low() {
-            (memory_map.stack_address_low(), &self.stack)
-        } else if address >= memory_map.rw_data_address() {
-            (memory_map.rw_data_address(), &self.rw_data)
-        } else if address >= memory_map.ro_data_address() {
-            let module = self.module.interpreted_module().unwrap();
-            (memory_map.ro_data_address(), &module.ro_data)
-        } else {
-            return None;
-        };
-
-        let offset = address - start;
-        memory_slice.get(offset as usize..offset as usize + length as usize)
-    }
-
-    fn get_memory_slice_mut(&mut self, address: u32, length: u32) -> Option<&mut [u8]> {
-        let memory_map = self.module.memory_map();
-        let (start, memory_slice) = if address >= memory_map.stack_address_low() {
-            (memory_map.stack_address_low(), &mut self.stack)
-        } else if address >= memory_map.rw_data_address() {
-            (memory_map.rw_data_address(), &mut self.rw_data)
-        } else {
-            return None;
-        };
-
-        let offset = (address - start) as usize;
-        memory_slice.get_mut(offset..offset + length as usize)
-    }
-
     fn on_start_new_basic_block<const DEBUG: bool>(&mut self) -> Result<(), ExecutionError> {
         if let Some(ref mut gas_remaining) = self.gas_remaining {
             let module = self.module.interpreted_module().unwrap();
@@ -407,7 +443,11 @@ impl<'a> Access<'a> for InterpretedAccess<'a> {
         T: ?Sized + AsUninitSliceMut,
     {
         let buffer: &mut [MaybeUninit<u8>] = buffer.as_uninit_slice_mut();
-        let Some(slice) = self.instance.get_memory_slice(address, buffer.len() as u32) else {
+        let Some(slice) = self
+            .instance
+            .memory
+            .get_memory_slice(&self.instance.module, address, buffer.len() as u32)
+        else {
             return Err(MemoryAccessError {
                 address,
                 length: buffer.len() as u64,
@@ -419,9 +459,11 @@ impl<'a> Access<'a> for InterpretedAccess<'a> {
     }
 
     fn write_memory(&mut self, address: u32, data: &[u8]) -> Result<(), Self::Error> {
-        self.instance.is_memory_dirty = true;
-
-        let Some(slice) = self.instance.get_memory_slice_mut(address, data.len() as u32) else {
+        let Some(slice) = self
+            .instance
+            .memory
+            .get_memory_slice_mut(&self.instance.module, address, data.len() as u32)
+        else {
             return Err(MemoryAccessError {
                 address,
                 length: data.len() as u64,
@@ -438,7 +480,7 @@ impl<'a> Access<'a> for InterpretedAccess<'a> {
     }
 
     fn heap_size(&self) -> u32 {
-        self.instance.heap_size
+        self.instance.memory.heap_size()
     }
 
     fn program_counter(&self) -> Option<u32> {
@@ -535,7 +577,7 @@ impl<'a, 'b, const DEBUG: bool> Visitor<'a, 'b, DEBUG> {
 
         let address = base.map_or(0, |base| self.inner.regs[base as usize]).wrapping_add(offset);
         let length = core::mem::size_of::<T>() as u32;
-        let Some(slice) = self.inner.get_memory_slice(address, length) else {
+        let Some(slice) = self.inner.memory.get_memory_slice(&self.inner.module, address, length) else {
             if DEBUG {
                 log::debug!(
                     "Load of {length} bytes from 0x{address:x} failed! (pc = #{pc}, cycle = {cycle})",
@@ -563,7 +605,6 @@ impl<'a, 'b, const DEBUG: bool> Visitor<'a, 'b, DEBUG> {
 
     fn store<T: StoreTy>(&mut self, src: impl IntoRegImm, base: Option<Reg>, offset: u32) -> Result<(), ExecutionError> {
         assert!(core::mem::size_of::<T>() >= 1);
-        self.inner.is_memory_dirty = true;
 
         let address = base.map_or(0, |base| self.inner.regs[base as usize]).wrapping_add(offset);
         let value = match src.into() {
@@ -585,7 +626,7 @@ impl<'a, 'b, const DEBUG: bool> Visitor<'a, 'b, DEBUG> {
         };
 
         let length = core::mem::size_of::<T>() as u32;
-        let Some(slice) = self.inner.get_memory_slice_mut(address, length) else {
+        let Some(slice) = self.inner.memory.get_memory_slice_mut(&self.inner.module, address, length) else {
             if DEBUG {
                 log::debug!(
                     "Store of {length} bytes to 0x{address:x} failed! (pc = #{pc}, cycle = {cycle})",
