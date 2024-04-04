@@ -557,6 +557,35 @@ unsafe fn initialize(mut stack: *mut usize) -> linux_raw::Fd {
     // Change the name of the process.
     linux_raw::sys_prctl_set_name(b"polkavm-sandbox\0").unwrap_or_else(|error| abort_with_error("failed to set the process name", error));
 
+    // Unmount the filesystem.
+    //
+    // Previously we did this before `execveat`ing into the zygote but for some
+    // ungodly unexplicable reason on *some* Linux distributions (but not all of them!)
+    // the `pivot_root` makes the `execveat` fail with an ENOENT error, even if we
+    // physically copy the zygote binary into the newly created filesystem and open
+    // it immediately before `execveat`ing with an `open`, and even if we also have
+    // /proc mounted in the new namespace.
+    linux_raw::sys_pivot_root(linux_raw::cstr!("."), linux_raw::cstr!("."))
+        .unwrap_or_else(|error| abort_with_error("failed to sandbox the filesystem", error));
+    linux_raw::sys_umount2(linux_raw::cstr!("."), linux_raw::MNT_DETACH)
+        .unwrap_or_else(|error| abort_with_error("failed to sandbox the filesystem", error));
+
+    linux_raw::sys_prctl_set_securebits(
+        // Make UID == 0 have no special privileges.
+        linux_raw::SECBIT_NOROOT |
+        linux_raw::SECBIT_NOROOT_LOCKED |
+        // Calling 'setuid' from/to UID == 0 doesn't change any privileges.
+        linux_raw::SECBIT_NO_SETUID_FIXUP |
+        linux_raw::SECBIT_NO_SETUID_FIXUP_LOCKED |
+        // The process cannot add capabilities to its ambient set.
+        linux_raw::SECBIT_NO_CAP_AMBIENT_RAISE |
+        linux_raw::SECBIT_NO_CAP_AMBIENT_RAISE_LOCKED,
+    )
+    .unwrap_or_else(|error| abort_with_error("failed to sandbox the zygote", error));
+
+    // Finally, drop all capabilities.
+    linux_raw::sys_capset_drop_all().unwrap_or_else(|error| abort_with_error("failed to sandbox the zygote", error));
+
     const SECCOMP_FILTER: &[linux_raw::sock_filter] = &linux_raw::bpf! {
         (a = syscall_nr),
         (if a == linux_raw::SYS_futex => jump @1),
