@@ -9,7 +9,6 @@ pub struct Instance {
     instance: polkavm::Instance<()>,
 }
 
-#[cfg(target_arch = "x86_64")]
 impl Backend for PolkaVM {
     type Engine = polkavm::Engine;
     type Blob = Vec<u8>;

@@ -32,7 +32,6 @@ pub trait Backend: Copy + Clone {
     }
 }
 
-#[cfg(target_arch = "x86_64")]
 mod backend_polkavm;
 
 #[cfg(all(feature = "pvf-executor", target_arch = "x86_64"))]
@@ -227,14 +226,13 @@ macro_rules! define_backends {
 }
 
 define_backends! {
-    #[cfg(target_arch = "x86_64")]
-    PolkaVM_Compiler_NoGas => backend_polkavm::PolkaVM(polkavm::BackendKind::Compiler, None),
-    #[cfg(target_arch = "x86_64")]
-    PolkaVM_Compiler_AsyncGas => backend_polkavm::PolkaVM(polkavm::BackendKind::Compiler, Some(polkavm::GasMeteringKind::Async)),
-    #[cfg(target_arch = "x86_64")]
-    PolkaVM_Compiler_SyncGas => backend_polkavm::PolkaVM(polkavm::BackendKind::Compiler, Some(polkavm::GasMeteringKind::Sync)),
-
     #[cfg(not(dummy))] // A dummy cfg since the macro requires it.
+    PolkaVM_Compiler_NoGas => backend_polkavm::PolkaVM(polkavm::BackendKind::Compiler, None),
+    #[cfg(not(dummy))]
+    PolkaVM_Compiler_AsyncGas => backend_polkavm::PolkaVM(polkavm::BackendKind::Compiler, Some(polkavm::GasMeteringKind::Async)),
+    #[cfg(not(dummy))]
+    PolkaVM_Compiler_SyncGas => backend_polkavm::PolkaVM(polkavm::BackendKind::Compiler, Some(polkavm::GasMeteringKind::Sync)),
+    #[cfg(not(dummy))]
     PolkaVM_Interpreter => backend_polkavm::PolkaVM(polkavm::BackendKind::Interpreter, None),
 
     #[cfg(all(feature = "wasmtime", any(target_arch = "x86_64", target_arch = "aarch64")))]
@@ -290,7 +288,6 @@ impl BenchmarkKind {
         let mut output = Vec::new();
         match self {
             BenchmarkKind::PolkaVM => {
-                #[cfg(target_arch = "x86_64")]
                 if polkavm::BackendKind::Compiler.is_supported() {
                     output.extend([
                         BackendKind::PolkaVM_Compiler_NoGas,
