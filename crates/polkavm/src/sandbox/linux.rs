@@ -651,8 +651,6 @@ unsafe fn child_main(zygote_memfd: Fd, child_socket: Fd, uid_map: &str, gid_map:
         let mount_flags = linux_raw::MS_REC | linux_raw::MS_NODEV | linux_raw::MS_NOEXEC | linux_raw::MS_NOSUID | linux_raw::MS_RDONLY;
         linux_raw::sys_mount(cstr!("none"), cstr!("/tmp"), cstr!("tmpfs"), mount_flags, Some(cstr!("size=0")))?;
         linux_raw::sys_chdir(cstr!("/tmp"))?;
-        linux_raw::sys_pivot_root(cstr!("."), cstr!("."))?;
-        linux_raw::sys_umount2(cstr!("."), linux_raw::MNT_DETACH)?;
     }
 
     // Clear all of our ambient capabilities.
@@ -660,20 +658,6 @@ unsafe fn child_main(zygote_memfd: Fd, child_socket: Fd, uid_map: &str, gid_map:
 
     // Flag ourselves that we won't ever want to acquire any new privileges.
     linux_raw::sys_prctl_set_no_new_privs()?;
-
-    if !cfg!(polkavm_dev_debug_zygote) {
-        linux_raw::sys_prctl_set_securebits(
-            // Make UID == 0 have no special privileges.
-            linux_raw::SECBIT_NOROOT |
-            linux_raw::SECBIT_NOROOT_LOCKED |
-            // Calling 'setuid' from/to UID == 0 doesn't change any privileges.
-            linux_raw::SECBIT_NO_SETUID_FIXUP |
-            linux_raw::SECBIT_NO_SETUID_FIXUP_LOCKED |
-            // The process cannot add capabilities to its ambient set.
-            linux_raw::SECBIT_NO_CAP_AMBIENT_RAISE |
-            linux_raw::SECBIT_NO_CAP_AMBIENT_RAISE_LOCKED,
-        )?;
-    }
 
     // Set resource limits.
     let max_memory = 8 * 1024 * 1024 * 1024;
@@ -698,9 +682,6 @@ unsafe fn child_main(zygote_memfd: Fd, child_socket: Fd, uid_map: &str, gid_map:
     linux_raw::sys_setrlimit(linux_raw::RLIMIT_LOCKS, &linux_raw::rlimit { rlim_cur: 0, rlim_max: 0 })?;
     linux_raw::sys_setrlimit(linux_raw::RLIMIT_MEMLOCK, &linux_raw::rlimit { rlim_cur: 0, rlim_max: 0 })?;
     linux_raw::sys_setrlimit(linux_raw::RLIMIT_MSGQUEUE, &linux_raw::rlimit { rlim_cur: 0, rlim_max: 0 })?;
-
-    // Finally, drop all capabilities.
-    linux_raw::sys_capset_drop_all()?;
 
     if cfg!(polkavm_dev_debug_zygote) {
         let pid = linux_raw::sys_getpid()?;
