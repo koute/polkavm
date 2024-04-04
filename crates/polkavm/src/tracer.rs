@@ -30,7 +30,7 @@ impl Tracer {
             program_counter_history: [!0; 8],
             program_counter_history_position: 0,
             crosscheck_interpreter: if module.compiled_module().is_some() {
-                InterpretedInstance::new_from_module(module).ok()
+                Some(InterpretedInstance::new_from_module(module.clone()))
             } else {
                 None
             },

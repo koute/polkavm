@@ -157,6 +157,27 @@ struct ModulePrivate {
     gas_metering: Option<GasMeteringKind>,
 }
 
+impl ModulePrivate {
+    fn empty() -> Self {
+        ModulePrivate {
+            debug_trace_execution: false,
+            exports: Default::default(),
+            imports: Default::default(),
+            export_index_by_symbol: Default::default(),
+
+            instruction_by_basic_block: Default::default(),
+            jump_table_index_by_basic_block: Default::default(),
+            basic_block_by_jump_table_index: Default::default(),
+
+            blob: Default::default(),
+            compiled_module: CompiledModuleKind::Unavailable,
+            interpreted_module: None,
+            memory_map: MemoryMap::empty(),
+            gas_metering: None,
+        }
+    }
+}
+
 /// A compiled PolkaVM program module.
 #[derive(Clone)]
 pub struct Module(Arc<ModulePrivate>);
@@ -942,6 +963,10 @@ where
 }
 
 impl Module {
+    pub(crate) fn empty() -> Self {
+        Module(Arc::new(ModulePrivate::empty()))
+    }
+
     pub(crate) fn is_debug_trace_execution_enabled(&self) -> bool {
         self.0.debug_trace_execution
     }
@@ -1980,7 +2005,7 @@ impl<T> InstancePre<T> {
 
         let backend = match backend {
             Some(backend) => backend,
-            None => InstanceBackend::Interpreted(InterpretedInstance::new_from_module(&self.0.module)?),
+            None => InstanceBackend::Interpreted(InterpretedInstance::new_from_module(self.0.module.clone())),
         };
 
         let tracer = if self.0.module.0.debug_trace_execution {
