@@ -266,14 +266,14 @@ impl ModuleConfig {
     /// Creates a new default module configuration.
     pub fn new() -> Self {
         ModuleConfig {
-            page_size: 0x4000,
+            page_size: 0x1000,
             gas_metering: None,
         }
     }
 
     /// Sets the page size used for the module.
     ///
-    /// Default: `16384` (16k)
+    /// Default: `4096` (4k)
     pub fn set_page_size(&mut self, page_size: u32) -> &mut Self {
         self.page_size = page_size;
         self

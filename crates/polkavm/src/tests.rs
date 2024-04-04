@@ -281,7 +281,9 @@ fn doom(config: Config, elf: &'static [u8]) {
     let _ = env_logger::try_init();
     let blob = get_blob(elf);
     let engine = Engine::new(&config).unwrap();
-    let module = Module::from_blob(&engine, &Default::default(), &blob).unwrap();
+    let mut module_config = ModuleConfig::default();
+    module_config.set_page_size(16 * 1024); // TODO: Also test with other page sizes.
+    let module = Module::from_blob(&engine, &module_config, &blob).unwrap();
     let mut linker = Linker::new(&engine);
 
     struct State {
