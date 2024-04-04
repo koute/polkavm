@@ -17,10 +17,10 @@ libloading = { version = "0.8.1", optional = true }
 log = { workspace = true }
 object = { version = "0.32.1", default-features = false, features = ["std", "elf"], optional = true }
 wasmi = { version = "0.32.0-beta.7", optional = true }
+polkavm = { workspace = true }
 
 [target.'cfg(target_arch = "x86_64")'.dependencies]
 ckb-vm = { version = "0.24.9", features = ["asm"], optional = true }
-polkavm = { workspace = true }
 pvf-executor = { git = "https://github.com/paritytech/pvf-executor.git", rev = "d3b2bb77b783bcfaff540c2f9ade99f58a311ac3", optional = true }
 wasm3 = { git = "https://github.com/wasm3/wasm3-rs.git", rev = "df74c2a17ed8831595de43db98c406da4633e32a", features = ["build-bindgen"], optional = true }
 
