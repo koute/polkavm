@@ -1,4 +1,5 @@
 use clap::Parser;
+use core::time::Duration;
 #[cfg(feature = "criterion")]
 use criterion::*;
 use std::ffi::OsStr;
@@ -215,6 +216,7 @@ fn find_benchmarks() -> Result<Vec<Benchmark>, std::io::Error> {
     Ok(output)
 }
 
+#[derive(Copy, Clone)]
 enum BenchVariant {
     Runtime,
     Compilation,
@@ -388,6 +390,10 @@ enum Args {
         #[clap(long, short = 'i')]
         iteration_limit: Option<u64>,
 
+        /// Runs the benchmark forever, periodically outputing the measurements.
+        #[clap(long)]
+        forever: bool,
+
         filter: Option<String>,
     },
 
@@ -443,7 +449,11 @@ fn main() {
             criterion_main(&mut criterion, &benches);
             criterion.final_summary();
         }
-        Args::Benchmark { iteration_limit, filter } => {
+        Args::Benchmark {
+            iteration_limit,
+            filter,
+            forever,
+        } => {
             let mut list = Vec::new();
             let benches = find_benchmarks().unwrap();
             for bench in &benches {
@@ -464,41 +474,107 @@ fn main() {
                 }
             }
 
-            for (name, variant, bench, backend) in list {
-                use std::io::Write;
-                let _ = write!(&mut std::io::stdout(), "{name}: ...");
-                let _ = std::io::stdout().flush();
+            struct Stats {
+                min: Duration,
+                max: Duration,
+                sum: Duration,
+                count: u32,
+                samples: Vec<Duration>,
+            }
 
-                let elapsed = match variant {
-                    BenchVariant::Runtime => {
-                        let (outer_count, inner_count) = if backend.is_slow() {
-                            (iteration_limit.unwrap_or(1), SLOW_INNER_COUNT)
+            let mut stats_for_bench = Vec::new();
+            loop {
+                let is_initial_run = stats_for_bench.is_empty();
+                for (nth_bench, &(ref name, variant, bench, backend)) in list.iter().enumerate() {
+                    use std::io::Write;
+                    let _ = write!(&mut std::io::stdout(), "{name}: ...");
+                    let _ = std::io::stdout().flush();
+
+                    let elapsed = match variant {
+                        BenchVariant::Runtime => {
+                            let (outer_count, inner_count) = if backend.is_slow() {
+                                (iteration_limit.unwrap_or(1), SLOW_INNER_COUNT)
+                            } else {
+                                (iteration_limit.unwrap_or(12), FAST_INNER_COUNT)
+                            };
+                            benchmark_execution(outer_count, inner_count, backend, &bench.path) / outer_count as u32
+                        }
+                        BenchVariant::Compilation => {
+                            let count = if cfg!(miri) { 1 } else { iteration_limit.unwrap_or(128) };
+                            benchmark_compilation(count, backend, &bench.path) / count as u32
+                        }
+                        BenchVariant::Oneshot => {
+                            let count = iteration_limit.unwrap_or(10);
+                            benchmark_oneshot(count, backend, &bench.path) / count as u32
+                        }
+                    };
+
+                    if is_initial_run {
+                        let mut samples = vec![elapsed];
+                        samples.reserve(100);
+                        stats_for_bench.push(Stats {
+                            min: elapsed,
+                            max: elapsed,
+                            sum: elapsed,
+                            count: 1,
+                            samples,
+                        });
+                    } else {
+                        stats_for_bench[nth_bench].min = core::cmp::min(stats_for_bench[nth_bench].min, elapsed);
+                        stats_for_bench[nth_bench].max = core::cmp::max(stats_for_bench[nth_bench].max, elapsed);
+                        stats_for_bench[nth_bench].sum += elapsed;
+                        stats_for_bench[nth_bench].count += 1;
+                        stats_for_bench[nth_bench].samples.push(elapsed);
+                        while stats_for_bench[nth_bench].samples.len() > 100 {
+                            stats_for_bench[nth_bench].samples.pop();
+                        }
+                        stats_for_bench[nth_bench].samples.sort_unstable();
+                    }
+
+                    fn format_time(elapsed: Duration) -> String {
+                        let s = elapsed.as_secs_f64();
+                        if elapsed.as_secs() > 0 {
+                            format!("{:.03}s", s)
+                        } else if elapsed.as_millis() > 9 {
+                            format!("{:.02}ms", s * 1000.0)
+                        } else if elapsed.as_micros() > 0 {
+                            format!("{:.02}us", s * 1000000.0)
                         } else {
-                            (iteration_limit.unwrap_or(12), FAST_INNER_COUNT)
-                        };
-                        benchmark_execution(outer_count, inner_count, backend, &bench.path) / outer_count as u32
+                            format!("{}ns", elapsed.as_nanos())
+                        }
                     }
-                    BenchVariant::Compilation => {
-                        let count = if cfg!(miri) { 1 } else { iteration_limit.unwrap_or(128) };
-                        benchmark_compilation(count, backend, &bench.path) / count as u32
-                    }
-                    BenchVariant::Oneshot => {
-                        let count = iteration_limit.unwrap_or(10);
-                        benchmark_oneshot(count, backend, &bench.path) / count as u32
-                    }
-                };
 
-                let elapsed = if elapsed.as_secs() > 0 {
-                    format!("{:.03}s", elapsed.as_secs_f64())
-                } else if elapsed.as_millis() > 9 {
-                    format!("{}ms", elapsed.as_millis())
-                } else if elapsed.as_micros() > 0 {
-                    format!("{}us", elapsed.as_micros())
-                } else {
-                    format!("{}ns", elapsed.as_nanos())
-                };
+                    fn median(xs: &[Duration]) -> Duration {
+                        if xs.len() % 2 == 1 {
+                            xs[xs.len() / 2]
+                        } else {
+                            let mid_right = xs.len() / 2;
+                            let mid_left = mid_right - 1;
+                            (xs[mid_left] + xs[mid_right]) / 2
+                        }
+                    }
 
-                let _ = writeln!(&mut std::io::stdout(), "\r{name}: {elapsed}");
+                    if is_initial_run {
+                        let _ = writeln!(&mut std::io::stdout(), "\r{name}: {}", format_time(elapsed));
+                    } else {
+                        let stats = &stats_for_bench[nth_bench];
+                        let avg = stats.sum / stats.count;
+                        let med = median(&stats.samples);
+                        let _ = writeln!(
+                            &mut std::io::stdout(),
+                            "\r{name}: {} (min={} max={} avg={} med={})",
+                            format_time(elapsed),
+                            format_time(stats.min),
+                            format_time(stats.max),
+                            format_time(avg),
+                            format_time(med)
+                        );
+                    }
+                }
+
+                if !forever {
+                    break;
+                }
             }
         }
         #[cfg(target_os = "linux")]
