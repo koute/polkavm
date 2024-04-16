@@ -1,5 +1,5 @@
 use core::mem::MaybeUninit;
-use polkavm::{Caller, Config, Engine, ExecutionError, Instance, Linker, Module, ProgramBlob, Trap};
+use polkavm::{Caller, Config, Engine, ExecutionError, Instance, Linker, Module, ModuleConfig, ProgramBlob, Trap};
 
 struct State {
     rom: Vec<u8>,
@@ -20,7 +20,9 @@ impl Vm {
     pub fn from_blob(blob: ProgramBlob) -> Result<Self, polkavm::Error> {
         let config = Config::from_env()?;
         let engine = Engine::new(&config)?;
-        let module = Module::from_blob(&engine, &Default::default(), &blob)?;
+        let mut module_config = ModuleConfig::new();
+        module_config.set_page_size(0x4000);
+        let module = Module::from_blob(&engine, &module_config, &blob)?;
         let mut linker = Linker::new(&engine);
 
         linker.func_wrap(
