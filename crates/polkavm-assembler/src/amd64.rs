@@ -1588,6 +1588,12 @@ pub mod inst {
             None,
             (fmt.write_str("cdq")),
 
+        // https://www.felixcloutier.com/x86/bswap
+        bswap(RegSize, Reg) =>
+            Inst::with_reg_in_op(0xc8, self.1).op_alt().rex_64b_if(matches!(self.0, RegSize::R64)).encode(),
+            None,
+            (fmt.write_fmt(core::format_args!("bswap {}", self.1.name_from(self.0)))),
+
         // https://www.felixcloutier.com/x86/setcc
         setcc(Condition, RegMem) =>
             {
@@ -2214,6 +2220,7 @@ mod tests {
     generate_tests! {
         add,
         and,
+        bswap,
         bts,
         call_rel32,
         call,
