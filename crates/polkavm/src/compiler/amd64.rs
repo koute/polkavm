@@ -717,6 +717,17 @@ impl<'a> InstructionVisitor for VisitorWrapper<'a, Compiler<'a>> {
     }
 
     #[inline(always)]
+    fn bswap(&mut self, dst: Reg, src: Reg) -> Self::ReturnTy {
+        let dst = conv_reg(dst);
+        let src = conv_reg(src);
+        if dst != src {
+            self.push(mov(RegSize::R32, dst, src));
+        }
+
+        self.push(bswap(RegSize::R32, dst));
+    }
+
+    #[inline(always)]
     fn ecalli(&mut self, imm: u32) -> Self::ReturnTy {
         let ecall_label = self.ecall_label;
         self.push(mov_imm(TMP_REG, imm32(imm)));

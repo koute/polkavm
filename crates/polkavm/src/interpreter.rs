@@ -817,6 +817,13 @@ impl<'a, 'b, const DEBUG: bool> InstructionVisitor for Visitor<'a, 'b, DEBUG> {
         Ok(())
     }
 
+    fn bswap(&mut self, dst: Reg, src: Reg) -> Self::ReturnTy {
+        let value = self.get(src).swap_bytes();
+        self.set(dst, value)?;
+        self.inner.nth_instruction += 1;
+        Ok(())
+    }
+
     fn ecalli(&mut self, imm: u32) -> Self::ReturnTy {
         if let Some(on_hostcall) = self.ctx.on_hostcall.as_mut() {
             let access = BackendAccess::Interpreted(self.inner.access());

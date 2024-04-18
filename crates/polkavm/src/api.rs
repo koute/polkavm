@@ -361,6 +361,13 @@ where
     }
 
     #[inline(always)]
+    fn bswap(&mut self, d: Reg, s: Reg) -> Self::ReturnTy {
+        self.0.before_instruction();
+        self.0.bswap(d, s);
+        Ok(())
+    }
+
+    #[inline(always)]
     fn ecalli(&mut self, imm: u32) -> Self::ReturnTy {
         if self.imports.get(imm as usize).is_none() {
             #[cold]

@@ -269,6 +269,10 @@ pub enum Inst {
         src: Reg,
         cond: Reg,
     },
+    Rev8 {
+        dst: Reg,
+        src: Reg,
+    },
 }
 
 #[derive(Copy, Clone, PartialEq, Eq, Debug, Hash)]
@@ -515,6 +519,10 @@ impl Inst {
                         imm: bits(0, 4, op, 20) as i32,
                     })
                 }
+                0b101 if op >> 20 == 0b011010011000 => Some(Inst::Rev8 {
+                    dst: Reg::decode(op >> 7),
+                    src: Reg::decode(op >> 15),
+                }),
                 0b101 => {
                     let kind = match (op & 0xfe000000) >> 24 {
                         0b00000000 => RegImmKind::ShiftLogicalRight,
@@ -836,6 +844,9 @@ impl Inst {
                     | ((kind as u32) << 25)
                     | (1 << 30),
             ),
+            Inst::Rev8 { dst, src } => {
+                Some(0b0010011 | (0b101 << 12) | ((dst as u32) << 7) | ((src as u32) << 15) | (0b011010011000 << 20))
+            }
         }
     }
 }
