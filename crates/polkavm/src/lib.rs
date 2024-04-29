@@ -44,6 +44,7 @@ mod error;
 mod api;
 mod caller;
 mod config;
+mod gas;
 mod interpreter;
 mod source_cache;
 mod tracer;

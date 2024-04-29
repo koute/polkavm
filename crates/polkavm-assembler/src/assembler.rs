@@ -1,12 +1,12 @@
 use alloc::vec::Vec;
+use core::num::NonZeroU32;
 
 #[derive(Copy, Clone)]
 struct Fixup {
     target_label: Label,
     instruction_offset: usize,
     instruction_length: u8,
-    fixup_offset: u8,
-    fixup_length: u8,
+    kind: FixupKind,
 }
 
 pub struct Assembler {
@@ -59,6 +59,10 @@ impl Assembler {
         }
     }
 
+    pub fn origin(&self) -> u64 {
+        self.origin
+    }
+
     pub fn set_origin(&mut self, origin: u64) {
         self.origin = origin;
     }
@@ -70,22 +74,22 @@ impl Assembler {
     pub fn forward_declare_label(&mut self) -> Label {
         let label = self.labels.len() as u32;
         self.labels.push(isize::MAX);
-        Label(label)
+        Label::from_raw(label)
     }
 
     pub fn create_label(&mut self) -> Label {
         let label = self.labels.len() as u32;
         self.labels.push(self.code.len() as isize);
-        Label(label)
+        Label::from_raw(label)
     }
 
     pub fn define_label(&mut self, label: Label) -> &mut Self {
         assert_eq!(
-            self.labels[label.0 as usize],
+            self.labels[label.raw() as usize],
             isize::MAX,
             "tried to redefine an already defined label"
         );
-        self.labels[label.0 as usize] = self.code.len() as isize;
+        self.labels[label.raw() as usize] = self.code.len() as isize;
         self
     }
 
@@ -99,7 +103,7 @@ impl Assembler {
 
     #[inline]
     pub fn get_label_origin_offset(&self, label: Label) -> Option<isize> {
-        let offset = self.labels[label.0 as usize];
+        let offset = self.labels[label.raw() as usize];
         if offset == isize::MAX {
             None
         } else {
@@ -113,35 +117,25 @@ impl Assembler {
     }
 
     pub fn set_label_origin_offset(&mut self, label: Label, offset: isize) {
-        self.labels[label.0 as usize] = offset;
+        self.labels[label.raw() as usize] = offset;
     }
 
     #[inline(always)]
-    fn add_fixup(
-        &mut self,
-        instruction_offset: usize,
-        instruction_length: usize,
-        InstFixup {
-            target_label,
-            fixup_offset,
-            fixup_length,
-        }: InstFixup,
-    ) {
-        debug_assert!((target_label.0 as usize) < self.labels.len());
+    fn add_fixup(&mut self, instruction_offset: usize, instruction_length: usize, target_label: Label, kind: FixupKind) {
+        debug_assert!((target_label.raw() as usize) < self.labels.len());
         debug_assert!(
-            (fixup_offset as usize) < instruction_length,
+            (kind.offset() as usize) < instruction_length,
             "instruction is {} bytes long and yet its target fixup starts at {}",
             instruction_length,
-            fixup_offset
+            kind.offset()
         );
-        debug_assert!((fixup_length as usize) < instruction_length);
-        debug_assert!((fixup_offset as usize + fixup_length as usize) <= instruction_length);
+        debug_assert!((kind.length() as usize) < instruction_length);
+        debug_assert!((kind.offset() as usize + kind.length() as usize) <= instruction_length);
         self.fixups.push(Fixup {
             target_label,
             instruction_offset,
             instruction_length: instruction_length as u8,
-            fixup_offset,
-            fixup_length,
+            kind,
         });
     }
 
@@ -172,8 +166,8 @@ impl Assembler {
         }
         self.guaranteed_capacity -= 1;
 
-        if let Some(fixup) = instruction.fixup {
-            self.add_fixup(instruction_offset, instruction.bytes.len(), fixup);
+        if let Some((label, fixup)) = instruction.fixup {
+            self.add_fixup(instruction_offset, instruction.bytes.len(), label, fixup);
         }
 
         self
@@ -187,16 +181,34 @@ impl Assembler {
     pub fn finalize(&mut self) -> AssembledCode {
         for fixup in self.fixups.drain(..) {
             let origin = fixup.instruction_offset + fixup.instruction_length as usize;
-            let target_absolute = self.labels[fixup.target_label.0 as usize];
-            assert_ne!(target_absolute, isize::MAX);
+            let target_absolute = self.labels[fixup.target_label.raw() as usize];
+            if target_absolute == isize::MAX {
+                log::trace!("Undefined label found: {}", fixup.target_label);
+                continue;
+            }
+
+            let opcode = (fixup.kind.0 << 8) >> 8;
+            let fixup_offset = fixup.kind.offset();
+            let fixup_length = fixup.kind.length();
+
+            if fixup_offset >= 1 {
+                self.code[fixup.instruction_offset] = opcode as u8;
+                if fixup_offset >= 2 {
+                    self.code[fixup.instruction_offset + 1] = (opcode >> 8) as u8;
+                    if fixup_offset >= 3 {
+                        self.code[fixup.instruction_offset + 2] = (opcode >> 16) as u8;
+                    }
+                }
+            }
+
             let offset = target_absolute - origin as isize;
-            let p = fixup.instruction_offset + fixup.fixup_offset as usize;
-            if fixup.fixup_length == 1 {
+            let p = fixup.instruction_offset + fixup_offset as usize;
+            if fixup_length == 1 {
                 if offset > i8::MAX as isize || offset < i8::MIN as isize {
                     panic!("out of range jump");
                 }
                 self.code[p] = offset as i8 as u8;
-            } else if fixup.fixup_length == 4 {
+            } else if fixup_length == 4 {
                 if offset > i32::MAX as isize || offset < i32::MIN as isize {
                     panic!("out of range jump");
                 }
@@ -251,7 +263,19 @@ impl Assembler {
 
 #[derive(Copy, Clone, PartialEq, Eq, Debug)]
 #[repr(transparent)]
-pub struct Label(u32);
+pub struct Label(NonZeroU32);
+
+impl Label {
+    #[inline]
+    pub fn raw(self) -> u32 {
+        self.0.get() - 1
+    }
+
+    #[inline]
+    pub fn from_raw(value: u32) -> Self {
+        Label(NonZeroU32::new(value + 1).unwrap())
+    }
+}
 
 impl core::fmt::Display for Label {
     fn fmt(&self, fmt: &mut core::fmt::Formatter) -> core::fmt::Result {
@@ -260,10 +284,43 @@ impl core::fmt::Display for Label {
 }
 
 #[derive(Copy, Clone)]
+#[repr(transparent)]
+pub(crate) struct FixupKind(u32);
+
+impl FixupKind {
+    #[inline]
+    const fn offset(self) -> u32 {
+        (self.0 >> 24) & 0b11
+    }
+
+    #[inline]
+    const fn length(self) -> u32 {
+        self.0 >> 28
+    }
+
+    #[inline]
+    pub const fn new_1(opcode: u32, length: u32) -> Self {
+        FixupKind((1 << 24) | (length << 28) | opcode)
+    }
+
+    #[inline]
+    pub const fn new_2(opcode: [u32; 2], length: u32) -> Self {
+        let opcode = opcode[0] | (opcode[1] << 8);
+        FixupKind((2 << 24) | (length << 28) | opcode)
+    }
+
+    #[inline]
+    pub const fn new_3(opcode: [u32; 3], length: u32) -> Self {
+        let opcode = opcode[0] | (opcode[1] << 8) | (opcode[2] << 16);
+        FixupKind((3 << 24) | (length << 28) | opcode)
+    }
+}
+
+#[derive(Copy, Clone)]
 pub struct Instruction<T> {
     pub(crate) instruction: T,
     pub(crate) bytes: InstBuf,
-    pub(crate) fixup: Option<InstFixup>,
+    pub(crate) fixup: Option<(Label, FixupKind)>,
 }
 
 impl<T> core::fmt::Debug for Instruction<T>
@@ -290,13 +347,6 @@ impl<T> Instruction<T> {
     pub fn len(&self) -> usize {
         self.bytes.len()
     }
-}
-
-#[derive(Copy, Clone)]
-pub struct InstFixup {
-    pub(crate) target_label: Label,
-    pub(crate) fixup_offset: u8,
-    pub(crate) fixup_length: u8,
 }
 
 const MAXIMUM_INSTRUCTION_SIZE: usize = 16;

@@ -9,7 +9,6 @@ use std::sync::Mutex;
 
 use polkavm_common::program::asm;
 use polkavm_common::program::Reg::*;
-use polkavm_common::program::{ProgramExport, ProgramImport};
 use polkavm_common::utils::align_to_next_page_u32;
 use polkavm_common::writer::ProgramBlobBuilder;
 
@@ -91,15 +90,18 @@ fn basic_test_blob() -> ProgramBlob<'static> {
     let memory_map = MemoryMap::new(0x4000, 0, 0x4000, 0).unwrap();
     let mut builder = ProgramBlobBuilder::new();
     builder.set_rw_data_size(0x4000);
-    builder.add_export(ProgramExport::new(0, "main".into()));
-    builder.add_import(ProgramImport::new("hostcall".into()));
-    builder.set_code(&[
-        asm::store_imm_u32(0x12345678, memory_map.rw_data_address()),
-        asm::add(S0, A0, A1),
-        asm::ecalli(0),
-        asm::add(A0, A0, S0),
-        asm::ret(),
-    ]);
+    builder.add_export_by_basic_block(0, "main".into());
+    builder.add_import("hostcall".into());
+    builder.set_code(
+        &[
+            asm::store_imm_u32(0x12345678, memory_map.rw_data_address()),
+            asm::add(S0, A0, A1),
+            asm::ecalli(0),
+            asm::add(A0, A0, S0),
+            asm::ret(),
+        ],
+        &[],
+    );
     ProgramBlob::parse(builder.into_vec()).unwrap()
 }
 
@@ -657,9 +659,7 @@ fn test_blob_call_sbrk_impl(config: Config, mut call_sbrk: impl FnMut(&mut TestI
         .all(|&byte| byte == 0));
     assert_eq!(i.instance.heap_size(), 0);
 
-    log::error!("AAA");
     assert_eq!(call_sbrk(&mut i, 0), heap_base);
-    log::error!("BBB");
     assert_eq!(i.instance.heap_size(), 0);
     assert_eq!(call_sbrk(&mut i, 0), heap_base);
     assert_eq!(call_sbrk(&mut i, 1), heap_base + 1);
@@ -705,8 +705,8 @@ fn basic_gas_metering(config: Config, gas_metering_kind: GasMeteringKind) {
     let _ = env_logger::try_init();
 
     let mut builder = ProgramBlobBuilder::new();
-    builder.add_export(ProgramExport::new(0, "main".into()));
-    builder.set_code(&[asm::add_imm(A0, A0, 666), asm::ret()]);
+    builder.add_export_by_basic_block(0, "main".into());
+    builder.set_code(&[asm::add_imm(A0, A0, 666), asm::ret()], &[]);
 
     let blob = ProgramBlob::parse(builder.into_vec()).unwrap();
     let engine = Engine::new(&config).unwrap();
@@ -777,9 +777,9 @@ fn consume_gas_in_host_function(config: Config, gas_metering_kind: GasMeteringKi
     let _ = env_logger::try_init();
 
     let mut builder = ProgramBlobBuilder::new();
-    builder.add_export(ProgramExport::new(0, "main".into()));
-    builder.add_import(ProgramImport::new("hostfn".into()));
-    builder.set_code(&[asm::ecalli(0), asm::ret()]);
+    builder.add_export_by_basic_block(0, "main".into());
+    builder.add_import("hostfn".into());
+    builder.set_code(&[asm::ecalli(0), asm::ret()], &[]);
 
     let blob = ProgramBlob::parse(builder.into_vec()).unwrap();
     let engine = Engine::new(&config).unwrap();
@@ -840,15 +840,18 @@ fn gas_metering_with_more_than_one_basic_block(config: Config) {
     let _ = env_logger::try_init();
 
     let mut builder = ProgramBlobBuilder::new();
-    builder.add_export(ProgramExport::new(0, "export_1".into()));
-    builder.add_export(ProgramExport::new(1, "export_2".into()));
-    builder.set_code(&[
-        asm::add_imm(A0, A0, 666),
-        asm::ret(),
-        asm::add_imm(A0, A0, 666),
-        asm::add_imm(A0, A0, 100),
-        asm::ret(),
-    ]);
+    builder.add_export_by_basic_block(0, "export_1".into());
+    builder.add_export_by_basic_block(1, "export_2".into());
+    builder.set_code(
+        &[
+            asm::add_imm(A0, A0, 666),
+            asm::ret(),
+            asm::add_imm(A0, A0, 666),
+            asm::add_imm(A0, A0, 100),
+            asm::ret(),
+        ],
+        &[],
+    );
 
     let blob = ProgramBlob::parse(builder.into_vec()).unwrap();
     let engine = Engine::new(&config).unwrap();
@@ -885,11 +888,11 @@ fn spawn_stress_test(mut config: Config) {
     let _ = env_logger::try_init();
 
     let mut builder = ProgramBlobBuilder::new();
-    builder.add_export(ProgramExport::new(0, "main".into()));
+    builder.add_export_by_basic_block(0, "main".into());
     builder.set_ro_data_size(1);
     builder.set_rw_data_size(1);
     builder.set_ro_data(vec![0x00]);
-    builder.set_code(&[asm::ret()]);
+    builder.set_code(&[asm::ret()], &[]);
 
     let blob = ProgramBlob::parse(builder.into_vec()).unwrap();
 

@@ -5408,13 +5408,7 @@ fn emit_code(
                     Instruction::ecalli(import.metadata.index.expect("internal error: no index was assigned to an ecall"))
                 }
                 BasicInst::Sbrk { dst, size } => Instruction::sbrk(conv_reg(dst), conv_reg(size)),
-                BasicInst::Nop => {
-                    if is_optimized {
-                        unreachable!("internal error: a nop instruction was not removed")
-                    } else {
-                        continue;
-                    }
-                }
+                BasicInst::Nop => unreachable!("internal error: a nop instruction was not removed"),
             };
 
             code.push((source.clone(), op));
@@ -5438,9 +5432,17 @@ fn emit_code(
                 assert!(can_fallthrough_to_next_block.contains(block_target));
 
                 let target = get_jump_target(target)?;
-                get_jump_target(target_return)?;
+                let target_return = get_jump_target(target_return)?
+                    .dynamic_target
+                    .expect("missing jump target for address");
+                let Some(target_return) = target_return.checked_mul(VM_CODE_ADDRESS_ALIGNMENT) else {
+                    return Err(ProgramFromElfError::other("overflow when emitting an indirect call"));
+                };
 
-                code.push((block.next.source.clone(), Instruction::call(conv_reg(ra), target.static_target)));
+                code.push((
+                    block.next.source.clone(),
+                    Instruction::load_imm_and_jump(conv_reg(ra), target_return, target.static_target),
+                ));
             }
             ControlInst::JumpIndirect { base, offset } => {
                 code.push((block.next.source.clone(), Instruction::jump_indirect(conv_reg(base), offset as u32)));
@@ -5452,10 +5454,17 @@ fn emit_code(
                 target_return,
             } => {
                 assert!(can_fallthrough_to_next_block.contains(block_target));
-                get_jump_target(target_return)?;
+
+                let target_return = get_jump_target(target_return)?
+                    .dynamic_target
+                    .expect("missing jump target for address");
+                let Some(target_return) = target_return.checked_mul(VM_CODE_ADDRESS_ALIGNMENT) else {
+                    return Err(ProgramFromElfError::other("overflow when emitting an indirect call"));
+                };
+
                 code.push((
                     block.next.source.clone(),
-                    Instruction::call_indirect(conv_reg(ra), conv_reg(base), offset as u32),
+                    Instruction::load_imm_and_jump_indirect(conv_reg(ra), conv_reg(base), target_return, offset as u32),
                 ));
             }
             ControlInst::Branch {
@@ -6597,6 +6606,10 @@ pub fn program_from_elf(config: Config, data: &[u8]) -> Result<ProgramBlob, Prog
             panic!("internal error: inconsistent reachability after optimization; this is a bug, please report it!");
         }
     } else {
+        for current in (0..all_blocks.len()).map(BlockTarget::from_raw) {
+            perform_nop_elimination(&mut all_blocks, current);
+        }
+
         reachability_graph = ReachabilityGraph::default();
         for current in (0..all_blocks.len()).map(BlockTarget::from_raw) {
             let reachability = reachability_graph.for_code.entry(current).or_default();
@@ -6999,7 +7012,7 @@ pub fn program_from_elf(config: Config, data: &[u8]) -> Result<ProgramBlob, Prog
             assert_eq!(index, next_index);
             next_index += 1;
 
-            builder.add_import(polkavm_common::program::ProgramImport::new(import.metadata.symbol.into()));
+            builder.add_import(polkavm_common::program::ProgramSymbol::new(import.metadata.symbol.into()));
         }
     }
 
@@ -7011,13 +7024,8 @@ pub fn program_from_elf(config: Config, data: &[u8]) -> Result<ProgramBlob, Prog
         let jump_target = jump_target_for_block[block_target.index()]
             .expect("internal error: export metadata points to a block without a jump target assigned");
 
-        builder.add_export(polkavm_common::program::ProgramExport::new(
-            jump_target.static_target,
-            export.metadata.symbol.into(),
-        ));
+        builder.add_export_by_basic_block(jump_target.static_target, export.metadata.symbol.into());
     }
-
-    builder.set_jump_table(&jump_table);
 
     let mut locations_for_instruction: Vec<Option<Arc<[Location]>>> = Vec::with_capacity(code.len());
     let mut raw_code = Vec::with_capacity(code.len());
@@ -7085,7 +7093,7 @@ pub fn program_from_elf(config: Config, data: &[u8]) -> Result<ProgramBlob, Prog
         );
     }
 
-    builder.set_code(&raw_code);
+    builder.set_code(&raw_code, &jump_table);
 
     if !config.strip {
         emit_debug_info(&mut builder, &locations_for_instruction);

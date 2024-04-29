@@ -157,13 +157,6 @@ fn main_stats(inputs: Vec<PathBuf>) -> Result<(), String> {
     for input in inputs {
         let blob = load_blob(&input)?;
         for instruction in blob.instructions() {
-            let instruction = match instruction {
-                Ok(instruction) => instruction,
-                Err(error) => {
-                    bail!("failed to parse instruction: {error}");
-                }
-            };
-
             *map.get_mut(&instruction.opcode()).unwrap() += 1;
         }
     }
@@ -204,23 +197,24 @@ fn main_disassemble(input: PathBuf, format: DisassemblyFormat, display_gas: bool
             Err(error) => bail!("failed to compile {input:?}: {error}"),
         };
 
-        let code = match module.machine_code() {
+        let machine_code = match module.machine_code() {
             Some(code) => code.into_owned(),
             None => bail!("currently selected VM backend doesn't provide raw machine code"),
         };
 
-        let instruction_map = match module.nth_instruction_to_code_offset_map() {
+        let instruction_map = match module.code_offset_to_native_code_offset() {
             Some(map) => map.to_vec(),
             None => bail!("currently selected VM backend doesn't provide a machine code map"),
         };
 
-        let code_origin = module.machine_code_origin().unwrap_or(0);
-        Some((code_origin, code, instruction_map))
+        let machine_code_origin = module.machine_code_origin().unwrap_or(0);
+        Some((machine_code_origin, machine_code, instruction_map))
     } else {
         None
     };
 
-    let gas_cost_map = if display_gas {
+    let mut gas_cost_map = HashMap::new();
+    if display_gas {
         let mut config = match polkavm::Config::from_env() {
             Ok(config) => config,
             Err(error) => bail!("failed to fetch VM configuration from the environment: {error}"),
@@ -242,12 +236,19 @@ fn main_disassemble(input: PathBuf, format: DisassemblyFormat, display_gas: bool
             Err(error) => bail!("failed to compile {input:?}: {error}"),
         };
 
-        match module.nth_basic_block_to_gas_cost_map() {
-            Some(map) => Some(map.to_vec()),
-            None => bail!("the gas cost map is unavailable"),
+        let mut in_new_block = true;
+        for instruction in blob.instructions() {
+            if in_new_block {
+                in_new_block = false;
+                if let Some(cost) = module.gas_cost_for_code_offset(instruction.offset) {
+                    gas_cost_map.insert(instruction.offset, cost);
+                }
+            }
+
+            if instruction.starts_new_basic_block() {
+                in_new_block = true;
+            }
         }
-    } else {
-        None
     };
 
     match output {
@@ -332,93 +333,61 @@ impl AssemblyFormatter {
     }
 }
 
+#[allow(clippy::type_complexity)]
 fn disassemble_into(
     format: DisassemblyFormat,
     blob: &polkavm_linker::ProgramBlob,
-    native: Option<(u64, Vec<u8>, Vec<u32>)>,
-    gas_cost_map: Option<Vec<u32>>,
+    native: Option<(u64, Vec<u8>, Vec<(u32, u32)>)>,
+    gas_cost_map: HashMap<u32, i64>,
     mut writer: impl Write,
 ) -> Result<(), String> {
     let mut instructions = Vec::new();
-    for (nth_instruction, maybe_instruction) in blob.instructions().enumerate() {
-        let instruction = match maybe_instruction {
-            Ok(instruction) => instruction,
-            Err(error) => {
-                bail!("failed to parse instruction #{nth_instruction}: {error}");
-            }
-        };
-
-        instructions.push(instruction);
+    for instruction in blob.instructions() {
+        instructions.push((instruction.offset, instruction.kind));
     }
 
-    let mut exports_for_jump_target = HashMap::new();
+    let mut exports_for_code_offset = HashMap::new();
     for (nth_export, export) in blob.exports().enumerate() {
-        let export = match export {
-            Ok(export) => export,
-            Err(error) => {
-                bail!("failed to parse export: {error}");
-            }
-        };
-
-        exports_for_jump_target
-            .entry(export.jump_target())
+        exports_for_code_offset
+            .entry(export.target_code_offset())
             .or_insert_with(Vec::new)
             .push((nth_export, export));
     }
 
-    let mut imports = Vec::new();
-    for import in blob.imports() {
-        let import = match import {
-            Ok(import) => import,
-            Err(error) => {
-                bail!("failed to parse import: {error}");
-            }
-        };
-
-        imports.push(import);
-    }
-
     let mut jump_table_map = HashMap::new();
     let mut jump_table = Vec::new();
-    for maybe_target in blob.jump_table() {
-        let target = match maybe_target {
-            Ok(target) => target,
-            Err(error) => {
-                bail!("failed to parse the jump table: {error}");
-            }
-        };
-
+    for target_code_offset in blob.jump_table() {
         let jump_table_index = jump_table.len() + 1;
-        jump_table.push(target);
-        assert!(jump_table_map.insert(target, jump_table_index).is_none());
+        jump_table.push(target_code_offset);
+        assert!(jump_table_map.insert(target_code_offset, jump_table_index).is_none());
     }
 
-    let format_jump_target = |jump_target_counter: u32| {
+    let format_jump_target = |target_offset: u32, basic_block_counter: u32| {
         use core::fmt::Write;
 
         let mut buf = String::new();
         if !matches!(format, DisassemblyFormat::DiffFriendly) {
-            write!(&mut buf, "@{jump_target_counter:x}:").unwrap()
+            write!(&mut buf, "@{basic_block_counter}").unwrap()
         } else {
             buf.push_str("@_:");
         }
 
-        if let Some(jump_table_index) = jump_table_map.get(&jump_target_counter) {
+        if let Some(jump_table_index) = jump_table_map.get(&target_offset) {
             if !matches!(format, DisassemblyFormat::DiffFriendly) {
-                write!(&mut buf, " [@dyn {jump_table_index:x}]").unwrap()
+                write!(&mut buf, " [@dyn {jump_table_index}]").unwrap()
             } else {
                 buf.push_str(" [_]");
             }
         }
 
-        if let Some(exports) = exports_for_jump_target.get(&jump_target_counter) {
+        if let Some(exports) = exports_for_code_offset.get(&target_offset) {
             for (nth_export, export) in exports {
                 write!(&mut buf, " [export #{}: {}]", nth_export, export.symbol()).unwrap()
             }
         }
 
-        if let Some(ref map) = gas_cost_map {
-            write!(&mut buf, " (gas: {})", map[jump_target_counter as usize]).unwrap();
+        if let Some(gas_cost) = gas_cost_map.get(&target_offset) {
+            write!(&mut buf, " (gas: {})", gas_cost).unwrap();
         }
 
         buf
@@ -427,13 +396,15 @@ fn disassemble_into(
     let mut fmt = AssemblyFormatter::default();
     let mut last_line_program_entry = None;
     let mut last_full_name = String::new();
-    let mut jump_target_counter = 0;
+    let mut basic_block_counter = 0;
     let mut pending_label = true;
-    for (nth_instruction, instruction) in instructions.iter().enumerate() {
-        let instruction_s = if instruction.opcode() == polkavm_common::program::Opcode::fallthrough {
-            format_jump_target(jump_target_counter + 1)
-        } else if let polkavm_common::program::Instruction::ecalli(nth_import) = instruction {
-            format!("{instruction} // {}", imports[*nth_import as usize].symbol())
+    for (nth_instruction, (offset, instruction)) in instructions.iter().copied().enumerate() {
+        let instruction_s = if let polkavm_common::program::Instruction::ecalli(nth_import) = instruction {
+            if let Some(import) = blob.imports().get(nth_import) {
+                format!("{instruction} // {}", import)
+            } else {
+                format!("{instruction} // INVALID")
+            }
         } else {
             instruction.to_string()
         };
@@ -499,9 +470,9 @@ fn disassemble_into(
         if pending_label {
             pending_label = false;
             let result = if !matches!(format, DisassemblyFormat::DiffFriendly) {
-                writeln!(&mut writer, "      : {}", format_jump_target(jump_target_counter))
+                writeln!(&mut writer, "      : {}", format_jump_target(offset, basic_block_counter))
             } else {
-                writeln!(&mut writer, "    {}", format_jump_target(jump_target_counter))
+                writeln!(&mut writer, "    {}", format_jump_target(offset, basic_block_counter))
             };
 
             if let Err(error) = result {
@@ -532,23 +503,25 @@ fn disassemble_into(
                 bail!("failed to write to output: {error}");
             }
         } else if matches!(format, DisassemblyFormat::Guest | DisassemblyFormat::GuestAndNative) {
-            if let Err(error) = writeln!(&mut writer, "{nth_instruction:6}: {instruction_s}") {
+            if let Err(error) = writeln!(&mut writer, "{offset:6}: {instruction_s}") {
                 bail!("failed to write to output: {error}");
             }
         }
 
         if matches!(format, DisassemblyFormat::Native | DisassemblyFormat::GuestAndNative) {
-            let (code_origin, code, map) = native.as_ref().unwrap();
-            let code_position = map[nth_instruction] as usize;
-            let next_code_position = map[nth_instruction + 1] as usize;
-            let length = next_code_position - code_position;
+            let (machine_code_origin, machine_code, map) = native.as_ref().unwrap();
+            assert_eq!(offset, map[nth_instruction].0);
+
+            let machine_code_position = map[nth_instruction].1 as usize;
+            let machine_next_code_position = map[nth_instruction + 1].1 as usize;
+            let length = machine_next_code_position - machine_code_position;
             if length != 0 {
-                let code_chunk = &code[code_position..next_code_position];
+                let machine_code_chunk = &machine_code[machine_code_position..machine_next_code_position];
                 if let Err(error) = fmt.emit(
                     matches!(format, DisassemblyFormat::GuestAndNative),
-                    *code_origin,
-                    code_chunk,
-                    code_position,
+                    *machine_code_origin,
+                    machine_code_chunk,
+                    machine_code_position,
                     &mut writer,
                 ) {
                     bail!("failed to write to output: {error}");
@@ -557,10 +530,10 @@ fn disassemble_into(
         }
 
         if instruction.opcode().starts_new_basic_block() {
-            if instruction.opcode() != polkavm_common::program::Opcode::fallthrough && nth_instruction + 1 != instructions.len() {
+            if nth_instruction + 1 != instructions.len() {
                 pending_label = true;
             }
-            jump_target_counter += 1;
+            basic_block_counter += 1;
         }
     }
 
