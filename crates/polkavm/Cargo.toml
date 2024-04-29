@@ -1,6 +1,6 @@
 [package]
 name = "polkavm"
-version = "0.9.3"
+version.workspace = true
 authors.workspace = true
 license.workspace = true
 edition.workspace = true
