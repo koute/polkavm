@@ -113,15 +113,16 @@ pub const VM_COMPILER_MAXIMUM_INSTRUCTION_LENGTH: u32 = 53;
 pub const VM_COMPILER_MAXIMUM_EPILOGUE_LENGTH: u32 = 1024 * 1024;
 
 /// The maximum number of bytes the jump table can be.
-pub const VM_SANDBOX_MAXIMUM_JUMP_TABLE_SIZE: u64 = (crate::abi::VM_MAXIMUM_INSTRUCTION_COUNT as u64 + 1)
+pub const VM_SANDBOX_MAXIMUM_JUMP_TABLE_SIZE: u64 = (crate::abi::VM_MAXIMUM_JUMP_TABLE_ENTRIES as u64 + 1)
     * core::mem::size_of::<u64>() as u64
     * crate::abi::VM_CODE_ADDRESS_ALIGNMENT as u64;
 
 /// The maximum number of bytes the jump table can span in virtual memory.
 pub const VM_SANDBOX_MAXIMUM_JUMP_TABLE_VIRTUAL_SIZE: u64 = 0x100000000 * core::mem::size_of::<u64>() as u64;
 
+// TODO: Make this smaller.
 /// The maximum number of bytes the native code can be.
-pub const VM_SANDBOX_MAXIMUM_NATIVE_CODE_SIZE: u32 = 512 * 1024 * 1024 - 1;
+pub const VM_SANDBOX_MAXIMUM_NATIVE_CODE_SIZE: u32 = 2048 * 1024 * 1024 - 1;
 
 /// The memory configuration used by a given program and/or sandbox instance.
 #[derive(Clone)]
@@ -361,7 +362,7 @@ static_assert!((1 << VM_ADDR_JUMP_TABLE.trailing_zeros()) == VM_ADDR_JUMP_TABLE)
 
 static_assert!(
     VM_SANDBOX_MAXIMUM_NATIVE_CODE_SIZE
-        >= crate::abi::VM_MAXIMUM_INSTRUCTION_COUNT * VM_COMPILER_MAXIMUM_INSTRUCTION_LENGTH + VM_COMPILER_MAXIMUM_EPILOGUE_LENGTH
+        >= crate::abi::VM_MAXIMUM_CODE_SIZE * VM_COMPILER_MAXIMUM_INSTRUCTION_LENGTH + VM_COMPILER_MAXIMUM_EPILOGUE_LENGTH
 );
 static_assert!(VM_ADDR_NATIVE_CODE > 0xffffffff);
 static_assert!(VM_ADDR_VMCTX > 0xffffffff);

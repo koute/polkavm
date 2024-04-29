@@ -1,9 +1,10 @@
+use crate::abi::{VM_CODE_ADDRESS_ALIGNMENT, VM_MAXIMUM_CODE_SIZE, VM_MAXIMUM_IMPORT_COUNT, VM_MAXIMUM_JUMP_TABLE_ENTRIES};
 use crate::utils::CowBytes;
-use crate::varint::{read_varint, write_varint, MAX_VARINT_LENGTH};
+use crate::varint::{read_simple_varint_fast, read_varint, read_varint_fast, write_simple_varint, write_varint, MAX_VARINT_LENGTH};
 use core::ops::Range;
 
 #[derive(Copy, Clone, PartialEq, Eq, Debug, Hash)]
-#[repr(u8)]
+#[repr(u32)]
 pub enum Reg {
     RA = 0,
     SP = 1,
@@ -81,100 +82,227 @@ impl core::fmt::Display for Reg {
 
 #[allow(clippy::partial_pub_fields)]
 #[doc(hidden)]
-pub struct VisitorHelper<'a, T> {
+pub struct VisitorHelper<T> {
+    chunk: u128,
     pub visitor: T,
-    reader: Reader<'a>,
+    args_length: usize,
+    instruction_offset: u32,
+    opcode: u8,
 }
 
-impl<'a, T> VisitorHelper<'a, T> {
-    #[inline]
-    pub fn run<E>(
-        blob: &'a ProgramBlob<'a>,
-        visitor: T,
-        decode_table: &[fn(&mut Self) -> <T as InstructionVisitor>::ReturnTy; 256],
-    ) -> (T, <T as InstructionVisitor>::ReturnTy)
+macro_rules! skip {
+    ($chunk:expr, $count:expr) => {
+        $chunk >> ($count << 3)
+    };
+}
+
+macro_rules! read_reg {
+    ($chunk:ident) => {{
+        let reg = Reg::from_u8($chunk as u8)?;
+        (reg, skip!($chunk, 1))
+    }};
+}
+
+macro_rules! read_reg2 {
+    ($chunk:ident) => {{
+        let value = $chunk as u8;
+        let reg1 = Reg::from_u8(value & 0b1111)?;
+        let reg2 = Reg::from_u8(value >> 4)?;
+        (reg1, reg2, skip!($chunk, 1))
+    }};
+}
+
+macro_rules! read_simple_varint {
+    ($chunk:expr, $length:expr) => {{
+        let imm = read_simple_varint_fast($chunk as u32, $length as u32);
+        (imm, skip!($chunk, $length))
+    }};
+}
+
+macro_rules! read_varint {
+    ($chunk:ident) => {{
+        let (imm_length, imm) = read_varint_fast($chunk as u64)?;
+        let imm_length = imm_length as usize;
+        (imm, skip!($chunk, imm_length), imm_length)
+    }};
+}
+
+impl<T> VisitorHelper<T> {
+    #[allow(clippy::type_complexity)]
+    #[inline(never)]
+    #[cold]
+    fn step_slow(
+        &mut self,
+        code: &[u8],
+        instruction_offset: usize,
+        instruction_length: usize,
+        decode_table: &[fn(state: &mut Self) -> <T as InstructionVisitor>::ReturnTy],
+    ) -> Option<<T as InstructionVisitor>::ReturnTy>
     where
-        T: ParsingVisitor<E>,
+        T: ParsingVisitor,
     {
-        let mut state = VisitorHelper {
-            visitor,
-            reader: blob.get_section_reader(blob.code.clone()),
+        let chunk = code.get(instruction_offset..instruction_offset + instruction_length)?;
+        let opcode = chunk[0];
+        let args = &chunk[1..instruction_length];
+        let mut t: [u8; 16] = [0; 16];
+        t[..instruction_length].copy_from_slice(chunk);
+        self.chunk = u128::from_le_bytes([
+            t[0], t[1], t[2], t[3], t[4], t[5], t[6], t[7], t[8], t[9], t[10], t[11], t[12], t[13], t[14], t[15],
+        ]) >> 8;
+
+        self.opcode = opcode;
+        self.args_length = args.len();
+        self.instruction_offset = instruction_offset as u32;
+
+        self.visitor.on_pre_visit(instruction_offset, opcode);
+        Some(decode_table[opcode as usize](self))
+    }
+
+    #[allow(clippy::type_complexity)]
+    #[cfg_attr(not(debug_assertions), inline(always))]
+    fn step(
+        &mut self,
+        code: &[u8],
+        bitmask: &[u8],
+        offset: &mut usize,
+        decode_table: &[fn(state: &mut Self) -> <T as InstructionVisitor>::ReturnTy],
+    ) -> Option<<T as InstructionVisitor>::ReturnTy>
+    where
+        T: ParsingVisitor,
+    {
+        let instruction_offset = *offset;
+        let args_length = parse_bitmask(bitmask, offset)?;
+        let instruction_length = args_length + 1;
+
+        let padded_length = core::cmp::max(instruction_length, 16);
+        let Some(chunk) = code.get(instruction_offset..instruction_offset + padded_length) else {
+            return self.step_slow(code, instruction_offset, instruction_length, decode_table);
         };
 
-        let mut result = Ok(());
-        loop {
-            let Ok(opcode) = state.reader.read_byte() else { break };
-            result = state.visitor.on_pre_visit(state.reader.position - 1 - blob.code.start, opcode);
-            if result.is_err() {
-                break;
-            }
+        assert!(chunk.len() >= 16);
+        let opcode = chunk[0];
 
-            result = decode_table[opcode as usize](&mut state);
-            if result.is_err() {
-                break;
-            }
+        // NOTE: This should produce the same assembly as the unsafe `read_unaligned`.
+        self.chunk = u128::from_le_bytes([
+            chunk[0], chunk[1], chunk[2], chunk[3], chunk[4], chunk[5], chunk[6], chunk[7], chunk[8], chunk[9], chunk[10], chunk[11],
+            chunk[12], chunk[13], chunk[14], chunk[15],
+        ]) >> 8;
 
-            result = state.visitor.on_post_visit();
-            if result.is_err() {
-                break;
-            }
+        self.opcode = opcode;
+        self.args_length = instruction_length - 1;
+        self.instruction_offset = instruction_offset as u32;
+
+        self.visitor.on_pre_visit(instruction_offset, opcode);
+        Some(decode_table[opcode as usize](self))
+    }
+
+    #[inline]
+    pub fn new(visitor: T) -> Self {
+        VisitorHelper {
+            chunk: 0,
+            visitor,
+            args_length: 0,
+            instruction_offset: 0,
+            opcode: 0,
         }
-
-        (state.visitor, result)
     }
 
-    #[cold]
-    pub fn unknown_opcode<U, E>(&mut self) -> <T as InstructionVisitor>::ReturnTy
+    #[inline]
+    pub fn run(mut self, blob: &ProgramBlob, decode_table: &[fn(&mut Self) -> <T as InstructionVisitor>::ReturnTy; 256]) -> T
     where
-        T: InstructionVisitor<ReturnTy = Result<U, E>>,
-        E: From<ProgramParseError>,
+        T: ParsingVisitor<ReturnTy = ()>,
     {
-        let error = ProgramParseError::unexpected_instruction(self.reader.position - 1);
-        Err(error.into())
+        let code = blob.code();
+        let bitmask = blob.bitmask();
+        debug_assert_eq!(bitmask[0] & 0b1, 1);
+
+        let mut offset = 0;
+        while self.step(code, bitmask, &mut offset, decode_table).is_some() {}
+        self.visitor
+    }
+
+    #[inline]
+    pub fn opcode(&self) -> u8 {
+        self.opcode
     }
 
     #[inline(always)]
-    pub fn read_args_imm(&mut self) -> Result<u32, ProgramParseError> {
-        self.reader.read_varint()
+    pub fn read_args_offset(&mut self) -> Option<u32> {
+        let (imm, _) = read_simple_varint!(self.chunk, self.args_length);
+        Some(self.instruction_offset.wrapping_add(imm))
     }
 
     #[inline(always)]
-    pub fn read_args_imm2(&mut self) -> Result<(u32, u32), ProgramParseError> {
-        let imm1 = self.reader.read_varint()?;
-        let imm2 = self.reader.read_varint()?;
-        Ok((imm1, imm2))
+    pub fn read_args_imm(&mut self) -> Option<u32> {
+        let (imm, _) = read_simple_varint!(self.chunk, self.args_length);
+        Some(imm)
     }
 
     #[inline(always)]
-    pub fn read_args_reg_imm(&mut self) -> Result<(Reg, u32), ProgramParseError> {
-        let reg = self.reader.read_reg()?;
-        let imm = self.reader.read_varint()?;
-        Ok((reg, imm))
+    pub fn read_args_imm2(&mut self) -> Option<(u32, u32)> {
+        let chunk = self.chunk;
+        let (imm1, chunk, imm1_length) = read_varint!(chunk);
+        let (imm2, _) = read_simple_varint!(chunk, self.args_length - imm1_length);
+        Some((imm1, imm2))
     }
 
     #[inline(always)]
-    pub fn read_args_reg_imm2(&mut self) -> Result<(Reg, u32, u32), ProgramParseError> {
-        let reg = self.reader.read_reg()?;
-        let imm1 = self.reader.read_varint()?;
-        let imm2 = self.reader.read_varint()?;
-        Ok((reg, imm1, imm2))
+    pub fn read_args_reg_imm(&mut self) -> Option<(Reg, u32)> {
+        let chunk = self.chunk;
+        let (reg, chunk) = read_reg!(chunk);
+        let (imm, _) = read_simple_varint!(chunk, self.args_length - 1);
+        Some((reg, imm))
     }
 
     #[inline(always)]
-    pub fn read_args_regs2_imm(&mut self) -> Result<(Reg, Reg, u32), ProgramParseError> {
-        let (reg1, reg2) = self.reader.read_regs2()?;
-        let imm = self.reader.read_varint()?;
-        Ok((reg1, reg2, imm))
+    pub fn read_args_reg_imm_offset(&mut self) -> Option<(Reg, u32, u32)> {
+        let chunk = self.chunk;
+        let (reg, chunk) = read_reg!(chunk);
+        let (imm1, chunk, imm1_length) = read_varint!(chunk);
+        let (imm2, _) = read_simple_varint!(chunk, self.args_length - 1 - imm1_length);
+        let imm2 = self.instruction_offset.wrapping_add(imm2);
+        Some((reg, imm1, imm2))
     }
 
     #[inline(always)]
-    pub fn read_args_regs3(&mut self) -> Result<(Reg, Reg, Reg), ProgramParseError> {
-        self.reader.read_regs3()
+    pub fn read_args_reg_imm2(&mut self) -> Option<(Reg, u32, u32)> {
+        let chunk = self.chunk;
+        let (reg, chunk) = read_reg!(chunk);
+        let (imm1, chunk, imm1_length) = read_varint!(chunk);
+        let (imm2, _) = read_simple_varint!(chunk, self.args_length - 1 - imm1_length);
+        Some((reg, imm1, imm2))
     }
 
     #[inline(always)]
-    pub fn read_args_regs2(&mut self) -> Result<(Reg, Reg), ProgramParseError> {
-        self.reader.read_regs2()
+    pub fn read_args_regs2_imm2(&mut self) -> Option<(Reg, Reg, u32, u32)> {
+        let chunk = self.chunk;
+        let (reg1, reg2, chunk) = read_reg2!(chunk);
+        let (imm1, chunk, imm1_length) = read_varint!(chunk);
+        let (imm2, _) = read_simple_varint!(chunk, self.args_length - 1 - imm1_length);
+        Some((reg1, reg2, imm1, imm2))
+    }
+
+    #[inline(always)]
+    pub fn read_args_regs2_imm(&mut self) -> Option<(Reg, Reg, u32)> {
+        let chunk = self.chunk;
+        let (reg1, reg2, chunk) = read_reg2!(chunk);
+        let (imm, _) = read_simple_varint!(chunk, self.args_length - 1);
+        Some((reg1, reg2, imm))
+    }
+
+    #[inline(always)]
+    pub fn read_args_regs3(&mut self) -> Option<(Reg, Reg, Reg)> {
+        let chunk = self.chunk;
+        let (reg1, reg2, chunk) = read_reg2!(chunk);
+        let (reg3, _) = read_reg!(chunk);
+        Some((reg1, reg2, reg3))
+    }
+
+    #[inline(always)]
+    pub fn read_args_regs2(&mut self) -> Option<(Reg, Reg)> {
+        let chunk = self.chunk;
+        let (reg1, reg2, _) = read_reg2!(chunk);
+        Some((reg1, reg2))
     }
 }
 
@@ -238,21 +366,18 @@ macro_rules! define_opcodes {
 
         [$($name_argless:ident = $value_argless:expr,)+]
         [$($name_reg_imm:ident = $value_reg_imm:expr,)+]
+        [$($name_reg_imm_offset:ident = $value_reg_imm_offset:expr,)+]
         [$($name_reg_imm_imm:ident = $value_reg_imm_imm:expr,)+]
         [$($name_reg_reg_imm:ident = $value_reg_reg_imm:expr,)+]
         [$($name_reg_reg_reg:ident = $value_reg_reg_reg:expr,)+]
+        [$($name_offset:ident = $value_offset:expr,)+]
         [$($name_imm:ident = $value_imm:expr,)+]
         [$($name_imm_imm:ident = $value_imm_imm:expr,)+]
         [$($name_reg_reg:ident = $value_reg_reg:expr,)+]
+        [$($name_reg_reg_imm_imm:ident = $value_reg_reg_imm_imm:expr,)+]
     ) => {
-        pub trait ParsingVisitor<E>: InstructionVisitor<ReturnTy = Result<(), E>> {
-            fn on_pre_visit(&mut self, _offset: usize, _opcode: u8) -> Self::ReturnTy {
-                Ok(())
-            }
-
-            fn on_post_visit(&mut self) -> Self::ReturnTy {
-                Ok(())
-            }
+        pub trait ParsingVisitor: InstructionVisitor {
+            fn on_pre_visit(&mut self, _offset: usize, _opcode: u8);
         }
 
         pub trait InstructionVisitor {
@@ -260,13 +385,21 @@ macro_rules! define_opcodes {
 
             $(fn $name_argless(&mut self) -> Self::ReturnTy;)+
             $(fn $name_reg_imm(&mut self, reg: Reg, imm: u32) -> Self::ReturnTy;)+
+            $(fn $name_reg_imm_offset(&mut self, reg: Reg, imm1: u32, imm2: u32) -> Self::ReturnTy;)+
             $(fn $name_reg_imm_imm(&mut self, reg: Reg, imm1: u32, imm2: u32) -> Self::ReturnTy;)+
             $(fn $name_reg_reg_imm(&mut self, reg1: Reg, reg2: Reg, imm: u32) -> Self::ReturnTy;)+
             $(fn $name_reg_reg_reg(&mut self, reg1: Reg, reg2: Reg, reg3: Reg) -> Self::ReturnTy;)+
+            $(fn $name_offset(&mut self, imm: u32) -> Self::ReturnTy;)+
             $(fn $name_imm(&mut self, imm: u32) -> Self::ReturnTy;)+
             $(fn $name_imm_imm(&mut self, imm1: u32, imm2: u32) -> Self::ReturnTy;)+
             $(fn $name_reg_reg(&mut self, reg1: Reg, reg2: Reg) -> Self::ReturnTy;)+
+            $(fn $name_reg_reg_imm_imm(&mut self, reg1: Reg, reg2: Reg, imm1: u32, imm2: u32) -> Self::ReturnTy;)+
 
+            #[inline(never)]
+            #[cold]
+            fn invalid(&mut self, _opcode: u8) -> Self::ReturnTy {
+                self.trap()
+            }
         }
 
         #[macro_export]
@@ -281,6 +414,9 @@ macro_rules! define_opcodes {
                     $(fn $name_reg_imm(&mut self, reg: Reg, imm: u32) -> Self::ReturnTy {
                         self.$method(polkavm_common::program::Instruction::$name_reg_imm(reg, imm));
                     })+
+                    $(fn $name_reg_imm_offset(&mut self, reg: Reg, imm1: u32, imm2: u32) -> Self::ReturnTy {
+                        self.$method(polkavm_common::program::Instruction::$name_reg_imm_offset(reg, imm1, imm2));
+                    })+
                     $(fn $name_reg_imm_imm(&mut self, reg: Reg, imm1: u32, imm2: u32) -> Self::ReturnTy {
                         self.$method(polkavm_common::program::Instruction::$name_reg_imm_imm(reg, imm1, imm2));
                     })+
@@ -289,6 +425,9 @@ macro_rules! define_opcodes {
                     })+
                     $(fn $name_reg_reg_reg(&mut self, reg1: Reg, reg2: Reg, reg3: Reg) -> Self::ReturnTy {
                         self.$method(polkavm_common::program::Instruction::$name_reg_reg_reg(reg1, reg2, reg3));
+                    })+
+                    $(fn $name_offset(&mut self, imm: u32) -> Self::ReturnTy {
+                        self.$method(polkavm_common::program::Instruction::$name_offset(imm));
                     })+
                     $(fn $name_imm(&mut self, imm: u32) -> Self::ReturnTy {
                         self.$method(polkavm_common::program::Instruction::$name_imm(imm));
@@ -299,6 +438,9 @@ macro_rules! define_opcodes {
                     $(fn $name_reg_reg(&mut self, reg1: Reg, reg2: Reg) -> Self::ReturnTy {
                         self.$method(polkavm_common::program::Instruction::$name_reg_reg(reg1, reg2));
                     })+
+                    $(fn $name_reg_reg_imm_imm(&mut self, reg1: Reg, reg2: Reg, imm1: u32, imm2: u32) -> Self::ReturnTy {
+                        self.$method(polkavm_common::program::Instruction::$name_reg_reg_imm_imm(reg1, reg2, imm1, imm2));
+                    })+
                 }
             }
         }
@@ -307,15 +449,20 @@ macro_rules! define_opcodes {
 
         #[derive(Copy, Clone, PartialEq, Eq, Debug)]
         #[allow(non_camel_case_types)]
+        #[repr(u32)]
         pub enum Instruction {
-            $($name_argless,)+
-            $($name_reg_imm(Reg, u32),)+
-            $($name_reg_imm_imm(Reg, u32, u32),)+
-            $($name_reg_reg_imm(Reg, Reg, u32),)+
-            $($name_reg_reg_reg(Reg, Reg, Reg),)+
-            $($name_imm(u32),)+
-            $($name_imm_imm(u32, u32),)+
-            $($name_reg_reg(Reg, Reg),)+
+            $($name_argless = $value_argless,)+
+            $($name_reg_imm(Reg, u32) = $value_reg_imm,)+
+            $($name_reg_imm_offset(Reg, u32, u32) = $value_reg_imm_offset,)+
+            $($name_reg_imm_imm(Reg, u32, u32) = $value_reg_imm_imm,)+
+            $($name_reg_reg_imm(Reg, Reg, u32) = $value_reg_reg_imm,)+
+            $($name_reg_reg_reg(Reg, Reg, Reg) = $value_reg_reg_reg,)+
+            $($name_offset(u32) = $value_offset,)+
+            $($name_imm(u32) = $value_imm,)+
+            $($name_imm_imm(u32, u32) = $value_imm_imm,)+
+            $($name_reg_reg(Reg, Reg) = $value_reg_reg,)+
+            $($name_reg_reg_imm_imm(Reg, Reg, u32, u32) = $value_reg_reg_imm_imm,)+
+            invalid(u8) = 88,
         }
 
         impl Instruction {
@@ -323,25 +470,33 @@ macro_rules! define_opcodes {
                 match self {
                     $(Self::$name_argless => visitor.$name_argless(),)+
                     $(Self::$name_reg_imm(reg, imm) => visitor.$name_reg_imm(reg, imm),)+
+                    $(Self::$name_reg_imm_offset(reg, imm1, imm2) => visitor.$name_reg_imm_offset(reg, imm1, imm2),)+
                     $(Self::$name_reg_imm_imm(reg, imm1, imm2) => visitor.$name_reg_imm_imm(reg, imm1, imm2),)+
                     $(Self::$name_reg_reg_imm(reg1, reg2, imm) => visitor.$name_reg_reg_imm(reg1, reg2, imm),)+
                     $(Self::$name_reg_reg_reg(reg1, reg2, reg3) => visitor.$name_reg_reg_reg(reg1, reg2, reg3),)+
+                    $(Self::$name_offset(imm) => visitor.$name_offset(imm),)+
                     $(Self::$name_imm(imm) => visitor.$name_imm(imm),)+
                     $(Self::$name_imm_imm(imm1, imm2) => visitor.$name_imm_imm(imm1, imm2),)+
                     $(Self::$name_reg_reg(reg1, reg2) => visitor.$name_reg_reg(reg1, reg2),)+
+                    $(Self::$name_reg_reg_imm_imm(reg1, reg2, imm1, imm2) => visitor.$name_reg_reg_imm_imm(reg1, reg2, imm1, imm2),)+
+                    Self::invalid(opcode) => visitor.invalid(opcode),
                 }
             }
 
-            pub fn serialize_into(self, buffer: &mut [u8]) -> usize {
+            pub fn serialize_into(self, position: u32, buffer: &mut [u8]) -> usize {
                 match self {
                     $(Self::$name_argless => Self::serialize_argless(buffer, Opcode::$name_argless),)+
                     $(Self::$name_reg_imm(reg, imm) => Self::serialize_reg_imm(buffer, Opcode::$name_reg_imm, reg, imm),)+
+                    $(Self::$name_reg_imm_offset(reg, imm1, imm2) => Self::serialize_reg_imm_offset(buffer, position, Opcode::$name_reg_imm_offset, reg, imm1, imm2),)+
                     $(Self::$name_reg_imm_imm(reg, imm1, imm2) => Self::serialize_reg_imm_imm(buffer, Opcode::$name_reg_imm_imm, reg, imm1, imm2),)+
                     $(Self::$name_reg_reg_imm(reg1, reg2, imm) => Self::serialize_reg_reg_imm(buffer, Opcode::$name_reg_reg_imm, reg1, reg2, imm),)+
                     $(Self::$name_reg_reg_reg(reg1, reg2, reg3) => Self::serialize_reg_reg_reg(buffer, Opcode::$name_reg_reg_reg, reg1, reg2, reg3),)+
+                    $(Self::$name_offset(imm) => Self::serialize_offset(buffer, position, Opcode::$name_offset, imm),)+
                     $(Self::$name_imm(imm) => Self::serialize_imm(buffer, Opcode::$name_imm, imm),)+
                     $(Self::$name_imm_imm(imm1, imm2) => Self::serialize_imm_imm(buffer, Opcode::$name_imm_imm, imm1, imm2),)+
                     $(Self::$name_reg_reg(reg1, reg2) => Self::serialize_reg_reg(buffer, Opcode::$name_reg_reg, reg1, reg2),)+
+                    $(Self::$name_reg_reg_imm_imm(reg1, reg2, imm1, imm2) => Self::serialize_reg_reg_imm_imm(buffer, Opcode::$name_reg_reg_imm_imm, reg1, reg2, imm1, imm2),)+
+                    Self::invalid(..) => Self::serialize_argless(buffer, Opcode::trap),
 
                 }
             }
@@ -350,12 +505,16 @@ macro_rules! define_opcodes {
                 match self {
                     $(Self::$name_argless => Opcode::$name_argless,)+
                     $(Self::$name_reg_imm(..) => Opcode::$name_reg_imm,)+
+                    $(Self::$name_reg_imm_offset(..) => Opcode::$name_reg_imm_offset,)+
                     $(Self::$name_reg_imm_imm(..) => Opcode::$name_reg_imm_imm,)+
                     $(Self::$name_reg_reg_imm(..) => Opcode::$name_reg_reg_imm,)+
                     $(Self::$name_reg_reg_reg(..) => Opcode::$name_reg_reg_reg,)+
+                    $(Self::$name_offset(..) => Opcode::$name_offset,)+
                     $(Self::$name_imm(..) => Opcode::$name_imm,)+
                     $(Self::$name_imm_imm(..) => Opcode::$name_imm_imm,)+
                     $(Self::$name_reg_reg(..) => Opcode::$name_reg_reg,)+
+                    $(Self::$name_reg_reg_imm_imm(..) => Opcode::$name_reg_reg_imm_imm,)+
+                    Self::invalid(..) => Opcode::trap,
                 }
             }
         }
@@ -364,46 +523,6 @@ macro_rules! define_opcodes {
             fn fmt(&self, fmt: &mut core::fmt::Formatter) -> core::fmt::Result {
                 self.visit(fmt)
             }
-        }
-
-        fn parse_instruction_impl(opcode: u8, reader: &mut Reader) -> Result<Instruction, ProgramParseError> {
-            Ok(match opcode {
-                $($value_argless => Instruction::$name_argless,)+
-                $($value_reg_imm => {
-                    let reg = reader.read_reg()?;
-                    let imm = reader.read_varint()?;
-                    Instruction::$name_reg_imm(reg, imm)
-                },)+
-                $($value_reg_imm_imm => {
-                    let reg = reader.read_reg()?;
-                    let imm1 = reader.read_varint()?;
-                    let imm2 = reader.read_varint()?;
-                    Instruction::$name_reg_imm_imm(reg, imm1, imm2)
-                },)+
-                $($value_reg_reg_imm => {
-                    let (reg1, reg2) = reader.read_regs2()?;
-                    let imm = reader.read_varint()?;
-                    Instruction::$name_reg_reg_imm(reg1, reg2, imm)
-                },)+
-                $($value_reg_reg_reg => {
-                    let (reg1, reg2) = reader.read_regs2()?;
-                    let reg3 = reader.read_reg()?;
-                    Instruction::$name_reg_reg_reg(reg1, reg2, reg3)
-                },)+
-                $($value_imm => {
-                    Instruction::$name_imm(reader.read_varint()?)
-                },)+
-                $($value_imm_imm => {
-                    let imm1 = reader.read_varint()?;
-                    let imm2 = reader.read_varint()?;
-                    Instruction::$name_imm_imm(imm1, imm2)
-                },)+
-                $($value_reg_reg => {
-                    let (reg1, reg2) = reader.read_regs2()?;
-                    Instruction::$name_reg_reg(reg1, reg2)
-                },)+
-                _ => return Err(ProgramParseError::unexpected_instruction(reader.position - 1))
-            })
         }
 
         pub mod asm {
@@ -418,6 +537,12 @@ macro_rules! define_opcodes {
             $(
                 pub fn $name_reg_imm(reg: Reg, imm: u32) -> Instruction {
                     Instruction::$name_reg_imm(reg, imm)
+                }
+            )+
+
+            $(
+                pub fn $name_reg_imm_offset(reg: Reg, imm1: u32, imm2: u32) -> Instruction {
+                    Instruction::$name_reg_imm_offset(reg, imm1, imm2)
                 }
             )+
 
@@ -440,6 +565,12 @@ macro_rules! define_opcodes {
             )+
 
             $(
+                pub fn $name_offset(imm: u32) -> Instruction {
+                    Instruction::$name_offset(imm)
+                }
+            )+
+
+            $(
                 pub fn $name_imm(imm: u32) -> Instruction {
                     Instruction::$name_imm(imm)
                 }
@@ -457,6 +588,12 @@ macro_rules! define_opcodes {
                 }
             )+
 
+            $(
+                pub fn $name_reg_reg_imm_imm(reg1: Reg, reg2: Reg, imm1: u32, imm2: u32) -> Instruction {
+                    Instruction::$name_reg_reg_imm_imm(reg1, reg2, imm1, imm2)
+                }
+            )+
+
             pub fn ret() -> Instruction {
                 jump_indirect(Reg::RA, 0)
             }
@@ -464,24 +601,25 @@ macro_rules! define_opcodes {
 
         #[macro_export]
         macro_rules! prepare_visitor {
-            ($table_name:ident, $visitor_ty:ident<$d($visitor_ty_params:tt),*>) => {{
-                use polkavm_common::program::{
+            (@define_table $table_name:ident, $visitor_ty:ident<$d($visitor_ty_params:tt),*>) => {
+                use $crate::program::{
                     InstructionVisitor,
                     VisitorHelper,
                 };
 
                 type ReturnTy<$d($visitor_ty_params),*> = <$visitor_ty<$d($visitor_ty_params),*> as InstructionVisitor>::ReturnTy;
-                type VisitFn<'_code, $d($visitor_ty_params),*> = fn(state: &mut VisitorHelper<'_code, $visitor_ty<$d($visitor_ty_params),*>>) -> ReturnTy<$d($visitor_ty_params),*>;
+                type VisitFn<$d($visitor_ty_params),*> = fn(state: &mut VisitorHelper<$visitor_ty<$d($visitor_ty_params),*>>) -> ReturnTy<$d($visitor_ty_params),*>;
 
+                #[allow(unsafe_code)]
                 static $table_name: [VisitFn; 256] = {
-                    let mut table = [VisitorHelper::unknown_opcode as VisitFn; 256];
+                    let mut table = [invalid_instruction as VisitFn; 256];
                     $({
                         // Putting all of the handlers in a single link section can make a big difference
                         // when it comes to performance, even up to 10% in some cases. This will force the
                         // compiler and the linker to put all of this code near each other, minimizing
                         // instruction cache misses.
                         #[cfg_attr(target_os = "linux", link_section = concat!(".text.", stringify!($table_name)))]
-                        fn $name_argless<'_code, $d($visitor_ty_params),*>(state: &mut VisitorHelper<'_code, $visitor_ty<$d($visitor_ty_params),*>>) -> ReturnTy<$d($visitor_ty_params),*>{
+                        fn $name_argless<$d($visitor_ty_params),*>(state: &mut VisitorHelper<$visitor_ty<$d($visitor_ty_params),*>>) -> ReturnTy<$d($visitor_ty_params),*>{
                             state.visitor.$name_argless()
                         }
 
@@ -490,9 +628,12 @@ macro_rules! define_opcodes {
 
                     $({
                         #[cfg_attr(target_os = "linux", link_section = concat!(".text.", stringify!($table_name)))]
-                        fn $name_reg_imm<'_code, $d($visitor_ty_params),*>(state: &mut VisitorHelper<'_code, $visitor_ty<$d($visitor_ty_params),*>>) -> ReturnTy<$d($visitor_ty_params),*>{
-                            let (reg, imm) = state.read_args_reg_imm()?;
-                            state.visitor.$name_reg_imm(reg, imm)
+                        fn $name_reg_imm<$d($visitor_ty_params),*>(state: &mut VisitorHelper<$visitor_ty<$d($visitor_ty_params),*>>) -> ReturnTy<$d($visitor_ty_params),*>{
+                            if let Some((reg, imm)) = state.read_args_reg_imm() {
+                                return state.visitor.$name_reg_imm(reg, imm);
+                            };
+
+                            state.visitor.invalid($value_reg_imm)
                         }
 
                         table[$value_reg_imm] = $name_reg_imm;
@@ -500,9 +641,25 @@ macro_rules! define_opcodes {
 
                     $({
                         #[cfg_attr(target_os = "linux", link_section = concat!(".text.", stringify!($table_name)))]
-                        fn $name_reg_imm_imm<'_code, $d($visitor_ty_params),*>(state: &mut VisitorHelper<'_code, $visitor_ty<$d($visitor_ty_params),*>>) -> ReturnTy<$d($visitor_ty_params),*>{
-                            let (reg, imm1, imm2) = state.read_args_reg_imm2()?;
-                            state.visitor.$name_reg_imm_imm(reg, imm1, imm2)
+                        fn $name_reg_imm_offset<$d($visitor_ty_params),*>(state: &mut VisitorHelper<$visitor_ty<$d($visitor_ty_params),*>>) -> ReturnTy<$d($visitor_ty_params),*>{
+                            if let Some((reg, imm1, imm2)) = state.read_args_reg_imm_offset() {
+                                return state.visitor.$name_reg_imm_offset(reg, imm1, imm2);
+                            }
+
+                            state.visitor.invalid($value_reg_imm_offset)
+                        }
+
+                        table[$value_reg_imm_offset] = $name_reg_imm_offset;
+                    })*
+
+                    $({
+                        #[cfg_attr(target_os = "linux", link_section = concat!(".text.", stringify!($table_name)))]
+                        fn $name_reg_imm_imm<$d($visitor_ty_params),*>(state: &mut VisitorHelper<$visitor_ty<$d($visitor_ty_params),*>>) -> ReturnTy<$d($visitor_ty_params),*>{
+                            if let Some((reg, imm1, imm2)) = state.read_args_reg_imm2() {
+                                return state.visitor.$name_reg_imm_imm(reg, imm1, imm2);
+                            }
+
+                            state.visitor.invalid($value_reg_imm_imm)
                         }
 
                         table[$value_reg_imm_imm] = $name_reg_imm_imm;
@@ -510,9 +667,12 @@ macro_rules! define_opcodes {
 
                     $({
                         #[cfg_attr(target_os = "linux", link_section = concat!(".text.", stringify!($table_name)))]
-                        fn $name_reg_reg_imm<'_code, $d($visitor_ty_params),*>(state: &mut VisitorHelper<'_code, $visitor_ty<$d($visitor_ty_params),*>>) -> ReturnTy<$d($visitor_ty_params),*>{
-                            let (reg1, reg2, imm) = state.read_args_regs2_imm()?;
-                            state.visitor.$name_reg_reg_imm(reg1, reg2, imm)
+                        fn $name_reg_reg_imm<$d($visitor_ty_params),*>(state: &mut VisitorHelper<$visitor_ty<$d($visitor_ty_params),*>>) -> ReturnTy<$d($visitor_ty_params),*>{
+                            if let Some((reg1, reg2, imm)) = state.read_args_regs2_imm() {
+                                return state.visitor.$name_reg_reg_imm(reg1, reg2, imm);
+                            }
+
+                            state.visitor.invalid($value_reg_reg_imm)
                         }
 
                         table[$value_reg_reg_imm] = $name_reg_reg_imm;
@@ -520,9 +680,12 @@ macro_rules! define_opcodes {
 
                     $({
                         #[cfg_attr(target_os = "linux", link_section = concat!(".text.", stringify!($table_name)))]
-                        fn $name_reg_reg_reg<'_code, $d($visitor_ty_params),*>(state: &mut VisitorHelper<'_code, $visitor_ty<$d($visitor_ty_params),*>>) -> ReturnTy<$d($visitor_ty_params),*>{
-                            let (reg1, reg2, reg3) = state.read_args_regs3()?;
-                            state.visitor.$name_reg_reg_reg(reg1, reg2, reg3)
+                        fn $name_reg_reg_reg<$d($visitor_ty_params),*>(state: &mut VisitorHelper<$visitor_ty<$d($visitor_ty_params),*>>) -> ReturnTy<$d($visitor_ty_params),*>{
+                            if let Some((reg1, reg2, reg3)) = state.read_args_regs3() {
+                                return state.visitor.$name_reg_reg_reg(reg1, reg2, reg3);
+                            }
+
+                            state.visitor.invalid($value_reg_reg_reg)
                         }
 
                         table[$value_reg_reg_reg] = $name_reg_reg_reg;
@@ -530,9 +693,25 @@ macro_rules! define_opcodes {
 
                     $({
                         #[cfg_attr(target_os = "linux", link_section = concat!(".text.", stringify!($table_name)))]
-                        fn $name_imm<'_code, $d($visitor_ty_params),*>(state: &mut VisitorHelper<'_code, $visitor_ty<$d($visitor_ty_params),*>>) -> ReturnTy<$d($visitor_ty_params),*>{
-                            let imm = state.read_args_imm()?;
-                            state.visitor.$name_imm(imm)
+                        fn $name_offset<$d($visitor_ty_params),*>(state: &mut VisitorHelper<$visitor_ty<$d($visitor_ty_params),*>>) -> ReturnTy<$d($visitor_ty_params),*>{
+                            if let Some(imm) = state.read_args_offset() {
+                                return state.visitor.$name_offset(imm);
+                            }
+
+                            state.visitor.invalid($value_offset)
+                        }
+
+                        table[$value_offset] = $name_offset;
+                    })*
+
+                    $({
+                        #[cfg_attr(target_os = "linux", link_section = concat!(".text.", stringify!($table_name)))]
+                        fn $name_imm<$d($visitor_ty_params),*>(state: &mut VisitorHelper<$visitor_ty<$d($visitor_ty_params),*>>) -> ReturnTy<$d($visitor_ty_params),*>{
+                            if let Some(imm) = state.read_args_imm() {
+                                return state.visitor.$name_imm(imm);
+                            }
+
+                            state.visitor.invalid($value_imm)
                         }
 
                         table[$value_imm] = $name_imm;
@@ -540,9 +719,12 @@ macro_rules! define_opcodes {
 
                     $({
                         #[cfg_attr(target_os = "linux", link_section = concat!(".text.", stringify!($table_name)))]
-                        fn $name_imm_imm<'_code, $d($visitor_ty_params),*>(state: &mut VisitorHelper<'_code, $visitor_ty<$d($visitor_ty_params),*>>) -> ReturnTy<$d($visitor_ty_params),*>{
-                            let (imm1, imm2) = state.read_args_imm2()?;
-                            state.visitor.$name_imm_imm(imm1, imm2)
+                        fn $name_imm_imm<$d($visitor_ty_params),*>(state: &mut VisitorHelper<$visitor_ty<$d($visitor_ty_params),*>>) -> ReturnTy<$d($visitor_ty_params),*>{
+                            if let Some((imm1, imm2)) = state.read_args_imm2() {
+                                return state.visitor.$name_imm_imm(imm1, imm2);
+                            }
+
+                            state.visitor.invalid($value_imm_imm)
                         }
 
                         table[$value_imm_imm] = $name_imm_imm;
@@ -550,29 +732,57 @@ macro_rules! define_opcodes {
 
                     $({
                         #[cfg_attr(target_os = "linux", link_section = concat!(".text.", stringify!($table_name)))]
-                        fn $name_reg_reg<'_code, $d($visitor_ty_params),*>(state: &mut VisitorHelper<'_code, $visitor_ty<$d($visitor_ty_params),*>>) -> ReturnTy<$d($visitor_ty_params),*>{
-                            let (reg1, reg2) = state.read_args_regs2()?;
-                            state.visitor.$name_reg_reg(reg1, reg2)
+                        fn $name_reg_reg<$d($visitor_ty_params),*>(state: &mut VisitorHelper<$visitor_ty<$d($visitor_ty_params),*>>) -> ReturnTy<$d($visitor_ty_params),*>{
+                            if let Some((reg1, reg2)) = state.read_args_regs2() {
+                                return state.visitor.$name_reg_reg(reg1, reg2);
+                            }
+
+                            state.visitor.invalid($value_reg_reg)
                         }
 
                         table[$value_reg_reg] = $name_reg_reg;
                     })*
 
+                    $({
+                        #[cfg_attr(target_os = "linux", link_section = concat!(".text.", stringify!($table_name)))]
+                        fn $name_reg_reg_imm_imm<$d($visitor_ty_params),*>(state: &mut VisitorHelper<$visitor_ty<$d($visitor_ty_params),*>>) -> ReturnTy<$d($visitor_ty_params),*>{
+                            if let Some((reg1, reg2, imm1, imm2)) = state.read_args_regs2_imm2() {
+                                return state.visitor.$name_reg_reg_imm_imm(reg1, reg2, imm1, imm2);
+                            }
+
+                            state.visitor.invalid($value_reg_reg_imm_imm)
+                        }
+
+                        table[$value_reg_reg_imm_imm] = $name_reg_reg_imm_imm;
+                    })*
+
+                    #[cfg_attr(target_os = "linux", link_section = concat!(".text.", stringify!($table_name)))]
+                    #[cold]
+                    fn invalid_instruction<$d($visitor_ty_params),*>(state: &mut VisitorHelper<$visitor_ty<$d($visitor_ty_params),*>>) -> ReturnTy<$d($visitor_ty_params),*>{
+                        state.visitor.invalid(state.opcode())
+                    }
+
                     table
                 };
+            };
+
+            ($table_name:ident, $visitor_ty:ident<$d($visitor_ty_params:tt),*>) => {{
+                $crate::program::prepare_visitor!(@define_table $table_name, $visitor_ty<$d($visitor_ty_params),*>);
 
                 #[inline]
                 fn run<$d($visitor_ty_params),*>(
                     blob: &ProgramBlob,
                     visitor: $visitor_ty<$d($visitor_ty_params),*>,
                 )
-                    -> ($visitor_ty<$d($visitor_ty_params),*>, <$visitor_ty<$d($visitor_ty_params),*> as InstructionVisitor>::ReturnTy)
+                    -> $visitor_ty<$d($visitor_ty_params),*>
                 {
-                    let decode_table: &[VisitFn; 256] = &$table_name;
+                    let decode_table: &'static [VisitFn; 256] = &$table_name;
+
+                    #[allow(unsafe_code)]
                     // SAFETY: Here we transmute the lifetimes which were unnecessarily extended to be 'static due to the table here being a `static`.
                     let decode_table: &[VisitFn; 256] = unsafe { core::mem::transmute(decode_table) };
 
-                    VisitorHelper::run(blob, visitor, decode_table)
+                    VisitorHelper::new(visitor).run(blob, decode_table)
                 }
 
                 run
@@ -581,16 +791,85 @@ macro_rules! define_opcodes {
 
         pub use prepare_visitor;
 
+        struct ToEnumVisitor<'a>(core::marker::PhantomData<&'a ()>);
+
+        impl<'a> ParsingVisitor for ToEnumVisitor<'a> {
+            fn on_pre_visit(&mut self, _offset: usize, _opcode: u8) {}
+        }
+
+        impl<'a> InstructionVisitor for ToEnumVisitor<'a> {
+            type ReturnTy = Instruction;
+
+            $(fn $name_argless(&mut self) -> Self::ReturnTy {
+                Instruction::$name_argless
+            })+
+            $(fn $name_reg_imm(&mut self, reg: Reg, imm: u32) -> Self::ReturnTy {
+                Instruction::$name_reg_imm(reg, imm)
+            })+
+            $(fn $name_reg_imm_offset(&mut self, reg: Reg, imm1: u32, imm2: u32) -> Self::ReturnTy {
+                Instruction::$name_reg_imm_offset(reg, imm1, imm2)
+            })+
+            $(fn $name_reg_imm_imm(&mut self, reg: Reg, imm1: u32, imm2: u32) -> Self::ReturnTy {
+                Instruction::$name_reg_imm_imm(reg, imm1, imm2)
+            })+
+            $(fn $name_reg_reg_imm(&mut self, reg1: Reg, reg2: Reg, imm: u32) -> Self::ReturnTy {
+                Instruction::$name_reg_reg_imm(reg1, reg2, imm)
+            })+
+            $(fn $name_reg_reg_reg(&mut self, reg1: Reg, reg2: Reg, reg3: Reg) -> Self::ReturnTy {
+                Instruction::$name_reg_reg_reg(reg1, reg2, reg3)
+            })+
+            $(fn $name_offset(&mut self, imm: u32) -> Self::ReturnTy {
+                Instruction::$name_offset(imm)
+            })+
+            $(fn $name_imm(&mut self, imm: u32) -> Self::ReturnTy {
+                Instruction::$name_imm(imm)
+            })+
+            $(fn $name_imm_imm(&mut self, imm1: u32, imm2: u32) -> Self::ReturnTy {
+                Instruction::$name_imm_imm(imm1, imm2)
+            })+
+            $(fn $name_reg_reg(&mut self, reg1: Reg, reg2: Reg) -> Self::ReturnTy {
+                Instruction::$name_reg_reg(reg1, reg2)
+            })+
+            $(fn $name_reg_reg_imm_imm(&mut self, reg1: Reg, reg2: Reg, imm1: u32, imm2: u32) -> Self::ReturnTy {
+                Instruction::$name_reg_reg_imm_imm(reg1, reg2, imm1, imm2)
+            })+
+        }
+
+        #[inline]
+        fn parse_instruction(code: &[u8], bitmask: &[u8], offset: &mut usize) -> Option<ParsedInstruction> {
+            prepare_visitor!(@define_table TO_ENUM_VISITOR, ToEnumVisitor<'a>);
+
+            let decode_table: &[VisitFn; 256] = &TO_ENUM_VISITOR;
+
+            #[allow(unsafe_code)]
+            // SAFETY: Here we transmute the lifetimes which were unnecessarily extended to be 'static due to the table here being a `static`.
+            let decode_table: &[VisitFn; 256] = unsafe { core::mem::transmute(decode_table) };
+
+            let mut helper = VisitorHelper::new(ToEnumVisitor(core::marker::PhantomData));
+            let origin = *offset;
+            let instruction = helper.step(code, bitmask, offset, decode_table)?;
+            let length = helper.args_length + 1;
+
+            Some(ParsedInstruction {
+                kind: instruction,
+                offset: origin as u32,
+                length: length as u32,
+            })
+        }
+
         define_opcodes!(
             @impl_shared
             $($name_argless = $value_argless,)+
             $($name_reg_imm = $value_reg_imm,)+
+            $($name_reg_imm_offset = $value_reg_imm_offset,)+
             $($name_reg_imm_imm = $value_reg_imm_imm,)+
             $($name_reg_reg_imm = $value_reg_reg_imm,)+
             $($name_reg_reg_reg = $value_reg_reg_reg,)+
+            $($name_offset = $value_offset,)+
             $($name_imm = $value_imm,)+
             $($name_imm_imm = $value_imm_imm,)+
             $($name_reg_reg = $value_reg_reg,)+
+            $($name_reg_reg_imm_imm = $value_reg_reg_imm_imm,)+
         );
     }
 }
@@ -608,7 +887,6 @@ define_opcodes! {
 
     // Instructions with args: reg, imm
     [
-        call                                     = 6,
         jump_indirect                            = 19,
         load_imm                                 = 4,
         load_u8                                  = 60,
@@ -621,8 +899,9 @@ define_opcodes! {
         store_u32                                = 22,
     ]
 
-    // Instructions with args: reg, imm, imm
+    // Instructions with args: reg, imm, offset
     [
+        load_imm_and_jump                        = 6,
         branch_eq_imm                            = 7,
         branch_not_eq_imm                        = 15,
         branch_less_unsigned_imm                 = 44,
@@ -633,6 +912,10 @@ define_opcodes! {
         branch_less_or_equal_unsigned_imm        = 59,
         branch_greater_signed_imm                = 53,
         branch_greater_unsigned_imm              = 50,
+    ]
+
+    // Instructions with args: reg, imm, imm
+    [
         store_imm_indirect_u8                    = 26,
         store_imm_indirect_u16                   = 54,
         store_imm_indirect_u32                   = 13,
@@ -648,7 +931,6 @@ define_opcodes! {
         load_indirect_u16                        = 37,
         load_indirect_i16                        = 33,
         load_indirect_u32                        = 1,
-        call_indirect                            = 42,
         add_imm                                  = 2,
         and_imm                                  = 18,
         xor_imm                                  = 31,
@@ -703,9 +985,13 @@ define_opcodes! {
         cmov_if_not_zero                         = 84,
     ]
 
-    // Instructions with args: imm
+    // Instructions with args: offset
     [
         jump                                     = 5,
+    ]
+
+    // Instructions with args: imm
+    [
         ecalli                                   = 78,
     ]
 
@@ -721,6 +1007,11 @@ define_opcodes! {
         move_reg                                 = 82,
         sbrk                                     = 87,
     ]
+
+    // Instructions with args: reg, reg, imm, imm
+    [
+        load_imm_and_jump_indirect               = 42,
+    ]
 }
 
 impl Opcode {
@@ -731,8 +1022,8 @@ impl Opcode {
                 | Self::fallthrough
                 | Self::jump
                 | Self::jump_indirect
-                | Self::call
-                | Self::call_indirect
+                | Self::load_imm_and_jump
+                | Self::load_imm_and_jump_indirect
                 | Self::branch_eq
                 | Self::branch_eq_imm
                 | Self::branch_greater_or_equal_signed
@@ -754,12 +1045,8 @@ impl Opcode {
 }
 
 impl Instruction {
-    pub fn deserialize(input: &[u8]) -> Option<(usize, Self)> {
-        let mut reader = Reader { blob: input, position: 0 };
-
-        let opcode = reader.read_byte().ok()?;
-        let instruction = parse_instruction_impl(opcode, &mut reader).ok()?;
-        Some((reader.position, instruction))
+    pub fn starts_new_basic_block(self) -> bool {
+        self.opcode().starts_new_basic_block()
     }
 
     fn serialize_argless(buffer: &mut [u8], opcode: Opcode) -> usize {
@@ -767,12 +1054,30 @@ impl Instruction {
         1
     }
 
+    fn serialize_reg_imm_offset(buffer: &mut [u8], position: u32, opcode: Opcode, reg: Reg, imm1: u32, imm2: u32) -> usize {
+        let imm2 = imm2.wrapping_sub(position);
+        buffer[0] = opcode as u8;
+        buffer[1] = reg as u8;
+        let mut position = 2;
+        position += write_varint(imm1, &mut buffer[position..]);
+        position += write_simple_varint(imm2, &mut buffer[position..]);
+        position
+    }
+
     fn serialize_reg_imm_imm(buffer: &mut [u8], opcode: Opcode, reg: Reg, imm1: u32, imm2: u32) -> usize {
         buffer[0] = opcode as u8;
         buffer[1] = reg as u8;
         let mut position = 2;
         position += write_varint(imm1, &mut buffer[position..]);
-        position += write_varint(imm2, &mut buffer[position..]);
+        position += write_simple_varint(imm2, &mut buffer[position..]);
+        position
+    }
+    fn serialize_reg_reg_imm_imm(buffer: &mut [u8], opcode: Opcode, reg1: Reg, reg2: Reg, imm1: u32, imm2: u32) -> usize {
+        buffer[0] = opcode as u8;
+        buffer[1] = reg1 as u8 | (reg2 as u8) << 4;
+        let mut position = 2;
+        position += write_varint(imm1, &mut buffer[position..]);
+        position += write_simple_varint(imm2, &mut buffer[position..]);
         position
     }
 
@@ -786,25 +1091,31 @@ impl Instruction {
     fn serialize_reg_reg_imm(buffer: &mut [u8], opcode: Opcode, reg1: Reg, reg2: Reg, imm: u32) -> usize {
         buffer[0] = opcode as u8;
         buffer[1] = reg1 as u8 | (reg2 as u8) << 4;
-        write_varint(imm, &mut buffer[2..]) + 2
+        write_simple_varint(imm, &mut buffer[2..]) + 2
     }
 
     fn serialize_reg_imm(buffer: &mut [u8], opcode: Opcode, reg: Reg, imm: u32) -> usize {
         buffer[0] = opcode as u8;
         buffer[1] = reg as u8;
-        write_varint(imm, &mut buffer[2..]) + 2
+        write_simple_varint(imm, &mut buffer[2..]) + 2
+    }
+
+    fn serialize_offset(buffer: &mut [u8], position: u32, opcode: Opcode, imm: u32) -> usize {
+        let imm = imm.wrapping_sub(position);
+        buffer[0] = opcode as u8;
+        write_simple_varint(imm, &mut buffer[1..]) + 1
     }
 
     fn serialize_imm(buffer: &mut [u8], opcode: Opcode, imm: u32) -> usize {
         buffer[0] = opcode as u8;
-        write_varint(imm, &mut buffer[1..]) + 1
+        write_simple_varint(imm, &mut buffer[1..]) + 1
     }
 
     fn serialize_imm_imm(buffer: &mut [u8], opcode: Opcode, imm1: u32, imm2: u32) -> usize {
         buffer[0] = opcode as u8;
         let mut position = 1;
         position += write_varint(imm1, &mut buffer[position..]);
-        position += write_varint(imm2, &mut buffer[position..]);
+        position += write_simple_varint(imm2, &mut buffer[position..]);
         position
     }
 
@@ -825,7 +1136,7 @@ impl<'a> InstructionVisitor for core::fmt::Formatter<'a> {
     }
 
     fn fallthrough(&mut self) -> Self::ReturnTy {
-        write!(self, "@:")
+        write!(self, "fallthrough")
     }
 
     fn sbrk(&mut self, d: Reg, s: Reg) -> Self::ReturnTy {
@@ -1133,78 +1444,75 @@ impl<'a> InstructionVisitor for core::fmt::Formatter<'a> {
     }
 
     fn branch_less_unsigned(&mut self, s1: Reg, s2: Reg, imm: u32) -> Self::ReturnTy {
-        write!(self, "if {} <u {}: jump @{:x}", s1, s2, imm)
+        write!(self, "jump {} if {} <u {}", imm, s1, s2)
     }
 
     fn branch_less_signed(&mut self, s1: Reg, s2: Reg, imm: u32) -> Self::ReturnTy {
-        write!(self, "if {} <s {}: jump @{:x}", s1, s2, imm)
+        write!(self, "jump {} if {} <s {}", imm, s1, s2)
     }
 
     fn branch_less_unsigned_imm(&mut self, s1: Reg, s2: u32, imm: u32) -> Self::ReturnTy {
-        write!(self, "if {} <u {}: jump @{:x}", s1, s2, imm)
+        write!(self, "jump {} if {} <u {}", imm, s1, s2)
     }
 
     fn branch_less_signed_imm(&mut self, s1: Reg, s2: u32, imm: u32) -> Self::ReturnTy {
-        write!(self, "if {} <s {}: jump @{:x}", s1, s2, imm)
+        write!(self, "jump {} if {} <s {}", imm, s1, s2)
     }
 
     fn branch_greater_or_equal_unsigned(&mut self, s1: Reg, s2: Reg, imm: u32) -> Self::ReturnTy {
-        write!(self, "if {} >=u {}: jump @{:x}", s1, s2, imm)
+        write!(self, "jump {} if {} >=u {}", imm, s1, s2)
     }
 
     fn branch_greater_or_equal_signed(&mut self, s1: Reg, s2: Reg, imm: u32) -> Self::ReturnTy {
-        write!(self, "if {} >=s {}: jump @{:x}", s1, s2, imm)
+        write!(self, "jump {} if {} >=s {}", imm, s1, s2)
     }
 
     fn branch_greater_or_equal_unsigned_imm(&mut self, s1: Reg, s2: u32, imm: u32) -> Self::ReturnTy {
-        write!(self, "if {} >=u {}: jump @{:x}", s1, s2, imm)
+        write!(self, "jump {} if {} >=u {}", imm, s1, s2)
     }
 
     fn branch_greater_or_equal_signed_imm(&mut self, s1: Reg, s2: u32, imm: u32) -> Self::ReturnTy {
-        write!(self, "if {} >=s {}: jump @{:x}", s1, s2, imm)
+        write!(self, "jump {} if {} >=s {}", imm, s1, s2)
     }
 
     fn branch_eq(&mut self, s1: Reg, s2: Reg, imm: u32) -> Self::ReturnTy {
-        write!(self, "if {} == {}: jump @{:x}", s1, s2, imm)
+        write!(self, "jump {} if {} == {}", imm, s1, s2)
     }
 
     fn branch_not_eq(&mut self, s1: Reg, s2: Reg, imm: u32) -> Self::ReturnTy {
-        write!(self, "if {} != {}: jump @{:x}", s1, s2, imm)
+        write!(self, "jump {} if {} != {}", imm, s1, s2)
     }
 
     fn branch_eq_imm(&mut self, s1: Reg, s2: u32, imm: u32) -> Self::ReturnTy {
-        write!(self, "if {} == {}: jump @{:x}", s1, s2, imm)
+        write!(self, "jump {} if {} == {}", imm, s1, s2)
     }
 
     fn branch_not_eq_imm(&mut self, s1: Reg, s2: u32, imm: u32) -> Self::ReturnTy {
-        write!(self, "if {} != {}: jump @{:x}", s1, s2, imm)
+        write!(self, "jump {} if {} != {}", imm, s1, s2)
     }
 
     fn branch_less_or_equal_unsigned_imm(&mut self, s1: Reg, s2: u32, imm: u32) -> Self::ReturnTy {
-        write!(self, "if {} <=u {}: jump @{:x}", s1, s2, imm)
+        write!(self, "jump {} if {} <=u {}", imm, s1, s2)
     }
 
     fn branch_less_or_equal_signed_imm(&mut self, s1: Reg, s2: u32, imm: u32) -> Self::ReturnTy {
-        write!(self, "if {} <=s {}: jump @{:x}", s1, s2, imm)
+        write!(self, "jump {} if {} <=s {}", imm, s1, s2)
     }
 
     fn branch_greater_unsigned_imm(&mut self, s1: Reg, s2: u32, imm: u32) -> Self::ReturnTy {
-        write!(self, "if {} >u {}: jump @{:x}", s1, s2, imm)
+        write!(self, "jump {} if {} >u {}", imm, s1, s2)
     }
 
     fn branch_greater_signed_imm(&mut self, s1: Reg, s2: u32, imm: u32) -> Self::ReturnTy {
-        write!(self, "if {} >s {}: jump @{:x}", s1, s2, imm)
+        write!(self, "jump {} if {} >s {}", imm, s1, s2)
     }
 
     fn jump(&mut self, target: u32) -> Self::ReturnTy {
-        write!(self, "jump @{:x}", target)
+        write!(self, "jump {}", target)
     }
 
-    fn call(&mut self, ra: Reg, target: u32) -> Self::ReturnTy {
-        match ra {
-            Reg::RA => write!(self, "call @{:x}", target),
-            _ => write!(self, "call @{:x}, {}", target, ra),
-        }
+    fn load_imm_and_jump(&mut self, ra: Reg, value: u32, target: u32) -> Self::ReturnTy {
+        write!(self, "{ra} = {value}, jump {target}")
     }
 
     fn jump_indirect(&mut self, base: Reg, offset: u32) -> Self::ReturnTy {
@@ -1216,14 +1524,16 @@ impl<'a> InstructionVisitor for core::fmt::Formatter<'a> {
         }
     }
 
-    fn call_indirect(&mut self, ra: Reg, base: Reg, offset: u32) -> Self::ReturnTy {
-        use Reg::*;
-        match (ra, base, offset) {
-            (RA, _, 0) => write!(self, "call [{}]", base),
-            (RA, _, _) => write!(self, "call [{} + {}]", base, offset),
-            (_, _, 0) => write!(self, "call [{}], {}", base, ra),
-            (_, _, _) => write!(self, "call [{} + {}], {}", base, offset, ra),
+    fn load_imm_and_jump_indirect(&mut self, ra: Reg, base: Reg, value: u32, offset: u32) -> Self::ReturnTy {
+        if offset == 0 {
+            write!(self, "jump [{base}], {ra} = {value}")
+        } else {
+            write!(self, "jump [{base} + {offset}], {ra} = {value}")
         }
+    }
+
+    fn invalid(&mut self, opcode: u8) -> Self::ReturnTy {
+        write!(self, "invalid 0x{opcode:02x}")
     }
 }
 
@@ -1238,15 +1548,9 @@ enum ProgramParseErrorKind {
     FailedToReadStringNonUtf {
         offset: usize,
     },
-    FailedToReadInstructionArguments {
-        offset: usize,
-    },
     UnexpectedSection {
         offset: usize,
         section: u8,
-    },
-    UnexpectedInstruction {
-        offset: usize,
     },
     UnexpectedEnd {
         offset: usize,
@@ -1260,18 +1564,6 @@ enum ProgramParseErrorKind {
 }
 
 impl ProgramParseError {
-    #[cold]
-    #[inline]
-    fn unexpected_instruction(offset: usize) -> ProgramParseError {
-        ProgramParseError(ProgramParseErrorKind::UnexpectedInstruction { offset })
-    }
-
-    #[cold]
-    #[inline]
-    fn failed_to_read_instruction_arguments(offset: usize) -> ProgramParseError {
-        ProgramParseError(ProgramParseErrorKind::FailedToReadInstructionArguments { offset })
-    }
-
     #[cold]
     #[inline]
     fn failed_to_read_varint(offset: usize) -> ProgramParseError {
@@ -1306,25 +1598,11 @@ impl core::fmt::Display for ProgramParseError {
                     offset
                 )
             }
-            ProgramParseErrorKind::FailedToReadInstructionArguments { offset } => {
-                write!(
-                    fmt,
-                    "failed to parse program blob: failed to parse instruction arguments at offset 0x{:x}",
-                    offset
-                )
-            }
             ProgramParseErrorKind::UnexpectedSection { offset, section } => {
                 write!(
                     fmt,
                     "failed to parse program blob: found unexpected section as offset 0x{:x}: 0x{:x}",
                     offset, section
-                )
-            }
-            ProgramParseErrorKind::UnexpectedInstruction { offset } => {
-                write!(
-                    fmt,
-                    "failed to parse program blob: failed to parse instruction at offset 0x{:x}",
-                    offset
                 )
             }
             ProgramParseErrorKind::UnexpectedEnd {
@@ -1349,17 +1627,20 @@ impl std::error::Error for ProgramParseError {}
 
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub struct ProgramExport<'a> {
-    jump_target: u32,
+    target_code_offset: u32,
     symbol: ProgramSymbol<'a>,
 }
 
 impl<'a> ProgramExport<'a> {
-    pub fn new(jump_target: u32, symbol: ProgramSymbol<'a>) -> Self {
-        Self { jump_target, symbol }
+    pub fn new(target_code_offset: u32, symbol: ProgramSymbol<'a>) -> Self {
+        Self {
+            target_code_offset,
+            symbol,
+        }
     }
 
-    pub fn jump_target(&self) -> u32 {
-        self.jump_target
+    pub fn target_code_offset(&self) -> u32 {
+        self.target_code_offset
     }
 
     pub fn symbol(&self) -> &ProgramSymbol<'a> {
@@ -1369,29 +1650,7 @@ impl<'a> ProgramExport<'a> {
     #[cfg(feature = "alloc")]
     pub fn into_owned(self) -> ProgramExport<'static> {
         ProgramExport {
-            jump_target: self.jump_target,
-            symbol: self.symbol.into_owned(),
-        }
-    }
-}
-
-#[derive(Clone, PartialEq, Eq, Debug)]
-pub struct ProgramImport<'a> {
-    symbol: ProgramSymbol<'a>,
-}
-
-impl<'a> ProgramImport<'a> {
-    pub fn new(symbol: ProgramSymbol<'a>) -> Self {
-        Self { symbol }
-    }
-
-    pub fn symbol(&self) -> &ProgramSymbol<'a> {
-        &self.symbol
-    }
-
-    #[cfg(feature = "alloc")]
-    pub fn into_owned(self) -> ProgramImport<'static> {
-        ProgramImport {
+            target_code_offset: self.target_code_offset,
             symbol: self.symbol.into_owned(),
         }
     }
@@ -1407,6 +1666,10 @@ impl<'a> ProgramSymbol<'a> {
 
     pub fn into_inner(self) -> CowBytes<'a> {
         self.0
+    }
+
+    pub fn as_bytes(&'a self) -> &'a [u8] {
+        &self.0
     }
 
     #[cfg(feature = "alloc")]
@@ -1471,16 +1734,16 @@ pub struct ProgramBlob<'a> {
     ro_data: Range<usize>,
     rw_data: Range<usize>,
     exports: Range<usize>,
-    imports: Range<usize>,
+    import_offsets: Range<usize>,
+    import_symbols: Range<usize>,
     code: Range<usize>,
     jump_table: Range<usize>,
+    jump_table_entry_size: u8,
+    bitmask: Range<usize>,
 
     debug_strings: Range<usize>,
     debug_line_program_ranges: Range<usize>,
     debug_line_programs: Range<usize>,
-
-    instruction_count: u32,
-    basic_block_count: u32,
 }
 
 #[derive(Clone)]
@@ -1492,11 +1755,6 @@ struct Reader<'a> {
 impl<'a> Reader<'a> {
     fn skip(&mut self, count: usize) -> Result<(), ProgramParseError> {
         self.read_slice_as_range(count).map(|_| ())
-    }
-
-    fn finish(&mut self) {
-        self.position += self.blob.len();
-        self.blob = b"";
     }
 
     #[inline(always)]
@@ -1527,47 +1785,6 @@ impl<'a> Reader<'a> {
         Ok(value)
     }
 
-    #[inline(always)]
-    fn read_regs3(&mut self) -> Result<(Reg, Reg, Reg), ProgramParseError> {
-        let data = self.read_slice(2)?;
-        let reg1 = data[0] & 0b1111;
-        let reg2 = data[0] >> 4;
-        let reg3 = data[1];
-        if let Some(reg1) = Reg::from_u8(reg1) {
-            if let Some(reg2) = Reg::from_u8(reg2) {
-                if let Some(reg3) = Reg::from_u8(reg3) {
-                    return Ok((reg1, reg2, reg3));
-                }
-            }
-        }
-
-        Err(ProgramParseError::failed_to_read_instruction_arguments(self.position - 2))
-    }
-
-    #[inline(always)]
-    fn read_reg(&mut self) -> Result<Reg, ProgramParseError> {
-        let reg = self.read_byte()?;
-        if let Some(reg) = Reg::from_u8(reg) {
-            return Ok(reg);
-        }
-
-        Err(ProgramParseError::failed_to_read_instruction_arguments(self.position - 1))
-    }
-
-    #[inline(always)]
-    fn read_regs2(&mut self) -> Result<(Reg, Reg), ProgramParseError> {
-        let regs = self.read_byte()?;
-        let reg1 = regs & 0b1111;
-        let reg2 = regs >> 4;
-        if let Some(reg1) = Reg::from_u8(reg1) {
-            if let Some(reg2) = Reg::from_u8(reg2) {
-                return Ok((reg1, reg2));
-            }
-        }
-
-        Err(ProgramParseError::failed_to_read_instruction_arguments(self.position - 1))
-    }
-
     fn read_bytes_with_length(&mut self) -> Result<&'a [u8], ProgramParseError> {
         let length = self.read_varint()? as usize;
         self.read_slice(length)
@@ -1593,10 +1810,6 @@ impl<'a> Reader<'a> {
         Ok(range)
     }
 
-    fn is_eof(&self) -> bool {
-        self.blob.is_empty()
-    }
-
     fn read_section_range_into(
         &mut self,
         out_section: &mut u8,
@@ -1610,6 +1823,296 @@ impl<'a> Reader<'a> {
         }
 
         Ok(())
+    }
+}
+
+#[derive(Copy, Clone)]
+pub struct Imports<'a> {
+    offsets: &'a [u8],
+    symbols: &'a [u8],
+}
+
+impl<'a> Imports<'a> {
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    pub fn len(&self) -> u32 {
+        (self.offsets.len() / 4) as u32
+    }
+
+    pub fn get(&self, index: u32) -> Option<ProgramSymbol<'a>> {
+        let offset_start = index.checked_mul(4)?;
+        let offset_end = offset_start.checked_add(4)?;
+        let xs = self.offsets.get(offset_start as usize..offset_end as usize)?;
+        let offset = u32::from_le_bytes([xs[0], xs[1], xs[2], xs[3]]) as usize;
+        let next_offset = offset_end
+            .checked_add(4)
+            .and_then(|next_offset_end| self.offsets.get(offset_end as usize..next_offset_end as usize))
+            .map_or(self.symbols.len(), |xs| u32::from_le_bytes([xs[0], xs[1], xs[2], xs[3]]) as usize);
+
+        let symbol = self.symbols.get(offset..next_offset)?;
+        Some(ProgramSymbol::new(symbol.into()))
+    }
+
+    pub fn iter(&self) -> ImportsIter<'a> {
+        ImportsIter { imports: *self, index: 0 }
+    }
+}
+
+impl<'a> IntoIterator for Imports<'a> {
+    type Item = Option<ProgramSymbol<'a>>;
+    type IntoIter = ImportsIter<'a>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.iter()
+    }
+}
+
+impl<'a> IntoIterator for &'a Imports<'a> {
+    type Item = Option<ProgramSymbol<'a>>;
+    type IntoIter = ImportsIter<'a>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.iter()
+    }
+}
+
+pub struct ImportsIter<'a> {
+    imports: Imports<'a>,
+    index: u32,
+}
+
+impl<'a> Iterator for ImportsIter<'a> {
+    type Item = Option<ProgramSymbol<'a>>;
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.index >= self.imports.len() {
+            None
+        } else {
+            let value = self.imports.get(self.index);
+            self.index += 1;
+            Some(value)
+        }
+    }
+}
+
+#[derive(Copy, Clone)]
+pub struct JumpTable<'a> {
+    blob: &'a [u8],
+    entry_size: u32,
+}
+
+impl<'a> JumpTable<'a> {
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    pub fn len(&self) -> u32 {
+        if self.entry_size == 0 {
+            0
+        } else {
+            self.blob.len() as u32 / self.entry_size
+        }
+    }
+
+    pub fn get_by_address(&self, address: u32) -> Option<u32> {
+        if address & (VM_CODE_ADDRESS_ALIGNMENT - 1) != 0 || address == 0 {
+            return None;
+        }
+
+        self.get_by_index((address - VM_CODE_ADDRESS_ALIGNMENT) / VM_CODE_ADDRESS_ALIGNMENT)
+    }
+
+    pub fn get_by_index(&self, index: u32) -> Option<u32> {
+        if self.entry_size == 0 {
+            return None;
+        }
+
+        let start = index.checked_mul(self.entry_size)?;
+        let end = start.checked_add(self.entry_size)?;
+        self.blob.get(start as usize..end as usize).map(|xs| match xs.len() {
+            1 => u32::from(xs[0]),
+            2 => u32::from(u16::from_le_bytes([xs[0], xs[1]])),
+            3 => u32::from_le_bytes([xs[0], xs[1], xs[2], 0]),
+            4 => u32::from_le_bytes([xs[0], xs[1], xs[2], xs[3]]),
+            _ => unreachable!(),
+        })
+    }
+
+    pub fn iter(&self) -> JumpTableIter<'a> {
+        JumpTableIter {
+            jump_table: *self,
+            index: 0,
+        }
+    }
+}
+
+impl<'a> IntoIterator for JumpTable<'a> {
+    type Item = u32;
+    type IntoIter = JumpTableIter<'a>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.iter()
+    }
+}
+
+impl<'a> IntoIterator for &'a JumpTable<'a> {
+    type Item = u32;
+    type IntoIter = JumpTableIter<'a>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.iter()
+    }
+}
+
+pub struct JumpTableIter<'a> {
+    jump_table: JumpTable<'a>,
+    index: u32,
+}
+
+impl<'a> Iterator for JumpTableIter<'a> {
+    type Item = u32;
+    fn next(&mut self) -> Option<Self::Item> {
+        let value = self.jump_table.get_by_index(self.index)?;
+        self.index += 1;
+        Some(value)
+    }
+}
+
+#[inline(never)]
+#[cold]
+fn parse_bitmask_slow(bitmask: &[u8], code_offset: &mut usize) -> Option<usize> {
+    if bitmask.is_empty() {
+        return None;
+    }
+
+    let mut offset = *code_offset + 1;
+    let mut args_length = 0;
+    while let Some(&byte) = bitmask.get(offset >> 3) {
+        let shift = offset & 7;
+        let mask = byte >> shift;
+
+        if mask == 0 {
+            args_length += 8 - shift;
+            offset += 8 - shift;
+            continue;
+        }
+
+        let length = mask.trailing_zeros() as usize;
+        if length == 0 {
+            break;
+        }
+
+        args_length += length;
+        offset += length;
+    }
+
+    *code_offset = offset;
+    Some(args_length)
+}
+
+#[cfg_attr(not(debug_assertions), inline(always))]
+pub(crate) fn parse_bitmask(bitmask: &[u8], code_offset: &mut usize) -> Option<usize> {
+    let mut offset = *code_offset + 1;
+    let Some(bitmask) = bitmask.get(offset >> 3..(offset >> 3) + 4) else {
+        return parse_bitmask_slow(bitmask, code_offset);
+    };
+
+    let shift = offset & 7;
+    let mask = u32::from_le_bytes([bitmask[0], bitmask[1], bitmask[2], bitmask[3]]) >> shift;
+
+    if mask == 0 {
+        return parse_bitmask_slow(bitmask, code_offset);
+    }
+
+    let args_length = mask.trailing_zeros() as usize;
+    offset += args_length;
+    *code_offset = offset;
+
+    Some(args_length)
+}
+
+#[test]
+fn test_parse_bitmask() {
+    fn p(bitmask: &[u8]) -> (Option<usize>, usize) {
+        let mut offset = 0;
+        (parse_bitmask(bitmask, &mut offset), offset)
+    }
+
+    assert_eq!(p(&[0b00000001, 0, 0, 0]), (Some(31), 32));
+    assert_eq!(p(&[0b00000001, 0, 0]), (Some(23), 24));
+    assert_eq!(p(&[0b00000001, 0]), (Some(15), 16));
+    assert_eq!(p(&[0b00000001]), (Some(7), 8));
+    assert_eq!(p(&[0b00000011]), (Some(0), 1));
+    assert_eq!(p(&[0b00000011, 0]), (Some(0), 1));
+    assert_eq!(p(&[0b00000101]), (Some(1), 2));
+    assert_eq!(p(&[0b10000001]), (Some(6), 7));
+    assert_eq!(p(&[0b00000001, 1]), (Some(7), 8));
+}
+
+#[derive(Clone)]
+pub struct Instructions<'a> {
+    code: &'a [u8],
+    bitmask: &'a [u8],
+    offset: usize,
+}
+
+#[derive(Copy, Clone, Debug)]
+pub struct ParsedInstruction {
+    pub kind: Instruction,
+    pub offset: u32,
+    pub length: u32,
+}
+
+impl core::ops::Deref for ParsedInstruction {
+    type Target = Instruction;
+
+    #[inline]
+    fn deref(&self) -> &Self::Target {
+        &self.kind
+    }
+}
+
+impl core::fmt::Display for ParsedInstruction {
+    fn fmt(&self, fmt: &mut core::fmt::Formatter) -> core::fmt::Result {
+        write!(fmt, "{:>7}: {}", self.offset, self.kind)
+    }
+}
+
+impl<'a> Instructions<'a> {
+    #[inline]
+    pub fn new(code: &'a [u8], bitmask: &'a [u8], offset: u32) -> Self {
+        Self {
+            code,
+            bitmask,
+            offset: offset as usize,
+        }
+    }
+
+    #[inline]
+    pub fn offset(&self) -> u32 {
+        self.offset as u32
+    }
+
+    #[inline]
+    pub fn visit<T>(&mut self, visitor: &mut T) -> Option<<T as InstructionVisitor>::ReturnTy>
+    where
+        T: InstructionVisitor,
+    {
+        // TODO: Make this directly dispatched?
+        Some(self.next()?.visit(visitor))
+    }
+}
+
+impl<'a> Iterator for Instructions<'a> {
+    type Item = ParsedInstruction;
+    #[inline(always)]
+    fn next(&mut self) -> Option<Self::Item> {
+        parse_instruction(self.code, self.bitmask, &mut self.offset)
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        (0, Some(self.code.len() - core::cmp::min(self.offset, self.code.len())))
     }
 }
 
@@ -1666,9 +2169,29 @@ impl<'a> ProgramBlob<'a> {
 
         reader.read_section_range_into(&mut section, &mut program.ro_data, SECTION_RO_DATA)?;
         reader.read_section_range_into(&mut section, &mut program.rw_data, SECTION_RW_DATA)?;
-        reader.read_section_range_into(&mut section, &mut program.imports, SECTION_IMPORTS)?;
+
+        if section == SECTION_IMPORTS {
+            let section_length = reader.read_varint()? as usize;
+            let section_start = reader.position;
+            let import_count = reader.read_varint()?;
+            if import_count > VM_MAXIMUM_IMPORT_COUNT {
+                return Err(ProgramParseError(ProgramParseErrorKind::Other("too many imports")));
+            }
+
+            let Some(import_offsets_size) = import_count.checked_mul(4) else {
+                return Err(ProgramParseError(ProgramParseErrorKind::Other("the imports section is invalid")));
+            };
+
+            program.import_offsets = reader.read_slice_as_range(import_offsets_size as usize)?;
+            let Some(import_symbols_size) = section_length.checked_sub(reader.position - section_start) else {
+                return Err(ProgramParseError(ProgramParseErrorKind::Other("the imports section is invalid")));
+            };
+
+            program.import_symbols = reader.read_slice_as_range(import_symbols_size)?;
+            section = reader.read_byte()?;
+        }
+
         reader.read_section_range_into(&mut section, &mut program.exports, SECTION_EXPORTS)?;
-        reader.read_section_range_into(&mut section, &mut program.jump_table, SECTION_JUMP_TABLE)?;
 
         if program.ro_data.len() > program.ro_data_size as usize {
             return Err(ProgramParseError(ProgramParseErrorKind::Other(
@@ -1685,25 +2208,39 @@ impl<'a> ProgramBlob<'a> {
         if section == SECTION_CODE {
             let section_length = reader.read_varint()?;
             let initial_position = reader.position;
-            let instruction_count = reader.read_varint()?;
-            let basic_block_count = reader.read_varint()?;
+            let jump_table_entry_count = reader.read_varint()?;
+            if jump_table_entry_count > VM_MAXIMUM_JUMP_TABLE_ENTRIES {
+                return Err(ProgramParseError(ProgramParseErrorKind::Other(
+                    "the jump table section is too long",
+                )));
+            }
+
+            let jump_table_entry_size = reader.read_byte()?;
+            let code_length = reader.read_varint()?;
+            if code_length > VM_MAXIMUM_CODE_SIZE {
+                return Err(ProgramParseError(ProgramParseErrorKind::Other("the code section is too long")));
+            }
+
             let header_size = (reader.position - initial_position) as u32;
             if section_length < header_size {
                 return Err(ProgramParseError(ProgramParseErrorKind::Other("the code section is too short")));
             }
 
-            let body_length = section_length - header_size;
-            if instruction_count > body_length {
-                return Err(ProgramParseError(ProgramParseErrorKind::Other("invalid instruction count")));
+            if !matches!(jump_table_entry_size, 0..=4) {
+                return Err(ProgramParseError(ProgramParseErrorKind::Other("invalid jump table entry size")));
             }
 
-            if basic_block_count > body_length {
-                return Err(ProgramParseError(ProgramParseErrorKind::Other("invalid basic block count")));
-            }
+            let Some(jump_table_length) = jump_table_entry_count.checked_mul(u32::from(jump_table_entry_size)) else {
+                return Err(ProgramParseError(ProgramParseErrorKind::Other("the jump table is too long")));
+            };
 
-            program.instruction_count = instruction_count;
-            program.basic_block_count = basic_block_count;
-            program.code = reader.read_slice_as_range(body_length as usize)?;
+            program.jump_table = reader.read_slice_as_range(jump_table_length as usize)?;
+            program.jump_table_entry_size = jump_table_entry_size;
+            program.code = reader.read_slice_as_range(code_length as usize)?;
+
+            let bitmask_length = section_length - (reader.position - initial_position) as u32;
+            program.bitmask = reader.read_slice_as_range(bitmask_length as usize)?;
+
             section = reader.read_byte()?;
         }
 
@@ -1724,14 +2261,31 @@ impl<'a> ProgramBlob<'a> {
             section = reader.read_byte()?;
         }
 
-        if section == SECTION_END_OF_FILE {
-            return Ok(program);
+        if section != SECTION_END_OF_FILE {
+            return Err(ProgramParseError(ProgramParseErrorKind::UnexpectedSection {
+                offset: reader.position - 1,
+                section,
+            }));
         }
 
-        Err(ProgramParseError(ProgramParseErrorKind::UnexpectedSection {
-            offset: reader.position - 1,
-            section,
-        }))
+        let mut expected_bitmask_length = program.code.len() / 8;
+        if program.code.len() % 8 != 0 {
+            expected_bitmask_length += 1;
+        }
+
+        if program.bitmask.len() != expected_bitmask_length {
+            return Err(ProgramParseError(ProgramParseErrorKind::Other(
+                "the bitmask length doesn't match the code length",
+            )));
+        }
+
+        if !program.bitmask.is_empty() && program.blob[program.bitmask.clone()][0] & 1 != 1 {
+            return Err(ProgramParseError(ProgramParseErrorKind::Other(
+                "the bitmask doesn't start with a 1",
+            )));
+        }
+
+        Ok(program)
     }
 
     /// Returns the contents of the read-only data section.
@@ -1772,22 +2326,9 @@ impl<'a> ProgramBlob<'a> {
         &self.blob[self.code.clone()]
     }
 
-    /// Returns the number of instructions the code section should contain.
-    ///
-    /// NOTE: It is safe to preallocate memory based on this value as we make sure
-    /// that it is no larger than the the physical size of the code section, however
-    /// we do not verify that it is actually true, so it should *not* be blindly trusted!
-    pub fn instruction_count(&self) -> u32 {
-        self.instruction_count
-    }
-
-    /// Returns the number of basic blocks the code section should contain.
-    ///
-    /// NOTE: It is safe to preallocate memory based on this value as we make sure
-    /// that it is no larger than the the physical size of the code section, however
-    /// we do not verify that it is actually true, so it should *not* be blindly trusted!
-    pub fn basic_block_count(&self) -> u32 {
-        self.basic_block_count
+    /// Returns the code bitmask in its raw form.
+    pub fn bitmask(&self) -> &[u8] {
+        &self.blob[self.bitmask.clone()]
     }
 
     fn get_section_reader(&self, range: Range<usize>) -> Reader {
@@ -1797,66 +2338,15 @@ impl<'a> ProgramBlob<'a> {
         }
     }
 
-    /// Returns an iterator over program imports.
-    pub fn imports(&'_ self) -> impl Iterator<Item = Result<ProgramImport, ProgramParseError>> + Clone + '_ {
-        #[derive(Clone)]
-        enum State {
-            Uninitialized,
-            Pending(u32),
-            Finished,
-        }
-
-        #[derive(Clone)]
-        struct ImportIterator<'a> {
-            state: State,
-            reader: Reader<'a>,
-        }
-
-        impl<'a> ImportIterator<'a> {
-            fn read_next(&mut self) -> Result<Option<ProgramImport<'a>>, ProgramParseError> {
-                let remaining = match core::mem::replace(&mut self.state, State::Finished) {
-                    State::Uninitialized => self.reader.read_varint()?,
-                    State::Pending(remaining) => remaining,
-                    State::Finished => return Ok(None),
-                };
-
-                if remaining == 0 {
-                    if !self.reader.is_eof() {
-                        return Err(ProgramParseError(ProgramParseErrorKind::Other(
-                            "the import section contains more data than expected",
-                        )));
-                    }
-
-                    return Ok(None);
-                }
-
-                let symbol = self.reader.read_bytes_with_length()?;
-                let import = ProgramImport { symbol: symbol.into() };
-
-                self.state = State::Pending(remaining - 1);
-                Ok(Some(import))
-            }
-        }
-
-        impl<'a> Iterator for ImportIterator<'a> {
-            type Item = Result<ProgramImport<'a>, ProgramParseError>;
-            fn next(&mut self) -> Option<Self::Item> {
-                self.read_next().transpose()
-            }
-        }
-
-        ImportIterator {
-            state: if self.imports != (0_usize..0_usize) {
-                State::Uninitialized
-            } else {
-                State::Finished
-            },
-            reader: self.get_section_reader(self.imports.clone()),
+    pub fn imports(&self) -> Imports {
+        Imports {
+            offsets: &self.blob[self.import_offsets.clone()],
+            symbols: &self.blob[self.import_symbols.clone()],
         }
     }
 
     /// Returns an iterator over program exports.
-    pub fn exports(&'_ self) -> impl Iterator<Item = Result<ProgramExport, ProgramParseError>> + Clone + '_ {
+    pub fn exports(&'_ self) -> impl Iterator<Item = ProgramExport> + Clone + '_ {
         #[derive(Clone)]
         enum State {
             Uninitialized,
@@ -1870,40 +2360,28 @@ impl<'a> ProgramBlob<'a> {
             reader: Reader<'a>,
         }
 
-        impl<'a> ExportIterator<'a> {
-            fn read_next(&mut self) -> Result<Option<ProgramExport<'a>>, ProgramParseError> {
+        impl<'a> Iterator for ExportIterator<'a> {
+            type Item = ProgramExport<'a>;
+            fn next(&mut self) -> Option<Self::Item> {
                 let remaining = match core::mem::replace(&mut self.state, State::Finished) {
-                    State::Uninitialized => self.reader.read_varint()?,
+                    State::Uninitialized => self.reader.read_varint().ok()?,
                     State::Pending(remaining) => remaining,
-                    State::Finished => return Ok(None),
+                    State::Finished => return None,
                 };
 
                 if remaining == 0 {
-                    if !self.reader.is_eof() {
-                        return Err(ProgramParseError(ProgramParseErrorKind::Other(
-                            "the export section contains more data than expected",
-                        )));
-                    }
-
-                    return Ok(None);
+                    return None;
                 }
 
-                let jump_target = self.reader.read_varint()?;
-                let symbol = self.reader.read_bytes_with_length()?;
+                let target_code_offset = self.reader.read_varint().ok()?;
+                let symbol = self.reader.read_bytes_with_length().ok()?;
                 let export = ProgramExport {
-                    jump_target,
+                    target_code_offset,
                     symbol: symbol.into(),
                 };
 
                 self.state = State::Pending(remaining - 1);
-                Ok(Some(export))
-            }
-        }
-
-        impl<'a> Iterator for ExportIterator<'a> {
-            type Item = Result<ProgramExport<'a>, ProgramParseError>;
-            fn next(&mut self) -> Option<Self::Item> {
-                self.read_next().transpose()
+                Some(export)
             }
         }
 
@@ -1917,63 +2395,38 @@ impl<'a> ProgramBlob<'a> {
         }
     }
 
-    /// Returns an iterator over program instructions.
-    pub fn instructions(&'_ self) -> impl Iterator<Item = Result<Instruction, ProgramParseError>> + Clone + '_ {
-        #[derive(Clone)]
-        struct CodeIterator<'a> {
-            reader: Reader<'a>,
-        }
-
-        impl<'a> Iterator for CodeIterator<'a> {
-            type Item = Result<Instruction, ProgramParseError>;
-            fn next(&mut self) -> Option<Self::Item> {
-                if self.reader.is_eof() {
-                    return None;
-                }
-
-                let result = (|| -> Result<Instruction, ProgramParseError> {
-                    let opcode = self.reader.read_byte()?;
-                    parse_instruction_impl(opcode, &mut self.reader)
-                })();
-
-                if result.is_err() {
-                    self.reader.finish();
-                }
-
-                Some(result)
-            }
-        }
-
-        CodeIterator {
-            reader: self.get_section_reader(self.code.clone()),
+    #[inline]
+    pub fn instructions(&'a self) -> Instructions<'a> {
+        Instructions {
+            code: self.code(),
+            bitmask: self.bitmask(),
+            offset: 0,
         }
     }
 
-    /// The upper bound of how many entries there might be in this program's jump table, excluding the very first implicit entry.
-    pub fn jump_table_upper_bound(&self) -> usize {
-        self.jump_table.len()
+    #[inline]
+    pub fn instructions_at(&'a self, offset: u32) -> Option<Instructions<'a>> {
+        let bitmask = self.bitmask();
+        if (bitmask.get(offset as usize >> 3)? >> (offset as usize & 7)) & 1 == 0 {
+            None
+        } else {
+            Some(Instructions {
+                code: self.code(),
+                bitmask,
+                offset: offset as usize,
+            })
+        }
     }
 
-    /// Returns an iterator over the jump table entries, excluding the very first implicit entry.
-    pub fn jump_table(&'_ self) -> impl Iterator<Item = Result<u32, ProgramParseError>> + Clone + '_ {
-        #[derive(Clone)]
-        struct JumpTableIterator<'a> {
-            reader: Reader<'a>,
-        }
-
-        impl<'a> Iterator for JumpTableIterator<'a> {
-            type Item = Result<u32, ProgramParseError>;
-            fn next(&mut self) -> Option<Self::Item> {
-                if self.reader.is_eof() {
-                    return None;
-                }
-
-                Some(self.reader.read_varint())
-            }
-        }
-
-        JumpTableIterator {
-            reader: self.get_section_reader(self.jump_table.clone()),
+    /// Returns a jump table.
+    pub fn jump_table(&self) -> JumpTable {
+        JumpTable {
+            blob: if self.jump_table_entry_size == 0 {
+                &[]
+            } else {
+                &self.blob[self.jump_table.clone()]
+            },
+            entry_size: u32::from(self.jump_table_entry_size),
         }
     }
 
@@ -2061,16 +2514,16 @@ impl<'a> ProgramBlob<'a> {
             ro_data: self.ro_data,
             rw_data: self.rw_data,
             exports: self.exports,
-            imports: self.imports,
+            import_symbols: self.import_symbols,
+            import_offsets: self.import_offsets,
             code: self.code,
             jump_table: self.jump_table,
+            jump_table_entry_size: self.jump_table_entry_size,
+            bitmask: self.bitmask,
 
             debug_strings: self.debug_strings,
             debug_line_program_ranges: self.debug_line_program_ranges,
             debug_line_programs: self.debug_line_programs,
-
-            instruction_count: self.instruction_count,
-            basic_block_count: self.basic_block_count,
         }
     }
 }
@@ -2546,8 +2999,7 @@ pub const SECTION_RO_DATA: u8 = 2;
 pub const SECTION_RW_DATA: u8 = 3;
 pub const SECTION_IMPORTS: u8 = 4;
 pub const SECTION_EXPORTS: u8 = 5;
-pub const SECTION_JUMP_TABLE: u8 = 6;
-pub const SECTION_CODE: u8 = 7;
+pub const SECTION_CODE: u8 = 6;
 pub const SECTION_OPT_DEBUG_STRINGS: u8 = 128;
 pub const SECTION_OPT_DEBUG_LINE_PROGRAMS: u8 = 129;
 pub const SECTION_OPT_DEBUG_LINE_PROGRAM_RANGES: u8 = 130;

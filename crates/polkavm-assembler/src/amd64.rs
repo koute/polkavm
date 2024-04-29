@@ -1,6 +1,6 @@
 #![allow(non_camel_case_types)]
 
-use crate::assembler::{InstBuf, InstFixup, Instruction, Label};
+use crate::assembler::{FixupKind, InstBuf, Instruction, Label};
 
 /// The REX prefix.
 const REX: u8 = 0x40;
@@ -832,9 +832,8 @@ macro_rules! impl_inst {
                     }
 
                     #[inline(always)]
-                    pub fn fixup($self) -> Option<InstFixup> {
-                        let value: Option<(Label, u8, u8)> = $fixup;
-                        value.map(|(target_label, fixup_offset, fixup_length)| InstFixup { target_label, fixup_offset, fixup_length})
+                    pub(crate) fn fixup($self) -> Option<(Label, FixupKind)> {
+                        $fixup
                     }
                 }
 
@@ -1661,33 +1660,36 @@ pub mod inst {
 
         // (label instructions)
         jmp_label8(Label) =>
-            jmp_rel8(0).encode(),
-            Some((self.0, 1, 1)),
+            ud2().encode(),
+            Some((self.0, FixupKind::new_1(0xeb, 1))),
             (fmt.write_fmt(core::format_args!("jmp {}", self.0))),
 
         jmp_label32(Label) =>
-            jmp_rel32(0).encode(),
-            Some((self.0, 1, 4)),
+            InstBuf::from_array([0x0f, 0x0b, 0x90, 0x0f, 0x0b]),
+            Some((self.0, FixupKind::new_1(0xe9, 4))),
             (fmt.write_fmt(core::format_args!("jmp {}", self.0))),
 
         call_label32(Label) =>
-            call_rel32(0).encode(),
-            Some((self.0, 1, 4)),
+            InstBuf::from_array([0x0f, 0x0b, 0x90, 0x0f, 0x0b]),
+            Some((self.0, FixupKind::new_1(0xe8, 4))),
             (fmt.write_fmt(core::format_args!("call {}", self.0))),
 
         jcc_label8(Condition, Label) =>
-            jcc_rel8(self.0, 0).encode(),
-            Some((self.1, 1, 1)),
+            ud2().encode(),
+            Some((self.1, FixupKind::new_1(0x70 | self.0 as u32, 1))),
             (fmt.write_fmt(core::format_args!("j{} {}", self.0.suffix(), self.1))),
 
         jcc_label32(Condition, Label) =>
-            jcc_rel32(self.0, 0).encode(),
-            Some((self.1, 2, 4)),
+            InstBuf::from_array([0x0f, 0x0b, 0x0f, 0x0b, 0x0f, 0x0b]),
+            Some((self.1, FixupKind::new_2([0x0f, 0x80 | self.0 as u32], 4))),
             (fmt.write_fmt(core::format_args!("j{} {}", self.0.suffix(), self.1))),
 
         lea_rip_label(Reg, Label) =>
-            lea(RegSize::R64, self.0, MemOp::RipRelative(None, 0)).encode(),
-            Some((self.1, 3, 4)),
+            InstBuf::from_array([0x0f, 0x0b, 0x0f, 0x0b, 0x0f, 0x0b, 0x90]),
+            {
+                let inst = Inst::new(0x8d).rex_64b().modrm_reg(self.0).mem(MemOp::RipRelative(None, 0));
+                Some((self.1, FixupKind::new_3([u32::from(inst.rex), u32::from(inst.opcode), u32::from(inst.modrm)], 4)))
+            },
             (fmt.write_fmt(core::format_args!("lea {}, [{}]", self.0, self.1))),
     }
 }
@@ -2281,6 +2283,16 @@ mod tests {
     }
 
     #[test]
+    fn jmp_label8_undefined() {
+        use super::inst::*;
+        let mut asm = crate::Assembler::new();
+        let label = asm.forward_declare_label();
+        asm.push(jmp_label8(label));
+        let disassembly = disassemble(&asm.finalize());
+        assert_eq!(disassembly, "00000000 0f0b ud2");
+    }
+
+    #[test]
     fn jmp_label32_infinite_loop() {
         use super::inst::*;
         let mut asm = crate::Assembler::new();
@@ -2291,6 +2303,16 @@ mod tests {
     }
 
     #[test]
+    fn jmp_label32_undefined() {
+        use super::inst::*;
+        let mut asm = crate::Assembler::new();
+        let label = asm.forward_declare_label();
+        asm.push(jmp_label32(label));
+        let disassembly = disassemble(&asm.finalize());
+        assert_eq!(disassembly, "00000000 0f0b ud2\n00000002 90 nop\n00000003 0f0b ud2");
+    }
+
+    #[test]
     fn call_label32_infinite_loop() {
         use super::inst::*;
         let mut asm = crate::Assembler::new();
@@ -2298,6 +2320,16 @@ mod tests {
         asm.push_with_label(label, call_label32(label));
         let disassembly = disassemble(&asm.finalize());
         assert_eq!(disassembly, "00000000 e8fbffffff call 0x0");
+    }
+
+    #[test]
+    fn call_label32_undefined() {
+        use super::inst::*;
+        let mut asm = crate::Assembler::new();
+        let label = asm.forward_declare_label();
+        asm.push(call_label32(label));
+        let disassembly = disassemble(&asm.finalize());
+        assert_eq!(disassembly, "00000000 0f0b ud2\n00000002 90 nop\n00000003 0f0b ud2");
     }
 
     #[test]
@@ -2312,6 +2344,18 @@ mod tests {
                 disassembly,
                 format!("00000000 {:02x}fe j{} short 0x0", 0x70 + cond as u8, cond.suffix())
             );
+        });
+    }
+
+    #[test]
+    fn jcc_label8_undefined() {
+        use super::inst::*;
+        super::Condition::generate_test_values(|cond| {
+            let mut asm = crate::Assembler::new();
+            let label = asm.forward_declare_label();
+            asm.push(jcc_label8(cond, label));
+            let disassembly = disassemble(&asm.finalize());
+            assert_eq!(disassembly, "00000000 0f0b ud2");
         });
     }
 
@@ -2376,6 +2420,18 @@ mod tests {
     }
 
     #[test]
+    fn jcc_label32_undefined() {
+        use super::inst::*;
+        super::Condition::generate_test_values(|cond| {
+            let mut asm = crate::Assembler::new();
+            let label = asm.forward_declare_label();
+            asm.push(jcc_label32(cond, label));
+            let disassembly = disassemble(&asm.finalize());
+            assert_eq!(disassembly, "00000000 0f0b ud2\n00000002 0f0b ud2\n00000004 0f0b ud2");
+        });
+    }
+
+    #[test]
     fn lea_rip_label_infinite_loop() {
         use super::inst::*;
         let mut asm = crate::Assembler::new();
@@ -2383,6 +2439,21 @@ mod tests {
         asm.push_with_label(label, lea_rip_label(super::Reg::rax, label));
         let disassembly = disassemble(&asm.finalize());
         assert_eq!(disassembly, "00000000 488d05f9ffffff lea rax, [rip-0x7]");
+    }
+
+    #[test]
+    fn lea_rip_label_undefined() {
+        use super::inst::*;
+        super::Reg::generate_test_values(|reg| {
+            let mut asm = crate::Assembler::new();
+            let label = asm.forward_declare_label();
+            asm.push(lea_rip_label(reg, label));
+            let disassembly = disassemble(&asm.finalize());
+            assert_eq!(
+                disassembly,
+                "00000000 0f0b ud2\n00000002 0f0b ud2\n00000004 0f0b ud2\n00000006 90 nop"
+            );
+        });
     }
 
     #[test]

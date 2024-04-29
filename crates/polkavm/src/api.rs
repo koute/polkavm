@@ -4,11 +4,11 @@ use std::sync::{Arc, Mutex};
 
 use core::marker::PhantomData;
 
-use polkavm_common::abi::{MemoryMap, VM_MAXIMUM_EXPORT_COUNT, VM_MAXIMUM_IMPORT_COUNT, VM_MAXIMUM_INSTRUCTION_COUNT};
+use polkavm_common::abi::MemoryMap;
 use polkavm_common::abi::{VM_ADDR_RETURN_TO_HOST, VM_ADDR_USER_STACK_HIGH};
 use polkavm_common::error::Trap;
-use polkavm_common::program::{FrameKind, Instruction, InstructionVisitor, Reg};
-use polkavm_common::program::{ProgramBlob, ProgramExport, ProgramImport, ProgramSymbol};
+use polkavm_common::program::{FrameKind, Imports, Reg};
+use polkavm_common::program::{ProgramBlob, ProgramSymbol};
 use polkavm_common::utils::{Access, AsUninitSliceMut, Gas};
 
 use crate::caller::{Caller, CallerRaw};
@@ -38,14 +38,20 @@ if_compiler_is_supported! {
         }
 
         use crate::sandbox::SandboxCache;
+        use crate::compiler::CompilerCache;
     } else {
         struct SandboxCache;
+
+        #[derive(Default)]
+        struct CompilerCache;
     }
 }
 
 pub(crate) struct EngineState {
     #[allow(dead_code)]
     sandbox_cache: Option<SandboxCache>,
+    #[allow(dead_code)]
+    compiler_cache: CompilerCache,
 }
 
 pub struct Engine {
@@ -114,7 +120,10 @@ impl Engine {
             selected_sandbox,
             interpreter_enabled: debug_trace_execution || selected_backend == BackendKind::Interpreter,
             debug_trace_execution,
-            state: Arc::new(EngineState { sandbox_cache }),
+            state: Arc::new(EngineState {
+                sandbox_cache,
+                compiler_cache: Default::default(),
+            }),
         })
     }
 }
@@ -142,38 +151,28 @@ impl CompiledModuleKind {
 
 struct ModulePrivate {
     debug_trace_execution: bool,
-    exports: Vec<ProgramExport<'static>>,
-    imports: Vec<ProgramImport<'static>>,
-    export_index_by_symbol: HashMap<Vec<u8>, usize>,
-
-    instruction_by_basic_block: Vec<u32>,
-    jump_table_index_by_basic_block: Vec<u32>,
-    basic_block_by_jump_table_index: Vec<u32>,
+    code_offset_by_symbol: HashMap<Vec<u8>, u32>,
 
     blob: ProgramBlob<'static>,
     compiled_module: CompiledModuleKind,
     interpreted_module: Option<InterpretedModule>,
     memory_map: MemoryMap,
     gas_metering: Option<GasMeteringKind>,
+    is_strict: bool,
 }
 
 impl ModulePrivate {
     fn empty() -> Self {
         ModulePrivate {
             debug_trace_execution: false,
-            exports: Default::default(),
-            imports: Default::default(),
-            export_index_by_symbol: Default::default(),
-
-            instruction_by_basic_block: Default::default(),
-            jump_table_index_by_basic_block: Default::default(),
-            basic_block_by_jump_table_index: Default::default(),
+            code_offset_by_symbol: Default::default(),
 
             blob: Default::default(),
             compiled_module: CompiledModuleKind::Unavailable,
             interpreted_module: None,
             memory_map: MemoryMap::empty(),
             gas_metering: None,
+            is_strict: false,
         }
     }
 }
@@ -182,786 +181,6 @@ impl ModulePrivate {
 #[derive(Clone)]
 pub struct Module(Arc<ModulePrivate>);
 
-pub(crate) trait BackendModule: Sized {
-    type BackendVisitor<'a>;
-    type Aux;
-
-    #[allow(clippy::too_many_arguments)]
-    fn create_visitor<'a>(
-        config: &'a ModuleConfig,
-        exports: &'a [ProgramExport],
-        basic_block_by_jump_table_index: &'a [u32],
-        jump_table_index_by_basic_block: &'a [u32],
-        init: GuestInit<'a>,
-        instruction_count: usize,
-        basic_block_count: usize,
-        debug_trace_execution: bool,
-    ) -> Result<(Self::BackendVisitor<'a>, Self::Aux), Error>;
-
-    fn finish_compilation<'a>(wrapper: VisitorWrapper<'a, Self::BackendVisitor<'a>>, aux: Self::Aux) -> Result<(Common<'a>, Self), Error>;
-}
-
-pub(crate) trait BackendVisitor: InstructionVisitor<ReturnTy = ()> {
-    fn before_instruction(&mut self);
-    fn after_instruction(&mut self);
-}
-
-polkavm_common::program::implement_instruction_visitor!(impl<'a> VisitorWrapper<'a, Vec<Instruction>>, push);
-
-impl<'a> BackendVisitor for VisitorWrapper<'a, Vec<Instruction>> {
-    fn before_instruction(&mut self) {}
-    fn after_instruction(&mut self) {}
-}
-
-pub(crate) struct Common<'a> {
-    pub(crate) code: &'a [u8],
-    pub(crate) config: &'a ModuleConfig,
-    pub(crate) imports: &'a Vec<ProgramImport<'a>>,
-    pub(crate) jump_table_index_by_basic_block: &'a Vec<u32>,
-    pub(crate) instruction_by_basic_block: Vec<u32>,
-    pub(crate) gas_cost_for_basic_block: Vec<u32>,
-    pub(crate) maximum_seen_jump_target: u32,
-    pub(crate) nth_instruction: usize,
-    pub(crate) instruction_count: usize,
-    pub(crate) basic_block_count: usize,
-    pub(crate) block_in_progress: bool,
-    pub(crate) current_instruction_offset: usize,
-}
-
-impl<'a> Common<'a> {
-    pub(crate) fn is_last_instruction(&self) -> bool {
-        self.nth_instruction + 1 == self.instruction_count
-    }
-}
-
-pub(crate) struct VisitorWrapper<'a, T> {
-    pub(crate) common: Common<'a>,
-    pub(crate) visitor: T,
-}
-
-impl<'a, T> core::ops::Deref for VisitorWrapper<'a, T> {
-    type Target = T;
-
-    #[inline]
-    fn deref(&self) -> &Self::Target {
-        &self.visitor
-    }
-}
-
-impl<'a, T> core::ops::DerefMut for VisitorWrapper<'a, T> {
-    #[inline]
-    fn deref_mut(&mut self) -> &mut Self::Target {
-        &mut self.visitor
-    }
-}
-
-#[repr(transparent)]
-pub(crate) struct CommonVisitor<'a, T>(VisitorWrapper<'a, T>);
-
-impl<'a, T> core::ops::Deref for CommonVisitor<'a, T> {
-    type Target = Common<'a>;
-
-    #[inline]
-    fn deref(&self) -> &Self::Target {
-        &self.0.common
-    }
-}
-
-impl<'a, T> core::ops::DerefMut for CommonVisitor<'a, T> {
-    #[inline]
-    fn deref_mut(&mut self) -> &mut Self::Target {
-        &mut self.0.common
-    }
-}
-
-impl<'a, T> CommonVisitor<'a, T>
-where
-    VisitorWrapper<'a, T>: BackendVisitor,
-{
-    fn nth_basic_block(&self) -> usize {
-        self.instruction_by_basic_block.len() - 1
-    }
-
-    fn start_new_basic_block(&mut self) -> Result<(), Error> {
-        if !self.is_last_instruction() {
-            let nth = (self.nth_instruction + 1) as u32;
-            self.instruction_by_basic_block.push(nth);
-        }
-
-        if self.instruction_by_basic_block.len() > self.basic_block_count {
-            bail_static!("program contains an invalid basic block count");
-        }
-
-        self.block_in_progress = false;
-        Ok(())
-    }
-
-    fn branch(&mut self, jump_target: u32, cb: impl FnOnce(&mut VisitorWrapper<'a, T>)) -> Result<(), Error> {
-        self.maximum_seen_jump_target = core::cmp::max(self.maximum_seen_jump_target, jump_target);
-
-        self.start_new_basic_block()?;
-        self.0.before_instruction();
-        cb(&mut self.0);
-        Ok(())
-    }
-}
-
-impl<'a, T> polkavm_common::program::ParsingVisitor<Error> for CommonVisitor<'a, T>
-where
-    VisitorWrapper<'a, T>: BackendVisitor,
-{
-    #[cfg_attr(not(debug_assertions), inline)]
-    fn on_pre_visit(&mut self, offset: usize, _opcode: u8) -> Self::ReturnTy {
-        if self.config.gas_metering.is_some() {
-            // TODO: Come up with a better cost model.
-            let nth_basic_block = self.nth_basic_block();
-            self.gas_cost_for_basic_block[nth_basic_block] += 1;
-        }
-
-        self.current_instruction_offset = offset;
-        self.block_in_progress = true;
-        Ok(())
-    }
-
-    #[cfg_attr(not(debug_assertions), inline)]
-    fn on_post_visit(&mut self) -> Self::ReturnTy {
-        self.0.after_instruction();
-        self.nth_instruction += 1;
-        Ok(())
-    }
-}
-
-impl<'a, T> polkavm_common::program::InstructionVisitor for CommonVisitor<'a, T>
-where
-    VisitorWrapper<'a, T>: BackendVisitor,
-{
-    type ReturnTy = Result<(), Error>;
-
-    #[inline(always)]
-    fn trap(&mut self) -> Self::ReturnTy {
-        self.start_new_basic_block()?;
-        self.0.before_instruction();
-        self.0.trap();
-        Ok(())
-    }
-
-    #[inline(always)]
-    fn fallthrough(&mut self) -> Self::ReturnTy {
-        self.start_new_basic_block()?;
-        self.0.before_instruction();
-        self.0.fallthrough();
-        Ok(())
-    }
-
-    #[inline(always)]
-    fn sbrk(&mut self, d: Reg, s: Reg) -> Self::ReturnTy {
-        self.0.before_instruction();
-        self.0.sbrk(d, s);
-        Ok(())
-    }
-
-    #[inline(always)]
-    fn ecalli(&mut self, imm: u32) -> Self::ReturnTy {
-        if self.imports.get(imm as usize).is_none() {
-            #[cold]
-            fn error_unrecognized_ecall(imm: u32) -> Error {
-                Error::from(format!("found an unrecognized ecall number: {imm}"))
-            }
-
-            return Err(error_unrecognized_ecall(imm));
-        }
-
-        self.0.before_instruction();
-        self.0.ecalli(imm);
-        Ok(())
-    }
-
-    #[inline(always)]
-    fn set_less_than_unsigned(&mut self, d: Reg, s1: Reg, s2: Reg) -> Self::ReturnTy {
-        self.0.before_instruction();
-        self.0.set_less_than_unsigned(d, s1, s2);
-        Ok(())
-    }
-
-    #[inline(always)]
-    fn set_less_than_signed(&mut self, d: Reg, s1: Reg, s2: Reg) -> Self::ReturnTy {
-        self.0.before_instruction();
-        self.0.set_less_than_signed(d, s1, s2);
-        Ok(())
-    }
-
-    #[inline(always)]
-    fn shift_logical_right(&mut self, d: Reg, s1: Reg, s2: Reg) -> Self::ReturnTy {
-        self.0.before_instruction();
-        self.0.shift_logical_right(d, s1, s2);
-        Ok(())
-    }
-
-    #[inline(always)]
-    fn shift_arithmetic_right(&mut self, d: Reg, s1: Reg, s2: Reg) -> Self::ReturnTy {
-        self.0.before_instruction();
-        self.0.shift_arithmetic_right(d, s1, s2);
-        Ok(())
-    }
-
-    #[inline(always)]
-    fn shift_logical_left(&mut self, d: Reg, s1: Reg, s2: Reg) -> Self::ReturnTy {
-        self.0.before_instruction();
-        self.0.shift_logical_left(d, s1, s2);
-        Ok(())
-    }
-
-    #[inline(always)]
-    fn xor(&mut self, d: Reg, s1: Reg, s2: Reg) -> Self::ReturnTy {
-        self.0.before_instruction();
-        self.0.xor(d, s1, s2);
-        Ok(())
-    }
-
-    #[inline(always)]
-    fn and(&mut self, d: Reg, s1: Reg, s2: Reg) -> Self::ReturnTy {
-        self.0.before_instruction();
-        self.0.and(d, s1, s2);
-        Ok(())
-    }
-
-    #[inline(always)]
-    fn or(&mut self, d: Reg, s1: Reg, s2: Reg) -> Self::ReturnTy {
-        self.0.before_instruction();
-        self.0.or(d, s1, s2);
-        Ok(())
-    }
-
-    #[inline(always)]
-    fn add(&mut self, d: Reg, s1: Reg, s2: Reg) -> Self::ReturnTy {
-        self.0.before_instruction();
-        self.0.add(d, s1, s2);
-        Ok(())
-    }
-
-    #[inline(always)]
-    fn sub(&mut self, d: Reg, s1: Reg, s2: Reg) -> Self::ReturnTy {
-        self.0.before_instruction();
-        self.0.sub(d, s1, s2);
-        Ok(())
-    }
-
-    #[inline(always)]
-    fn mul(&mut self, d: Reg, s1: Reg, s2: Reg) -> Self::ReturnTy {
-        self.0.before_instruction();
-        self.0.mul(d, s1, s2);
-        Ok(())
-    }
-
-    #[inline(always)]
-    fn mul_upper_signed_signed(&mut self, d: Reg, s1: Reg, s2: Reg) -> Self::ReturnTy {
-        self.0.before_instruction();
-        self.0.mul_upper_signed_signed(d, s1, s2);
-        Ok(())
-    }
-
-    #[inline(always)]
-    fn mul_upper_unsigned_unsigned(&mut self, d: Reg, s1: Reg, s2: Reg) -> Self::ReturnTy {
-        self.0.before_instruction();
-        self.0.mul_upper_unsigned_unsigned(d, s1, s2);
-        Ok(())
-    }
-
-    #[inline(always)]
-    fn mul_upper_signed_unsigned(&mut self, d: Reg, s1: Reg, s2: Reg) -> Self::ReturnTy {
-        self.0.before_instruction();
-        self.0.mul_upper_signed_unsigned(d, s1, s2);
-        Ok(())
-    }
-
-    #[inline(always)]
-    fn div_unsigned(&mut self, d: Reg, s1: Reg, s2: Reg) -> Self::ReturnTy {
-        self.0.before_instruction();
-        self.0.div_unsigned(d, s1, s2);
-        Ok(())
-    }
-
-    #[inline(always)]
-    fn div_signed(&mut self, d: Reg, s1: Reg, s2: Reg) -> Self::ReturnTy {
-        self.0.before_instruction();
-        self.0.div_signed(d, s1, s2);
-        Ok(())
-    }
-
-    #[inline(always)]
-    fn rem_unsigned(&mut self, d: Reg, s1: Reg, s2: Reg) -> Self::ReturnTy {
-        self.0.before_instruction();
-        self.0.rem_unsigned(d, s1, s2);
-        Ok(())
-    }
-
-    #[inline(always)]
-    fn rem_signed(&mut self, d: Reg, s1: Reg, s2: Reg) -> Self::ReturnTy {
-        self.0.before_instruction();
-        self.0.rem_signed(d, s1, s2);
-        Ok(())
-    }
-
-    #[inline(always)]
-    fn mul_imm(&mut self, d: Reg, s1: Reg, s2: u32) -> Self::ReturnTy {
-        self.0.before_instruction();
-        self.0.mul_imm(d, s1, s2);
-        Ok(())
-    }
-
-    #[inline(always)]
-    fn mul_upper_signed_signed_imm(&mut self, d: Reg, s1: Reg, s2: u32) -> Self::ReturnTy {
-        self.0.before_instruction();
-        self.0.mul_upper_signed_signed_imm(d, s1, s2);
-        Ok(())
-    }
-
-    #[inline(always)]
-    fn mul_upper_unsigned_unsigned_imm(&mut self, d: Reg, s1: Reg, s2: u32) -> Self::ReturnTy {
-        self.0.before_instruction();
-        self.0.mul_upper_unsigned_unsigned_imm(d, s1, s2);
-        Ok(())
-    }
-
-    #[inline(always)]
-    fn set_less_than_unsigned_imm(&mut self, d: Reg, s1: Reg, s2: u32) -> Self::ReturnTy {
-        self.0.before_instruction();
-        self.0.set_less_than_unsigned_imm(d, s1, s2);
-        Ok(())
-    }
-
-    #[inline(always)]
-    fn set_less_than_signed_imm(&mut self, d: Reg, s1: Reg, s2: u32) -> Self::ReturnTy {
-        self.0.before_instruction();
-        self.0.set_less_than_signed_imm(d, s1, s2);
-        Ok(())
-    }
-
-    #[inline(always)]
-    fn set_greater_than_unsigned_imm(&mut self, d: Reg, s1: Reg, s2: u32) -> Self::ReturnTy {
-        self.0.before_instruction();
-        self.0.set_greater_than_unsigned_imm(d, s1, s2);
-        Ok(())
-    }
-
-    #[inline(always)]
-    fn set_greater_than_signed_imm(&mut self, d: Reg, s1: Reg, s2: u32) -> Self::ReturnTy {
-        self.0.before_instruction();
-        self.0.set_greater_than_signed_imm(d, s1, s2);
-        Ok(())
-    }
-
-    #[inline(always)]
-    fn shift_logical_right_imm(&mut self, d: Reg, s1: Reg, s2: u32) -> Self::ReturnTy {
-        self.0.before_instruction();
-        self.0.shift_logical_right_imm(d, s1, s2);
-        Ok(())
-    }
-
-    #[inline(always)]
-    fn shift_arithmetic_right_imm(&mut self, d: Reg, s1: Reg, s2: u32) -> Self::ReturnTy {
-        self.0.before_instruction();
-        self.0.shift_arithmetic_right_imm(d, s1, s2);
-        Ok(())
-    }
-
-    #[inline(always)]
-    fn shift_logical_left_imm(&mut self, d: Reg, s1: Reg, s2: u32) -> Self::ReturnTy {
-        self.0.before_instruction();
-        self.0.shift_logical_left_imm(d, s1, s2);
-        Ok(())
-    }
-
-    #[inline(always)]
-    fn shift_logical_right_imm_alt(&mut self, d: Reg, s2: Reg, s1: u32) -> Self::ReturnTy {
-        self.0.before_instruction();
-        self.0.shift_logical_right_imm_alt(d, s2, s1);
-        Ok(())
-    }
-
-    #[inline(always)]
-    fn shift_arithmetic_right_imm_alt(&mut self, d: Reg, s2: Reg, s1: u32) -> Self::ReturnTy {
-        self.0.before_instruction();
-        self.0.shift_arithmetic_right_imm_alt(d, s2, s1);
-        Ok(())
-    }
-
-    #[inline(always)]
-    fn shift_logical_left_imm_alt(&mut self, d: Reg, s2: Reg, s1: u32) -> Self::ReturnTy {
-        self.0.before_instruction();
-        self.0.shift_logical_left_imm_alt(d, s2, s1);
-        Ok(())
-    }
-
-    #[inline(always)]
-    fn or_imm(&mut self, d: Reg, s: Reg, imm: u32) -> Self::ReturnTy {
-        self.0.before_instruction();
-        self.0.or_imm(d, s, imm);
-        Ok(())
-    }
-
-    #[inline(always)]
-    fn and_imm(&mut self, d: Reg, s: Reg, imm: u32) -> Self::ReturnTy {
-        self.0.before_instruction();
-        self.0.and_imm(d, s, imm);
-        Ok(())
-    }
-
-    #[inline(always)]
-    fn xor_imm(&mut self, d: Reg, s: Reg, imm: u32) -> Self::ReturnTy {
-        self.0.before_instruction();
-        self.0.xor_imm(d, s, imm);
-        Ok(())
-    }
-
-    #[inline(always)]
-    fn move_reg(&mut self, d: Reg, s: Reg) -> Self::ReturnTy {
-        self.0.before_instruction();
-        self.0.move_reg(d, s);
-        Ok(())
-    }
-
-    #[inline(always)]
-    fn cmov_if_zero(&mut self, d: Reg, s: Reg, c: Reg) -> Self::ReturnTy {
-        self.0.before_instruction();
-        self.0.cmov_if_zero(d, s, c);
-        Ok(())
-    }
-
-    #[inline(always)]
-    fn cmov_if_not_zero(&mut self, d: Reg, s: Reg, c: Reg) -> Self::ReturnTy {
-        self.0.before_instruction();
-        self.0.cmov_if_not_zero(d, s, c);
-        Ok(())
-    }
-
-    #[inline(always)]
-    fn cmov_if_zero_imm(&mut self, d: Reg, c: Reg, s: u32) -> Self::ReturnTy {
-        self.0.before_instruction();
-        self.0.cmov_if_zero_imm(d, c, s);
-        Ok(())
-    }
-
-    #[inline(always)]
-    fn cmov_if_not_zero_imm(&mut self, d: Reg, c: Reg, s: u32) -> Self::ReturnTy {
-        self.0.before_instruction();
-        self.0.cmov_if_not_zero_imm(d, c, s);
-        Ok(())
-    }
-
-    #[inline(always)]
-    fn add_imm(&mut self, d: Reg, s: Reg, imm: u32) -> Self::ReturnTy {
-        self.0.before_instruction();
-        self.0.add_imm(d, s, imm);
-        Ok(())
-    }
-
-    #[inline(always)]
-    fn negate_and_add_imm(&mut self, d: Reg, s1: Reg, s2: u32) -> Self::ReturnTy {
-        self.0.before_instruction();
-        self.0.negate_and_add_imm(d, s1, s2);
-        Ok(())
-    }
-
-    #[inline(always)]
-    fn store_imm_indirect_u8(&mut self, base: Reg, offset: u32, value: u32) -> Self::ReturnTy {
-        self.0.before_instruction();
-        self.0.store_imm_indirect_u8(base, offset, value);
-        Ok(())
-    }
-
-    #[inline(always)]
-    fn store_imm_indirect_u16(&mut self, base: Reg, offset: u32, value: u32) -> Self::ReturnTy {
-        self.0.before_instruction();
-        self.0.store_imm_indirect_u16(base, offset, value);
-        Ok(())
-    }
-
-    #[inline(always)]
-    fn store_imm_indirect_u32(&mut self, base: Reg, offset: u32, value: u32) -> Self::ReturnTy {
-        self.0.before_instruction();
-        self.0.store_imm_indirect_u32(base, offset, value);
-        Ok(())
-    }
-
-    #[inline(always)]
-    fn store_indirect_u8(&mut self, src: Reg, base: Reg, offset: u32) -> Self::ReturnTy {
-        self.0.before_instruction();
-        self.0.store_indirect_u8(src, base, offset);
-        Ok(())
-    }
-
-    #[inline(always)]
-    fn store_indirect_u16(&mut self, src: Reg, base: Reg, offset: u32) -> Self::ReturnTy {
-        self.0.before_instruction();
-        self.0.store_indirect_u16(src, base, offset);
-        Ok(())
-    }
-
-    #[inline(always)]
-    fn store_indirect_u32(&mut self, src: Reg, base: Reg, offset: u32) -> Self::ReturnTy {
-        self.0.before_instruction();
-        self.0.store_indirect_u32(src, base, offset);
-        Ok(())
-    }
-
-    #[inline(always)]
-    fn store_imm_u8(&mut self, value: u32, offset: u32) -> Self::ReturnTy {
-        self.0.before_instruction();
-        self.0.store_imm_u8(value, offset);
-        Ok(())
-    }
-
-    #[inline(always)]
-    fn store_imm_u16(&mut self, value: u32, offset: u32) -> Self::ReturnTy {
-        self.0.before_instruction();
-        self.0.store_imm_u16(value, offset);
-        Ok(())
-    }
-
-    #[inline(always)]
-    fn store_imm_u32(&mut self, value: u32, offset: u32) -> Self::ReturnTy {
-        self.0.before_instruction();
-        self.0.store_imm_u32(value, offset);
-        Ok(())
-    }
-
-    #[inline(always)]
-    fn store_u8(&mut self, src: Reg, offset: u32) -> Self::ReturnTy {
-        self.0.before_instruction();
-        self.0.store_u8(src, offset);
-        Ok(())
-    }
-
-    #[inline(always)]
-    fn store_u16(&mut self, src: Reg, offset: u32) -> Self::ReturnTy {
-        self.0.before_instruction();
-        self.0.store_u16(src, offset);
-        Ok(())
-    }
-
-    #[inline(always)]
-    fn store_u32(&mut self, src: Reg, offset: u32) -> Self::ReturnTy {
-        self.0.before_instruction();
-        self.0.store_u32(src, offset);
-        Ok(())
-    }
-
-    #[inline(always)]
-    fn load_indirect_u8(&mut self, dst: Reg, base: Reg, offset: u32) -> Self::ReturnTy {
-        self.0.before_instruction();
-        self.0.load_indirect_u8(dst, base, offset);
-        Ok(())
-    }
-
-    #[inline(always)]
-    fn load_indirect_i8(&mut self, dst: Reg, base: Reg, offset: u32) -> Self::ReturnTy {
-        self.0.before_instruction();
-        self.0.load_indirect_i8(dst, base, offset);
-        Ok(())
-    }
-
-    #[inline(always)]
-    fn load_indirect_u16(&mut self, dst: Reg, base: Reg, offset: u32) -> Self::ReturnTy {
-        self.0.before_instruction();
-        self.0.load_indirect_u16(dst, base, offset);
-        Ok(())
-    }
-
-    #[inline(always)]
-    fn load_indirect_i16(&mut self, dst: Reg, base: Reg, offset: u32) -> Self::ReturnTy {
-        self.0.before_instruction();
-        self.0.load_indirect_i16(dst, base, offset);
-        Ok(())
-    }
-
-    #[inline(always)]
-    fn load_indirect_u32(&mut self, dst: Reg, base: Reg, offset: u32) -> Self::ReturnTy {
-        self.0.before_instruction();
-        self.0.load_indirect_u32(dst, base, offset);
-        Ok(())
-    }
-
-    #[inline(always)]
-    fn load_u8(&mut self, dst: Reg, offset: u32) -> Self::ReturnTy {
-        self.0.before_instruction();
-        self.0.load_u8(dst, offset);
-        Ok(())
-    }
-
-    #[inline(always)]
-    fn load_i8(&mut self, dst: Reg, offset: u32) -> Self::ReturnTy {
-        self.0.before_instruction();
-        self.0.load_i8(dst, offset);
-        Ok(())
-    }
-
-    #[inline(always)]
-    fn load_u16(&mut self, dst: Reg, offset: u32) -> Self::ReturnTy {
-        self.0.before_instruction();
-        self.0.load_u16(dst, offset);
-        Ok(())
-    }
-
-    #[inline(always)]
-    fn load_i16(&mut self, dst: Reg, offset: u32) -> Self::ReturnTy {
-        self.0.before_instruction();
-        self.0.load_i16(dst, offset);
-        Ok(())
-    }
-
-    #[inline(always)]
-    fn load_u32(&mut self, dst: Reg, offset: u32) -> Self::ReturnTy {
-        self.0.before_instruction();
-        self.0.load_u32(dst, offset);
-        Ok(())
-    }
-
-    #[inline(always)]
-    fn branch_less_unsigned(&mut self, s1: Reg, s2: Reg, imm: u32) -> Self::ReturnTy {
-        self.branch(imm, move |backend| backend.branch_less_unsigned(s1, s2, imm))
-    }
-
-    #[inline(always)]
-    fn branch_less_signed(&mut self, s1: Reg, s2: Reg, imm: u32) -> Self::ReturnTy {
-        self.branch(imm, move |backend| backend.branch_less_signed(s1, s2, imm))
-    }
-
-    #[inline(always)]
-    fn branch_greater_or_equal_unsigned(&mut self, s1: Reg, s2: Reg, imm: u32) -> Self::ReturnTy {
-        self.branch(imm, move |backend| backend.branch_greater_or_equal_unsigned(s1, s2, imm))
-    }
-
-    #[inline(always)]
-    fn branch_greater_or_equal_signed(&mut self, s1: Reg, s2: Reg, imm: u32) -> Self::ReturnTy {
-        self.branch(imm, move |backend| backend.branch_greater_or_equal_signed(s1, s2, imm))
-    }
-
-    #[inline(always)]
-    fn branch_eq(&mut self, s1: Reg, s2: Reg, imm: u32) -> Self::ReturnTy {
-        self.branch(imm, move |backend| backend.branch_eq(s1, s2, imm))
-    }
-
-    #[inline(always)]
-    fn branch_not_eq(&mut self, s1: Reg, s2: Reg, imm: u32) -> Self::ReturnTy {
-        self.branch(imm, move |backend| backend.branch_not_eq(s1, s2, imm))
-    }
-
-    #[inline(always)]
-    fn branch_eq_imm(&mut self, s1: Reg, s2: u32, imm: u32) -> Self::ReturnTy {
-        self.branch(imm, move |backend| backend.branch_eq_imm(s1, s2, imm))
-    }
-
-    #[inline(always)]
-    fn branch_not_eq_imm(&mut self, s1: Reg, s2: u32, imm: u32) -> Self::ReturnTy {
-        self.branch(imm, move |backend| backend.branch_not_eq_imm(s1, s2, imm))
-    }
-
-    #[inline(always)]
-    fn branch_less_unsigned_imm(&mut self, s1: Reg, s2: u32, imm: u32) -> Self::ReturnTy {
-        self.branch(imm, move |backend| backend.branch_less_unsigned_imm(s1, s2, imm))
-    }
-
-    #[inline(always)]
-    fn branch_less_signed_imm(&mut self, s1: Reg, s2: u32, imm: u32) -> Self::ReturnTy {
-        self.branch(imm, move |backend| backend.branch_less_signed_imm(s1, s2, imm))
-    }
-
-    #[inline(always)]
-    fn branch_greater_or_equal_unsigned_imm(&mut self, s1: Reg, s2: u32, imm: u32) -> Self::ReturnTy {
-        self.branch(imm, move |backend| backend.branch_greater_or_equal_unsigned_imm(s1, s2, imm))
-    }
-
-    #[inline(always)]
-    fn branch_greater_or_equal_signed_imm(&mut self, s1: Reg, s2: u32, imm: u32) -> Self::ReturnTy {
-        self.branch(imm, move |backend| backend.branch_greater_or_equal_signed_imm(s1, s2, imm))
-    }
-
-    #[inline(always)]
-    fn branch_less_or_equal_unsigned_imm(&mut self, s1: Reg, s2: u32, imm: u32) -> Self::ReturnTy {
-        self.branch(imm, move |backend| backend.branch_less_or_equal_unsigned_imm(s1, s2, imm))
-    }
-
-    #[inline(always)]
-    fn branch_less_or_equal_signed_imm(&mut self, s1: Reg, s2: u32, imm: u32) -> Self::ReturnTy {
-        self.branch(imm, move |backend| backend.branch_less_or_equal_signed_imm(s1, s2, imm))
-    }
-
-    #[inline(always)]
-    fn branch_greater_unsigned_imm(&mut self, s1: Reg, s2: u32, imm: u32) -> Self::ReturnTy {
-        self.branch(imm, move |backend| backend.branch_greater_unsigned_imm(s1, s2, imm))
-    }
-
-    #[inline(always)]
-    fn branch_greater_signed_imm(&mut self, s1: Reg, s2: u32, imm: u32) -> Self::ReturnTy {
-        self.branch(imm, move |backend| backend.branch_greater_signed_imm(s1, s2, imm))
-    }
-
-    #[inline(always)]
-    fn load_imm(&mut self, dst: Reg, value: u32) -> Self::ReturnTy {
-        self.0.before_instruction();
-        self.0.load_imm(dst, value);
-        Ok(())
-    }
-
-    #[inline(always)]
-    fn call(&mut self, ra: Reg, target: u32) -> Self::ReturnTy {
-        let return_basic_block = self.instruction_by_basic_block.len() as u32;
-        if self
-            .jump_table_index_by_basic_block
-            .get(return_basic_block as usize)
-            .copied()
-            .unwrap_or(0)
-            == 0
-        {
-            bail_static!("found a call instruction where the next basic block is not part of the jump table");
-        }
-
-        self.maximum_seen_jump_target = core::cmp::max(self.maximum_seen_jump_target, target);
-
-        self.start_new_basic_block()?;
-        self.0.before_instruction();
-        self.0.call(ra, target);
-        Ok(())
-    }
-
-    #[inline(always)]
-    fn call_indirect(&mut self, ra: Reg, base: Reg, offset: u32) -> Self::ReturnTy {
-        let return_basic_block = self.instruction_by_basic_block.len() as u32;
-        if self
-            .jump_table_index_by_basic_block
-            .get(return_basic_block as usize)
-            .copied()
-            .unwrap_or(0)
-            == 0
-        {
-            bail_static!("found a call instruction where the next basic block is not part of the jump table");
-        }
-
-        self.start_new_basic_block()?;
-        self.0.before_instruction();
-        self.0.call_indirect(ra, base, offset);
-        Ok(())
-    }
-
-    #[inline(always)]
-    fn jump(&mut self, target: u32) -> Self::ReturnTy {
-        self.maximum_seen_jump_target = core::cmp::max(self.maximum_seen_jump_target, target);
-        self.start_new_basic_block()?;
-        self.0.before_instruction();
-        self.0.jump(target);
-        Ok(())
-    }
-
-    #[inline(always)]
-    fn jump_indirect(&mut self, base: Reg, offset: u32) -> Self::ReturnTy {
-        self.start_new_basic_block()?;
-        self.0.before_instruction();
-        self.0.jump_indirect(base, offset);
-        Ok(())
-    }
-}
-
 impl Module {
     pub(crate) fn empty() -> Self {
         Module(Arc::new(ModulePrivate::empty()))
@@ -969,10 +188,6 @@ impl Module {
 
     pub(crate) fn is_debug_trace_execution_enabled(&self) -> bool {
         self.0.debug_trace_execution
-    }
-
-    pub(crate) fn instructions(&self) -> &[Instruction] {
-        &self.interpreted_module().unwrap().instructions
     }
 
     pub(crate) fn compiled_module(&self) -> &CompiledModuleKind {
@@ -985,32 +200,6 @@ impl Module {
 
     pub(crate) fn blob(&self) -> &ProgramBlob<'static> {
         &self.0.blob
-    }
-
-    pub(crate) fn get_export(&self, export_index: usize) -> Option<&ProgramExport> {
-        self.0.exports.get(export_index)
-    }
-
-    pub(crate) fn instruction_by_basic_block(&self, nth_basic_block: u32) -> Option<u32> {
-        self.0.instruction_by_basic_block.get(nth_basic_block as usize).copied()
-    }
-
-    pub(crate) fn jump_table_index_by_basic_block(&self, nth_basic_block: u32) -> Option<u32> {
-        let index = self
-            .0
-            .jump_table_index_by_basic_block
-            .get(nth_basic_block as usize)
-            .copied()
-            .unwrap_or(0);
-        if index == 0 {
-            None
-        } else {
-            Some(index)
-        }
-    }
-
-    pub(crate) fn basic_block_by_jump_table_index(&self, jump_table_index: u32) -> Option<u32> {
-        self.0.basic_block_by_jump_table_index.get(jump_table_index as usize).copied()
     }
 
     pub(crate) fn gas_metering(&self) -> Option<GasMeteringKind> {
@@ -1036,74 +225,50 @@ impl Module {
         // Do an early check for memory config validity.
         MemoryMap::new(config.page_size, blob.ro_data_size(), blob.rw_data_size(), blob.stack_size()).map_err(Error::from_static_str)?;
 
-        let imports = {
-            log::trace!("Parsing imports...");
-            let mut imports = Vec::new();
-            for import in blob.imports() {
-                let import = import.map_err(Error::from_display)?;
-                log::trace!("  Import #{}: {}", imports.len(), import.symbol());
-
-                if imports.len() > VM_MAXIMUM_IMPORT_COUNT as usize {
-                    bail!(
-                        "too many imports; the program contains more than {} imports",
-                        VM_MAXIMUM_IMPORT_COUNT
-                    );
-                }
-
-                imports.push(import);
-            }
-            imports
-        };
-
-        let (initial_maximum_seen_jump_target, basic_block_by_jump_table_index, jump_table_index_by_basic_block) = {
-            log::trace!("Parsing jump table...");
-            let mut basic_block_by_jump_table_index = Vec::with_capacity(blob.jump_table_upper_bound() + 1);
-            let mut jump_table_index_by_basic_block = vec![0; blob.basic_block_count() as usize];
-
-            // The very first entry is always invalid.
-            basic_block_by_jump_table_index.push(u32::MAX);
-
-            let mut maximum_seen_jump_target = 0;
-            for nth_basic_block in blob.jump_table() {
-                let nth_basic_block = nth_basic_block.map_err(Error::from_display)?;
-
-                if let Some(slot) = jump_table_index_by_basic_block.get_mut(nth_basic_block as usize) {
-                    *slot = basic_block_by_jump_table_index.len() as u32;
+        if config.is_strict || cfg!(debug_assertions) {
+            log::trace!("Checking imports...");
+            for (nth_import, import) in blob.imports().into_iter().enumerate() {
+                if let Some(ref import) = import {
+                    log::trace!("  Import #{}: {}", nth_import, import);
                 } else {
-                    bail_static!("program contains an invalid basic block count");
+                    log::trace!("  Import #{}: INVALID", nth_import);
+                    if config.is_strict {
+                        bail_static!("found an invalid import");
+                    }
                 }
-
-                maximum_seen_jump_target = core::cmp::max(maximum_seen_jump_target, nth_basic_block);
-                basic_block_by_jump_table_index.push(nth_basic_block);
             }
 
-            basic_block_by_jump_table_index.shrink_to_fit();
-
-            (
-                maximum_seen_jump_target,
-                basic_block_by_jump_table_index,
-                jump_table_index_by_basic_block,
-            )
+            log::trace!("Checking jump table...");
+            for (nth_entry, code_offset) in blob.jump_table().iter().enumerate() {
+                if code_offset as usize >= blob.code().len() {
+                    log::trace!(
+                        "  Invalid jump table entry #{nth_entry}: {code_offset} (should be less than {})",
+                        blob.code().len()
+                    );
+                    if config.is_strict {
+                        bail_static!("out of range jump table entry found");
+                    }
+                }
+            }
         };
 
-        let (maximum_export_jump_target, exports) = {
+        let exports = {
             log::trace!("Parsing exports...");
-            let mut maximum_export_jump_target = 0;
             let mut exports = Vec::with_capacity(1);
             for export in blob.exports() {
-                let export = export.map_err(Error::from_display)?;
-                maximum_export_jump_target = core::cmp::max(maximum_export_jump_target, export.jump_target());
-
-                log::trace!("  Export at @{}: {}", export.jump_target(), export.symbol());
-                exports.push(export);
-                if exports.len() > VM_MAXIMUM_EXPORT_COUNT as usize {
+                log::trace!("  Export at {}: {}", export.target_code_offset(), export.symbol());
+                if config.is_strict && export.target_code_offset() as usize >= blob.code().len() {
                     bail!(
-                        "too many exports; the program contains more than {} exports",
-                        VM_MAXIMUM_EXPORT_COUNT
+                        "out of range export found; export {} points to code offset {}, while the code blob is only {} bytes",
+                        export.symbol(),
+                        export.target_code_offset(),
+                        blob.code().len(),
                     );
                 }
+
+                exports.push(export);
             }
-            (maximum_export_jump_target, exports)
+            exports
         };
 
         let init = GuestInit {
@@ -1115,62 +280,32 @@ impl Module {
             stack_size: blob.stack_size(),
         };
 
-        macro_rules! new_common {
-            () => {{
-                let mut common = Common {
-                    code: blob.code(),
-                    config,
-                    imports: &imports,
-                    jump_table_index_by_basic_block: &jump_table_index_by_basic_block,
-                    instruction_by_basic_block: Vec::new(),
-                    gas_cost_for_basic_block: Vec::new(),
-                    maximum_seen_jump_target: initial_maximum_seen_jump_target,
-                    nth_instruction: 0,
-                    instruction_count: blob.instruction_count() as usize,
-                    basic_block_count: blob.basic_block_count() as usize,
-                    block_in_progress: false,
-                    current_instruction_offset: 0,
-                };
-
-                common.instruction_by_basic_block.reserve(common.basic_block_count + 1);
-                common.instruction_by_basic_block.push(0);
-                if config.gas_metering.is_some() {
-                    common.gas_cost_for_basic_block.resize(common.basic_block_count, 0);
-                }
-
-                common
-            }};
-        }
-
         #[allow(unused_macros)]
         macro_rules! compile_module {
             ($sandbox_kind:ident, $module_kind:ident, $run:ident) => {{
-                let (visitor, aux) = CompiledModule::<$sandbox_kind>::create_visitor(
+                let (visitor, aux) = crate::compiler::CompilerVisitor::new::<$sandbox_kind>(
+                    &engine.state.compiler_cache,
                     config,
+                    blob.jump_table(),
+                    blob.code(),
+                    blob.bitmask(),
                     &exports,
-                    &basic_block_by_jump_table_index,
-                    &jump_table_index_by_basic_block,
-                    init,
-                    blob.instruction_count() as usize,
-                    blob.basic_block_count() as usize,
                     engine.debug_trace_execution,
+                    blob.code().len() as u32,
+                    init,
                 )?;
 
-                let common = new_common!();
-                let visitor = CommonVisitor(VisitorWrapper { common, visitor });
-                let (visitor, result) = $run(blob, visitor);
-                result?;
-
-                let (common, module) = CompiledModule::<$sandbox_kind>::finish_compilation(visitor.0, aux)?;
-                Some((common, CompiledModuleKind::$module_kind(module)))
+                let visitor = $run(blob, visitor);
+                let module = visitor.finish_compilation(&engine.state.compiler_cache, aux)?;
+                Some(CompiledModuleKind::$module_kind(module))
             }};
         }
 
-        let compiled: Option<(Common, CompiledModuleKind)> = if_compiler_is_supported! {
+        let compiled_module: Option<CompiledModuleKind> = if_compiler_is_supported! {
             {
                 if engine.selected_backend == BackendKind::Compiler {
                     if let Some(selected_sandbox) = engine.selected_sandbox {
-                        type VisitorTy<'a> = CommonVisitor<'a, crate::compiler::Compiler<'a>>;
+                        type VisitorTy<'a> = crate::compiler::CompilerVisitor<'a>;
                         let run = polkavm_common::program::prepare_visitor!(COMPILER_VISITOR, VisitorTy<'a>);
 
                         match selected_sandbox {
@@ -1201,106 +336,13 @@ impl Module {
             }}
         };
 
-        let interpreted: Option<(Common, InterpretedModule)> = if engine.interpreter_enabled {
-            let common = new_common!();
-            type VisitorTy<'a> = CommonVisitor<'a, Vec<Instruction>>;
-            let instructions = Vec::with_capacity(blob.instruction_count() as usize);
-            let visitor: VisitorTy = CommonVisitor(VisitorWrapper {
-                common,
-                visitor: instructions,
-            });
-
-            let run = polkavm_common::program::prepare_visitor!(INTERPRETER_VISITOR, VisitorTy<'a>);
-            let (visitor, result) = run(blob, visitor);
-            result?;
-
-            let CommonVisitor(VisitorWrapper {
-                mut common,
-                visitor: instructions,
-            }) = visitor;
-
-            let module = InterpretedModule::new(init, core::mem::take(&mut common.gas_cost_for_basic_block), instructions)?;
-            Some((common, module))
+        let interpreted_module = if engine.interpreter_enabled {
+            Some(InterpretedModule::new(init)?)
         } else {
             None
         };
 
-        let mut common = None;
-        let compiled_module = if let Some((compiled_common, compiled_module)) = compiled {
-            common = Some(compiled_common);
-            compiled_module
-        } else {
-            CompiledModuleKind::Unavailable
-        };
-
-        let interpreted_module = if let Some((interpreted_common, interpreted_module)) = interpreted {
-            if common.is_none() {
-                common = Some(interpreted_common);
-            }
-            Some(interpreted_module)
-        } else {
-            None
-        };
-
-        let common = common.unwrap();
-        if common.nth_instruction == 0 {
-            bail!("the module contains no code");
-        }
-
-        if common.block_in_progress {
-            bail!("code doesn't end with a control flow instruction");
-        }
-
-        if common.nth_instruction > VM_MAXIMUM_INSTRUCTION_COUNT as usize {
-            bail!(
-                "too many instructions; the program contains more than {} instructions",
-                VM_MAXIMUM_INSTRUCTION_COUNT
-            );
-        }
-
-        if common.nth_instruction != common.instruction_count {
-            bail!(
-                "program contains an invalid instruction count (expected {}, found {})",
-                common.instruction_count,
-                common.nth_instruction
-            );
-        }
-
-        if common.instruction_by_basic_block.len() != common.basic_block_count {
-            bail!(
-                "program contains an invalid basic block count (expected {}, found {})",
-                common.basic_block_count,
-                common.instruction_by_basic_block.len()
-            );
-        }
-
-        debug_assert!(!common.instruction_by_basic_block.is_empty());
-        let maximum_valid_jump_target = (common.instruction_by_basic_block.len() - 1) as u32;
-        if common.maximum_seen_jump_target > maximum_valid_jump_target {
-            bail!(
-                "out of range jump found; found a jump to @{:x}, while the very last valid jump target is @{maximum_valid_jump_target:x}",
-                common.maximum_seen_jump_target
-            );
-        }
-
-        if maximum_export_jump_target > maximum_valid_jump_target {
-            let export = exports
-                .iter()
-                .find(|export| export.jump_target() == maximum_export_jump_target)
-                .unwrap();
-            bail!(
-                "out of range export found; export {} points to @{:x}, while the very last valid jump target is @{maximum_valid_jump_target:x}",
-                export.symbol(),
-                export.jump_target(),
-            );
-        }
-
-        let instruction_by_basic_block = {
-            let mut vec = common.instruction_by_basic_block;
-            vec.shrink_to_fit();
-            vec
-        };
-
+        let compiled_module = compiled_module.unwrap_or(CompiledModuleKind::Unavailable);
         log::trace!("Processing finished!");
 
         assert!(compiled_module.is_some() || interpreted_module.is_some());
@@ -1310,14 +352,10 @@ impl Module {
             log::debug!("Backend used: 'interpreted'");
         }
 
-        let export_index_by_symbol = exports
+        let code_offset_by_symbol = exports
             .iter()
-            .enumerate()
-            .map(|(index, export)| (export.symbol().to_vec(), index))
+            .map(|export| (export.symbol().to_vec(), export.target_code_offset()))
             .collect();
-
-        let exports = exports.into_iter().map(|export| export.into_owned()).collect();
-        let imports = imports.into_iter().map(|import| import.into_owned()).collect();
 
         let memory_map = init.memory_map().map_err(Error::from_static_str)?;
         log::debug!(
@@ -1344,13 +382,7 @@ impl Module {
 
         Ok(Module(Arc::new(ModulePrivate {
             debug_trace_execution: engine.debug_trace_execution,
-            exports,
-            imports,
-            export_index_by_symbol,
-
-            instruction_by_basic_block,
-            jump_table_index_by_basic_block,
-            basic_block_by_jump_table_index,
+            code_offset_by_symbol,
 
             // TODO: Remove the clone.
             blob: blob.clone().into_owned(),
@@ -1358,6 +390,7 @@ impl Module {
             interpreted_module,
             memory_map,
             gas_metering: config.gas_metering,
+            is_strict: config.is_strict,
         })))
     }
 
@@ -1369,8 +402,8 @@ impl Module {
     /// Searches for a given symbol exported by the module.
     pub fn lookup_export(&self, symbol: impl AsRef<[u8]>) -> Option<ExportIndex> {
         let symbol = symbol.as_ref();
-        let export_index = *self.0.export_index_by_symbol.get(symbol)?;
-        Some(ExportIndex(export_index))
+        let code_offset = *self.0.code_offset_by_symbol.get(symbol)?;
+        Some(ExportIndex(code_offset))
     }
 
     /// The raw machine code of the compiled module.
@@ -1411,8 +444,10 @@ impl Module {
         }
     }
 
-    /// A map which makes it possible to map a position within the guest program
-    /// into the exact range of native machine code instructions.
+    /// A slice which contains pairs of PolkaVM bytecode offsets and native machine code offsets.
+    ///
+    /// This makes it possible to map a position within the guest program into the
+    /// exact range of native machine code instructions.
     ///
     /// The returned slice has as many elements as there were instructions in the
     /// original guest program, plus one extra to make it possible to figure out
@@ -1422,13 +457,13 @@ impl Module {
     ///
     /// Will return `None` when running under an interpreter.
     /// Mostly only useful for debugging.
-    pub fn nth_instruction_to_code_offset_map(&self) -> Option<&[u32]> {
+    pub fn code_offset_to_native_code_offset(&self) -> Option<&[(u32, u32)]> {
         if_compiler_is_supported! {
             {
                 match self.0.compiled_module {
                     #[cfg(target_os = "linux")]
-                    CompiledModuleKind::Linux(ref module) => Some(module.nth_instruction_to_code_offset_map()),
-                    CompiledModuleKind::Generic(ref module) => Some(module.nth_instruction_to_code_offset_map()),
+                    CompiledModuleKind::Linux(ref module) => Some(module.code_offset_to_native_code_offset()),
+                    CompiledModuleKind::Generic(ref module) => Some(module.code_offset_to_native_code_offset()),
                     CompiledModuleKind::Unavailable => None,
                 }
             } else {
@@ -1437,15 +472,13 @@ impl Module {
         }
     }
 
-    /// A map with gas costs for each basic block of the program.
+    /// Calculates the gas cost for a given basic block starting at `code_offset`.
     ///
-    /// Will return `None` when *not* running under an interpreter or if the gas metering was not enabled.
+    /// Will return `None` if the given `code_offset` is invalid.
     /// Mostly only useful for debugging.
-    pub fn nth_basic_block_to_gas_cost_map(&self) -> Option<&[u32]> {
-        self.0
-            .interpreted_module
-            .as_ref()
-            .map(|module| module.gas_cost_for_basic_block.as_slice())
+    pub fn gas_cost_for_code_offset(&self, code_offset: u32) -> Option<i64> {
+        let instructions = self.0.blob.instructions_at(code_offset)?;
+        Some(i64::from(crate::gas::calculate_for_block(instructions)))
     }
 
     pub(crate) fn debug_print_location(&self, log_level: log::Level, pc: u32) {
@@ -1935,22 +968,28 @@ impl<T> Linker<T> {
 
     /// Pre-instantiates a new module, linking it with the external functions previously defined on this object.
     pub fn instantiate_pre(&self, module: &Module) -> Result<InstancePre<T>, Error> {
-        let mut host_functions: Vec<Option<CallFnArc<T>>> = Vec::with_capacity(module.0.imports.len());
-        for import in &module.0.imports {
-            let symbol_bytes: &[u8] = import.symbol();
-            let Some(host_fn) = self.host_functions.get(symbol_bytes) else {
-                if self.fallback_handler.is_some() {
-                    host_functions.push(None);
-                    continue;
-                } else {
-                    bail!("failed to instantiate module: missing host function: {}", import.symbol());
-                }
+        let mut host_functions: Vec<Option<CallFnArc<T>>> = Vec::with_capacity(module.0.blob.imports().len() as usize);
+        for symbol in module.0.blob.imports() {
+            let Some(symbol) = symbol else {
+                host_functions.push(None);
+                continue;
             };
 
-            host_functions.push(Some(host_fn.clone()));
+            let host_fn = if let Some(host_fn) = self.host_functions.get(symbol.as_bytes()) {
+                Some(host_fn.clone())
+            } else if self.fallback_handler.is_some() {
+                None
+            } else if module.0.is_strict {
+                bail!("failed to instantiate module: missing host function: {}", symbol);
+            } else {
+                log::debug!("Missing host function: {}", symbol);
+                None
+            };
+
+            host_functions.push(host_fn);
         }
 
-        assert_eq!(host_functions.len(), module.0.imports.len());
+        assert_eq!(host_functions.len(), module.0.blob.imports().len() as usize);
         Ok(InstancePre(Arc::new(InstancePrePrivate {
             engine_state: Arc::clone(&self.engine_state),
             module: module.clone(),
@@ -2362,47 +1401,53 @@ impl<T> Instance<T> {
         args.gas = state_args.gas;
         args.sbrk = state_args.sbrk;
 
-        let (result, export) = if let Some(call_args) = call_args.as_mut() {
-            let Some(export) = module.0.exports.get(call_args.export_index) else {
-                return Err(ExecutionError::Error(
-                    format!(
-                        "failed to call export #{}: out of range index; the module doesn't contain this many exports",
-                        call_args.export_index
-                    )
-                    .into(),
-                ));
-            };
-
-            args.entry_point = Some(call_args.export_index);
+        #[allow(clippy::branches_sharing_code)]
+        let result = if let Some(call_args) = call_args.as_mut() {
+            args.entry_point = Some(call_args.code_offset);
             args.regs = Some(&call_args.initial_regs);
             if call_args.reset_memory_after_call {
                 args.flags |= VM_RPC_FLAG_RESET_MEMORY_AFTER_EXECUTION;
             }
 
-            log::trace!(
-                "Calling into {}... (gas limit = {:?})",
-                export.symbol(),
-                module.0.gas_metering.and(args.gas)
-            );
+            if log::log_enabled!(log::Level::Trace) {
+                if let Some(export) = self
+                    .0
+                    .instance_pre
+                    .0
+                    .module
+                    .0
+                    .blob
+                    .exports()
+                    .find(|export| export.target_code_offset() == call_args.code_offset)
+                {
+                    log::trace!(
+                        "Calling into {}... (gas limit = {:?})",
+                        export.symbol(),
+                        module.0.gas_metering.and(args.gas)
+                    );
+                } else {
+                    log::trace!(
+                        "Calling into code offset {}... (gas limit = {:?})",
+                        call_args.code_offset,
+                        module.0.gas_metering.and(args.gas)
+                    );
+                }
+            }
 
             if let Some(ref mut tracer) = mutable.tracer() {
                 tracer.on_before_execute(&args);
             }
 
-            let result = {
-                let mut on_hostcall = on_hostcall(
-                    call_args.user_data,
-                    &instance_pre.0.host_functions,
-                    &instance_pre.0.module.0.imports,
-                    instance_pre.0.fallback_handler.as_ref(),
-                    &mut mutable.raw,
-                );
+            let mut on_hostcall = on_hostcall(
+                call_args.user_data,
+                &instance_pre.0.host_functions,
+                instance_pre.0.module.0.blob.imports(),
+                instance_pre.0.fallback_handler.as_ref(),
+                &mut mutable.raw,
+            );
 
-                args.hostcall_handler = Some(&mut on_hostcall);
-                mutable.backend.execute(args)
-            };
-
-            (result, Some(export))
+            args.hostcall_handler = Some(&mut on_hostcall);
+            mutable.backend.execute(args)
         } else {
             log::trace!("Updating state...");
 
@@ -2410,8 +1455,7 @@ impl<T> Instance<T> {
                 tracer.on_before_execute(&args);
             }
 
-            let result = mutable.backend.execute(args);
-            (result, None)
+            mutable.backend.execute(args)
         };
 
         if let Some(ref mut tracer) = mutable.tracer() {
@@ -2428,7 +1472,16 @@ impl<T> Instance<T> {
             Err(ExecutionError::Error(error)) => {
                 log::trace!("...execution finished: error: {error}");
 
-                if let Some(export) = export {
+                if let Some(export) = call_args.as_ref().and_then(|call_args| {
+                    self.0
+                        .instance_pre
+                        .0
+                        .module
+                        .0
+                        .blob
+                        .exports()
+                        .find(|export| export.target_code_offset() == call_args.code_offset)
+                }) {
                     return Err(ExecutionError::Error(
                         format!("failed to call function {}: {}", export.symbol(), error).into(),
                     ));
@@ -2552,21 +1605,21 @@ impl<T> Instance<T> {
     }
 }
 
-/// The index of an exported function to be called.
+/// The code offset an exported function to be called.
 #[derive(Copy, Clone, Debug)]
-pub struct ExportIndex(usize);
+pub struct ExportIndex(u32);
 
 /// A helper struct used when calling into a function exported by the guest program.
 pub struct CallArgs<'a, T> {
     pub(crate) initial_regs: [RegValue; Reg::ALL.len()],
     pub(crate) user_data: &'a mut T,
-    pub(crate) export_index: usize,
+    pub(crate) code_offset: u32,
     pub(crate) reset_memory_after_call: bool,
 }
 
 impl<'a, T> CallArgs<'a, T> {
     /// Creates a new `CallArgs`.
-    pub fn new(user_data: &'a mut T, export_index: ExportIndex) -> Self {
+    pub fn new(user_data: &'a mut T, code_offset: ExportIndex) -> Self {
         let mut initial_regs = [0; Reg::ALL.len()];
         initial_regs[Reg::SP as usize] = VM_ADDR_USER_STACK_HIGH;
         initial_regs[Reg::RA as usize] = VM_ADDR_RETURN_TO_HOST;
@@ -2574,7 +1627,7 @@ impl<'a, T> CallArgs<'a, T> {
         Self {
             initial_regs,
             user_data,
-            export_index: export_index.0,
+            code_offset: code_offset.0,
             reset_memory_after_call: false,
         }
     }
@@ -2675,7 +1728,7 @@ impl StateArgs {
 pub(crate) type HostcallHandler<'a> = &'a mut dyn for<'r> FnMut(u32, BackendAccess<'r>) -> Result<(), Trap>;
 
 pub(crate) struct ExecuteArgs<'a> {
-    pub(crate) entry_point: Option<usize>,
+    pub(crate) entry_point: Option<u32>,
     pub(crate) regs: Option<&'a [RegValue; Reg::ALL.len()]>,
     pub(crate) gas: Option<Gas>,
     pub(crate) sbrk: u32,
@@ -2703,7 +1756,7 @@ impl<'a> ExecuteArgs<'a> {
 fn on_hostcall<'a, T>(
     user_data: &'a mut T,
     host_functions: &'a [Option<CallFnArc<T>>],
-    imports: &'a [ProgramImport<'a>],
+    imports: Imports<'a>,
     fallback_handler: Option<&'a FallbackHandlerArc<T>>,
     raw: &'a mut CallerRaw,
 ) -> impl for<'r> FnMut(u32, BackendAccess<'r>) -> Result<(), Trap> + 'a {
@@ -2724,12 +1777,12 @@ fn on_hostcall<'a, T>(
 
         let Some(host_fn) = host_functions.get(hostcall as usize).and_then(|func| func.as_ref()) else {
             if let Some(fallback_handler) = fallback_handler {
-                let import = &imports[hostcall as usize];
-                return Caller::wrap(user_data, &mut access, raw, move |caller| fallback_handler(caller, import.symbol()));
+                if let Some(ref symbol) = imports.get(hostcall) {
+                    return Caller::wrap(user_data, &mut access, raw, move |caller| fallback_handler(caller, symbol));
+                }
             }
 
-            // This should never happen.
-            log::error!("hostcall to a function which doesn't exist: {}", hostcall);
+            log::debug!("hostcall to a function which doesn't exist: {}", hostcall);
             return Err(Trap::default());
         };
 

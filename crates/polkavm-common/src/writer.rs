@@ -1,6 +1,71 @@
-use crate::program::{self, Instruction, ProgramExport, ProgramImport};
+use crate::program::{self, Instruction, ProgramSymbol};
 use alloc::vec::Vec;
 use core::ops::Range;
+
+#[derive(Copy, Clone)]
+struct InstructionBuffer {
+    bytes: [u8; program::MAX_INSTRUCTION_LENGTH],
+    length: u8,
+}
+
+impl InstructionBuffer {
+    fn len(&self) -> usize {
+        self.length as usize
+    }
+}
+
+impl core::ops::Deref for InstructionBuffer {
+    type Target = [u8];
+    fn deref(&self) -> &Self::Target {
+        &self.bytes[..self.length as usize]
+    }
+}
+
+impl From<(u32, Instruction)> for InstructionBuffer {
+    fn from((position, instruction): (u32, Instruction)) -> Self {
+        let mut buffer = Self {
+            bytes: [0; program::MAX_INSTRUCTION_LENGTH],
+            length: 0,
+        };
+
+        buffer.length = instruction.serialize_into(position, &mut buffer.bytes) as u8;
+        buffer
+    }
+}
+
+impl Instruction {
+    fn target_mut(&mut self) -> Option<&mut u32> {
+        match self {
+            Instruction::jump(ref mut target)
+            | Instruction::load_imm_and_jump(_, _, ref mut target)
+            | Instruction::branch_eq_imm(_, _, ref mut target)
+            | Instruction::branch_not_eq_imm(_, _, ref mut target)
+            | Instruction::branch_less_unsigned_imm(_, _, ref mut target)
+            | Instruction::branch_less_signed_imm(_, _, ref mut target)
+            | Instruction::branch_greater_or_equal_unsigned_imm(_, _, ref mut target)
+            | Instruction::branch_greater_or_equal_signed_imm(_, _, ref mut target)
+            | Instruction::branch_less_or_equal_signed_imm(_, _, ref mut target)
+            | Instruction::branch_less_or_equal_unsigned_imm(_, _, ref mut target)
+            | Instruction::branch_greater_signed_imm(_, _, ref mut target)
+            | Instruction::branch_greater_unsigned_imm(_, _, ref mut target)
+            | Instruction::branch_eq(_, _, ref mut target)
+            | Instruction::branch_not_eq(_, _, ref mut target)
+            | Instruction::branch_less_unsigned(_, _, ref mut target)
+            | Instruction::branch_less_signed(_, _, ref mut target)
+            | Instruction::branch_greater_or_equal_unsigned(_, _, ref mut target)
+            | Instruction::branch_greater_or_equal_signed(_, _, ref mut target) => Some(target),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Copy, Clone)]
+struct SerializedInstruction {
+    instruction: Instruction,
+    bytes: InstructionBuffer,
+    target_nth_instruction: Option<usize>,
+    position: u32,
+}
 
 #[derive(Default)]
 pub struct ProgramBlobBuilder {
@@ -9,13 +74,18 @@ pub struct ProgramBlobBuilder {
     stack_size: u32,
     ro_data: Vec<u8>,
     rw_data: Vec<u8>,
-    imports: Vec<ProgramImport<'static>>,
-    exports: Vec<ProgramExport<'static>>,
+    imports: Vec<ProgramSymbol<'static>>,
+    exports: Vec<(u32, ProgramSymbol<'static>)>,
     jump_table: Vec<u8>,
+    jump_table_entry_count: u32,
+    jump_table_entry_size: u8,
     code: Vec<u8>,
+    bitmask: Vec<u8>,
     custom: Vec<(u8, Vec<u8>)>,
     instruction_count: u32,
     basic_block_count: u32,
+    basic_block_to_instruction_index: Vec<usize>,
+    instruction_index_to_code_offset: Vec<u32>,
 }
 
 impl ProgramBlobBuilder {
@@ -43,33 +113,169 @@ impl ProgramBlobBuilder {
         self.rw_data = data;
     }
 
-    pub fn add_import(&mut self, import: ProgramImport) {
+    pub fn add_import(&mut self, import: ProgramSymbol) {
         self.imports.push(import.into_owned());
     }
 
-    pub fn add_export(&mut self, export: ProgramExport) {
-        self.exports.push(export.into_owned());
+    pub fn add_export_by_basic_block(&mut self, target_basic_block: u32, symbol: ProgramSymbol) {
+        self.exports.push((target_basic_block, symbol.into_owned()));
     }
 
-    pub fn set_jump_table(&mut self, jump_table: &[u32]) {
-        self.jump_table.clear();
-        let mut writer = Writer::new(&mut self.jump_table);
-        for &target in jump_table {
-            writer.push_varint(target);
+    pub fn set_code(&mut self, code: &[Instruction], jump_table: &[u32]) {
+        fn mutate<T>(slot: &mut T, value: T) -> bool
+        where
+            T: PartialEq,
+        {
+            if *slot == value {
+                false
+            } else {
+                *slot = value;
+                true
+            }
         }
-    }
 
-    pub fn set_code(&mut self, code: &[Instruction]) {
-        self.instruction_count = 0;
-        self.basic_block_count = 0;
-        for instruction in code {
-            let mut buffer = [0; program::MAX_INSTRUCTION_LENGTH];
-            let length = instruction.serialize_into(&mut buffer);
-            self.code.extend_from_slice(&buffer[..length]);
-            self.instruction_count += 1;
+        let mut basic_block_to_instruction_index = Vec::with_capacity(code.len());
+        basic_block_to_instruction_index.push(0);
 
+        for (nth_instruction, instruction) in code.iter().enumerate() {
             if instruction.opcode().starts_new_basic_block() {
-                self.basic_block_count += 1;
+                basic_block_to_instruction_index.push(nth_instruction + 1);
+            }
+        }
+
+        self.jump_table.clear();
+        self.code.clear();
+        self.instruction_count = u32::try_from(code.len()).expect("too many instructions");
+        self.basic_block_count = u32::try_from(basic_block_to_instruction_index.len()).expect("too many basic blocks");
+
+        let mut instructions = Vec::new();
+        let mut position: u32 = 0;
+        for (nth_instruction, instruction) in code.iter().enumerate() {
+            let mut instruction = *instruction;
+            let target = instruction.target_mut();
+            let target_nth_instruction = target.map(|target| {
+                let target_nth_instruction = basic_block_to_instruction_index[*target as usize];
+
+                // This is completely inaccurate, but that's fine.
+                *target = position.wrapping_add((target_nth_instruction as i32 - nth_instruction as i32) as u32);
+                target_nth_instruction
+            });
+
+            let entry = SerializedInstruction {
+                instruction,
+                bytes: InstructionBuffer::from((position, instruction)),
+                target_nth_instruction,
+                position,
+            };
+
+            position = position.checked_add(entry.bytes.len() as u32).expect("too many instructions");
+            instructions.push(entry);
+        }
+
+        // Adjust offsets to other instructions until we reach a steady state.
+        loop {
+            let mut modified = false;
+            position = 0;
+            for nth_instruction in 0..instructions.len() {
+                modified |= mutate(&mut instructions[nth_instruction].position, position);
+
+                if let Some(target_nth_instruction) = instructions[nth_instruction].target_nth_instruction {
+                    let new_target = instructions[target_nth_instruction].position;
+                    if mutate(instructions[nth_instruction].instruction.target_mut().unwrap(), new_target) || modified {
+                        instructions[nth_instruction].bytes =
+                            InstructionBuffer::from((position, instructions[nth_instruction].instruction));
+                    }
+                }
+
+                position = position
+                    .checked_add(instructions[nth_instruction].bytes.len() as u32)
+                    .expect("too many instructions");
+            }
+
+            if !modified {
+                break;
+            }
+        }
+
+        let mut jump_table_entry_size = 0;
+        let mut jump_table_entries = Vec::with_capacity(jump_table.len());
+        for &target in jump_table {
+            let target_nth_instruction = basic_block_to_instruction_index[target as usize];
+            let offset = instructions[target_nth_instruction].position.to_le_bytes();
+            jump_table_entries.push(offset);
+            jump_table_entry_size = core::cmp::max(jump_table_entry_size, offset.iter().take_while(|&&b| b != 0).count());
+        }
+
+        self.jump_table_entry_count = jump_table_entries.len() as u32;
+        self.jump_table_entry_size = jump_table_entry_size as u8;
+        for target in jump_table_entries {
+            self.jump_table.extend_from_slice(&target[..jump_table_entry_size]);
+        }
+
+        struct BitVec {
+            bytes: Vec<u8>,
+            current: usize,
+            bits: usize,
+        }
+
+        impl BitVec {
+            fn new() -> Self {
+                BitVec {
+                    bytes: Vec::new(),
+                    current: 0,
+                    bits: 0,
+                }
+            }
+
+            fn push(&mut self, value: bool) {
+                self.current |= usize::from(value) << self.bits;
+                self.bits += 1;
+                if self.bits == 8 {
+                    self.bytes.push(self.current as u8);
+                    self.current = 0;
+                    self.bits = 0;
+                }
+            }
+
+            fn finish(mut self) -> Vec<u8> {
+                while self.bits > 0 {
+                    self.push(true);
+                }
+                self.bytes
+            }
+        }
+
+        let mut bitmask = BitVec::new();
+        for entry in &instructions {
+            bitmask.push(true);
+            for _ in 1..entry.bytes.len() {
+                bitmask.push(false);
+            }
+
+            self.code.extend_from_slice(&entry.bytes);
+        }
+
+        self.bitmask = bitmask.finish();
+
+        self.basic_block_to_instruction_index = basic_block_to_instruction_index;
+        self.instruction_index_to_code_offset = instructions.iter().map(|entry| entry.position).collect();
+
+        if cfg!(debug_assertions) {
+            // Sanity check.
+            let mut parsed = Vec::new();
+            let mut offsets = alloc::collections::BTreeSet::new();
+            for instruction in crate::program::Instructions::new(&self.code, &self.bitmask, 0) {
+                parsed.push((instruction.offset, instruction.kind));
+                offsets.insert(instruction.offset);
+            }
+
+            assert_eq!(parsed.len(), instructions.len());
+            for ((offset, mut instruction), entry) in parsed.into_iter().zip(instructions.into_iter()) {
+                assert_eq!(instruction, entry.instruction);
+                assert_eq!(entry.position, offset);
+                if let Some(target) = instruction.target_mut() {
+                    assert!(offsets.contains(target));
+                }
             }
         }
     }
@@ -97,28 +303,38 @@ impl ProgramBlobBuilder {
         writer.push_section(program::SECTION_RW_DATA, &self.rw_data);
         if !self.imports.is_empty() {
             writer.push_section_inplace(program::SECTION_IMPORTS, |writer| {
-                writer.push_varint(self.imports.len().try_into().expect("too many imports"));
-                for import in self.imports {
-                    writer.push_bytes_with_length(import.symbol());
+                let mut offsets_blob = Vec::new();
+                let mut symbols_blob = Vec::new();
+                for symbol in &self.imports {
+                    offsets_blob.extend_from_slice(&(symbols_blob.len() as u32).to_le_bytes());
+                    symbols_blob.extend_from_slice(symbol)
                 }
+
+                writer.push_varint(self.imports.len().try_into().expect("too many imports"));
+                writer.push_raw_bytes(&offsets_blob);
+                writer.push_raw_bytes(&symbols_blob);
             });
         }
 
         if !self.exports.is_empty() {
             writer.push_section_inplace(program::SECTION_EXPORTS, |writer| {
                 writer.push_varint(self.exports.len().try_into().expect("too many exports"));
-                for export in self.exports {
-                    writer.push_varint(export.jump_target());
-                    writer.push_bytes_with_length(export.symbol());
+                for (target_basic_block, symbol) in self.exports {
+                    let nth_instruction = self.basic_block_to_instruction_index[target_basic_block as usize];
+                    let offset = self.instruction_index_to_code_offset[nth_instruction];
+                    writer.push_varint(offset);
+                    writer.push_bytes_with_length(&symbol);
                 }
             });
         }
 
-        writer.push_section(program::SECTION_JUMP_TABLE, &self.jump_table);
         writer.push_section_inplace(program::SECTION_CODE, |writer| {
-            writer.push_varint(self.instruction_count);
-            writer.push_varint(self.basic_block_count);
+            writer.push_varint(self.jump_table_entry_count);
+            writer.push_byte(self.jump_table_entry_size);
+            writer.push_varint(self.code.len() as u32);
+            writer.push_raw_bytes(&self.jump_table);
             writer.push_raw_bytes(&self.code);
+            writer.push_raw_bytes(&self.bitmask);
         });
 
         for (section, contents) in self.custom {

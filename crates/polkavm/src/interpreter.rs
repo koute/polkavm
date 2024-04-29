@@ -1,12 +1,13 @@
 use crate::api::{BackendAccess, ExecuteArgs, HostcallHandler, MemoryAccessError, Module};
 use crate::error::Error;
 use crate::utils::GuestInit;
-use crate::utils::RegImm;
+use crate::utils::{FlatMap, RegImm};
 use core::mem::MaybeUninit;
-use polkavm_common::abi::{VM_ADDR_RETURN_TO_HOST, VM_CODE_ADDRESS_ALIGNMENT};
+use core::num::NonZeroU32;
+use polkavm_common::abi::VM_ADDR_RETURN_TO_HOST;
 use polkavm_common::error::Trap;
 use polkavm_common::operation::*;
-use polkavm_common::program::{Instruction, InstructionVisitor, Reg};
+use polkavm_common::program::{Instruction, InstructionVisitor, ParsedInstruction, Reg};
 use polkavm_common::utils::{align_to_next_page_usize, byte_slice_init, Access, AsUninitSliceMut, Gas};
 use polkavm_common::{
     VM_RPC_FLAG_CLEAR_PROGRAM_AFTER_EXECUTION, VM_RPC_FLAG_RESET_MEMORY_AFTER_EXECUTION, VM_RPC_FLAG_RESET_MEMORY_BEFORE_EXECUTION,
@@ -34,23 +35,19 @@ impl IntoRegImm for u32 {
 }
 
 pub(crate) struct InterpretedModule {
-    pub(crate) instructions: Vec<Instruction>,
     ro_data: Vec<u8>,
     rw_data: Vec<u8>,
-    pub(crate) gas_cost_for_basic_block: Vec<u32>,
 }
 
 impl InterpretedModule {
-    pub fn new(init: GuestInit, gas_cost_for_basic_block: Vec<u32>, instructions: Vec<Instruction>) -> Result<Self, Error> {
+    pub fn new(init: GuestInit) -> Result<Self, Error> {
         let memory_map = init.memory_map().map_err(Error::from_static_str)?;
         let mut ro_data: Vec<_> = init.ro_data.into();
         ro_data.resize(memory_map.ro_data_size() as usize, 0);
 
         Ok(InterpretedModule {
-            instructions,
             ro_data,
             rw_data: init.rw_data.into(),
-            gas_cost_for_basic_block,
         })
     }
 }
@@ -188,30 +185,52 @@ impl BasicMemory {
     }
 }
 
+#[derive(Copy, Clone)]
+#[repr(transparent)]
+struct GasCost(NonZeroU32);
+
+impl GasCost {
+    fn new(cost: u32) -> Self {
+        GasCost(NonZeroU32::new(cost + 1).expect("invalid gas"))
+    }
+
+    fn get(self) -> u32 {
+        self.0.get() - 1
+    }
+}
+
 pub(crate) struct InterpretedInstance {
     module: Module,
     memory: BasicMemory,
     regs: [u32; Reg::ALL.len()],
-    nth_instruction: u32,
-    nth_basic_block: u32,
+    instruction_offset: u32,
+    instruction_length: u32,
     return_to_host: bool,
     cycle_counter: u64,
+    gas_cost_for_block: FlatMap<GasCost>,
     gas_remaining: Option<i64>,
     in_new_execution: bool,
+    compiled_offset_for_block: FlatMap<NonZeroU32>,
+    compiled_instructions: Vec<ParsedInstruction>,
+    compiled_offset: usize,
 }
 
 impl InterpretedInstance {
     pub fn new_from_module(module: Module) -> Self {
         let mut instance = Self {
+            compiled_offset_for_block: FlatMap::new(module.blob().code().len() as u32),
+            compiled_instructions: Default::default(),
+            gas_cost_for_block: FlatMap::new(module.blob().code().len() as u32),
             module,
             memory: BasicMemory::new(),
             regs: [0; Reg::ALL.len()],
-            nth_instruction: VM_ADDR_RETURN_TO_HOST,
-            nth_basic_block: 0,
+            instruction_offset: 0,
+            instruction_length: 0,
             return_to_host: true,
             cycle_counter: 0,
             gas_remaining: None,
             in_new_execution: false,
+            compiled_offset: 0,
         };
 
         instance.initialize_module();
@@ -233,13 +252,17 @@ impl InterpretedInstance {
     }
 
     pub fn run(&mut self, ctx: InterpreterContext) -> Result<(), ExecutionError<Error>> {
-        if log::log_enabled!(target: "polkavm", log::Level::Debug) || log::log_enabled!(target: "polkavm::interpreter", log::Level::Debug) {
+        if log::log_enabled!(target: "polkavm", log::Level::Debug)
+            || log::log_enabled!(target: "polkavm::interpreter", log::Level::Debug)
+            || cfg!(test)
+        {
             self.run_impl::<true>(ctx)
         } else {
             self.run_impl::<false>(ctx)
         }
     }
 
+    #[inline(never)]
     fn run_impl<const DEBUG: bool>(&mut self, ctx: InterpreterContext) -> Result<(), ExecutionError<Error>> {
         #[cold]
         fn translate_error(error: ExecutionError) -> ExecutionError<Error> {
@@ -264,16 +287,20 @@ impl InterpretedInstance {
             }
         }
 
-        let module = self.module.clone();
-        let instructions = module.instructions();
         let mut visitor = Visitor::<DEBUG> { inner: self, ctx };
         loop {
             visitor.inner.cycle_counter += 1;
-            let Some(instruction) = instructions.get(visitor.inner.nth_instruction as usize) else {
+            let Some(&instruction) = visitor.inner.compiled_instructions.get(visitor.inner.compiled_offset) else {
+                if DEBUG {
+                    log::trace!("Trap at {}: no instruction found", visitor.inner.instruction_offset);
+                }
                 return Err(trap());
             };
 
-            visitor.trace_current_instruction(instruction);
+            visitor.inner.compiled_offset += 1;
+            visitor.inner.instruction_offset = instruction.offset;
+            visitor.inner.instruction_length = instruction.length;
+            visitor.trace_current_instruction(&instruction);
             if let Err(error) = instruction.visit(&mut visitor) {
                 return Err(translate_error(error));
             }
@@ -293,13 +320,26 @@ impl InterpretedInstance {
         }
 
         self.cycle_counter += 1;
-        let Some(instruction) = self.module.instructions().get(self.nth_instruction as usize).copied() else {
+        let Some(mut instructions) = self.module.blob().instructions_at(self.instruction_offset) else {
             return Err(ExecutionError::Trap(Default::default()));
         };
 
+        let Some(instruction) = instructions.next() else {
+            return Err(ExecutionError::Trap(Default::default()));
+        };
+
+        self.instruction_offset = instruction.offset;
+        self.instruction_length = instruction.length;
         let mut visitor = Visitor::<true> { inner: self, ctx };
+
         visitor.trace_current_instruction(&instruction);
-        instruction.visit(&mut visitor)
+        instruction.visit(&mut visitor)?;
+
+        if !instruction.starts_new_basic_block() {
+            self.instruction_offset += instruction.length;
+        }
+
+        Ok(())
     }
 
     fn clear_instance(&mut self) {
@@ -349,19 +389,7 @@ impl InterpretedInstance {
         }
 
         if let Some(entry_point) = args.entry_point {
-            let nth_basic_block = self
-                .module
-                .get_export(entry_point)
-                .expect("internal error: invalid export index")
-                .jump_target();
-
-            let nth_instruction = self
-                .module
-                .instruction_by_basic_block(nth_basic_block)
-                .expect("internal error: invalid export address");
-
-            self.nth_instruction = nth_instruction;
-            self.nth_basic_block = nth_basic_block;
+            self.instruction_offset = entry_point;
         }
 
         if args.flags & VM_RPC_FLAG_RESET_MEMORY_BEFORE_EXECUTION != 0 {
@@ -388,15 +416,28 @@ impl InterpretedInstance {
         InterpretedAccess { instance: self }
     }
 
+    #[cfg_attr(not(debug_assertions), inline(always))]
     fn on_start_new_basic_block<const DEBUG: bool>(&mut self) -> Result<(), ExecutionError> {
-        if let Some(ref mut gas_remaining) = self.gas_remaining {
-            let module = self.module.interpreted_module().unwrap();
-            let gas_cost = i64::from(module.gas_cost_for_basic_block[self.nth_basic_block as usize]);
+        let instruction_offset = self.instruction_offset;
+        if let Some(compiled_offset) = self.compiled_offset_for_block.get(instruction_offset) {
+            self.compiled_offset = (compiled_offset.get() - 1) as usize;
+        } else {
+            self.compiled_offset = self.compiled_instructions.len();
+            self.compile_block::<DEBUG>();
+        }
 
+        if self.gas_remaining.is_some() {
+            let gas_cost: i64 = if let Some(cost) = self.gas_cost_for_block.get(instruction_offset) {
+                u64::from(cost.get()) as i64
+            } else {
+                self.calculate_gas_cost()
+            };
+
+            let gas_remaining = self.gas_remaining.as_mut().unwrap();
             if DEBUG {
                 log::trace!(
-                    "Consume gas at @{:x}: {} ({} -> {})",
-                    self.nth_basic_block,
+                    "Consume gas at at {}: {} ({} -> {})",
+                    instruction_offset,
                     gas_cost,
                     *gas_remaining,
                     *gas_remaining - gas_cost
@@ -410,6 +451,50 @@ impl InterpretedInstance {
         }
 
         Ok(())
+    }
+
+    #[inline(never)]
+    #[cold]
+    fn calculate_gas_cost(&mut self) -> i64 {
+        let instruction_offset = self.instruction_offset;
+        let Some(instructions) = self.module.blob().instructions_at(instruction_offset) else {
+            return 0;
+        };
+
+        let cost = crate::gas::calculate_for_block(instructions);
+        self.gas_cost_for_block.insert(instruction_offset, GasCost::new(cost));
+        u64::from(cost) as i64
+    }
+
+    #[inline(never)]
+    #[cold]
+    fn compile_block<const DEBUG: bool>(&mut self) {
+        let Some(instructions) = self.module.blob().instructions_at(self.instruction_offset) else {
+            return;
+        };
+        if DEBUG {
+            log::debug!("Compiling block at {}:", self.instruction_offset);
+        }
+
+        let starting_offset = self.compiled_instructions.len();
+        for instruction in instructions {
+            if DEBUG {
+                log::debug!(
+                    "  [{}]: {}: {}",
+                    self.compiled_instructions.len(),
+                    instruction.offset,
+                    instruction.kind
+                );
+            }
+
+            self.compiled_instructions.push(instruction);
+            if instruction.opcode().starts_new_basic_block() {
+                break;
+            }
+        }
+
+        self.compiled_offset_for_block
+            .insert(self.instruction_offset, NonZeroU32::new((starting_offset + 1) as u32).unwrap());
     }
 
     fn check_gas(&mut self) -> Result<(), ExecutionError> {
@@ -484,7 +569,7 @@ impl<'a> Access<'a> for InterpretedAccess<'a> {
     }
 
     fn program_counter(&self) -> Option<u32> {
-        Some(self.instance.nth_instruction)
+        Some(self.instance.instruction_offset)
     }
 
     fn native_program_counter(&self) -> Option<u64> {
@@ -544,7 +629,6 @@ impl<'a, 'b, const DEBUG: bool> Visitor<'a, 'b, DEBUG> {
         let s1 = self.get(s1);
         let s2 = self.get(s2);
         self.set(dst, callback(s1, s2))?;
-        self.inner.nth_instruction += 1;
         Ok(())
     }
 
@@ -558,20 +642,15 @@ impl<'a, 'b, const DEBUG: bool> Visitor<'a, 'b, DEBUG> {
         let s1 = self.get(s1);
         let s2 = self.get(s2);
         if callback(s1, s2) {
-            self.inner.nth_instruction = self
-                .inner
-                .module
-                .instruction_by_basic_block(target)
-                .expect("internal error: couldn't fetch the instruction index for a branch");
-            self.inner.nth_basic_block = target;
+            self.inner.instruction_offset = target;
         } else {
-            self.inner.nth_instruction += 1;
-            self.inner.nth_basic_block += 1;
+            self.inner.instruction_offset += self.inner.instruction_length;
         }
 
         self.inner.on_start_new_basic_block::<DEBUG>()
     }
 
+    #[cfg_attr(not(debug_assertions), inline(always))]
     fn load<T: LoadTy>(&mut self, dst: Reg, base: Option<Reg>, offset: u32) -> Result<(), ExecutionError> {
         assert!(core::mem::size_of::<T>() >= 1);
 
@@ -580,14 +659,14 @@ impl<'a, 'b, const DEBUG: bool> Visitor<'a, 'b, DEBUG> {
         let Some(slice) = self.inner.memory.get_memory_slice(&self.inner.module, address, length) else {
             if DEBUG {
                 log::debug!(
-                    "Load of {length} bytes from 0x{address:x} failed! (pc = #{pc}, cycle = {cycle})",
-                    pc = self.inner.nth_instruction,
+                    "Load of {length} bytes from 0x{address:x} failed! (pc = {pc}, cycle = {cycle})",
+                    pc = self.inner.instruction_offset,
                     cycle = self.inner.cycle_counter
                 );
 
                 self.inner
                     .module
-                    .debug_print_location(log::Level::Debug, self.inner.nth_instruction);
+                    .debug_print_location(log::Level::Debug, self.inner.instruction_offset);
             }
 
             return Err(ExecutionError::Trap(Default::default()));
@@ -599,7 +678,6 @@ impl<'a, 'b, const DEBUG: bool> Visitor<'a, 'b, DEBUG> {
 
         let value = T::from_slice(slice);
         self.set(dst, value)?;
-        self.inner.nth_instruction += 1;
         Ok(())
     }
 
@@ -629,14 +707,14 @@ impl<'a, 'b, const DEBUG: bool> Visitor<'a, 'b, DEBUG> {
         let Some(slice) = self.inner.memory.get_memory_slice_mut(&self.inner.module, address, length) else {
             if DEBUG {
                 log::debug!(
-                    "Store of {length} bytes to 0x{address:x} failed! (pc = #{pc}, cycle = {cycle})",
-                    pc = self.inner.nth_instruction,
+                    "Store of {length} bytes to 0x{address:x} failed! (pc = {pc}, cycle = {cycle})",
+                    pc = self.inner.instruction_offset,
                     cycle = self.inner.cycle_counter
                 );
 
                 self.inner
                     .module
-                    .debug_print_location(log::Level::Debug, self.inner.nth_instruction);
+                    .debug_print_location(log::Level::Debug, self.inner.instruction_offset);
             }
 
             return Err(ExecutionError::Trap(Default::default()));
@@ -649,31 +727,11 @@ impl<'a, 'b, const DEBUG: bool> Visitor<'a, 'b, DEBUG> {
             (on_store)(address, value.as_ref()).map_err(ExecutionError::Trap)?;
         }
 
-        self.inner.nth_instruction += 1;
         Ok(())
     }
 
-    fn get_return_address(&self) -> u32 {
-        self.inner
-            .module
-            .jump_table_index_by_basic_block(self.inner.nth_basic_block + 1)
-            .expect("internal error: couldn't fetch the jump table index for the return basic block")
-            * VM_CODE_ADDRESS_ALIGNMENT
-    }
-
-    fn set_return_address(&mut self, ra: Reg, return_address: u32) -> Result<(), ExecutionError> {
-        if DEBUG {
-            log::trace!(
-                "Setting a call's return address: {ra} = @dyn {:x} (@{:x})",
-                return_address / VM_CODE_ADDRESS_ALIGNMENT,
-                self.inner.nth_basic_block + 1
-            );
-        }
-
-        self.set(ra, return_address)
-    }
-
-    fn dynamic_jump(&mut self, call: Option<(Reg, u32)>, base: Reg, offset: u32) -> Result<(), ExecutionError> {
+    #[cfg_attr(not(debug_assertions), inline(always))]
+    fn jump_indirect_impl(&mut self, call: Option<(Reg, u32)>, base: Reg, offset: u32) -> Result<(), ExecutionError> {
         let target = self.inner.regs[base as usize].wrapping_add(offset);
         if let Some((ra, return_address)) = call {
             self.set(ra, return_address)?;
@@ -684,43 +742,25 @@ impl<'a, 'b, const DEBUG: bool> Visitor<'a, 'b, DEBUG> {
             return Ok(());
         }
 
-        if target == 0 {
-            return Err(ExecutionError::Trap(Default::default()));
-        }
-
-        if target % VM_CODE_ADDRESS_ALIGNMENT != 0 {
-            log::error!("Found a dynamic jump with a misaligned target: target = {target}");
-            return Err(ExecutionError::Trap(Default::default()));
-        }
-
-        let Some(nth_basic_block) = self
-            .inner
-            .module
-            .basic_block_by_jump_table_index(target / VM_CODE_ADDRESS_ALIGNMENT)
-        else {
+        let Some(instruction_offset) = self.inner.module.blob().jump_table().get_by_address(target) else {
+            if DEBUG {
+                log::trace!("Indirect jump to address {target}: INVALID");
+            }
             return Err(ExecutionError::Trap(Default::default()));
         };
 
-        let nth_instruction = self
-            .inner
-            .module
-            .instruction_by_basic_block(nth_basic_block)
-            .expect("internal error: couldn't fetch the instruction index for a dynamic jump");
-
         if DEBUG {
-            log::trace!("Dynamic jump to: #{nth_instruction}: @{nth_basic_block:x}");
+            log::trace!("Indirect jump to address {target}: {instruction_offset}");
         }
 
-        self.inner.nth_basic_block = nth_basic_block;
-        self.inner.nth_instruction = nth_instruction;
+        self.inner.instruction_offset = instruction_offset;
         self.inner.on_start_new_basic_block::<DEBUG>()
     }
 
     #[inline(always)]
     fn trace_current_instruction(&self, instruction: &Instruction) {
         if DEBUG {
-            let program_counter = self.inner.nth_instruction;
-            log::trace!("#{program_counter}: {instruction}");
+            log::trace!("{}: {instruction}", self.inner.instruction_offset);
         }
     }
 }
@@ -795,17 +835,12 @@ impl<'a, 'b, const DEBUG: bool> InstructionVisitor for Visitor<'a, 'b, DEBUG> {
     type ReturnTy = Result<(), ExecutionError>;
 
     fn trap(&mut self) -> Self::ReturnTy {
-        log::debug!(
-            "Trap at instruction {} in block @{:x}",
-            self.inner.nth_instruction,
-            self.inner.nth_basic_block
-        );
+        log::debug!("Trap at {}: explicit trap", self.inner.instruction_offset);
         Err(ExecutionError::Trap(Default::default()))
     }
 
     fn fallthrough(&mut self) -> Self::ReturnTy {
-        self.inner.nth_instruction += 1;
-        self.inner.nth_basic_block += 1;
+        self.inner.instruction_offset += 1;
         self.inner.on_start_new_basic_block::<DEBUG>()
     }
 
@@ -813,7 +848,6 @@ impl<'a, 'b, const DEBUG: bool> InstructionVisitor for Visitor<'a, 'b, DEBUG> {
         let size = self.get(size);
         let result = self.inner.sbrk(size).unwrap_or(0);
         self.set(dst, result)?;
-        self.inner.nth_instruction += 1;
         Ok(())
     }
 
@@ -821,7 +855,6 @@ impl<'a, 'b, const DEBUG: bool> InstructionVisitor for Visitor<'a, 'b, DEBUG> {
         if let Some(on_hostcall) = self.ctx.on_hostcall.as_mut() {
             let access = BackendAccess::Interpreted(self.inner.access());
             (on_hostcall)(imm, access).map_err(ExecutionError::Trap)?;
-            self.inner.nth_instruction += 1;
             self.inner.check_gas()?;
             Ok(())
         } else {
@@ -972,14 +1005,12 @@ impl<'a, 'b, const DEBUG: bool> InstructionVisitor for Visitor<'a, 'b, DEBUG> {
 
     fn load_imm(&mut self, dst: Reg, imm: u32) -> Self::ReturnTy {
         self.set(dst, imm)?;
-        self.inner.nth_instruction += 1;
         Ok(())
     }
 
     fn move_reg(&mut self, d: Reg, s: Reg) -> Self::ReturnTy {
         let imm = self.get(s);
         self.set(d, imm)?;
-        self.inner.nth_instruction += 1;
         Ok(())
     }
 
@@ -989,7 +1020,6 @@ impl<'a, 'b, const DEBUG: bool> InstructionVisitor for Visitor<'a, 'b, DEBUG> {
             self.set(d, value)?;
         }
 
-        self.inner.nth_instruction += 1;
         Ok(())
     }
 
@@ -998,7 +1028,6 @@ impl<'a, 'b, const DEBUG: bool> InstructionVisitor for Visitor<'a, 'b, DEBUG> {
             self.set(d, s)?;
         }
 
-        self.inner.nth_instruction += 1;
         Ok(())
     }
 
@@ -1008,7 +1037,6 @@ impl<'a, 'b, const DEBUG: bool> InstructionVisitor for Visitor<'a, 'b, DEBUG> {
             self.set(d, value)?;
         }
 
-        self.inner.nth_instruction += 1;
         Ok(())
     }
 
@@ -1017,7 +1045,6 @@ impl<'a, 'b, const DEBUG: bool> InstructionVisitor for Visitor<'a, 'b, DEBUG> {
             self.set(d, s)?;
         }
 
-        self.inner.nth_instruction += 1;
         Ok(())
     }
 
@@ -1178,33 +1205,24 @@ impl<'a, 'b, const DEBUG: bool> InstructionVisitor for Visitor<'a, 'b, DEBUG> {
     }
 
     fn jump(&mut self, target: u32) -> Self::ReturnTy {
-        let nth_instruction = self
-            .inner
-            .module
-            .instruction_by_basic_block(target)
-            .expect("internal error: couldn't fetch the instruction index for a jump");
-
         if DEBUG {
-            log::trace!("Static jump to: #{nth_instruction}: @{target:x}");
+            log::trace!("Jump to: {target}");
         }
 
-        self.inner.nth_basic_block = target;
-        self.inner.nth_instruction = nth_instruction;
+        self.inner.instruction_offset = target;
         self.inner.on_start_new_basic_block::<DEBUG>()
     }
 
     fn jump_indirect(&mut self, base: Reg, offset: u32) -> Self::ReturnTy {
-        self.dynamic_jump(None, base, offset)
+        self.jump_indirect_impl(None, base, offset)
     }
 
-    fn call(&mut self, ra: Reg, target: u32) -> Self::ReturnTy {
-        let return_address = self.get_return_address();
-        self.set_return_address(ra, return_address)?;
+    fn load_imm_and_jump(&mut self, ra: Reg, value: u32, target: u32) -> Self::ReturnTy {
+        self.load_imm(ra, value)?;
         self.jump(target)
     }
 
-    fn call_indirect(&mut self, ra: Reg, base: Reg, offset: u32) -> Self::ReturnTy {
-        let return_address = self.get_return_address();
-        self.dynamic_jump(Some((ra, return_address)), base, offset)
+    fn load_imm_and_jump_indirect(&mut self, ra: Reg, base: Reg, value: u32, offset: u32) -> Self::ReturnTy {
+        self.jump_indirect_impl(Some((ra, value)), base, offset)
     }
 }

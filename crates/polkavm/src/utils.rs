@@ -35,3 +35,30 @@ impl<'a> GuestInit<'a> {
         polkavm_common::abi::MemoryMap::new(self.page_size, self.ro_data_size, self.rw_data_size, self.stack_size)
     }
 }
+
+pub(crate) struct FlatMap<T> {
+    inner: Vec<Option<T>>,
+}
+
+impl<T> FlatMap<T>
+where
+    T: Copy,
+{
+    #[inline]
+    pub fn new(capacity: u32) -> Self {
+        let mut inner = Vec::new();
+        inner.resize_with(capacity as usize, || None);
+
+        Self { inner }
+    }
+
+    #[inline]
+    pub fn get(&self, key: u32) -> Option<T> {
+        self.inner.get(key as usize).and_then(|value| *value)
+    }
+
+    #[inline]
+    pub fn insert(&mut self, key: u32, value: T) {
+        self.inner[key as usize] = Some(value);
+    }
+}

@@ -254,6 +254,7 @@ pub enum GasMeteringKind {
 pub struct ModuleConfig {
     pub(crate) page_size: u32,
     pub(crate) gas_metering: Option<GasMeteringKind>,
+    pub(crate) is_strict: bool,
 }
 
 impl Default for ModuleConfig {
@@ -268,6 +269,7 @@ impl ModuleConfig {
         ModuleConfig {
             page_size: 0x1000,
             gas_metering: None,
+            is_strict: false,
         }
     }
 
@@ -284,6 +286,15 @@ impl ModuleConfig {
     /// Default: `None`
     pub fn set_gas_metering(&mut self, kind: Option<GasMeteringKind>) -> &mut Self {
         self.gas_metering = kind;
+        self
+    }
+
+    /// Sets the strict mode. When disabled it's guaranteed that the semantics
+    /// of lazy execution match the semantics of eager execution.
+    ///
+    /// Default: `false`
+    pub fn set_strict(&mut self, is_strict: bool) -> &mut Self {
+        self.is_strict = is_strict;
         self
     }
 }

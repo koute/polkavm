@@ -73,8 +73,11 @@ impl Tracer {
         self.trace_current_instruction_source(program_counter);
 
         if let Some(native_address) = access.native_program_counter() {
-            let instruction = self.module.instructions()[program_counter as usize];
-            log::trace!("0x{native_address:x}: #{program_counter}: {instruction}");
+            if let Some(instruction) = self.module.blob().instructions_at(program_counter).and_then(|mut iter| iter.next()) {
+                log::trace!("0x{native_address:x}: #{program_counter}: {instruction}");
+            } else {
+                log::trace!("0x{native_address:x}: #{program_counter}: <NONE>");
+            }
         }
 
         self.step_crosscheck_interpreter(program_counter)?;
@@ -283,8 +286,11 @@ impl Tracer {
         self.program_counter_history[self.program_counter_history_position] = program_counter;
         self.program_counter_history_position = (self.program_counter_history_position + 1) % self.program_counter_history.len();
 
-        let instruction = self.module.instructions()[program_counter as usize];
-        if matches!(instruction.opcode(), Opcode::trap) {
+        let Some(instruction) = self.module.blob().instructions_at(program_counter).and_then(|mut iter| iter.next()) else {
+            return Ok(());
+        };
+
+        if matches!(instruction.kind.opcode(), Opcode::trap) {
             return Ok(());
         }
 

@@ -1299,7 +1299,7 @@ impl super::Sandbox for Sandbox {
             }
 
             *self.vmctx().rpc_address.get() = args.entry_point.map_or(0, |entry_point|
-                Self::as_compiled_module(self.module.as_ref().unwrap()).export_trampolines[entry_point] as usize
+                Self::as_compiled_module(self.module.as_ref().unwrap()).export_trampolines.get(&entry_point).copied().unwrap_or(0) as usize
             ) as u64;
 
             *self.vmctx().rpc_flags.get() = args.flags;

@@ -7,12 +7,10 @@ use polkavm_assembler::amd64::{Condition, LoadKind, RegSize, Size, MemOp};
 use polkavm_assembler::Label;
 
 use polkavm_common::program::{InstructionVisitor, Reg};
-use polkavm_common::abi::VM_CODE_ADDRESS_ALIGNMENT;
 use polkavm_common::zygote::VM_ADDR_VMCTX;
 
-use crate::api::VisitorWrapper;
 use crate::config::GasMeteringKind;
-use crate::compiler::{Compiler, SandboxKind};
+use crate::compiler::{ArchVisitor, SandboxKind};
 use crate::utils::RegImm;
 
 const TMP_REG: NativeReg = rcx;
@@ -150,8 +148,13 @@ enum ShiftKind {
     ArithmeticRight,
 }
 
-impl<'a> Compiler<'a> {
+impl<'r, 'a> ArchVisitor<'r, 'a> {
     pub const PADDING_BYTE: u8 = 0x90; // NOP
+
+    #[inline(always)]
+    fn push<T>(&mut self, inst: polkavm_assembler::Instruction<T>) where T: core::fmt::Display {
+        self.0.asm.push(inst);
+    }
 
     #[allow(clippy::unused_self)]
     #[cfg_attr(not(debug_assertions), inline(always))]
@@ -331,13 +334,12 @@ impl<'a> Compiler<'a> {
     }
 
     #[cfg_attr(not(debug_assertions), inline(always))]
-    fn branch(&mut self, s1: Reg, s2: impl Into<RegImm>, target: u32, condition: Condition) {
-        match s2.into() {
-            RegImm::Reg(s2) => self.push(cmp((self.reg_size(), conv_reg(s1), conv_reg(s2)))),
-            RegImm::Imm(s2) => self.push(cmp((conv_reg(s1), imm32(s2)))),
-        }
+    fn call_to_label(&mut self, label: Label) {
+        self.push(call_label32(label));
+    }
 
-        let label = self.get_or_forward_declare_label(target);
+    #[cfg_attr(not(debug_assertions), inline(always))]
+    fn branch_to_label(&mut self, condition: Condition, label: Label) {
         if let Some(offset) = self.asm.get_label_origin_offset(label) {
             let offset = self.calculate_label_offset(
                 jcc_rel8(condition, i8::MAX).len(),
@@ -352,8 +354,17 @@ impl<'a> Compiler<'a> {
         } else {
             self.push(jcc_label32(condition, label));
         }
+    }
 
-        self.start_new_basic_block();
+    #[cfg_attr(not(debug_assertions), inline(always))]
+    fn branch(&mut self, s1: Reg, s2: impl Into<RegImm>, target: u32, condition: Condition) {
+        match s2.into() {
+            RegImm::Reg(s2) => self.push(cmp((self.reg_size(), conv_reg(s1), conv_reg(s2)))),
+            RegImm::Imm(s2) => self.push(cmp((conv_reg(s1), imm32(s2)))),
+        }
+
+        let label = self.get_or_forward_declare_label(target);
+        self.branch_to_label(condition, label);
     }
 
     #[cfg_attr(not(debug_assertions), inline(always))]
@@ -509,7 +520,7 @@ impl<'a> Compiler<'a> {
             log::trace!("Emitting trampoline: export: {}", export.symbol());
 
             let trampoline_label = self.asm.create_label();
-            self.export_to_label.insert(export.jump_target(), trampoline_label);
+            self.export_to_label.insert(export.target_code_offset(), trampoline_label);
 
             if matches!(self.sandbox_kind, SandboxKind::Linux) {
                 self.push(mov_imm64(LINUX_SANDBOX_VMCTX_REG, VM_ADDR_VMCTX));
@@ -519,11 +530,11 @@ impl<'a> Compiler<'a> {
             if self.gas_metering.is_some() {
                 // Did we enter again after running out of gas? If so don't even bother running anything, just immediately trap.
                 self.push(cmp((self.vmctx_field(self.vmctx_gas_offset), imm64(0))));
-                self.push(jcc_label32(Condition::Sign, self.trap_label));
+                self.branch_to_label(Condition::Sign, self.trap_label);
             }
 
-            let target_label = self.get_or_forward_declare_label(export.jump_target());
-            self.push(jmp_label32(target_label));
+            let target_label = self.get_or_forward_declare_label(export.target_code_offset());
+            self.jump_to_label(target_label);
         }
     }
 
@@ -540,7 +551,8 @@ impl<'a> Compiler<'a> {
 
     pub(crate) fn emit_ecall_trampoline(&mut self) {
         log::trace!("Emitting trampoline: ecall");
-        self.define_label(self.ecall_label);
+        let label = self.ecall_label;
+        self.define_label(label);
 
         self.push(push(TMP_REG)); // Save the ecall number.
         self.save_registers_to_vmctx();
@@ -554,7 +566,8 @@ impl<'a> Compiler<'a> {
 
     pub(crate) fn emit_trace_trampoline(&mut self) {
         log::trace!("Emitting trampoline: trace");
-        self.define_label(self.trace_label);
+        let label = self.trace_label;
+        self.define_label(label);
 
         self.push(push(TMP_REG)); // Save the instruction number.
         self.save_registers_to_vmctx();
@@ -568,7 +581,8 @@ impl<'a> Compiler<'a> {
 
     pub(crate) fn emit_trap_trampoline(&mut self) {
         log::trace!("Emitting trampoline: trap");
-        self.define_label(self.trap_label);
+        let label = self.trap_label;
+        self.define_label(label);
 
         self.save_registers_to_vmctx();
         self.push(mov_imm64(TMP_REG, self.address_table.syscall_trap));
@@ -577,7 +591,8 @@ impl<'a> Compiler<'a> {
 
     pub(crate) fn emit_sbrk_trampoline(&mut self) {
         log::trace!("Emitting trampoline: sbrk");
-        self.define_label(self.sbrk_label);
+        let label = self.sbrk_label;
+        self.define_label(label);
 
         self.push(push(TMP_REG));
         self.save_registers_to_vmctx();
@@ -590,17 +605,19 @@ impl<'a> Compiler<'a> {
         self.push(ret());
     }
 
+    #[inline(never)]
     #[cold]
-    pub(crate) fn trace_execution(&mut self, nth_instruction: usize) {
-        self.push(mov_imm(TMP_REG, imm32(nth_instruction as u32)));
-        self.push(call_label32(self.trace_label));
+    pub(crate) fn trace_execution(&mut self) {
+        let code_offset = self.current_code_offset;
+        self.push(mov_imm(TMP_REG, imm32(code_offset)));
+        self.call_to_label(self.trace_label);
     }
 
     pub(crate) fn emit_gas_metering_stub(&mut self, kind: GasMeteringKind) {
         self.push(sub((self.vmctx_field(self.vmctx_gas_offset), imm64(i32::MAX))));
         if matches!(kind, GasMeteringKind::Sync) {
             self.push(cmp((self.vmctx_field(self.vmctx_gas_offset), imm64(0))));
-            self.push(jcc_label32(Condition::Sign, self.trap_label));
+            self.branch_to_label(Condition::Sign, self.trap_label);
         }
     }
 
@@ -611,29 +628,19 @@ impl<'a> Compiler<'a> {
     }
 
     #[cfg_attr(not(debug_assertions), inline(always))]
-    fn get_return_address(&self) -> u32 {
-        let index = self.jump_table_index_by_basic_block.get(self.next_basic_block() as usize).copied().unwrap_or(0);
-        if index == 0 {
-            panic!("internal error: couldn't fetch the jump table index for the return basic block");
-        }
-
-        index * VM_CODE_ADDRESS_ALIGNMENT
-    }
-
-    fn indirect_jump_or_call(&mut self, ra: Option<Reg>, base: Reg, offset: u32) {
-        let return_address = ra.map(|ra| (ra, self.get_return_address()));
+    fn jump_indirect_impl(&mut self, load_imm: Option<(Reg, u32)>, base: Reg, offset: u32) {
         match self.sandbox_kind {
             SandboxKind::Linux => {
                 use polkavm_assembler::amd64::{SegReg, Scale};
 
-                let target = if offset != 0 || ra == Some(base) {
+                let target = if offset != 0 || load_imm.map_or(false, |(t, _)| t == base) {
                     self.push(lea(RegSize::R32, TMP_REG, reg_indirect(RegSize::R32, conv_reg(base) + offset as i32)));
                     TMP_REG
                 } else {
                     conv_reg(base)
                 };
 
-                if let Some((return_register, return_address)) = return_address {
+                if let Some((return_register, return_address)) = load_imm {
                     self.load_immediate(return_register, return_address);
                 }
 
@@ -652,31 +659,33 @@ impl<'a> Compiler<'a> {
                 self.push(pop(conv_reg(base)));
                 self.push(load(LoadKind::U64, TMP_REG, reg_indirect(RegSize::R64, TMP_REG)));
 
-                if let Some((return_register, return_address)) = return_address {
+                if let Some((return_register, return_address)) = load_imm {
                     self.load_immediate(return_register, return_address);
                 }
 
                 self.push(jmp(TMP_REG));
             }
         }
-
-        self.start_new_basic_block();
     }
 }
 
-impl<'a> InstructionVisitor for VisitorWrapper<'a, Compiler<'a>> {
+impl<'r, 'a> InstructionVisitor for ArchVisitor<'r, 'a> {
     type ReturnTy = ();
 
     #[inline(always)]
     fn trap(&mut self) -> Self::ReturnTy {
-        let trap_label = self.trap_label;
-        self.push(jmp_label32(trap_label));
-        self.start_new_basic_block();
+        self.jump_to_label(self.trap_label);
+    }
+
+    #[inline(always)]
+    #[cold]
+    fn invalid(&mut self, opcode: u8) -> Self::ReturnTy {
+        log::debug!("Encountered invalid instruction: opcode = {opcode}");
+        self.trap()
     }
 
     #[inline(always)]
     fn fallthrough(&mut self) -> Self::ReturnTy {
-        self.start_new_basic_block();
     }
 
     #[inline(always)]
@@ -704,7 +713,7 @@ impl<'a> InstructionVisitor for VisitorWrapper<'a, Compiler<'a>> {
         // The new top-of-the-heap pointer crossed the threshold, so more involved handling is necessary.
         // We'll either allocate new memory, or return a null pointer.
         self.push(mov(RegSize::R64, TMP_REG, dst));
-        self.push(call_label32(sbrk_label));
+        self.call_to_label(sbrk_label);
         self.push(mov(RegSize::R32, dst, TMP_REG));
         // Note: `dst` can be zero here, which is why we do the pointer bump from within the handler.
         self.push(jmp_label8(label_continue));
@@ -718,9 +727,8 @@ impl<'a> InstructionVisitor for VisitorWrapper<'a, Compiler<'a>> {
 
     #[inline(always)]
     fn ecalli(&mut self, imm: u32) -> Self::ReturnTy {
-        let ecall_label = self.ecall_label;
         self.push(mov_imm(TMP_REG, imm32(imm)));
-        self.push(call_label32(ecall_label));
+        self.call_to_label(self.ecall_label);
     }
 
     #[inline(always)]
@@ -1294,25 +1302,22 @@ impl<'a> InstructionVisitor for VisitorWrapper<'a, Compiler<'a>> {
     fn jump(&mut self, target: u32) -> Self::ReturnTy {
         let label = self.get_or_forward_declare_label(target);
         self.jump_to_label(label);
-        self.start_new_basic_block();
     }
 
     #[inline(always)]
-    fn call(&mut self, ra: Reg, target: u32) -> Self::ReturnTy {
+    fn load_imm_and_jump(&mut self, ra: Reg, value: u32, target: u32) -> Self::ReturnTy {
         let label = self.get_or_forward_declare_label(target);
-        let return_address = self.get_return_address();
-        self.load_immediate(ra, return_address);
+        self.load_immediate(ra, value);
         self.jump_to_label(label);
-        self.start_new_basic_block();
     }
 
     #[inline(always)]
     fn jump_indirect(&mut self, base: Reg, offset: u32) -> Self::ReturnTy {
-        self.indirect_jump_or_call(None, base, offset)
+        self.jump_indirect_impl(None, base, offset)
     }
 
     #[inline(always)]
-    fn call_indirect(&mut self, ra: Reg, base: Reg, offset: u32) -> Self::ReturnTy {
-        self.indirect_jump_or_call(Some(ra), base, offset)
+    fn load_imm_and_jump_indirect(&mut self, ra: Reg, base: Reg, value: u32, offset: u32) -> Self::ReturnTy {
+        self.jump_indirect_impl(Some((ra, value)), base, offset)
     }
 }

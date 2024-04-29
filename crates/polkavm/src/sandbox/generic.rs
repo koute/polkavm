@@ -896,7 +896,7 @@ impl Sandbox {
 
         let mut trap_kind = TrapKind::None;
         if let Some(entry_point) = args.entry_point {
-            let entry_point = <Self as crate::sandbox::Sandbox>::as_compiled_module(self.module.as_ref().unwrap()).export_trampolines[entry_point] as usize;
+            let entry_point = <Self as crate::sandbox::Sandbox>::as_compiled_module(self.module.as_ref().unwrap()).export_trampolines.get(&entry_point).copied().unwrap_or(0) as usize;
 
             {
                 let Some(program) = self.program.as_ref() else {
