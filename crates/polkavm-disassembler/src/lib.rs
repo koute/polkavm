@@ -401,29 +401,34 @@ mod tests {
             .clone()
     }
 
+    fn test_all_formats(blob: ProgramBlob) {
+        for format in [
+            DisassemblyFormat::Guest,
+            DisassemblyFormat::DiffFriendly,
+            #[cfg(target_arg = "x86_84")]
+            DisassemblyFormat::GuestAndNative,
+            #[cfg(target_arg = "x86_84")]
+            DisassemblyFormat::Native,
+        ] {
+            let mut disassembler = Disassembler::new(&blob, format).unwrap();
+            disassembler.display_gas().unwrap();
+
+            let mut buffer = Vec::with_capacity(1 << 20);
+            disassembler.disassemble_into(&mut buffer).unwrap();
+
+            assert!(!buffer.is_empty());
+        }
+    }
+
     #[test]
     fn pinky() {
         let blob = get_blob(include_bytes!("../../../test-data/bench-pinky.elf.zst"));
-
-        let mut disassembler = Disassembler::new(&blob, DisassemblyFormat::Guest).unwrap();
-        disassembler.display_gas().unwrap();
-
-        let mut buffer = Vec::with_capacity(1 << 20);
-        disassembler.disassemble_into(&mut buffer).unwrap();
-
-        assert!(!buffer.is_empty());
+        test_all_formats(blob);
     }
 
     #[test]
     fn doom() {
         let blob = get_blob(include_bytes!("../../../test-data/doom_O3_dwarf5.elf.zst"));
-
-        let mut disassembler = Disassembler::new(&blob, DisassemblyFormat::Guest).unwrap();
-        disassembler.display_gas().unwrap();
-
-        let mut buffer = Vec::with_capacity(1 << 20);
-        disassembler.disassemble_into(&mut buffer).unwrap();
-
-        assert!(!buffer.is_empty());
+        test_all_formats(blob);
     }
 }
