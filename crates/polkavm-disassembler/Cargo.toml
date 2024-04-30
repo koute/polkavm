@@ -1,20 +1,24 @@
 [package]
-name = "polkatool"
+name = "polkavm-disassembler"
 version.workspace = true
 authors.workspace = true
 license.workspace = true
 edition.workspace = true
 rust-version.workspace = true
-description = "A swiss knife toolkit for PolkaVM"
+repository.workspace = true
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [dependencies]
 clap = { workspace = true, features = ["derive"] }
-env_logger = { workspace = true }
 iced-x86 = { workspace = true, features = ["code_asm"] }
-polkavm = { workspace = true }
+
 polkavm-common = { workspace = true }
 polkavm-linker = { workspace = true }
-polkavm-disassembler = { workspace = true }
+polkavm = { workspace = true }
+
+[dev-dependencies]
+ruzstd = { workspace = true }
 
 [lints]
 workspace = true

@@ -6,6 +6,7 @@ members = [
     "crates/polkavm-derive-impl-macro",
     "crates/polkavm-linker",
     "crates/polkavm-assembler",
+    "crates/polkavm-disassembler",
     "crates/polkavm-common",
     "crates/polkavm-linux-raw",
     "crates/polkavm",
@@ -31,6 +32,7 @@ repository = "https://github.com/koute/polkavm"
 [workspace.dependencies]
 polkavm                   = { version = "0.10.0", path = "crates/polkavm" }
 polkavm-assembler         = { version = "0.10.0", path = "crates/polkavm-assembler" }
+polkavm-disassembler      = { version = "0.10.0", path = "crates/polkavm-disassembler" }
 polkavm-common            = { version = "0.10.0", path = "crates/polkavm-common" }
 polkavm-derive            = { version = "0.10.0", path = "crates/polkavm-derive" }
 polkavm-derive-impl       = { version = "0.10.0", path = "crates/polkavm-derive-impl" }
