@@ -369,6 +369,10 @@ impl<'a, 'blob> Disassembler<'a, 'blob> {
 mod tests {
     use std::sync::Mutex;
 
+    use polkavm::{MemoryMap, Reg::*};
+    use polkavm_common::program::asm;
+    use polkavm_common::writer::ProgramBlobBuilder;
+
     use super::*;
 
     static BLOB_MAP: Mutex<Option<HashMap<&'static [u8], ProgramBlob>>> = Mutex::new(None);
@@ -401,7 +405,7 @@ mod tests {
             .clone()
     }
 
-    fn test_all_formats(blob: ProgramBlob) {
+    fn test_all_formats(blob: &ProgramBlob) {
         for format in [
             DisassemblyFormat::Guest,
             DisassemblyFormat::DiffFriendly,
@@ -410,25 +414,65 @@ mod tests {
             #[cfg(target_arg = "x86_84")]
             DisassemblyFormat::Native,
         ] {
-            let mut disassembler = Disassembler::new(&blob, format).unwrap();
-            disassembler.display_gas().unwrap();
-
-            let mut buffer = Vec::with_capacity(1 << 20);
-            disassembler.disassemble_into(&mut buffer).unwrap();
-
-            assert!(!buffer.is_empty());
+            assert!(!disassemble_with_gas(blob, format).is_empty());
         }
+    }
+
+    fn disassemble_with_gas(blob: &ProgramBlob, format: DisassemblyFormat) -> Vec<u8> {
+        let mut disassembler = Disassembler::new(blob, format).unwrap();
+        disassembler.display_gas().unwrap();
+
+        let mut buffer = Vec::with_capacity(1 << 20);
+        disassembler.disassemble_into(&mut buffer).unwrap();
+        buffer
     }
 
     #[test]
     fn pinky() {
         let blob = get_blob(include_bytes!("../../../test-data/bench-pinky.elf.zst"));
-        test_all_formats(blob);
+        test_all_formats(&blob);
     }
 
     #[test]
     fn doom() {
         let blob = get_blob(include_bytes!("../../../test-data/doom_O3_dwarf5.elf.zst"));
-        test_all_formats(blob);
+        test_all_formats(&blob);
+    }
+
+    #[test]
+    fn simple() {
+        let memory_map = MemoryMap::new(0x4000, 0, 0x4000, 0).unwrap();
+        let mut builder = ProgramBlobBuilder::new();
+        builder.set_rw_data_size(0x4000);
+        builder.add_export_by_basic_block(0, "main".into());
+        builder.add_import("hostcall".into());
+        builder.set_code(
+            &[
+                asm::store_imm_u32(0x12345678, memory_map.rw_data_address()),
+                asm::add(S0, A0, A1),
+                asm::ecalli(0),
+                asm::add(A0, A0, S0),
+                asm::ret(),
+            ],
+            &[],
+        );
+        let blob = ProgramBlob::parse(builder.into_vec()).unwrap();
+
+        test_all_formats(&blob);
+
+        let assembly_bytes = disassemble_with_gas(&blob, DisassemblyFormat::Guest);
+        let assembly_text = String::from_utf8(assembly_bytes).unwrap();
+        let expected = &[
+            "      : @0 [export #0: 'main'] (gas: 5)",
+            "     0: u32 [0x20000] = 305419896",
+            "     9: s0 = a0 + a1",
+            "    12: ecalli 0 // 'hostcall'",
+            "    13: a0 = a0 + s0",
+            "    16: ret",
+            "",
+        ]
+        .join("\n");
+
+        assert_eq!(&assembly_text, expected);
     }
 }
