@@ -1,5 +1,6 @@
-use std::borrow::Cow;
-use std::sync::{Arc, Mutex};
+use alloc::borrow::Cow;
+use alloc::sync::Arc;
+use std::sync::Mutex;
 use core::sync::atomic::{AtomicUsize, Ordering};
 
 use polkavm_common::{

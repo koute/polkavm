@@ -2,6 +2,7 @@ use crate::api::BackendAccess;
 use crate::api::ExecuteArgs;
 use crate::api::Module;
 use crate::interpreter::{InterpretedInstance, InterpreterContext};
+#[cfg(feature = "std")]
 use crate::source_cache::SourceCache;
 use core::mem::MaybeUninit;
 use polkavm_common::error::Trap;
@@ -10,6 +11,7 @@ use polkavm_common::utils::Access;
 
 pub(crate) struct Tracer {
     module: Module,
+    #[cfg(feature = "std")]
     source_cache: SourceCache,
     program_counter_history: [u32; 8],
     program_counter_history_position: usize,
@@ -35,6 +37,7 @@ impl Tracer {
                 None
             },
             module: module.clone(),
+            #[cfg(feature = "std")]
             source_cache: SourceCache::default(),
             crosscheck_reg: None,
             crosscheck_store: None,
@@ -264,6 +267,7 @@ impl Tracer {
             return;
         };
 
+        #[cfg(feature = "std")]
         if let Some(source_line) = self.source_cache.lookup_source_line(path, line) {
             log::trace!("   | {VT_GREEN}{source_line}{VT_RESET}");
         }

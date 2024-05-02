@@ -1,3 +1,4 @@
+use alloc::vec::Vec;
 use polkavm_common::program::Reg;
 
 #[derive(Copy, Clone)]
