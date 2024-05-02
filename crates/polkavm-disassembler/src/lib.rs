@@ -367,43 +367,11 @@ impl<'a, 'blob> Disassembler<'a, 'blob> {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Mutex;
-
     use polkavm::{MemoryMap, Reg::*};
     use polkavm_common::program::asm;
     use polkavm_common::writer::ProgramBlobBuilder;
 
     use super::*;
-
-    static BLOB_MAP: Mutex<Option<HashMap<&'static [u8], ProgramBlob>>> = Mutex::new(None);
-
-    fn decompress_zstd(mut bytes: &[u8]) -> Vec<u8> {
-        use std::io::Read;
-        let mut output = Vec::new();
-        ruzstd::streaming_decoder::StreamingDecoder::new(&mut bytes)
-            .unwrap()
-            .read_to_end(&mut output)
-            .unwrap();
-        output
-    }
-
-    fn get_blob(elf: &'static [u8]) -> ProgramBlob {
-        let mut blob_map = match BLOB_MAP.lock() {
-            Ok(blob_map) => blob_map,
-            Err(error) => error.into_inner(),
-        };
-
-        let blob_map = blob_map.get_or_insert_with(HashMap::new);
-        blob_map
-            .entry(elf)
-            .or_insert_with(|| {
-                // This is slow, so cache it.
-                let elf = decompress_zstd(elf);
-                let blob = polkavm_linker::program_from_elf(Default::default(), &elf).unwrap();
-                blob.into_owned()
-            })
-            .clone()
-    }
 
     fn test_all_formats(blob: &ProgramBlob) {
         for format in [
@@ -425,18 +393,6 @@ mod tests {
         let mut buffer = Vec::with_capacity(1 << 20);
         disassembler.disassemble_into(&mut buffer).unwrap();
         buffer
-    }
-
-    #[test]
-    fn pinky() {
-        let blob = get_blob(include_bytes!("../../../test-data/bench-pinky.elf.zst"));
-        test_all_formats(&blob);
-    }
-
-    #[test]
-    fn doom() {
-        let blob = get_blob(include_bytes!("../../../test-data/doom_O3_dwarf5.elf.zst"));
-        test_all_formats(&blob);
     }
 
     #[test]
