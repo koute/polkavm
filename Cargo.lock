@@ -1565,6 +1565,7 @@ dependencies = [
  "iced-x86",
  "polkavm",
  "polkavm-common",
+ "polkavm-disassembler",
  "polkavm-linker",
 ]
 
@@ -1622,6 +1623,18 @@ version = "0.10.0"
 dependencies = [
  "polkavm-derive-impl",
  "syn 2.0.38",
+]
+
+[[package]]
+name = "polkavm-disassembler"
+version = "0.10.0"
+dependencies = [
+ "clap 4.4.6",
+ "iced-x86",
+ "polkavm",
+ "polkavm-common",
+ "polkavm-linker",
+ "ruzstd",
 ]
 
 [[package]]

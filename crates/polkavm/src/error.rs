@@ -26,6 +26,13 @@ enum ErrorKind {
 #[repr(transparent)]
 pub struct Error(ErrorKind);
 
+impl From<&'static str> for Error {
+    #[cold]
+    fn from(message: &'static str) -> Self {
+        Error(ErrorKind::Static(message))
+    }
+}
+
 impl From<String> for Error {
     #[cold]
     fn from(string: String) -> Self {
