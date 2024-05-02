@@ -1,11 +1,12 @@
 use crate::api::BackendAccess;
 use crate::tracer::Tracer;
 use crate::Gas;
+use alloc::rc::{Rc, Weak};
+use alloc::vec::Vec;
 use core::mem::MaybeUninit;
 use polkavm_common::error::Trap;
 use polkavm_common::program::Reg;
 use polkavm_common::utils::{Access, AsUninitSliceMut};
-use std::rc::{Rc, Weak};
 
 pub(crate) struct CallerRaw {
     user_data: *mut core::ffi::c_void,

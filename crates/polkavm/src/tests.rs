@@ -1,11 +1,13 @@
+use crate::mutex::Mutex;
 use crate::{
     CallArgs, Caller, CallerRef, Config, Engine, ExecutionError, Gas, GasMeteringKind, Linker, MemoryMap, Module, ModuleConfig,
     ProgramBlob, Reg, StateArgs, Trap,
 };
+use alloc::collections::BTreeMap;
+use alloc::rc::Rc;
+use alloc::vec;
+use alloc::vec::Vec;
 use core::cell::RefCell;
-use std::collections::HashMap;
-use std::rc::Rc;
-use std::sync::Mutex;
 
 use polkavm_common::program::asm;
 use polkavm_common::program::Reg::*;
@@ -144,9 +146,12 @@ fn caller_and_caller_ref_work(config: Config) {
 
     assert_eq!(result, 111);
 
-    let caller = state.illegal_contraband.borrow_mut().take().unwrap();
-    let result = std::panic::catch_unwind(core::panic::AssertUnwindSafe(|| caller.get_reg(Reg::A0)));
-    assert!(result.is_err());
+    #[cfg(feature = "std")]
+    {
+        let caller = state.illegal_contraband.borrow_mut().take().unwrap();
+        let result = std::panic::catch_unwind(core::panic::AssertUnwindSafe(|| caller.get_reg(Reg::A0)));
+        assert!(result.is_err());
+    }
 }
 
 fn caller_split_works(config: Config) {
@@ -238,24 +243,28 @@ fn fallback_hostcall_handler_works(config: Config) {
 }
 
 fn decompress_zstd(mut bytes: &[u8]) -> Vec<u8> {
-    use std::io::Read;
+    use ruzstd::io::Read;
     let mut output = Vec::new();
-    ruzstd::streaming_decoder::StreamingDecoder::new(&mut bytes)
-        .unwrap()
-        .read_to_end(&mut output)
-        .unwrap();
+    let mut fp = ruzstd::streaming_decoder::StreamingDecoder::new(&mut bytes).unwrap();
+
+    let mut buffer = [0_u8; 32 * 1024];
+    loop {
+        let count = fp.read(&mut buffer).unwrap();
+        if count == 0 {
+            break;
+        }
+
+        output.extend_from_slice(&mut buffer);
+    }
+
     output
 }
 
-static BLOB_MAP: Mutex<Option<HashMap<&'static [u8], ProgramBlob>>> = Mutex::new(None);
+static BLOB_MAP: Mutex<Option<BTreeMap<&'static [u8], ProgramBlob>>> = Mutex::new(None);
 
 fn get_blob(elf: &'static [u8]) -> ProgramBlob {
-    let mut blob_map = match BLOB_MAP.lock() {
-        Ok(blob_map) => blob_map,
-        Err(error) => error.into_inner(),
-    };
-
-    let blob_map = blob_map.get_or_insert_with(HashMap::new);
+    let mut blob_map = BLOB_MAP.lock();
+    let blob_map = blob_map.get_or_insert_with(BTreeMap::new);
     blob_map
         .entry(elf)
         .or_insert_with(|| {
@@ -884,6 +893,10 @@ fn gas_metering_with_more_than_one_basic_block(config: Config) {
     }
 }
 
+#[cfg(not(feature = "std"))]
+fn spawn_stress_test(_config: Config) {}
+
+#[cfg(feature = "std")]
 fn spawn_stress_test(mut config: Config) {
     let _ = env_logger::try_init();
 
@@ -906,12 +919,12 @@ fn spawn_stress_test(mut config: Config) {
         let instance_pre = linker.instantiate_pre(&module).unwrap();
 
         const THREAD_COUNT: usize = 32;
-        let barrier = std::sync::Arc::new(std::sync::Barrier::new(THREAD_COUNT));
+        let barrier = alloc::sync::Arc::new(std::sync::Barrier::new(THREAD_COUNT));
 
         let mut threads = Vec::new();
         for _ in 0..THREAD_COUNT {
             let instance_pre = instance_pre.clone();
-            let barrier = std::sync::Arc::clone(&barrier);
+            let barrier = alloc::sync::Arc::clone(&barrier);
             let thread = std::thread::spawn(move || {
                 barrier.wait();
                 for _ in 0..64 {

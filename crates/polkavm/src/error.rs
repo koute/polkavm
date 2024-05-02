@@ -1,3 +1,5 @@
+use alloc::format;
+use alloc::string::{String, ToString};
 use polkavm_common::program::ProgramParseError;
 
 macro_rules! bail {
@@ -97,6 +99,7 @@ impl core::fmt::Display for Error {
     }
 }
 
+#[cfg(feature = "std")]
 impl std::error::Error for Error {}
 
 pub type ExecutionError<T = Error> = polkavm_common::error::ExecutionError<T>;

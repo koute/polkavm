@@ -1,3 +1,4 @@
+#![cfg_attr(not(feature = "std"), no_std)]
 #![forbid(unused_must_use)]
 #![forbid(clippy::missing_safety_doc)]
 #![deny(clippy::undocumented_unsafe_blocks)]
@@ -6,7 +7,8 @@
 #[cfg(all(
     not(miri),
     target_arch = "x86_64",
-    any(target_os = "linux", target_os = "macos", target_os = "freebsd")
+    any(target_os = "linux", target_os = "macos", target_os = "freebsd"),
+    feature = "std",
 ))]
 macro_rules! if_compiler_is_supported {
     ({
@@ -25,7 +27,8 @@ macro_rules! if_compiler_is_supported {
 #[cfg(not(all(
     not(miri),
     target_arch = "x86_64",
-    any(target_os = "linux", target_os = "macos", target_os = "freebsd")
+    any(target_os = "linux", target_os = "macos", target_os = "freebsd"),
+    feature = "std",
 )))]
 macro_rules! if_compiler_is_supported {
     ({
@@ -39,6 +42,8 @@ macro_rules! if_compiler_is_supported {
     ($($if_true:tt)*) => {}
 }
 
+extern crate alloc;
+
 mod error;
 
 mod api;
@@ -46,9 +51,22 @@ mod caller;
 mod config;
 mod gas;
 mod interpreter;
+#[cfg(feature = "std")]
 mod source_cache;
 mod tracer;
 mod utils;
+
+#[cfg(feature = "std")]
+mod mutex_std;
+
+#[cfg(feature = "std")]
+pub(crate) use mutex_std as mutex;
+
+#[cfg(not(feature = "std"))]
+mod mutex_no_std;
+
+#[cfg(not(feature = "std"))]
+pub(crate) use mutex_no_std as mutex;
 
 if_compiler_is_supported! {
     mod compiler;

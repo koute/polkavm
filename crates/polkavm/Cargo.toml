@@ -29,3 +29,7 @@ ruzstd = { workspace = true }
 
 [lints]
 workspace = true
+
+[features]
+default = ["std"]
+std = ["ruzstd/std"]

@@ -1,6 +1,12 @@
-use std::borrow::Cow;
+use alloc::borrow::{Cow, ToOwned};
+use alloc::format;
+use alloc::sync::Arc;
+use alloc::vec::Vec;
+
+#[cfg(not(feature = "std"))]
+use alloc::collections::BTreeMap as HashMap;
+#[cfg(feature = "std")]
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
 
 use core::marker::PhantomData;
 
@@ -15,6 +21,7 @@ use crate::caller::{Caller, CallerRaw};
 use crate::config::{BackendKind, Config, GasMeteringKind, ModuleConfig, SandboxKind};
 use crate::error::{bail, bail_static, Error, ExecutionError};
 use crate::interpreter::{InterpretedAccess, InterpretedInstance, InterpretedModule};
+use crate::mutex::Mutex;
 use crate::tracer::Tracer;
 use crate::utils::GuestInit;
 
@@ -868,7 +875,8 @@ struct DynamicFn<T, F> {
 }
 
 fn catch_hostcall_panic<R>(callback: impl FnOnce() -> R) -> Result<R, Trap> {
-    std::panic::catch_unwind(core::panic::AssertUnwindSafe(callback)).map_err(|panic| {
+    #[cfg(feature = "std")]
+    return std::panic::catch_unwind(core::panic::AssertUnwindSafe(callback)).map_err(|panic| {
         if let Some(message) = panic.downcast_ref::<&str>() {
             log::error!("Hostcall panicked: {message}");
         } else if let Some(message) = panic.downcast_ref::<String>() {
@@ -878,7 +886,12 @@ fn catch_hostcall_panic<R>(callback: impl FnOnce() -> R) -> Result<R, Trap> {
         }
 
         Trap::default()
-    })
+    });
+
+    #[cfg(not(feature = "std"))]
+    {
+        Ok(callback())
+    }
 }
 
 impl<T, F> CallFn<T> for DynamicFn<T, F>
@@ -1336,10 +1349,7 @@ impl<T> Instance<T> {
     /// This is equivalent to manually checking that the `size` bytes can actually be allocated, calling [`Instance::sbrk`] with an appropriately set up [`StateArgs`],
     /// and calculating the new address of the end of the guest's heap.
     pub fn sbrk(&self, size: u32) -> Result<Option<u32>, Error> {
-        let mut mutable = match self.0.mutable.lock() {
-            Ok(mutable) => mutable,
-            Err(poison) => poison.into_inner(),
-        };
+        let mut mutable = self.0.mutable.lock();
 
         let Some(new_size) = mutable.backend.access().heap_size().checked_add(size) else {
             return Ok(None);
@@ -1359,11 +1369,7 @@ impl<T> Instance<T> {
 
     fn execute(&self, state_args: StateArgs, call_args: Option<CallArgs<T>>) -> Result<(), ExecutionError> {
         let mutable = &self.0.mutable;
-        let mut mutable = match mutable.lock() {
-            Ok(mutable) => mutable,
-            Err(poison) => poison.into_inner(),
-        };
-
+        let mut mutable = mutable.lock();
         self.execute_impl(&mut mutable, state_args, call_args)
     }
 
@@ -1506,29 +1512,17 @@ impl<T> Instance<T> {
     where
         B: ?Sized + AsUninitSliceMut,
     {
-        let mut mutable = match self.0.mutable.lock() {
-            Ok(mutable) => mutable,
-            Err(poison) => poison.into_inner(),
-        };
-
+        let mut mutable = self.0.mutable.lock();
         mutable.backend.access().read_memory_into_slice(address, buffer)
     }
 
     pub fn read_memory_into_vec(&self, address: u32, length: u32) -> Result<Vec<u8>, Trap> {
-        let mut mutable = match self.0.mutable.lock() {
-            Ok(mutable) => mutable,
-            Err(poison) => poison.into_inner(),
-        };
-
+        let mut mutable = self.0.mutable.lock();
         mutable.backend.access().read_memory_into_vec(address, length)
     }
 
     pub fn write_memory(&self, address: u32, data: &[u8]) -> Result<(), Trap> {
-        let mut mutable = match self.0.mutable.lock() {
-            Ok(mutable) => mutable,
-            Err(poison) => poison.into_inner(),
-        };
-
+        let mut mutable = self.0.mutable.lock();
         let result = mutable.backend.access().write_memory(address, data);
         if let Some(ref mut tracer) = mutable.tracer() {
             tracer.on_memory_write_in_hostcall(address, data, result.is_ok())?;
@@ -1539,21 +1533,13 @@ impl<T> Instance<T> {
 
     /// Returns the current size of the program's heap.
     pub fn heap_size(&self) -> u32 {
-        let mut mutable = match self.0.mutable.lock() {
-            Ok(mutable) => mutable,
-            Err(poison) => poison.into_inner(),
-        };
-
+        let mut mutable = self.0.mutable.lock();
         mutable.backend.access().heap_size()
     }
 
     /// Returns the value of the given register.
     pub fn get_reg(&self, reg: Reg) -> RegValue {
-        let mut mutable = match self.0.mutable.lock() {
-            Ok(mutable) => mutable,
-            Err(poison) => poison.into_inner(),
-        };
-
+        let mut mutable = self.0.mutable.lock();
         mutable.backend.access().get_reg(reg)
     }
 
@@ -1564,11 +1550,7 @@ impl<T> Instance<T> {
     where
         FnResult: FuncResult,
     {
-        let mut mutable = match self.0.mutable.lock() {
-            Ok(mutable) => mutable,
-            Err(poison) => poison.into_inner(),
-        };
-
+        let mut mutable = self.0.mutable.lock();
         let mut output_count = 0;
         FnResult::_get(|| {
             let access = mutable.backend.access();
@@ -1583,11 +1565,7 @@ impl<T> Instance<T> {
     /// Note that this being zero doesn't necessarily mean that the execution ran out of gas,
     /// if the program ended up consuming *exactly* the amount of gas that it was provided with!
     pub fn gas_remaining(&self) -> Option<Gas> {
-        let mut mutable = match self.0.mutable.lock() {
-            Ok(mutable) => mutable,
-            Err(poison) => poison.into_inner(),
-        };
-
+        let mut mutable = self.0.mutable.lock();
         mutable.backend.access().gas_remaining()
     }
 
@@ -1596,11 +1574,7 @@ impl<T> Instance<T> {
     /// Will be `None` if the instance doesn't run in a separate process.
     /// Mostly only useful for debugging.
     pub fn pid(&self) -> Option<u32> {
-        let mutable = match self.0.mutable.lock() {
-            Ok(mutable) => mutable,
-            Err(poison) => poison.into_inner(),
-        };
-
+        let mutable = self.0.mutable.lock();
         mutable.backend.pid()
     }
 }

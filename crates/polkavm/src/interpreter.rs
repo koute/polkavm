@@ -2,6 +2,7 @@ use crate::api::{BackendAccess, ExecuteArgs, HostcallHandler, MemoryAccessError,
 use crate::error::Error;
 use crate::utils::GuestInit;
 use crate::utils::{FlatMap, RegImm};
+use alloc::vec::Vec;
 use core::mem::MaybeUninit;
 use core::num::NonZeroU32;
 use polkavm_common::abi::VM_ADDR_RETURN_TO_HOST;

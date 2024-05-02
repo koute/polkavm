@@ -18,6 +18,7 @@ impl core::fmt::Display for BackendKind {
 }
 
 impl BackendKind {
+    #[cfg(feature = "std")]
     fn from_os_str(s: &std::ffi::OsStr) -> Result<Option<BackendKind>, Error> {
         if s == "auto" {
             Ok(None)
@@ -62,6 +63,7 @@ impl core::fmt::Display for SandboxKind {
 }
 
 impl SandboxKind {
+    #[cfg(feature = "std")]
     fn from_os_str(s: &std::ffi::OsStr) -> Result<Option<SandboxKind>, Error> {
         if s == "auto" {
             Ok(None)
@@ -107,6 +109,7 @@ impl Default for Config {
     }
 }
 
+#[cfg(feature = "std")]
 fn env_bool(name: &str) -> Result<Option<bool>, Error> {
     if let Some(value) = std::env::var_os(name) {
         if value == "1" || value == "true" {
@@ -134,6 +137,7 @@ impl Config {
     }
 
     /// Creates a new default configuration and seeds it from the environment variables.
+    #[cfg(feature = "std")]
     pub fn from_env() -> Result<Self, Error> {
         let mut config = Self::new();
         if let Some(value) = std::env::var_os("POLKAVM_BACKEND") {
