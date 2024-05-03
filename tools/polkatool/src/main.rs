@@ -40,6 +40,9 @@ enum Args {
         #[clap(long)]
         display_gas: bool,
 
+        #[clap(long)]
+        show_raw_bytes: bool,
+
         /// The input file.
         input: PathBuf,
     },
@@ -72,8 +75,9 @@ fn main() {
             output,
             format,
             display_gas,
+            show_raw_bytes,
             input,
-        } => main_disassemble(input, format, display_gas, output),
+        } => main_disassemble(input, format, display_gas, show_raw_bytes, output),
         Args::Stats { inputs } => main_stats(inputs),
     };
 
@@ -162,10 +166,18 @@ fn main_stats(inputs: Vec<PathBuf>) -> Result<(), String> {
     Ok(())
 }
 
-fn main_disassemble(input: PathBuf, format: DisassemblyFormat, display_gas: bool, output: Option<PathBuf>) -> Result<(), String> {
+fn main_disassemble(
+    input: PathBuf,
+    format: DisassemblyFormat,
+    display_gas: bool,
+    show_raw_bytes: bool,
+    output: Option<PathBuf>,
+) -> Result<(), String> {
     let blob = load_blob(&input)?;
 
     let mut disassembler = polkavm_disassembler::Disassembler::new(&blob, format).map_err(|error| error.to_string())?;
+    disassembler.show_raw_bytes(show_raw_bytes);
+
     if display_gas {
         disassembler.display_gas().map_err(|error| error.to_string())?;
     }

@@ -116,6 +116,7 @@ pub struct Disassembler<'a, 'blob> {
     format: DisassemblyFormat,
     gas_cost_map: Option<HashMap<u32, i64>>,
     native: Option<NativeCode>,
+    show_raw_bytes: bool,
 }
 
 impl<'a, 'blob> Disassembler<'a, 'blob> {
@@ -131,7 +132,12 @@ impl<'a, 'blob> Disassembler<'a, 'blob> {
             format,
             gas_cost_map: None,
             native,
+            show_raw_bytes: false,
         })
+    }
+
+    pub fn show_raw_bytes(&mut self, value: bool) {
+        self.show_raw_bytes = value;
     }
 
     pub fn display_gas(&mut self) -> Result<(), polkavm::Error> {
@@ -168,7 +174,7 @@ impl<'a, 'blob> Disassembler<'a, 'blob> {
     pub fn disassemble_into(&self, mut writer: impl Write) -> Result<(), polkavm::Error> {
         let mut instructions = Vec::new();
         for instruction in self.blob.instructions() {
-            instructions.push((instruction.offset, instruction.kind));
+            instructions.push(instruction);
         }
 
         let mut exports_for_code_offset = HashMap::new();
@@ -223,7 +229,12 @@ impl<'a, 'blob> Disassembler<'a, 'blob> {
         let mut last_full_name = String::new();
         let mut basic_block_counter = 0;
         let mut pending_label = true;
-        for (nth_instruction, (offset, instruction)) in instructions.iter().copied().enumerate() {
+        for (nth_instruction, instruction) in instructions.iter().copied().enumerate() {
+            let offset = instruction.offset;
+            let length = instruction.length;
+            let instruction = instruction.kind;
+            let raw_bytes = &self.blob.code()[offset as usize..offset as usize + length as usize];
+
             let instruction_s = if let polkavm_common::program::Instruction::ecalli(nth_import) = instruction {
                 if let Some(import) = self.blob.imports().get(nth_import) {
                     format!("{instruction} // {}", import)
@@ -290,7 +301,11 @@ impl<'a, 'blob> Disassembler<'a, 'blob> {
             if pending_label {
                 pending_label = false;
                 let result = if !matches!(self.format, DisassemblyFormat::DiffFriendly) {
-                    writeln!(&mut writer, "      : {}", format_jump_target(offset, basic_block_counter))
+                    if self.show_raw_bytes {
+                        writeln!(&mut writer, "      : {:24} {}", "", format_jump_target(offset, basic_block_counter))
+                    } else {
+                        writeln!(&mut writer, "      : {}", format_jump_target(offset, basic_block_counter))
+                    }
                 } else {
                     writeln!(&mut writer, "    {}", format_jump_target(offset, basic_block_counter))
                 };
@@ -323,7 +338,14 @@ impl<'a, 'blob> Disassembler<'a, 'blob> {
                     return Err(format!("failed to write to output: {error}").into());
                 }
             } else if matches!(self.format, DisassemblyFormat::Guest | DisassemblyFormat::GuestAndNative) {
-                if let Err(error) = writeln!(&mut writer, "{offset:6}: {instruction_s}") {
+                let result = if self.show_raw_bytes {
+                    let raw_bytes = raw_bytes.iter().map(|byte| format!("{byte:02x}")).collect::<Vec<_>>().join(" ");
+                    writeln!(&mut writer, "{offset:6}: {raw_bytes:24} {instruction_s}")
+                } else {
+                    writeln!(&mut writer, "{offset:6}: {instruction_s}")
+                };
+
+                if let Err(error) = result {
                     return Err(format!("failed to write to output: {error}").into());
                 }
             }
