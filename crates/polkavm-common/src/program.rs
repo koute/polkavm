@@ -291,6 +291,15 @@ impl<T> VisitorHelper<T> {
     }
 
     #[inline(always)]
+    pub fn read_args_regs2_offset(&mut self) -> Option<(Reg, Reg, u32)> {
+        let chunk = self.chunk;
+        let (reg1, reg2, chunk) = read_reg2!(chunk);
+        let (imm, _) = read_simple_varint!(chunk, self.args_length - 1);
+        let imm = self.instruction_offset.wrapping_add(imm);
+        Some((reg1, reg2, imm))
+    }
+
+    #[inline(always)]
     pub fn read_args_regs3(&mut self) -> Option<(Reg, Reg, Reg)> {
         let chunk = self.chunk;
         let (reg1, reg2, chunk) = read_reg2!(chunk);
@@ -369,6 +378,7 @@ macro_rules! define_opcodes {
         [$($name_reg_imm_offset:ident = $value_reg_imm_offset:expr,)+]
         [$($name_reg_imm_imm:ident = $value_reg_imm_imm:expr,)+]
         [$($name_reg_reg_imm:ident = $value_reg_reg_imm:expr,)+]
+        [$($name_reg_reg_offset:ident = $value_reg_reg_offset:expr,)+]
         [$($name_reg_reg_reg:ident = $value_reg_reg_reg:expr,)+]
         [$($name_offset:ident = $value_offset:expr,)+]
         [$($name_imm:ident = $value_imm:expr,)+]
@@ -388,6 +398,7 @@ macro_rules! define_opcodes {
             $(fn $name_reg_imm_offset(&mut self, reg: Reg, imm1: u32, imm2: u32) -> Self::ReturnTy;)+
             $(fn $name_reg_imm_imm(&mut self, reg: Reg, imm1: u32, imm2: u32) -> Self::ReturnTy;)+
             $(fn $name_reg_reg_imm(&mut self, reg1: Reg, reg2: Reg, imm: u32) -> Self::ReturnTy;)+
+            $(fn $name_reg_reg_offset(&mut self, reg1: Reg, reg2: Reg, imm: u32) -> Self::ReturnTy;)+
             $(fn $name_reg_reg_reg(&mut self, reg1: Reg, reg2: Reg, reg3: Reg) -> Self::ReturnTy;)+
             $(fn $name_offset(&mut self, imm: u32) -> Self::ReturnTy;)+
             $(fn $name_imm(&mut self, imm: u32) -> Self::ReturnTy;)+
@@ -423,6 +434,9 @@ macro_rules! define_opcodes {
                     $(fn $name_reg_reg_imm(&mut self, reg1: Reg, reg2: Reg, imm: u32) -> Self::ReturnTy {
                         self.$method(polkavm_common::program::Instruction::$name_reg_reg_imm(reg1, reg2, imm));
                     })+
+                    $(fn $name_reg_reg_offset(&mut self, reg1: Reg, reg2: Reg, imm: u32) -> Self::ReturnTy {
+                        self.$method(polkavm_common::program::Instruction::$name_reg_reg_offset(reg1, reg2, imm));
+                    })+
                     $(fn $name_reg_reg_reg(&mut self, reg1: Reg, reg2: Reg, reg3: Reg) -> Self::ReturnTy {
                         self.$method(polkavm_common::program::Instruction::$name_reg_reg_reg(reg1, reg2, reg3));
                     })+
@@ -456,6 +470,7 @@ macro_rules! define_opcodes {
             $($name_reg_imm_offset(Reg, u32, u32) = $value_reg_imm_offset,)+
             $($name_reg_imm_imm(Reg, u32, u32) = $value_reg_imm_imm,)+
             $($name_reg_reg_imm(Reg, Reg, u32) = $value_reg_reg_imm,)+
+            $($name_reg_reg_offset(Reg, Reg, u32) = $value_reg_reg_offset,)+
             $($name_reg_reg_reg(Reg, Reg, Reg) = $value_reg_reg_reg,)+
             $($name_offset(u32) = $value_offset,)+
             $($name_imm(u32) = $value_imm,)+
@@ -473,6 +488,7 @@ macro_rules! define_opcodes {
                     $(Self::$name_reg_imm_offset(reg, imm1, imm2) => visitor.$name_reg_imm_offset(reg, imm1, imm2),)+
                     $(Self::$name_reg_imm_imm(reg, imm1, imm2) => visitor.$name_reg_imm_imm(reg, imm1, imm2),)+
                     $(Self::$name_reg_reg_imm(reg1, reg2, imm) => visitor.$name_reg_reg_imm(reg1, reg2, imm),)+
+                    $(Self::$name_reg_reg_offset(reg1, reg2, imm) => visitor.$name_reg_reg_offset(reg1, reg2, imm),)+
                     $(Self::$name_reg_reg_reg(reg1, reg2, reg3) => visitor.$name_reg_reg_reg(reg1, reg2, reg3),)+
                     $(Self::$name_offset(imm) => visitor.$name_offset(imm),)+
                     $(Self::$name_imm(imm) => visitor.$name_imm(imm),)+
@@ -490,6 +506,7 @@ macro_rules! define_opcodes {
                     $(Self::$name_reg_imm_offset(reg, imm1, imm2) => Self::serialize_reg_imm_offset(buffer, position, Opcode::$name_reg_imm_offset, reg, imm1, imm2),)+
                     $(Self::$name_reg_imm_imm(reg, imm1, imm2) => Self::serialize_reg_imm_imm(buffer, Opcode::$name_reg_imm_imm, reg, imm1, imm2),)+
                     $(Self::$name_reg_reg_imm(reg1, reg2, imm) => Self::serialize_reg_reg_imm(buffer, Opcode::$name_reg_reg_imm, reg1, reg2, imm),)+
+                    $(Self::$name_reg_reg_offset(reg1, reg2, imm) => Self::serialize_reg_reg_offset(buffer, position, Opcode::$name_reg_reg_offset, reg1, reg2, imm),)+
                     $(Self::$name_reg_reg_reg(reg1, reg2, reg3) => Self::serialize_reg_reg_reg(buffer, Opcode::$name_reg_reg_reg, reg1, reg2, reg3),)+
                     $(Self::$name_offset(imm) => Self::serialize_offset(buffer, position, Opcode::$name_offset, imm),)+
                     $(Self::$name_imm(imm) => Self::serialize_imm(buffer, Opcode::$name_imm, imm),)+
@@ -508,6 +525,7 @@ macro_rules! define_opcodes {
                     $(Self::$name_reg_imm_offset(..) => Opcode::$name_reg_imm_offset,)+
                     $(Self::$name_reg_imm_imm(..) => Opcode::$name_reg_imm_imm,)+
                     $(Self::$name_reg_reg_imm(..) => Opcode::$name_reg_reg_imm,)+
+                    $(Self::$name_reg_reg_offset(..) => Opcode::$name_reg_reg_offset,)+
                     $(Self::$name_reg_reg_reg(..) => Opcode::$name_reg_reg_reg,)+
                     $(Self::$name_offset(..) => Opcode::$name_offset,)+
                     $(Self::$name_imm(..) => Opcode::$name_imm,)+
@@ -555,6 +573,12 @@ macro_rules! define_opcodes {
             $(
                 pub fn $name_reg_reg_imm(reg1: Reg, reg2: Reg, imm: u32) -> Instruction {
                     Instruction::$name_reg_reg_imm(reg1, reg2, imm)
+                }
+            )+
+
+            $(
+                pub fn $name_reg_reg_offset(reg1: Reg, reg2: Reg, imm: u32) -> Instruction {
+                    Instruction::$name_reg_reg_offset(reg1, reg2, imm)
                 }
             )+
 
@@ -676,6 +700,19 @@ macro_rules! define_opcodes {
                         }
 
                         table[$value_reg_reg_imm] = $name_reg_reg_imm;
+                    })*
+
+                    $({
+                        #[cfg_attr(target_os = "linux", link_section = concat!(".text.", stringify!($table_name)))]
+                        fn $name_reg_reg_offset<$d($visitor_ty_params),*>(state: &mut VisitorHelper<$visitor_ty<$d($visitor_ty_params),*>>) -> ReturnTy<$d($visitor_ty_params),*>{
+                            if let Some((reg1, reg2, imm)) = state.read_args_regs2_offset() {
+                                return state.visitor.$name_reg_reg_offset(reg1, reg2, imm);
+                            }
+
+                            state.visitor.invalid($value_reg_reg_offset)
+                        }
+
+                        table[$value_reg_reg_offset] = $name_reg_reg_offset;
                     })*
 
                     $({
@@ -815,6 +852,9 @@ macro_rules! define_opcodes {
             $(fn $name_reg_reg_imm(&mut self, reg1: Reg, reg2: Reg, imm: u32) -> Self::ReturnTy {
                 Instruction::$name_reg_reg_imm(reg1, reg2, imm)
             })+
+            $(fn $name_reg_reg_offset(&mut self, reg1: Reg, reg2: Reg, imm: u32) -> Self::ReturnTy {
+                Instruction::$name_reg_reg_offset(reg1, reg2, imm)
+            })+
             $(fn $name_reg_reg_reg(&mut self, reg1: Reg, reg2: Reg, reg3: Reg) -> Self::ReturnTy {
                 Instruction::$name_reg_reg_reg(reg1, reg2, reg3)
             })+
@@ -864,6 +904,7 @@ macro_rules! define_opcodes {
             $($name_reg_imm_offset = $value_reg_imm_offset,)+
             $($name_reg_imm_imm = $value_reg_imm_imm,)+
             $($name_reg_reg_imm = $value_reg_reg_imm,)+
+            $($name_reg_reg_offset = $value_reg_reg_offset,)+
             $($name_reg_reg_reg = $value_reg_reg_reg,)+
             $($name_offset = $value_offset,)+
             $($name_imm = $value_imm,)+
@@ -949,15 +990,19 @@ define_opcodes! {
         shift_logical_right_imm_alt              = 72,
         shift_arithmetic_right_imm_alt           = 80,
         shift_logical_left_imm_alt               = 75,
+
+        cmov_if_zero_imm                         = 85,
+        cmov_if_not_zero_imm                     = 86,
+    ]
+
+    // Instructions with args: reg, reg, offset
+    [
         branch_eq                                = 24,
         branch_not_eq                            = 30,
         branch_less_unsigned                     = 47,
         branch_less_signed                       = 48,
         branch_greater_or_equal_unsigned         = 41,
         branch_greater_or_equal_signed           = 43,
-
-        cmov_if_zero_imm                         = 85,
-        cmov_if_not_zero_imm                     = 86,
     ]
 
     // Instructions with args: reg, reg, reg
@@ -1089,6 +1134,13 @@ impl Instruction {
     }
 
     fn serialize_reg_reg_imm(buffer: &mut [u8], opcode: Opcode, reg1: Reg, reg2: Reg, imm: u32) -> usize {
+        buffer[0] = opcode as u8;
+        buffer[1] = reg1 as u8 | (reg2 as u8) << 4;
+        write_simple_varint(imm, &mut buffer[2..]) + 2
+    }
+
+    fn serialize_reg_reg_offset(buffer: &mut [u8], position: u32, opcode: Opcode, reg1: Reg, reg2: Reg, imm: u32) -> usize {
+        let imm = imm.wrapping_sub(position);
         buffer[0] = opcode as u8;
         buffer[1] = reg1 as u8 | (reg2 as u8) << 4;
         write_simple_varint(imm, &mut buffer[2..]) + 2
