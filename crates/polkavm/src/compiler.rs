@@ -1,11 +1,12 @@
 use alloc::borrow::Cow;
 use std::collections::HashMap;
 use std::sync::Mutex;
+use core::marker::PhantomData;
 
 use polkavm_assembler::{Assembler, Label};
 use polkavm_common::program::{ParsedInstruction, ProgramExport, Instructions, JumpTable, Reg};
 use polkavm_common::zygote::{
-    AddressTable, VM_COMPILER_MAXIMUM_EPILOGUE_LENGTH, VM_COMPILER_MAXIMUM_INSTRUCTION_LENGTH,
+    VM_COMPILER_MAXIMUM_EPILOGUE_LENGTH, VM_COMPILER_MAXIMUM_INSTRUCTION_LENGTH,
 };
 use polkavm_common::abi::VM_CODE_ADDRESS_ALIGNMENT;
 
@@ -31,14 +32,13 @@ struct Cache {
 #[derive(Default)]
 pub(crate) struct CompilerCache(Mutex<Cache>);
 
-pub(crate) struct CompilerVisitor<'a> {
+pub(crate) struct CompilerVisitor<'a, S> where S: Sandbox {
     pub(crate) current_code_offset: u32,
 
     init: GuestInit<'a>,
     jump_table: JumpTable<'a>,
     code: &'a [u8],
     bitmask: &'a [u8],
-    address_table: AddressTable,
     asm: Assembler,
     basic_block_pending: bool,
     code_offset_to_label: FlatMap<Label>,
@@ -53,34 +53,32 @@ pub(crate) struct CompilerVisitor<'a> {
     gas_metering_stub_offsets: Vec<usize>,
     gas_cost_for_basic_block: Vec<u32>,
     code_length: u32,
-    sandbox_kind: SandboxKind,
     sbrk_label: Label,
     trace_label: Label,
     trap_label: Label,
-    vmctx_gas_offset: usize,
-    vmctx_heap_info_offset: usize,
-    vmctx_regs_offset: usize,
+
+    _phantom: PhantomData<S>,
 }
 
 #[repr(transparent)]
-pub(crate) struct ArchVisitor<'r, 'a>(pub &'r mut CompilerVisitor<'a>);
+pub(crate) struct ArchVisitor<'r, 'a, S>(pub &'r mut CompilerVisitor<'a, S>) where S: Sandbox;
 
-impl<'r, 'a> core::ops::Deref for ArchVisitor<'r, 'a> {
-    type Target = CompilerVisitor<'a>;
+impl<'r, 'a, S> core::ops::Deref for ArchVisitor<'r, 'a, S> where S: Sandbox {
+    type Target = CompilerVisitor<'a, S>;
     fn deref(&self) -> &Self::Target {
         self.0
     }
 }
 
-impl<'r, 'a> core::ops::DerefMut for ArchVisitor<'r, 'a> {
+impl<'r, 'a, S> core::ops::DerefMut for ArchVisitor<'r, 'a, S> where S: Sandbox {
     fn deref_mut(&mut self) -> &mut Self::Target {
         self.0
     }
 }
 
-impl<'a> CompilerVisitor<'a> {
+impl<'a, S> CompilerVisitor<'a, S> where S: Sandbox {
     #[allow(clippy::too_many_arguments)]
-    pub(crate) fn new<S>(
+    pub(crate) fn new(
         cache: &CompilerCache,
         config: &'a ModuleConfig,
         jump_table: JumpTable<'a>,
@@ -149,18 +147,14 @@ impl<'a> CompilerVisitor<'a> {
             trace_label,
             jump_table_label,
             sbrk_label,
-            sandbox_kind: S::KIND,
             gas_metering: config.gas_metering,
             debug_trace_execution,
-            address_table: S::address_table(),
-            vmctx_regs_offset: S::vmctx_regs_offset(),
-            vmctx_gas_offset: S::vmctx_gas_offset(),
-            vmctx_heap_info_offset: S::vmctx_heap_info_offset(),
             code_offset_to_native_code_offset,
             gas_metering_stub_offsets,
             gas_cost_for_basic_block,
             code_length,
             basic_block_pending: true,
+            _phantom: PhantomData,
         };
 
         ArchVisitor(&mut visitor).emit_trap_trampoline();
@@ -174,7 +168,7 @@ impl<'a> CompilerVisitor<'a> {
         Ok((visitor, address_space))
     }
 
-    pub(crate) fn finish_compilation<S>(mut self, cache: &CompilerCache, address_space: S::AddressSpace) -> Result<CompiledModule<S>, Error> where S: Sandbox {
+    pub(crate) fn finish_compilation(mut self, cache: &CompilerCache, address_space: S::AddressSpace) -> Result<CompiledModule<S>, Error> where S: Sandbox {
         let epilogue_start = self.asm.len();
         self.code_offset_to_native_code_offset.push((self.code_length, epilogue_start as u32));
         self.code_offset_to_native_code_offset.shrink_to_fit();
@@ -232,12 +226,12 @@ impl<'a> CompilerVisitor<'a> {
             .checked_add_signed(self.asm.get_label_origin_offset_or_panic(label_sysreturn) as i64)
             .expect("overflow");
 
-        match self.sandbox_kind {
+        match S::KIND {
             SandboxKind::Linux => {},
             SandboxKind::Generic => {
                 let native_page_size = crate::sandbox::get_native_page_size();
                 let padded_length = polkavm_common::utils::align_to_next_page_usize(native_page_size, self.asm.len()).unwrap();
-                self.asm.resize(padded_length, ArchVisitor::PADDING_BYTE);
+                self.asm.resize(padded_length, ArchVisitor::<S>::PADDING_BYTE);
                 self.asm.define_label(self.jump_table_label);
             }
         }
@@ -382,14 +376,14 @@ impl<'a> CompilerVisitor<'a> {
     }
 }
 
-impl<'a> polkavm_common::program::ParsingVisitor for CompilerVisitor<'a> {
+impl<'a, S> polkavm_common::program::ParsingVisitor for CompilerVisitor<'a, S> where S: Sandbox {
     #[cfg_attr(not(debug_assertions), inline)]
     fn on_pre_visit(&mut self, offset: usize, _opcode: u8) -> Self::ReturnTy {
         self.current_code_offset = offset as u32;
     }
 }
 
-impl<'a> polkavm_common::program::InstructionVisitor for CompilerVisitor<'a> {
+impl<'a, S> polkavm_common::program::InstructionVisitor for CompilerVisitor<'a, S> where S: Sandbox {
     type ReturnTy = ();
 
     #[inline(always)]

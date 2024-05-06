@@ -12,6 +12,7 @@ use polkavm_common::zygote::VM_ADDR_VMCTX;
 use crate::config::GasMeteringKind;
 use crate::compiler::{ArchVisitor, SandboxKind};
 use crate::utils::RegImm;
+use crate::sandbox::Sandbox;
 
 const TMP_REG: NativeReg = rcx;
 
@@ -82,8 +83,8 @@ macro_rules! with_sandbox_kind {
 }
 
 macro_rules! load_store_operand {
-    ($self:ident, $base:ident, $offset:expr, |$op:ident| $body:expr) => {
-        with_sandbox_kind!($self.sandbox_kind, |sandbox_kind| {
+    ($self:ident, $kind:expr, $base:ident, $offset:expr, |$op:ident| $body:expr) => {
+        with_sandbox_kind!($kind, |sandbox_kind| {
             match sandbox_kind {
                 SandboxKind::Linux => {
                     if let Some($base) = $base {
@@ -148,7 +149,7 @@ enum ShiftKind {
     ArithmeticRight,
 }
 
-impl<'r, 'a> ArchVisitor<'r, 'a> {
+impl<'r, 'a, S> ArchVisitor<'r, 'a, S> where S: Sandbox {
     pub const PADDING_BYTE: u8 = 0x90; // NOP
 
     #[inline(always)]
@@ -170,7 +171,7 @@ impl<'r, 'a> ArchVisitor<'r, 'a> {
     #[cfg_attr(not(debug_assertions), inline(always))]
     fn store(&mut self, src: impl Into<RegImm>, base: Option<Reg>, offset: u32, kind: Size) {
         let src = src.into();
-        load_store_operand!(self, base, offset, |dst| {
+        load_store_operand!(self, S::KIND, base, offset, |dst| {
             match src {
                 RegImm::Reg(src) => self.push(store(kind, dst, conv_reg(src))),
                 RegImm::Imm(value) => {
@@ -187,7 +188,7 @@ impl<'r, 'a> ArchVisitor<'r, 'a> {
 
     #[cfg_attr(not(debug_assertions), inline(always))]
     fn load(&mut self, dst: Reg, base: Option<Reg>, offset: u32, kind: LoadKind) {
-        load_store_operand!(self, base, offset, |src| {
+        load_store_operand!(self, S::KIND, base, offset, |src| {
             self.push(load(kind, conv_reg(dst), src));
         });
     }
@@ -480,8 +481,8 @@ impl<'r, 'a> ArchVisitor<'r, 'a> {
     }
 
     #[cfg_attr(not(debug_assertions), inline(always))]
-    fn vmctx_field(&self, offset: usize) -> MemOp {
-        match self.sandbox_kind {
+    fn vmctx_field(offset: usize) -> MemOp {
+        match S::KIND {
             SandboxKind::Linux => {
                 reg_indirect(RegSize::R64, LINUX_SANDBOX_VMCTX_REG + offset as i32)
             },
@@ -493,23 +494,23 @@ impl<'r, 'a> ArchVisitor<'r, 'a> {
     }
 
     fn load_vmctx_field_address(&mut self, offset: usize) -> NativeReg {
-        if offset == 0 && matches!(self.sandbox_kind, SandboxKind::Linux) {
+        if offset == 0 && matches!(S::KIND, SandboxKind::Linux) {
             LINUX_SANDBOX_VMCTX_REG
         } else {
-            self.push(lea(RegSize::R64, TMP_REG, self.vmctx_field(offset)));
+            self.push(lea(RegSize::R64, TMP_REG, Self::vmctx_field(offset)));
             TMP_REG
         }
     }
 
     fn save_registers_to_vmctx(&mut self) {
-        let regs_base = self.load_vmctx_field_address(self.vmctx_regs_offset);
+        let regs_base = self.load_vmctx_field_address(S::vmctx_regs_offset());
         for (nth, reg) in Reg::ALL.iter().copied().enumerate() {
             self.push(store(Size::U32, reg_indirect(RegSize::R64, regs_base + nth as i32 * 4), conv_reg(reg)));
         }
     }
 
     fn restore_registers_from_vmctx(&mut self) {
-        let regs_base = self.load_vmctx_field_address(self.vmctx_regs_offset);
+        let regs_base = self.load_vmctx_field_address(S::vmctx_regs_offset());
         for (nth, reg) in Reg::ALL.iter().copied().enumerate() {
             self.push(load(LoadKind::U32, conv_reg(reg), reg_indirect(RegSize::R64, regs_base + nth as i32 * 4)));
         }
@@ -522,14 +523,14 @@ impl<'r, 'a> ArchVisitor<'r, 'a> {
             let trampoline_label = self.asm.create_label();
             self.export_to_label.insert(export.target_code_offset(), trampoline_label);
 
-            if matches!(self.sandbox_kind, SandboxKind::Linux) {
+            if matches!(S::KIND, SandboxKind::Linux) {
                 self.push(mov_imm64(LINUX_SANDBOX_VMCTX_REG, VM_ADDR_VMCTX));
             }
             self.restore_registers_from_vmctx();
 
             if self.gas_metering.is_some() {
                 // Did we enter again after running out of gas? If so don't even bother running anything, just immediately trap.
-                self.push(cmp((self.vmctx_field(self.vmctx_gas_offset), imm64(0))));
+                self.push(cmp((Self::vmctx_field(S::vmctx_gas_offset()), imm64(0))));
                 self.branch_to_label(Condition::Sign, self.trap_label);
             }
 
@@ -543,7 +544,7 @@ impl<'r, 'a> ArchVisitor<'r, 'a> {
         let label = self.asm.create_label();
 
         self.save_registers_to_vmctx();
-        self.push(mov_imm64(TMP_REG, self.address_table.syscall_return));
+        self.push(mov_imm64(TMP_REG, S::address_table().syscall_return));
         self.push(jmp(TMP_REG));
 
         label
@@ -556,7 +557,7 @@ impl<'r, 'a> ArchVisitor<'r, 'a> {
 
         self.push(push(TMP_REG)); // Save the ecall number.
         self.save_registers_to_vmctx();
-        self.push(mov_imm64(TMP_REG, self.address_table.syscall_hostcall));
+        self.push(mov_imm64(TMP_REG, S::address_table().syscall_hostcall));
         self.push(pop(rdi)); // Pop the ecall number as an argument.
         self.push(call(TMP_REG));
         self.restore_registers_from_vmctx();
@@ -571,7 +572,7 @@ impl<'r, 'a> ArchVisitor<'r, 'a> {
 
         self.push(push(TMP_REG)); // Save the instruction number.
         self.save_registers_to_vmctx();
-        self.push(mov_imm64(TMP_REG, self.address_table.syscall_trace));
+        self.push(mov_imm64(TMP_REG, S::address_table().syscall_trace));
         self.push(pop(rdi)); // Pop the instruction number as an argument.
         self.push(load(LoadKind::U64, rsi, reg_indirect(RegSize::R64, rsp - 8))); // Grab the return address.
         self.push(call(TMP_REG));
@@ -585,7 +586,7 @@ impl<'r, 'a> ArchVisitor<'r, 'a> {
         self.define_label(label);
 
         self.save_registers_to_vmctx();
-        self.push(mov_imm64(TMP_REG, self.address_table.syscall_trap));
+        self.push(mov_imm64(TMP_REG, S::address_table().syscall_trap));
         self.push(jmp(TMP_REG));
     }
 
@@ -596,7 +597,7 @@ impl<'r, 'a> ArchVisitor<'r, 'a> {
 
         self.push(push(TMP_REG));
         self.save_registers_to_vmctx();
-        self.push(mov_imm64(TMP_REG, self.address_table.syscall_sbrk));
+        self.push(mov_imm64(TMP_REG, S::address_table().syscall_sbrk));
         self.push(pop(rdi));
         self.push(call(TMP_REG));
         self.push(push(rax));
@@ -614,22 +615,22 @@ impl<'r, 'a> ArchVisitor<'r, 'a> {
     }
 
     pub(crate) fn emit_gas_metering_stub(&mut self, kind: GasMeteringKind) {
-        self.push(sub((self.vmctx_field(self.vmctx_gas_offset), imm64(i32::MAX))));
+        self.push(sub((Self::vmctx_field(S::vmctx_gas_offset()), imm64(i32::MAX))));
         if matches!(kind, GasMeteringKind::Sync) {
-            self.push(cmp((self.vmctx_field(self.vmctx_gas_offset), imm64(0))));
+            self.push(cmp((Self::vmctx_field(S::vmctx_gas_offset()), imm64(0))));
             self.branch_to_label(Condition::Sign, self.trap_label);
         }
     }
 
     pub(crate) fn emit_weight(&mut self, offset: usize, cost: u32) {
-        let length = sub((self.vmctx_field(self.vmctx_gas_offset), imm64(i32::MAX))).len();
+        let length = sub((Self::vmctx_field(S::vmctx_gas_offset()), imm64(i32::MAX))).len();
         let xs = cost.to_le_bytes();
         self.asm.code_mut()[offset + length - 4..offset + length].copy_from_slice(&xs);
     }
 
     #[cfg_attr(not(debug_assertions), inline(always))]
     fn jump_indirect_impl(&mut self, load_imm: Option<(Reg, u32)>, base: Reg, offset: u32) {
-        match self.sandbox_kind {
+        match S::KIND {
             SandboxKind::Linux => {
                 use polkavm_assembler::amd64::{SegReg, Scale};
 
@@ -669,7 +670,7 @@ impl<'r, 'a> ArchVisitor<'r, 'a> {
     }
 }
 
-impl<'r, 'a> InstructionVisitor for ArchVisitor<'r, 'a> {
+impl<'r, 'a, S> InstructionVisitor for ArchVisitor<'r, 'a, S> where S: Sandbox {
     type ReturnTy = ();
 
     #[inline(always)]
@@ -700,7 +701,7 @@ impl<'r, 'a> InstructionVisitor for ArchVisitor<'r, 'a> {
             self.push(mov(RegSize::R32, dst, size));
         }
 
-        let offset = self.vmctx_heap_info_offset;
+        let offset = S::vmctx_heap_info_offset();
         let heap_info_base = self.load_vmctx_field_address(offset);
 
         // Calculate new top-of-the-heap pointer.
