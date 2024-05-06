@@ -254,7 +254,7 @@ fn decompress_zstd(mut bytes: &[u8]) -> Vec<u8> {
             break;
         }
 
-        output.extend_from_slice(&mut buffer);
+        output.extend_from_slice(&buffer);
     }
 
     output
