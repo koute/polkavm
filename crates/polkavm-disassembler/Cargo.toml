@@ -18,7 +18,7 @@ polkavm-linker = { workspace = true }
 polkavm = { workspace = true }
 
 [dev-dependencies]
-ruzstd = { workspace = true }
+ruzstd = { workspace = true, features = ["std"] }
 
 [lints]
 workspace = true
