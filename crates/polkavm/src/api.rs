@@ -289,8 +289,9 @@ impl Module {
 
         #[allow(unused_macros)]
         macro_rules! compile_module {
-            ($sandbox_kind:ident, $module_kind:ident, $run:ident) => {{
-                let (visitor, aux) = crate::compiler::CompilerVisitor::new::<$sandbox_kind>(
+            ($sandbox_kind:ident, $visitor_name:ident, $module_kind:ident) => {{
+                type VisitorTy<'a> = crate::compiler::CompilerVisitor<'a, $sandbox_kind>;
+                let (visitor, aux) = crate::compiler::CompilerVisitor::<$sandbox_kind>::new(
                     &engine.state.compiler_cache,
                     config,
                     blob.jump_table(),
@@ -302,7 +303,8 @@ impl Module {
                     init,
                 )?;
 
-                let visitor = $run(blob, visitor);
+                let run = polkavm_common::program::prepare_visitor!($visitor_name, VisitorTy<'a>);
+                let visitor = run(blob, visitor);
                 let module = visitor.finish_compilation(&engine.state.compiler_cache, aux)?;
                 Some(CompiledModuleKind::$module_kind(module))
             }};
@@ -312,14 +314,11 @@ impl Module {
             {
                 if engine.selected_backend == BackendKind::Compiler {
                     if let Some(selected_sandbox) = engine.selected_sandbox {
-                        type VisitorTy<'a> = crate::compiler::CompilerVisitor<'a>;
-                        let run = polkavm_common::program::prepare_visitor!(COMPILER_VISITOR, VisitorTy<'a>);
-
                         match selected_sandbox {
                             SandboxKind::Linux => {
                                 #[cfg(target_os = "linux")]
                                 {
-                                    compile_module!(SandboxLinux, Linux, run)
+                                    compile_module!(SandboxLinux, COMPILER_VISITOR_LINUX, Linux)
                                 }
 
                                 #[cfg(not(target_os = "linux"))]
@@ -329,7 +328,7 @@ impl Module {
                                 }
                             },
                             SandboxKind::Generic => {
-                                compile_module!(SandboxGeneric, Generic, run)
+                                compile_module!(SandboxGeneric, COMPILER_VISITOR_GENERIC, Generic)
                             },
                         }
                     } else {
