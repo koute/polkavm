@@ -260,24 +260,6 @@ pub enum Scale {
     x8 = 3,
 }
 
-#[derive(Copy, Clone)]
-enum RawImm {
-    Imm8(u8),
-    Imm16(u16),
-    Imm32(u32),
-}
-
-impl RawImm {
-    #[inline(always)]
-    fn append_into(self, buf: &mut InstBuf) {
-        match self {
-            RawImm::Imm8(value) => buf.append(value),
-            RawImm::Imm16(value) => buf.append2(value.to_le_bytes()),
-            RawImm::Imm32(value) => buf.append4(value.to_le_bytes()),
-        }
-    }
-}
-
 #[derive(Copy, Clone, PartialEq, Eq, Debug)]
 pub enum MemOp {
     /// segment:base + offset
@@ -469,8 +451,10 @@ struct Inst {
     opcode: u8,
     modrm: u8,
     sib: u8,
-    displacement: Option<RawImm>,
-    immediate: Option<RawImm>,
+    displacement: u32,
+    displacement_length: u32,
+    immediate: u32,
+    immediate_length: u32,
     override_segment: Option<SegReg>,
 }
 
@@ -487,8 +471,10 @@ impl Inst {
             opcode,
             modrm: 0,
             sib: 0,
-            displacement: None,
-            immediate: None,
+            displacement: 0,
+            displacement_length: 0,
+            immediate: 0,
+            immediate_length: 0,
             override_segment: None,
         }
     }
@@ -590,10 +576,12 @@ impl Inst {
                 if offset != 0 || matches!(base, Reg::rbp | Reg::r13) {
                     if offset <= i8::MAX as i32 && offset >= i8::MIN as i32 {
                         self.modrm |= 0b01000000;
-                        self.displacement = Some(RawImm::Imm8(offset as u8));
+                        self.displacement = offset as u8 as u32;
+                        self.displacement_length = 8;
                     } else {
                         self.modrm |= 0b10000000;
-                        self.displacement = Some(RawImm::Imm32(offset as u32));
+                        self.displacement = offset as u32;
+                        self.displacement_length = 32;
                     }
                 }
 
@@ -617,10 +605,12 @@ impl Inst {
                 if offset != 0 || matches!(base, Reg::rbp | Reg::r13) {
                     if offset <= i8::MAX as i32 && offset >= i8::MIN as i32 {
                         self.modrm |= 0b01000000;
-                        self.displacement = Some(RawImm::Imm8(offset as u8));
+                        self.displacement = offset as u8 as u32;
+                        self.displacement_length = 8;
                     } else {
                         self.modrm |= 0b10000000;
-                        self.displacement = Some(RawImm::Imm32(offset as u32));
+                        self.displacement = offset as u32;
+                        self.displacement_length = 32;
                     }
                 }
 
@@ -636,20 +626,23 @@ impl Inst {
                 self.sib |= index.into_reg().modrm_reg_bits();
                 self.sib |= 0b00000101;
                 self.sib |= ((scale as usize) << 6) as u8;
-                self.displacement = Some(RawImm::Imm32(offset as u32));
+                self.displacement = offset as u32;
+                self.displacement_length = 32;
                 self.override_segment = segment;
                 self.override_addr_size_if(matches!(reg_size, RegSize::R32))
             }
             MemOp::Offset(segment, reg_size, offset) => {
                 self.modrm |= 0b00000100;
                 self.sib |= 0b00100101;
-                self.displacement = Some(RawImm::Imm32(offset as u32));
+                self.displacement = offset as u32;
+                self.displacement_length = 32;
                 self.override_segment = segment;
                 self.override_addr_size_if(matches!(reg_size, RegSize::R32) && offset < 0)
             }
             MemOp::RipRelative(segment, offset) => {
                 self.modrm |= 0b00000101;
-                self.displacement = Some(RawImm::Imm32(offset as u32));
+                self.displacement = offset as u32;
+                self.displacement_length = 32;
                 self.override_segment = segment;
                 self
             }
@@ -675,19 +668,22 @@ impl Inst {
 
     #[inline]
     const fn imm8(mut self, value: u8) -> Self {
-        self.immediate = Some(RawImm::Imm8(value));
+        self.immediate = value as u32;
+        self.immediate_length = 8;
         self
     }
 
     #[inline]
     const fn imm16(mut self, value: u16) -> Self {
-        self.immediate = Some(RawImm::Imm16(value));
+        self.immediate = value as u32;
+        self.immediate_length = 16;
         self
     }
 
     #[inline]
     const fn imm32(mut self, value: u32) -> Self {
-        self.immediate = Some(RawImm::Imm32(value));
+        self.immediate = value;
+        self.immediate_length = 32;
         self
     }
 
@@ -731,13 +727,8 @@ impl Inst {
             }
         }
 
-        if let Some(displacement) = self.displacement {
-            displacement.append_into(buf);
-        }
-
-        if let Some(immediate) = self.immediate {
-            immediate.append_into(buf);
-        }
+        buf.append_packed_bytes(self.displacement, self.displacement_length);
+        buf.append_packed_bytes(self.immediate, self.immediate_length);
     }
 }
 

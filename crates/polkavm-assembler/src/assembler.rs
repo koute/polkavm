@@ -353,56 +353,38 @@ const MAXIMUM_INSTRUCTION_SIZE: usize = 16;
 
 #[derive(Copy, Clone)]
 pub struct InstBuf {
-    out_1: u64,
-    out_2: u64,
-    length: usize,
+    out: u128,
+    length: u32,
 }
 
 #[allow(clippy::new_without_default)]
 impl InstBuf {
     #[inline]
     pub fn new() -> Self {
-        Self {
-            out_1: 0,
-            out_2: 0,
-            length: 0,
-        }
+        Self { out: 0, length: 0 }
     }
 
     #[inline]
     pub fn len(&self) -> usize {
-        self.length
+        (self.length >> 3) as usize
     }
 
     #[inline]
     pub fn append(&mut self, byte: u8) {
-        if self.length < 8 {
-            self.out_1 |= u64::from(byte) << (self.length * 8);
-        } else {
-            self.out_2 |= u64::from(byte) << ((self.length - 8) * 8);
-        }
-
-        self.length += 1;
+        self.out |= u128::from(byte).wrapping_shl(self.length);
+        self.length += 8;
     }
 
     #[inline]
-    pub fn append2(&mut self, bytes: [u8; 2]) {
-        self.append(bytes[0]);
-        self.append(bytes[1]);
-    }
-
-    #[inline]
-    pub fn append4(&mut self, bytes: [u8; 4]) {
-        self.append(bytes[0]);
-        self.append(bytes[1]);
-        self.append(bytes[2]);
-        self.append(bytes[3]);
+    pub fn append_packed_bytes(&mut self, value: u32, length: u32) {
+        self.out |= u128::from(value).wrapping_shl(self.length);
+        self.length += length;
     }
 
     #[inline]
     unsafe fn encode_into_raw(self, output: *mut u8) {
-        core::ptr::write_unaligned(output.cast::<u64>(), u64::from_le(self.out_1));
-        core::ptr::write_unaligned(output.add(8).cast::<u64>(), u64::from_le(self.out_2));
+        core::ptr::write_unaligned(output.cast::<u64>(), u64::from_le(self.out as u64));
+        core::ptr::write_unaligned(output.add(8).cast::<u64>(), u64::from_le((self.out >> 64) as u64));
     }
 
     #[allow(clippy::debug_assert_with_mut_call)]
@@ -411,7 +393,7 @@ impl InstBuf {
         debug_assert!(output.spare_capacity_mut().len() >= MAXIMUM_INSTRUCTION_SIZE);
 
         self.encode_into_raw(output.spare_capacity_mut().as_mut_ptr().cast());
-        let new_length = output.len() + self.length;
+        let new_length = output.len() + (self.length as usize >> 3);
         output.set_len(new_length);
     }
 
@@ -478,4 +460,22 @@ fn test_inst_buf() {
         InstBuf::from_array([0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0A]).to_vec(),
         [0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0A]
     );
+
+    let mut buf = InstBuf::from_array([0x01]);
+    assert_eq!(buf.to_vec(), [0x01]);
+    buf.append_packed_bytes(0x05040302, 32);
+    assert_eq!(buf.to_vec(), [0x01, 0x02, 0x03, 0x04, 0x05]);
+    buf.append_packed_bytes(0x09080706, 32);
+    assert_eq!(buf.to_vec(), [0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09]);
+
+    let mut buf = InstBuf::from_array([0x01]);
+    assert_eq!(buf.to_vec(), [0x01]);
+    buf.append_packed_bytes(0x0302, 16);
+    assert_eq!(buf.to_vec(), [0x01, 0x02, 0x03]);
+    buf.append_packed_bytes(0x0504, 16);
+    assert_eq!(buf.to_vec(), [0x01, 0x02, 0x03, 0x04, 0x05]);
+    buf.append_packed_bytes(0x0706, 16);
+    assert_eq!(buf.to_vec(), [0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07]);
+    buf.append_packed_bytes(0x0908, 16);
+    assert_eq!(buf.to_vec(), [0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09]);
 }
