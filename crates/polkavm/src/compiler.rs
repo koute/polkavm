@@ -33,14 +33,15 @@ struct Cache {
 pub(crate) struct CompilerCache(Mutex<Cache>);
 
 pub(crate) struct CompilerVisitor<'a, S> where S: Sandbox {
-    pub(crate) current_code_offset: u32,
+    current_code_offset: u32,
+    next_code_offset: u32,
+    is_last_instruction: bool,
 
     init: GuestInit<'a>,
     jump_table: JumpTable<'a>,
     code: &'a [u8],
     bitmask: &'a [u8],
     asm: Assembler,
-    basic_block_pending: bool,
     code_offset_to_label: FlatMap<Label>,
     debug_trace_execution: bool,
     ecall_label: Label,
@@ -133,6 +134,8 @@ impl<'a, S> CompilerVisitor<'a, S> where S: Sandbox {
 
         let mut visitor = CompilerVisitor {
             current_code_offset: 0,
+            next_code_offset: 0,
+            is_last_instruction: false,
             gas_visitor: GasVisitor::default(),
             asm,
             exports,
@@ -153,7 +156,6 @@ impl<'a, S> CompilerVisitor<'a, S> where S: Sandbox {
             gas_metering_stub_offsets,
             gas_cost_for_basic_block,
             code_length,
-            basic_block_pending: true,
             _phantom: PhantomData,
         };
 
@@ -165,6 +167,7 @@ impl<'a, S> CompilerVisitor<'a, S> where S: Sandbox {
             ArchVisitor(&mut visitor).emit_trace_trampoline();
         }
 
+        visitor.start_new_basic_block::<true>();
         Ok((visitor, address_space))
     }
 
@@ -268,21 +271,35 @@ impl<'a, S> CompilerVisitor<'a, S> where S: Sandbox {
         Ok(module)
     }
 
-    fn start_new_basic_block(&mut self) {
-        if self.gas_metering.is_some() {
+    #[inline(always)]
+    fn start_new_basic_block<const IS_INITIAL: bool>(&mut self) {
+        if !IS_INITIAL && self.gas_metering.is_some() {
             let cost = self.gas_visitor.take_block_cost().unwrap();
             self.gas_cost_for_basic_block.push(cost);
         }
 
-        self.basic_block_pending = true;
+        if !self.is_last_instruction {
+            let code_offset = self.next_code_offset;
+
+            log::trace!("Starting new basic block at: {code_offset}");
+            if let Some(label) = self.code_offset_to_label.get(code_offset) {
+                log::trace!("Label: {label} -> {code_offset} -> {:08x}", self.asm.current_address());
+                self.asm.define_label(label);
+            } else {
+                let label = self.asm.create_label();
+                log::trace!("Label: {label} -> {code_offset} -> {:08x}", self.asm.current_address());
+                self.code_offset_to_label.insert(code_offset, label);
+            }
+
+            if let Some(gas_metering) = self.gas_metering {
+                self.gas_metering_stub_offsets.push(self.asm.len());
+                ArchVisitor(self).emit_gas_metering_stub(gas_metering);
+            }
+        }
     }
 
     #[inline(always)]
     fn before_instruction(&mut self) {
-        if self.basic_block_pending {
-            self.handle_pending_basic_block();
-        }
-
         self.code_offset_to_native_code_offset.push((self.current_code_offset, self.asm.len() as u32));
 
         if log::log_enabled!(log::Level::Trace) {
@@ -294,27 +311,6 @@ impl<'a, S> CompilerVisitor<'a, S> where S: Sandbox {
         }
 
         self.asm.reserve::<8>();
-    }
-
-    #[inline(never)]
-    fn handle_pending_basic_block(&mut self) {
-        let code_offset = self.current_code_offset;
-        self.basic_block_pending = false;
-
-        log::trace!("Starting new basic block at: {code_offset}");
-        if let Some(label) = self.code_offset_to_label.get(code_offset) {
-            log::trace!("Label: {label} -> {code_offset} -> {:08x}", self.asm.current_address());
-            self.asm.define_label(label);
-        } else {
-            let label = self.asm.create_label();
-            log::trace!("Label: {label} -> {code_offset} -> {:08x}", self.asm.current_address());
-            self.code_offset_to_label.insert(code_offset, label);
-        }
-
-        if let Some(gas_metering) = self.gas_metering {
-            self.gas_metering_stub_offsets.push(self.asm.len());
-            ArchVisitor(self).emit_gas_metering_stub(gas_metering);
-        }
     }
 
     fn after_instruction(&mut self) {
@@ -378,8 +374,11 @@ impl<'a, S> CompilerVisitor<'a, S> where S: Sandbox {
 
 impl<'a, S> polkavm_common::program::ParsingVisitor for CompilerVisitor<'a, S> where S: Sandbox {
     #[cfg_attr(not(debug_assertions), inline)]
-    fn on_pre_visit(&mut self, offset: usize, _opcode: u8) -> Self::ReturnTy {
+    fn on_pre_visit(&mut self, offset: usize, length: usize, _opcode: u8) -> Self::ReturnTy {
         self.current_code_offset = offset as u32;
+        let next_code_offset = offset + length;
+        self.next_code_offset = next_code_offset as u32;
+        self.is_last_instruction = next_code_offset == self.code.len();
     }
 }
 
@@ -392,7 +391,7 @@ impl<'a, S> polkavm_common::program::InstructionVisitor for CompilerVisitor<'a, 
         self.gas_visitor.trap();
         ArchVisitor(self).trap();
         self.after_instruction();
-        self.start_new_basic_block();
+        self.start_new_basic_block::<false>();
     }
 
     #[inline(always)]
@@ -401,7 +400,7 @@ impl<'a, S> polkavm_common::program::InstructionVisitor for CompilerVisitor<'a, 
         self.gas_visitor.fallthrough();
         ArchVisitor(self).fallthrough();
         self.after_instruction();
-        self.start_new_basic_block();
+        self.start_new_basic_block::<false>();
     }
 
     #[inline(always)]
@@ -930,7 +929,7 @@ impl<'a, S> polkavm_common::program::InstructionVisitor for CompilerVisitor<'a, 
         self.gas_visitor.branch_less_unsigned(s1, s2, imm);
         ArchVisitor(self).branch_less_unsigned(s1, s2, imm);
         self.after_instruction();
-        self.start_new_basic_block();
+        self.start_new_basic_block::<false>();
     }
 
     #[inline(always)]
@@ -939,7 +938,7 @@ impl<'a, S> polkavm_common::program::InstructionVisitor for CompilerVisitor<'a, 
         self.gas_visitor.branch_less_signed(s1, s2, imm);
         ArchVisitor(self).branch_less_signed(s1, s2, imm);
         self.after_instruction();
-        self.start_new_basic_block();
+        self.start_new_basic_block::<false>();
     }
 
     #[inline(always)]
@@ -948,7 +947,7 @@ impl<'a, S> polkavm_common::program::InstructionVisitor for CompilerVisitor<'a, 
         self.gas_visitor.branch_greater_or_equal_unsigned(s1, s2, imm);
         ArchVisitor(self).branch_greater_or_equal_unsigned(s1, s2, imm);
         self.after_instruction();
-        self.start_new_basic_block();
+        self.start_new_basic_block::<false>();
     }
 
     #[inline(always)]
@@ -957,7 +956,7 @@ impl<'a, S> polkavm_common::program::InstructionVisitor for CompilerVisitor<'a, 
         self.gas_visitor.branch_greater_or_equal_signed(s1, s2, imm);
         ArchVisitor(self).branch_greater_or_equal_signed(s1, s2, imm);
         self.after_instruction();
-        self.start_new_basic_block();
+        self.start_new_basic_block::<false>();
     }
 
     #[inline(always)]
@@ -966,7 +965,7 @@ impl<'a, S> polkavm_common::program::InstructionVisitor for CompilerVisitor<'a, 
         self.gas_visitor.branch_eq(s1, s2, imm);
         ArchVisitor(self).branch_eq(s1, s2, imm);
         self.after_instruction();
-        self.start_new_basic_block();
+        self.start_new_basic_block::<false>();
     }
 
     #[inline(always)]
@@ -975,7 +974,7 @@ impl<'a, S> polkavm_common::program::InstructionVisitor for CompilerVisitor<'a, 
         self.gas_visitor.branch_not_eq(s1, s2, imm);
         ArchVisitor(self).branch_not_eq(s1, s2, imm);
         self.after_instruction();
-        self.start_new_basic_block();
+        self.start_new_basic_block::<false>();
     }
 
     #[inline(always)]
@@ -984,7 +983,7 @@ impl<'a, S> polkavm_common::program::InstructionVisitor for CompilerVisitor<'a, 
         self.gas_visitor.branch_eq_imm(s1, s2, imm);
         ArchVisitor(self).branch_eq_imm(s1, s2, imm);
         self.after_instruction();
-        self.start_new_basic_block();
+        self.start_new_basic_block::<false>();
     }
 
     #[inline(always)]
@@ -993,7 +992,7 @@ impl<'a, S> polkavm_common::program::InstructionVisitor for CompilerVisitor<'a, 
         self.gas_visitor.branch_not_eq_imm(s1, s2, imm);
         ArchVisitor(self).branch_not_eq_imm(s1, s2, imm);
         self.after_instruction();
-        self.start_new_basic_block();
+        self.start_new_basic_block::<false>();
     }
 
     #[inline(always)]
@@ -1002,7 +1001,7 @@ impl<'a, S> polkavm_common::program::InstructionVisitor for CompilerVisitor<'a, 
         self.gas_visitor.branch_less_unsigned_imm(s1, s2, imm);
         ArchVisitor(self).branch_less_unsigned_imm(s1, s2, imm);
         self.after_instruction();
-        self.start_new_basic_block();
+        self.start_new_basic_block::<false>();
     }
 
     #[inline(always)]
@@ -1011,7 +1010,7 @@ impl<'a, S> polkavm_common::program::InstructionVisitor for CompilerVisitor<'a, 
         self.gas_visitor.branch_less_signed_imm(s1, s2, imm);
         ArchVisitor(self).branch_less_signed_imm(s1, s2, imm);
         self.after_instruction();
-        self.start_new_basic_block();
+        self.start_new_basic_block::<false>();
     }
 
     #[inline(always)]
@@ -1020,7 +1019,7 @@ impl<'a, S> polkavm_common::program::InstructionVisitor for CompilerVisitor<'a, 
         self.gas_visitor.branch_greater_or_equal_unsigned_imm(s1, s2, imm);
         ArchVisitor(self).branch_greater_or_equal_unsigned_imm(s1, s2, imm);
         self.after_instruction();
-        self.start_new_basic_block();
+        self.start_new_basic_block::<false>();
     }
 
     #[inline(always)]
@@ -1029,7 +1028,7 @@ impl<'a, S> polkavm_common::program::InstructionVisitor for CompilerVisitor<'a, 
         self.gas_visitor.branch_greater_or_equal_signed_imm(s1, s2, imm);
         ArchVisitor(self).branch_greater_or_equal_signed_imm(s1, s2, imm);
         self.after_instruction();
-        self.start_new_basic_block();
+        self.start_new_basic_block::<false>();
     }
 
     #[inline(always)]
@@ -1038,7 +1037,7 @@ impl<'a, S> polkavm_common::program::InstructionVisitor for CompilerVisitor<'a, 
         self.gas_visitor.branch_less_or_equal_unsigned_imm(s1, s2, imm);
         ArchVisitor(self).branch_less_or_equal_unsigned_imm(s1, s2, imm);
         self.after_instruction();
-        self.start_new_basic_block();
+        self.start_new_basic_block::<false>();
     }
 
     #[inline(always)]
@@ -1047,7 +1046,7 @@ impl<'a, S> polkavm_common::program::InstructionVisitor for CompilerVisitor<'a, 
         self.gas_visitor.branch_less_or_equal_signed_imm(s1, s2, imm);
         ArchVisitor(self).branch_less_or_equal_signed_imm(s1, s2, imm);
         self.after_instruction();
-        self.start_new_basic_block();
+        self.start_new_basic_block::<false>();
     }
 
     #[inline(always)]
@@ -1056,7 +1055,7 @@ impl<'a, S> polkavm_common::program::InstructionVisitor for CompilerVisitor<'a, 
         self.gas_visitor.branch_greater_unsigned_imm(s1, s2, imm);
         ArchVisitor(self).branch_greater_unsigned_imm(s1, s2, imm);
         self.after_instruction();
-        self.start_new_basic_block();
+        self.start_new_basic_block::<false>();
     }
 
     #[inline(always)]
@@ -1065,7 +1064,7 @@ impl<'a, S> polkavm_common::program::InstructionVisitor for CompilerVisitor<'a, 
         self.gas_visitor.branch_greater_signed_imm(s1, s2, imm);
         ArchVisitor(self).branch_greater_signed_imm(s1, s2, imm);
         self.after_instruction();
-        self.start_new_basic_block();
+        self.start_new_basic_block::<false>();
     }
 
     #[inline(always)]
@@ -1082,7 +1081,7 @@ impl<'a, S> polkavm_common::program::InstructionVisitor for CompilerVisitor<'a, 
         self.gas_visitor.load_imm_and_jump(ra, value, target);
         ArchVisitor(self).load_imm_and_jump(ra, value, target);
         self.after_instruction();
-        self.start_new_basic_block();
+        self.start_new_basic_block::<false>();
     }
 
     #[inline(always)]
@@ -1091,7 +1090,7 @@ impl<'a, S> polkavm_common::program::InstructionVisitor for CompilerVisitor<'a, 
         self.gas_visitor.load_imm_and_jump_indirect(ra, base, value, offset);
         ArchVisitor(self).load_imm_and_jump_indirect(ra, base, value, offset);
         self.after_instruction();
-        self.start_new_basic_block();
+        self.start_new_basic_block::<false>();
     }
 
     #[inline(always)]
@@ -1100,7 +1099,7 @@ impl<'a, S> polkavm_common::program::InstructionVisitor for CompilerVisitor<'a, 
         self.gas_visitor.jump(target);
         ArchVisitor(self).jump(target);
         self.after_instruction();
-        self.start_new_basic_block();
+        self.start_new_basic_block::<false>();
     }
 
     #[inline(always)]
@@ -1109,7 +1108,7 @@ impl<'a, S> polkavm_common::program::InstructionVisitor for CompilerVisitor<'a, 
         self.gas_visitor.jump_indirect(base, offset);
         ArchVisitor(self).jump_indirect(base, offset);
         self.after_instruction();
-        self.start_new_basic_block();
+        self.start_new_basic_block::<false>();
     }
 }
 
