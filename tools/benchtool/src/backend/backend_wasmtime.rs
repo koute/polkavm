@@ -35,7 +35,7 @@ impl Backend for Wasmtime {
         }
     }
 
-    fn create(&self) -> Self::Engine {
+    fn create(&self, _args: CreateArgs) -> Self::Engine {
         let mut config = wasmtime::Config::default();
         config.strategy(self.0);
         match self.1 {

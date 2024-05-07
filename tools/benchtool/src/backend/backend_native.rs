@@ -18,7 +18,7 @@ impl Backend for Native {
         "native"
     }
 
-    fn create(&self) -> Self::Engine {}
+    fn create(&self, _args: CreateArgs) -> Self::Engine {}
 
     fn load(&self, path: &Path) -> Self::Blob {
         path.to_owned()
