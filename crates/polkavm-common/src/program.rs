@@ -154,7 +154,7 @@ impl<T> VisitorHelper<T> {
         self.args_length = args.len();
         self.instruction_offset = instruction_offset as u32;
 
-        self.visitor.on_pre_visit(instruction_offset, opcode);
+        self.visitor.on_pre_visit(instruction_offset, instruction_length, opcode);
         Some(decode_table[opcode as usize](self))
     }
 
@@ -192,7 +192,7 @@ impl<T> VisitorHelper<T> {
         self.args_length = instruction_length - 1;
         self.instruction_offset = instruction_offset as u32;
 
-        self.visitor.on_pre_visit(instruction_offset, opcode);
+        self.visitor.on_pre_visit(instruction_offset, instruction_length, opcode);
         Some(decode_table[opcode as usize](self))
     }
 
@@ -387,7 +387,7 @@ macro_rules! define_opcodes {
         [$($name_reg_reg_imm_imm:ident = $value_reg_reg_imm_imm:expr,)+]
     ) => {
         pub trait ParsingVisitor: InstructionVisitor {
-            fn on_pre_visit(&mut self, _offset: usize, _opcode: u8);
+            fn on_pre_visit(&mut self, _offset: usize, _length: usize, _opcode: u8);
         }
 
         pub trait InstructionVisitor {
@@ -831,7 +831,7 @@ macro_rules! define_opcodes {
         struct ToEnumVisitor<'a>(core::marker::PhantomData<&'a ()>);
 
         impl<'a> ParsingVisitor for ToEnumVisitor<'a> {
-            fn on_pre_visit(&mut self, _offset: usize, _opcode: u8) {}
+            fn on_pre_visit(&mut self, _offset: usize, _length: usize, _opcode: u8) {}
         }
 
         impl<'a> InstructionVisitor for ToEnumVisitor<'a> {
