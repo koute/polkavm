@@ -129,7 +129,7 @@ impl Backend for WaZero {
         "wazero"
     }
 
-    fn create(&self) -> Self::Engine {
+    fn create(&self, _args: CreateArgs) -> Self::Engine {
         unsafe { WaZeroEngine((get_wazero().unwrap().engine_new)()) }
     }
 

@@ -2,8 +2,12 @@ use crate::BenchmarkKind;
 use std::path::Path;
 
 mod backend_prelude {
-    pub use super::Backend;
+    pub use super::{Backend, CreateArgs};
     pub use std::path::{Path, PathBuf};
+}
+
+pub struct CreateArgs {
+    pub is_compile_only: bool,
 }
 
 pub trait Backend: Copy + Clone {
@@ -13,7 +17,7 @@ pub trait Backend: Copy + Clone {
     type Instance;
 
     fn name(&self) -> &'static str;
-    fn create(&self) -> Self::Engine;
+    fn create(&self, args: CreateArgs) -> Self::Engine;
     fn load(&self, path: &Path) -> Self::Blob;
     fn compile(&self, engine: &mut Self::Engine, blob: &Self::Blob) -> Self::Module;
     fn spawn(&self, engine: &mut Self::Engine, module: &Self::Module) -> Self::Instance;
@@ -124,11 +128,11 @@ macro_rules! define_backends {
                 }
             }
 
-            fn create(&self) -> Self::Engine {
+            fn create(&self, args: CreateArgs) -> Self::Engine {
                 match self {
                     $(
                         #[cfg($($cfg)*)]
-                        Self::$backend => AnyEngine::$backend(self::$module::$struct($($ctor_args)*).create()),
+                        Self::$backend => AnyEngine::$backend(self::$module::$struct($($ctor_args)*).create(args)),
                     )+
                 }
             }

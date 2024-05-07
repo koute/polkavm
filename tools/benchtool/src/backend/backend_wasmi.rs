@@ -23,7 +23,7 @@ impl Backend for Wasmi {
         }
     }
 
-    fn create(&self) -> Self::Engine {
+    fn create(&self, _args: CreateArgs) -> Self::Engine {
         let mut config = wasmi::Config::default();
         config.compilation_mode(self.0);
         wasmi::Engine::new(&config)

@@ -19,14 +19,14 @@ use {
 mod backend;
 mod utils;
 
-use crate::backend::Backend;
+use crate::backend::{Backend, CreateArgs};
 
 const FAST_INNER_COUNT: u32 = 32;
 const SLOW_INNER_COUNT: u32 = 1;
 
 fn benchmark_execution<T: Backend>(outer_count: u64, inner_count: u32, backend: T, path: &Path) -> core::time::Duration {
     let mut total_elapsed = core::time::Duration::new(0, 0);
-    let mut engine = backend.create();
+    let mut engine = backend.create(CreateArgs { is_compile_only: false });
     let blob = backend.load(path);
     let module = backend.compile(&mut engine, &blob);
     for _ in 0..outer_count {
@@ -43,7 +43,7 @@ fn benchmark_execution<T: Backend>(outer_count: u64, inner_count: u32, backend: 
 }
 
 fn benchmark_compilation<T: Backend>(count: u64, backend: T, path: &Path) -> core::time::Duration {
-    let mut engine = backend.create();
+    let mut engine = backend.create(CreateArgs { is_compile_only: true });
     let blob = backend.load(path);
     let start = std::time::Instant::now();
     for _ in 0..count {
@@ -53,7 +53,7 @@ fn benchmark_compilation<T: Backend>(count: u64, backend: T, path: &Path) -> cor
 }
 
 fn benchmark_oneshot<T: Backend>(count: u64, backend: T, path: &Path) -> core::time::Duration {
-    let mut engine = backend.create();
+    let mut engine = backend.create(CreateArgs { is_compile_only: false });
     let blob = backend.load(path);
     let start = std::time::Instant::now();
     for _ in 0..count {
@@ -595,7 +595,7 @@ fn main() {
                 BenchVariant::Runtime => prepare_for_profiling(
                     iteration_limit,
                     move || {
-                        let mut engine = backend.create();
+                        let mut engine = backend.create(CreateArgs { is_compile_only: false });
                         let blob = backend.load(&bench.path);
                         let module = backend.compile(&mut engine, &blob);
                         let mut instance = backend.spawn(&mut engine, &module);
@@ -610,7 +610,7 @@ fn main() {
                 BenchVariant::Compilation => prepare_for_profiling(
                     iteration_limit,
                     move || {
-                        let engine = backend.create();
+                        let engine = backend.create(CreateArgs { is_compile_only: true });
                         let blob = backend.load(&bench.path);
                         ((engine, blob), None)
                     },
@@ -621,7 +621,7 @@ fn main() {
                 BenchVariant::Oneshot => prepare_for_profiling(
                     iteration_limit,
                     move || {
-                        let engine = backend.create();
+                        let engine = backend.create(CreateArgs { is_compile_only: false });
                         let blob = backend.load(&bench.path);
                         ((engine, blob), None)
                     },

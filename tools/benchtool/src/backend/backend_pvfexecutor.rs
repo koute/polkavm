@@ -13,7 +13,7 @@ impl Backend for PvfExecutor {
         "pvfexecutor"
     }
 
-    fn create(&self) -> Self::Engine {}
+    fn create(&self, _args: CreateArgs) -> Self::Engine {}
 
     fn load(&self, path: &Path) -> Self::Blob {
         std::fs::read(path).unwrap()

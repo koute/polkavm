@@ -68,7 +68,7 @@ impl Backend for SolanaRbpf {
         "solana_rbpf"
     }
 
-    fn create(&self) -> Self::Engine {
+    fn create(&self, _args: CreateArgs) -> Self::Engine {
         let config = Config {
             enable_instruction_meter: false,
             ..Config::default()

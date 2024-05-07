@@ -19,7 +19,7 @@ impl Backend for Wasm3 {
         "wasm3"
     }
 
-    fn create(&self) -> Self::Engine {
+    fn create(&self, _args: CreateArgs) -> Self::Engine {
         wasm3::Environment::new().unwrap()
     }
 
