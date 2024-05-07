@@ -394,6 +394,10 @@ enum Args {
         #[clap(long)]
         forever: bool,
 
+        /// Run with ASLR enabled.
+        #[clap(long)]
+        aslr: bool,
+
         filter: Option<String>,
     },
 
@@ -420,6 +424,11 @@ enum Args {
     },
 }
 
+fn disable_aslr() {
+    #[cfg(all(target_os = "linux", not(miri)))]
+    crate::utils::restart_with_disabled_aslr().unwrap();
+}
+
 fn main() {
     #[cfg(all(debug_assertions, not(miri)))]
     if std::env::var_os("TRUST_ME_BRO_I_KNOW_WHAT_I_AM_DOING").is_none() {
@@ -430,9 +439,6 @@ fn main() {
         std::process::exit(1);
     }
 
-    #[cfg(all(target_os = "linux", not(miri)))]
-    crate::utils::restart_with_disabled_aslr().unwrap();
-
     #[cfg(feature = "env_logger")]
     env_logger::init();
     let args = Args::parse();
@@ -440,6 +446,8 @@ fn main() {
     match args {
         #[cfg(feature = "criterion")]
         Args::Criterion { filter } => {
+            disable_aslr();
+
             let benches = find_benchmarks().unwrap();
             let mut criterion = Criterion::default().sample_size(10).with_output_color(true);
             if let Some(filter) = filter {
@@ -453,7 +461,12 @@ fn main() {
             iteration_limit,
             filter,
             forever,
+            aslr,
         } => {
+            if !aslr {
+                disable_aslr();
+            }
+
             let mut list = Vec::new();
             let benches = find_benchmarks().unwrap();
             for bench in &benches {
@@ -585,6 +598,8 @@ fn main() {
             command,
             perf_args,
         } => {
+            disable_aslr();
+
             let (variant, bench, backend) = pick_benchmark(benchmark);
 
             if time_limit.is_none() && iteration_limit.is_none() {
