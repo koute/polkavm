@@ -1261,17 +1261,17 @@ impl<'r, 'a, S> InstructionVisitor for ArchVisitor<'r, 'a, S> where S: Sandbox {
     }
 
     #[inline(always)]
-    fn store_imm_u8(&mut self, value: u32, offset: u32) -> Self::ReturnTy {
+    fn store_imm_u8(&mut self, offset: u32, value: u32) -> Self::ReturnTy {
         self.store(value, None, offset, Size::U8);
     }
 
     #[inline(always)]
-    fn store_imm_u16(&mut self, value: u32, offset: u32) -> Self::ReturnTy {
+    fn store_imm_u16(&mut self, offset: u32, value: u32) -> Self::ReturnTy {
         self.store(value, None, offset, Size::U16);
     }
 
     #[inline(always)]
-    fn store_imm_u32(&mut self, value: u32, offset: u32) -> Self::ReturnTy {
+    fn store_imm_u32(&mut self, offset: u32, value: u32) -> Self::ReturnTy {
         self.store(value, None, offset, Size::U32);
     }
 
