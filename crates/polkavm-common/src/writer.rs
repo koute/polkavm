@@ -271,7 +271,7 @@ impl ProgramBlobBuilder {
 
             assert_eq!(parsed.len(), instructions.len());
             for ((offset, mut instruction), entry) in parsed.into_iter().zip(instructions.into_iter()) {
-                assert_eq!(instruction, entry.instruction);
+                assert_eq!(instruction, entry.instruction, "broken serialization: {:?}", entry.bytes.bytes);
                 assert_eq!(entry.position, offset);
                 if let Some(target) = instruction.target_mut() {
                     assert!(offsets.contains(target));

@@ -7,20 +7,6 @@ fn get_varint_length(leading_zeros: u32) -> u32 {
 
 pub const MAX_VARINT_LENGTH: usize = 5;
 
-#[inline(always)]
-pub(crate) fn read_varint_fast(chunk: u64) -> Option<(u32, u32)> {
-    let first_byte = chunk as u8;
-    let length = (!first_byte).leading_zeros();
-    if length > 4 {
-        return None;
-    }
-
-    let upper_mask = 0b11111111_u32 >> length;
-    let lower_mask = ((1_u64 << (length << 3)) - 1) as u32;
-    let value = (upper_mask & u32::from(first_byte)).wrapping_shl(length * 8) | (((chunk >> 8) as u32) & lower_mask);
-    Some((length + 1, value))
-}
-
 #[inline]
 pub(crate) fn read_varint(input: &[u8], first_byte: u8) -> Option<(usize, u32)> {
     let length = (!first_byte).leading_zeros();
@@ -90,24 +76,71 @@ proptest::proptest! {
 }
 
 #[inline(always)]
-pub(crate) fn read_simple_varint_fast(chunk: u32, length: u32) -> u32 {
-    let mask = ((1_u64 << (length << 3)) - 1) as u32;
-    let value = chunk & mask;
+fn apply_zigzag(value: u32) -> u32 {
+    let value = value as i32;
+    let value = (value << 1) ^ (value >> 31);
+    value as u32
+}
+
+#[inline(always)]
+fn undo_zigzag(value: u32) -> u32 {
     (value >> 1) ^ (-((value & 1) as i32)) as u32
 }
 
+const fn bit_length_to_mask_u32_slow(length: u32) -> u32 {
+    if length >= 32 {
+        0xffffffff
+    } else {
+        (1_u32 << length) - 1
+    }
+}
+
+static LENGTH_MINUS_1_TO_MASK: [u32; 256] = {
+    let mut output = [0; 256];
+    let mut length = 0_u32;
+    while length < 256 {
+        let length_effective = length.wrapping_sub(1);
+        let length_effective = if length_effective < 4 { length_effective } else { 4 };
+        output[length as usize] = bit_length_to_mask_u32_slow(length_effective * 8);
+        length += 1;
+    }
+    output
+};
+
+#[inline(always)]
+pub(crate) fn read_simple_varint_length_minus_1(chunk: u32, length: u32) -> u32 {
+    let mask = LENGTH_MINUS_1_TO_MASK[length as u8 as usize];
+    undo_zigzag(chunk & mask)
+}
+
+static LENGTH_TO_MASK: [u32; 256] = {
+    let mut output = [0; 256];
+    let mut length = 0_u32;
+    while length < 256 {
+        let length_effective = if length < 4 { length } else { 4 };
+        output[length as usize] = bit_length_to_mask_u32_slow(length_effective * 8);
+        length += 1;
+    }
+    output
+};
+
+#[inline(always)]
+pub(crate) fn read_simple_varint(chunk: u32, length: u32) -> u32 {
+    let mask = LENGTH_TO_MASK[length as u8 as usize];
+    undo_zigzag(chunk & mask)
+}
+
 #[inline]
-fn get_simple_varint_length(leading_zeros: u32) -> u32 {
+fn get_bytes_required(value: u32) -> u32 {
+    let leading_zeros = value.leading_zeros();
     let bits_required = 32 - leading_zeros;
     bits_required / 8 + (if leading_zeros % 8 > 0 { 1 } else { 0 })
 }
 
 #[inline]
 pub(crate) fn write_simple_varint(value: u32, buffer: &mut [u8]) -> usize {
-    let value = value as i32;
-    let value = (value << 1) ^ (value >> 31);
-    let value = value as u32;
-    let varint_length = get_simple_varint_length(value.leading_zeros());
+    let value = apply_zigzag(value);
+    let varint_length = get_bytes_required(value);
     match varint_length {
         0 => {}
         1 => {
@@ -142,7 +175,7 @@ proptest::proptest! {
     #[allow(clippy::ignored_unit_patterns)]
     #[test]
     fn simple_varint_serialization(value in 0u32..=0xffffffff) {
-        fn read_simple_varint(input: &[u8]) -> Option<u32> {
+        fn read_simple_varint_slow(input: &[u8]) -> Option<u32> {
             let value = match input.len() {
                 0 => 0,
                 1 => u32::from(input[0]),
@@ -156,9 +189,16 @@ proptest::proptest! {
             Some(value)
         }
 
-        let mut buffer = [0; MAX_VARINT_LENGTH];
-        let length = write_simple_varint(value, &mut buffer);
-        let parsed_value = read_simple_varint(&buffer[..length]).unwrap();
-        assert_eq!(parsed_value, value, "value mismatch");
+        let mut t = [0; 4];
+        let length = write_simple_varint(value, &mut t);
+        assert_eq!(read_simple_varint_slow(&t[..length]).unwrap(), value, "value mismatch");
+
+        let chunk = u32::from_le_bytes([t[0], t[1], t[2], t[3]]);
+        assert_eq!(read_simple_varint(chunk, length as u32), value);
+        assert_eq!(read_simple_varint(chunk, length as u32 + 1), value);
+        assert_eq!(read_simple_varint(chunk, length as u32 + 2), value);
+        assert_eq!(read_simple_varint(chunk, length as u32 + 3), value);
+        assert_eq!(read_simple_varint(chunk, length as u32 + 4), value);
+        assert_eq!(read_simple_varint(chunk, 0xffffffff), value);
     }
 }

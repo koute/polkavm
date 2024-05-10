@@ -4,7 +4,7 @@ use std::sync::Mutex;
 use core::marker::PhantomData;
 
 use polkavm_assembler::{Assembler, Label};
-use polkavm_common::program::{ParsedInstruction, ProgramExport, Instructions, JumpTable, RawReg};
+use polkavm_common::program::{ParsedInstruction, ProgramExport, Instructions, JumpTable, RawReg, InstructionVisitor};
 use polkavm_common::zygote::{
     VM_COMPILER_MAXIMUM_EPILOGUE_LENGTH, VM_COMPILER_MAXIMUM_INSTRUCTION_LENGTH,
 };
@@ -33,10 +33,6 @@ struct Cache {
 pub(crate) struct CompilerCache(Mutex<Cache>);
 
 pub(crate) struct CompilerVisitor<'a, S> where S: Sandbox {
-    current_code_offset: u32,
-    next_code_offset: u32,
-    is_last_instruction: bool,
-
     init: GuestInit<'a>,
     jump_table: JumpTable<'a>,
     code: &'a [u8],
@@ -133,9 +129,6 @@ impl<'a, S> CompilerVisitor<'a, S> where S: Sandbox {
         asm.set_origin(native_code_address);
 
         let mut visitor = CompilerVisitor {
-            current_code_offset: 0,
-            next_code_offset: 0,
-            is_last_instruction: false,
             gas_visitor: GasVisitor::default(),
             asm,
             exports,
@@ -167,7 +160,7 @@ impl<'a, S> CompilerVisitor<'a, S> where S: Sandbox {
             ArchVisitor(&mut visitor).emit_trace_trampoline();
         }
 
-        visitor.start_new_basic_block::<true>();
+        visitor.force_start_new_basic_block(0);
         Ok((visitor, address_space))
     }
 
@@ -272,56 +265,61 @@ impl<'a, S> CompilerVisitor<'a, S> where S: Sandbox {
     }
 
     #[inline(always)]
-    fn start_new_basic_block<const IS_INITIAL: bool>(&mut self) {
-        if !IS_INITIAL && self.gas_metering.is_some() {
+    fn start_new_basic_block(&mut self, code_offset: u32, args_length: u32) {
+        if self.gas_metering.is_some() {
             let cost = self.gas_visitor.take_block_cost().unwrap();
             self.gas_cost_for_basic_block.push(cost);
         }
 
-        if !self.is_last_instruction {
-            let code_offset = self.next_code_offset;
-
-            log::trace!("Starting new basic block at: {code_offset}");
-            if let Some(label) = self.code_offset_to_label.get(code_offset) {
-                log::trace!("Label: {label} -> {code_offset} -> {:08x}", self.asm.current_address());
-                self.asm.define_label(label);
-            } else {
-                let label = self.asm.create_label();
-                log::trace!("Label: {label} -> {code_offset} -> {:08x}", self.asm.current_address());
-                self.code_offset_to_label.insert(code_offset, label);
-            }
-
-            if let Some(gas_metering) = self.gas_metering {
-                self.gas_metering_stub_offsets.push(self.asm.len());
-                ArchVisitor(self).emit_gas_metering_stub(gas_metering);
-            }
+        let next_code_offset = code_offset + args_length + 1;
+        let is_last_instruction = next_code_offset as usize >= self.code.len();
+        if !is_last_instruction {
+            self.force_start_new_basic_block(next_code_offset);
         }
     }
 
     #[inline(always)]
-    fn before_instruction(&mut self) {
-        self.code_offset_to_native_code_offset.push((self.current_code_offset, self.asm.len() as u32));
-
-        if log::log_enabled!(log::Level::Trace) {
-            self.trace_compiled_instruction();
+    fn force_start_new_basic_block(&mut self, next_code_offset: u32) {
+        log::trace!("Starting new basic block at: {next_code_offset}");
+        if let Some(label) = self.code_offset_to_label.get(next_code_offset) {
+            log::trace!("Label: {label} -> {next_code_offset} -> {:08x}", self.asm.current_address());
+            self.asm.define_label(label);
+        } else {
+            let label = self.asm.create_label();
+            log::trace!("Label: {label} -> {next_code_offset} -> {:08x}", self.asm.current_address());
+            self.code_offset_to_label.insert(next_code_offset, label);
         }
 
-        if self.debug_trace_execution {
-            ArchVisitor(self).trace_execution();
+        if let Some(gas_metering) = self.gas_metering {
+            self.gas_metering_stub_offsets.push(self.asm.len());
+            ArchVisitor(self).emit_gas_metering_stub(gas_metering);
         }
     }
 
-    fn after_instruction(&mut self) {
+    #[inline(always)]
+    fn before_instruction(&mut self, code_offset: u32) {
+        self.code_offset_to_native_code_offset.push((code_offset, self.asm.len() as u32));
+
+        if log::log_enabled!(log::Level::Trace) {
+            self.trace_compiled_instruction(code_offset);
+        }
+
+        if self.debug_trace_execution {
+            ArchVisitor(self).trace_execution(code_offset);
+        }
+    }
+
+    fn after_instruction(&mut self, code_offset: u32) {
         if cfg!(debug_assertions) && !self.debug_trace_execution {
             let offset = self.code_offset_to_native_code_offset.last().unwrap().1 as usize;
             let instruction_length = self.asm.len() - offset;
             if instruction_length > VM_COMPILER_MAXIMUM_INSTRUCTION_LENGTH as usize {
-                self.panic_on_too_long_instruction(instruction_length)
+                self.panic_on_too_long_instruction(code_offset, instruction_length)
             }
         }
     }
 
-    fn current_instruction(&self) -> impl core::fmt::Display {
+    fn current_instruction(&self, code_offset: u32) -> impl core::fmt::Display {
         struct MaybeInstruction(Option<ParsedInstruction>);
         impl core::fmt::Display for MaybeInstruction {
             fn fmt(&self, fmt: &mut core::fmt::Formatter) -> core::fmt::Result {
@@ -332,23 +330,23 @@ impl<'a, S> CompilerVisitor<'a, S> where S: Sandbox {
                 }
             }
         }
-        MaybeInstruction(Instructions::new(self.code, self.bitmask, self.current_code_offset).next())
+        MaybeInstruction(Instructions::new(self.code, self.bitmask, code_offset).next())
     }
 
     #[cold]
-    fn panic_on_too_long_instruction(&self, instruction_length: usize) -> ! {
+    fn panic_on_too_long_instruction(&self, code_offset: u32, instruction_length: usize) -> ! {
         panic!(
             "maximum instruction length of {} exceeded with {} bytes for instruction: {}",
             VM_COMPILER_MAXIMUM_INSTRUCTION_LENGTH,
             instruction_length,
-            self.current_instruction(),
+            self.current_instruction(code_offset),
         );
     }
 
     #[inline(never)]
     #[cold]
-    fn trace_compiled_instruction(&self) {
-        log::trace!("Compiling {}", self.current_instruction());
+    fn trace_compiled_instruction(&self, code_offset: u32) {
+        log::trace!("Compiling {}", self.current_instruction(code_offset));
     }
 
     fn get_or_forward_declare_label(&mut self, code_offset: u32) -> Label {
@@ -371,742 +369,732 @@ impl<'a, S> CompilerVisitor<'a, S> where S: Sandbox {
 }
 
 impl<'a, S> polkavm_common::program::ParsingVisitor for CompilerVisitor<'a, S> where S: Sandbox {
-    #[cfg_attr(not(debug_assertions), inline)]
-    fn on_pre_visit(&mut self, offset: usize, length: usize, _opcode: u8) -> Self::ReturnTy {
-        self.current_code_offset = offset as u32;
-        let next_code_offset = offset + length;
-        self.next_code_offset = next_code_offset as u32;
-        self.is_last_instruction = next_code_offset == self.code.len();
-    }
-}
-
-impl<'a, S> polkavm_common::program::InstructionVisitor for CompilerVisitor<'a, S> where S: Sandbox {
     type ReturnTy = ();
 
     #[inline(always)]
-    fn trap(&mut self) -> Self::ReturnTy {
-        self.before_instruction();
+    fn trap(&mut self, code_offset: u32, args_length: u32) -> Self::ReturnTy {
+        self.before_instruction(code_offset);
         self.gas_visitor.trap();
         ArchVisitor(self).trap();
-        self.after_instruction();
-        self.start_new_basic_block::<false>();
+        self.after_instruction(code_offset);
+        self.start_new_basic_block(code_offset, args_length);
     }
 
     #[inline(always)]
-    fn fallthrough(&mut self) -> Self::ReturnTy {
-        self.before_instruction();
+    fn fallthrough(&mut self, code_offset: u32, args_length: u32) -> Self::ReturnTy {
+        self.before_instruction(code_offset);
         self.gas_visitor.fallthrough();
         ArchVisitor(self).fallthrough();
-        self.after_instruction();
-        self.start_new_basic_block::<false>();
+        self.after_instruction(code_offset);
+        self.start_new_basic_block(code_offset, args_length);
     }
 
     #[inline(always)]
-    fn sbrk(&mut self, d: RawReg, s: RawReg) -> Self::ReturnTy {
-        self.before_instruction();
+    fn sbrk(&mut self, code_offset: u32, _args_length: u32, d: RawReg, s: RawReg) -> Self::ReturnTy {
+        self.before_instruction(code_offset);
         self.gas_visitor.sbrk(d, s);
         ArchVisitor(self).sbrk(d, s);
-        self.after_instruction();
+        self.after_instruction(code_offset);
     }
 
     #[inline(always)]
-    fn ecalli(&mut self, imm: u32) -> Self::ReturnTy {
-        self.before_instruction();
+    fn ecalli(&mut self, code_offset: u32, _args_length: u32, imm: u32) -> Self::ReturnTy {
+        self.before_instruction(code_offset);
         self.gas_visitor.ecalli(imm);
         ArchVisitor(self).ecalli(imm);
-        self.after_instruction();
+        self.after_instruction(code_offset);
     }
 
     #[inline(always)]
-    fn set_less_than_unsigned(&mut self, d: RawReg, s1: RawReg, s2: RawReg) -> Self::ReturnTy {
-        self.before_instruction();
+    fn set_less_than_unsigned(&mut self, code_offset: u32, _args_length: u32, d: RawReg, s1: RawReg, s2: RawReg) -> Self::ReturnTy {
+        self.before_instruction(code_offset);
         self.gas_visitor.set_less_than_unsigned(d, s1, s2);
         ArchVisitor(self).set_less_than_unsigned(d, s1, s2);
-        self.after_instruction();
+        self.after_instruction(code_offset);
     }
 
     #[inline(always)]
-    fn set_less_than_signed(&mut self, d: RawReg, s1: RawReg, s2: RawReg) -> Self::ReturnTy {
-        self.before_instruction();
+    fn set_less_than_signed(&mut self, code_offset: u32, _args_length: u32, d: RawReg, s1: RawReg, s2: RawReg) -> Self::ReturnTy {
+        self.before_instruction(code_offset);
         self.gas_visitor.set_less_than_signed(d, s1, s2);
         ArchVisitor(self).set_less_than_signed(d, s1, s2);
-        self.after_instruction();
+        self.after_instruction(code_offset);
     }
 
     #[inline(always)]
-    fn shift_logical_right(&mut self, d: RawReg, s1: RawReg, s2: RawReg) -> Self::ReturnTy {
-        self.before_instruction();
+    fn shift_logical_right(&mut self, code_offset: u32, _args_length: u32, d: RawReg, s1: RawReg, s2: RawReg) -> Self::ReturnTy {
+        self.before_instruction(code_offset);
         self.gas_visitor.shift_logical_right(d, s1, s2);
         ArchVisitor(self).shift_logical_right(d, s1, s2);
-        self.after_instruction();
+        self.after_instruction(code_offset);
     }
 
     #[inline(always)]
-    fn shift_arithmetic_right(&mut self, d: RawReg, s1: RawReg, s2: RawReg) -> Self::ReturnTy {
-        self.before_instruction();
+    fn shift_arithmetic_right(&mut self, code_offset: u32, _args_length: u32, d: RawReg, s1: RawReg, s2: RawReg) -> Self::ReturnTy {
+        self.before_instruction(code_offset);
         self.gas_visitor.shift_arithmetic_right(d, s1, s2);
         ArchVisitor(self).shift_arithmetic_right(d, s1, s2);
-        self.after_instruction();
+        self.after_instruction(code_offset);
     }
 
     #[inline(always)]
-    fn shift_logical_left(&mut self, d: RawReg, s1: RawReg, s2: RawReg) -> Self::ReturnTy {
-        self.before_instruction();
+    fn shift_logical_left(&mut self, code_offset: u32, _args_length: u32, d: RawReg, s1: RawReg, s2: RawReg) -> Self::ReturnTy {
+        self.before_instruction(code_offset);
         self.gas_visitor.shift_logical_left(d, s1, s2);
         ArchVisitor(self).shift_logical_left(d, s1, s2);
-        self.after_instruction();
+        self.after_instruction(code_offset);
     }
 
     #[inline(always)]
-    fn xor(&mut self, d: RawReg, s1: RawReg, s2: RawReg) -> Self::ReturnTy {
-        self.before_instruction();
+    fn xor(&mut self, code_offset: u32, _args_length: u32, d: RawReg, s1: RawReg, s2: RawReg) -> Self::ReturnTy {
+        self.before_instruction(code_offset);
         self.gas_visitor.xor(d, s1, s2);
         ArchVisitor(self).xor(d, s1, s2);
-        self.after_instruction();
+        self.after_instruction(code_offset);
     }
 
     #[inline(always)]
-    fn and(&mut self, d: RawReg, s1: RawReg, s2: RawReg) -> Self::ReturnTy {
-        self.before_instruction();
+    fn and(&mut self, code_offset: u32, _args_length: u32, d: RawReg, s1: RawReg, s2: RawReg) -> Self::ReturnTy {
+        self.before_instruction(code_offset);
         self.gas_visitor.and(d, s1, s2);
         ArchVisitor(self).and(d, s1, s2);
-        self.after_instruction();
+        self.after_instruction(code_offset);
     }
 
     #[inline(always)]
-    fn or(&mut self, d: RawReg, s1: RawReg, s2: RawReg) -> Self::ReturnTy {
-        self.before_instruction();
+    fn or(&mut self, code_offset: u32, _args_length: u32, d: RawReg, s1: RawReg, s2: RawReg) -> Self::ReturnTy {
+        self.before_instruction(code_offset);
         self.gas_visitor.or(d, s1, s2);
         ArchVisitor(self).or(d, s1, s2);
-        self.after_instruction();
+        self.after_instruction(code_offset);
     }
 
     #[inline(always)]
-    fn add(&mut self, d: RawReg, s1: RawReg, s2: RawReg) -> Self::ReturnTy {
-        self.before_instruction();
+    fn add(&mut self, code_offset: u32, _args_length: u32, d: RawReg, s1: RawReg, s2: RawReg) -> Self::ReturnTy {
+        self.before_instruction(code_offset);
         self.gas_visitor.add(d, s1, s2);
         ArchVisitor(self).add(d, s1, s2);
-        self.after_instruction();
+        self.after_instruction(code_offset);
     }
 
     #[inline(always)]
-    fn sub(&mut self, d: RawReg, s1: RawReg, s2: RawReg) -> Self::ReturnTy {
-        self.before_instruction();
+    fn sub(&mut self, code_offset: u32, _args_length: u32, d: RawReg, s1: RawReg, s2: RawReg) -> Self::ReturnTy {
+        self.before_instruction(code_offset);
         self.gas_visitor.sub(d, s1, s2);
         ArchVisitor(self).sub(d, s1, s2);
-        self.after_instruction();
+        self.after_instruction(code_offset);
     }
 
     #[inline(always)]
-    fn mul(&mut self, d: RawReg, s1: RawReg, s2: RawReg) -> Self::ReturnTy {
-        self.before_instruction();
+    fn mul(&mut self, code_offset: u32, _args_length: u32, d: RawReg, s1: RawReg, s2: RawReg) -> Self::ReturnTy {
+        self.before_instruction(code_offset);
         self.gas_visitor.mul(d, s1, s2);
         ArchVisitor(self).mul(d, s1, s2);
-        self.after_instruction();
+        self.after_instruction(code_offset);
     }
 
     #[inline(always)]
-    fn mul_upper_signed_signed(&mut self, d: RawReg, s1: RawReg, s2: RawReg) -> Self::ReturnTy {
-        self.before_instruction();
+    fn mul_upper_signed_signed(&mut self, code_offset: u32, _args_length: u32, d: RawReg, s1: RawReg, s2: RawReg) -> Self::ReturnTy {
+        self.before_instruction(code_offset);
         self.gas_visitor.mul_upper_signed_signed(d, s1, s2);
         ArchVisitor(self).mul_upper_signed_signed(d, s1, s2);
-        self.after_instruction();
+        self.after_instruction(code_offset);
     }
 
     #[inline(always)]
-    fn mul_upper_unsigned_unsigned(&mut self, d: RawReg, s1: RawReg, s2: RawReg) -> Self::ReturnTy {
-        self.before_instruction();
+    fn mul_upper_unsigned_unsigned(&mut self, code_offset: u32, _args_length: u32, d: RawReg, s1: RawReg, s2: RawReg) -> Self::ReturnTy {
+        self.before_instruction(code_offset);
         self.gas_visitor.mul_upper_unsigned_unsigned(d, s1, s2);
         ArchVisitor(self).mul_upper_unsigned_unsigned(d, s1, s2);
-        self.after_instruction();
+        self.after_instruction(code_offset);
     }
 
     #[inline(always)]
-    fn mul_upper_signed_unsigned(&mut self, d: RawReg, s1: RawReg, s2: RawReg) -> Self::ReturnTy {
-        self.before_instruction();
+    fn mul_upper_signed_unsigned(&mut self, code_offset: u32, _args_length: u32, d: RawReg, s1: RawReg, s2: RawReg) -> Self::ReturnTy {
+        self.before_instruction(code_offset);
         self.gas_visitor.mul_upper_signed_unsigned(d, s1, s2);
         ArchVisitor(self).mul_upper_signed_unsigned(d, s1, s2);
-        self.after_instruction();
+        self.after_instruction(code_offset);
     }
 
     #[inline(always)]
-    fn div_unsigned(&mut self, d: RawReg, s1: RawReg, s2: RawReg) -> Self::ReturnTy {
-        self.before_instruction();
+    fn div_unsigned(&mut self, code_offset: u32, _args_length: u32, d: RawReg, s1: RawReg, s2: RawReg) -> Self::ReturnTy {
+        self.before_instruction(code_offset);
         self.gas_visitor.div_unsigned(d, s1, s2);
         ArchVisitor(self).div_unsigned(d, s1, s2);
-        self.after_instruction();
+        self.after_instruction(code_offset);
     }
 
     #[inline(always)]
-    fn div_signed(&mut self, d: RawReg, s1: RawReg, s2: RawReg) -> Self::ReturnTy {
-        self.before_instruction();
+    fn div_signed(&mut self, code_offset: u32, _args_length: u32, d: RawReg, s1: RawReg, s2: RawReg) -> Self::ReturnTy {
+        self.before_instruction(code_offset);
         self.gas_visitor.div_signed(d, s1, s2);
         ArchVisitor(self).div_signed(d, s1, s2);
-        self.after_instruction();
+        self.after_instruction(code_offset);
     }
 
     #[inline(always)]
-    fn rem_unsigned(&mut self, d: RawReg, s1: RawReg, s2: RawReg) -> Self::ReturnTy {
-        self.before_instruction();
+    fn rem_unsigned(&mut self, code_offset: u32, _args_length: u32, d: RawReg, s1: RawReg, s2: RawReg) -> Self::ReturnTy {
+        self.before_instruction(code_offset);
         self.gas_visitor.rem_unsigned(d, s1, s2);
         ArchVisitor(self).rem_unsigned(d, s1, s2);
-        self.after_instruction();
+        self.after_instruction(code_offset);
     }
 
     #[inline(always)]
-    fn rem_signed(&mut self, d: RawReg, s1: RawReg, s2: RawReg) -> Self::ReturnTy {
-        self.before_instruction();
+    fn rem_signed(&mut self, code_offset: u32, _args_length: u32, d: RawReg, s1: RawReg, s2: RawReg) -> Self::ReturnTy {
+        self.before_instruction(code_offset);
         self.gas_visitor.rem_signed(d, s1, s2);
         ArchVisitor(self).rem_signed(d, s1, s2);
-        self.after_instruction();
+        self.after_instruction(code_offset);
     }
 
     #[inline(always)]
-    fn mul_imm(&mut self, d: RawReg, s1: RawReg, s2: u32) -> Self::ReturnTy {
-        self.before_instruction();
+    fn mul_imm(&mut self, code_offset: u32, _args_length: u32, d: RawReg, s1: RawReg, s2: u32) -> Self::ReturnTy {
+        self.before_instruction(code_offset);
         self.gas_visitor.mul_imm(d, s1, s2);
         ArchVisitor(self).mul_imm(d, s1, s2);
-        self.after_instruction();
+        self.after_instruction(code_offset);
     }
 
     #[inline(always)]
-    fn mul_upper_signed_signed_imm(&mut self, d: RawReg, s1: RawReg, s2: u32) -> Self::ReturnTy {
-        self.before_instruction();
+    fn mul_upper_signed_signed_imm(&mut self, code_offset: u32, _args_length: u32, d: RawReg, s1: RawReg, s2: u32) -> Self::ReturnTy {
+        self.before_instruction(code_offset);
         self.gas_visitor.mul_upper_signed_signed_imm(d, s1, s2);
         ArchVisitor(self).mul_upper_signed_signed_imm(d, s1, s2);
-        self.after_instruction();
+        self.after_instruction(code_offset);
     }
 
     #[inline(always)]
-    fn mul_upper_unsigned_unsigned_imm(&mut self, d: RawReg, s1: RawReg, s2: u32) -> Self::ReturnTy {
-        self.before_instruction();
+    fn mul_upper_unsigned_unsigned_imm(&mut self, code_offset: u32, _args_length: u32, d: RawReg, s1: RawReg, s2: u32) -> Self::ReturnTy {
+        self.before_instruction(code_offset);
         self.gas_visitor.mul_upper_unsigned_unsigned_imm(d, s1, s2);
         ArchVisitor(self).mul_upper_unsigned_unsigned_imm(d, s1, s2);
-        self.after_instruction();
+        self.after_instruction(code_offset);
     }
 
     #[inline(always)]
-    fn set_less_than_unsigned_imm(&mut self, d: RawReg, s1: RawReg, s2: u32) -> Self::ReturnTy {
-        self.before_instruction();
+    fn set_less_than_unsigned_imm(&mut self, code_offset: u32, _args_length: u32, d: RawReg, s1: RawReg, s2: u32) -> Self::ReturnTy {
+        self.before_instruction(code_offset);
         self.gas_visitor.set_less_than_unsigned_imm(d, s1, s2);
         ArchVisitor(self).set_less_than_unsigned_imm(d, s1, s2);
-        self.after_instruction();
+        self.after_instruction(code_offset);
     }
 
     #[inline(always)]
-    fn set_less_than_signed_imm(&mut self, d: RawReg, s1: RawReg, s2: u32) -> Self::ReturnTy {
-        self.before_instruction();
+    fn set_less_than_signed_imm(&mut self, code_offset: u32, _args_length: u32, d: RawReg, s1: RawReg, s2: u32) -> Self::ReturnTy {
+        self.before_instruction(code_offset);
         self.gas_visitor.set_less_than_signed_imm(d, s1, s2);
         ArchVisitor(self).set_less_than_signed_imm(d, s1, s2);
-        self.after_instruction();
+        self.after_instruction(code_offset);
     }
 
     #[inline(always)]
-    fn set_greater_than_unsigned_imm(&mut self, d: RawReg, s1: RawReg, s2: u32) -> Self::ReturnTy {
-        self.before_instruction();
+    fn set_greater_than_unsigned_imm(&mut self, code_offset: u32, _args_length: u32, d: RawReg, s1: RawReg, s2: u32) -> Self::ReturnTy {
+        self.before_instruction(code_offset);
         self.gas_visitor.set_greater_than_unsigned_imm(d, s1, s2);
         ArchVisitor(self).set_greater_than_unsigned_imm(d, s1, s2);
-        self.after_instruction();
+        self.after_instruction(code_offset);
     }
 
     #[inline(always)]
-    fn set_greater_than_signed_imm(&mut self, d: RawReg, s1: RawReg, s2: u32) -> Self::ReturnTy {
-        self.before_instruction();
+    fn set_greater_than_signed_imm(&mut self, code_offset: u32, _args_length: u32, d: RawReg, s1: RawReg, s2: u32) -> Self::ReturnTy {
+        self.before_instruction(code_offset);
         self.gas_visitor.set_greater_than_signed_imm(d, s1, s2);
         ArchVisitor(self).set_greater_than_signed_imm(d, s1, s2);
-        self.after_instruction();
+        self.after_instruction(code_offset);
     }
 
     #[inline(always)]
-    fn shift_logical_right_imm(&mut self, d: RawReg, s1: RawReg, s2: u32) -> Self::ReturnTy {
-        self.before_instruction();
+    fn shift_logical_right_imm(&mut self, code_offset: u32, _args_length: u32, d: RawReg, s1: RawReg, s2: u32) -> Self::ReturnTy {
+        self.before_instruction(code_offset);
         self.gas_visitor.shift_logical_right_imm(d, s1, s2);
         ArchVisitor(self).shift_logical_right_imm(d, s1, s2);
-        self.after_instruction();
+        self.after_instruction(code_offset);
     }
 
     #[inline(always)]
-    fn shift_arithmetic_right_imm(&mut self, d: RawReg, s1: RawReg, s2: u32) -> Self::ReturnTy {
-        self.before_instruction();
+    fn shift_arithmetic_right_imm(&mut self, code_offset: u32, _args_length: u32, d: RawReg, s1: RawReg, s2: u32) -> Self::ReturnTy {
+        self.before_instruction(code_offset);
         self.gas_visitor.shift_arithmetic_right_imm(d, s1, s2);
         ArchVisitor(self).shift_arithmetic_right_imm(d, s1, s2);
-        self.after_instruction();
+        self.after_instruction(code_offset);
     }
 
     #[inline(always)]
-    fn shift_logical_left_imm(&mut self, d: RawReg, s1: RawReg, s2: u32) -> Self::ReturnTy {
-        self.before_instruction();
+    fn shift_logical_left_imm(&mut self, code_offset: u32, _args_length: u32, d: RawReg, s1: RawReg, s2: u32) -> Self::ReturnTy {
+        self.before_instruction(code_offset);
         self.gas_visitor.shift_logical_left_imm(d, s1, s2);
         ArchVisitor(self).shift_logical_left_imm(d, s1, s2);
-        self.after_instruction();
+        self.after_instruction(code_offset);
     }
 
     #[inline(always)]
-    fn shift_logical_right_imm_alt(&mut self, d: RawReg, s2: RawReg, s1: u32) -> Self::ReturnTy {
-        self.before_instruction();
+    fn shift_logical_right_imm_alt(&mut self, code_offset: u32, _args_length: u32, d: RawReg, s2: RawReg, s1: u32) -> Self::ReturnTy {
+        self.before_instruction(code_offset);
         self.gas_visitor.shift_logical_right_imm_alt(d, s2, s1);
         ArchVisitor(self).shift_logical_right_imm_alt(d, s2, s1);
-        self.after_instruction();
+        self.after_instruction(code_offset);
     }
 
     #[inline(always)]
-    fn shift_arithmetic_right_imm_alt(&mut self, d: RawReg, s2: RawReg, s1: u32) -> Self::ReturnTy {
-        self.before_instruction();
+    fn shift_arithmetic_right_imm_alt(&mut self, code_offset: u32, _args_length: u32, d: RawReg, s2: RawReg, s1: u32) -> Self::ReturnTy {
+        self.before_instruction(code_offset);
         self.gas_visitor.shift_arithmetic_right_imm_alt(d, s2, s1);
         ArchVisitor(self).shift_arithmetic_right_imm_alt(d, s2, s1);
-        self.after_instruction();
+        self.after_instruction(code_offset);
     }
 
     #[inline(always)]
-    fn shift_logical_left_imm_alt(&mut self, d: RawReg, s2: RawReg, s1: u32) -> Self::ReturnTy {
-        self.before_instruction();
+    fn shift_logical_left_imm_alt(&mut self, code_offset: u32, _args_length: u32, d: RawReg, s2: RawReg, s1: u32) -> Self::ReturnTy {
+        self.before_instruction(code_offset);
         self.gas_visitor.shift_logical_left_imm_alt(d, s2, s1);
         ArchVisitor(self).shift_logical_left_imm_alt(d, s2, s1);
-        self.after_instruction();
+        self.after_instruction(code_offset);
     }
 
     #[inline(always)]
-    fn or_imm(&mut self, d: RawReg, s: RawReg, imm: u32) -> Self::ReturnTy {
-        self.before_instruction();
+    fn or_imm(&mut self, code_offset: u32, _args_length: u32, d: RawReg, s: RawReg, imm: u32) -> Self::ReturnTy {
+        self.before_instruction(code_offset);
         self.gas_visitor.or_imm(d, s, imm);
         ArchVisitor(self).or_imm(d, s, imm);
-        self.after_instruction();
+        self.after_instruction(code_offset);
     }
 
     #[inline(always)]
-    fn and_imm(&mut self, d: RawReg, s: RawReg, imm: u32) -> Self::ReturnTy {
-        self.before_instruction();
+    fn and_imm(&mut self, code_offset: u32, _args_length: u32, d: RawReg, s: RawReg, imm: u32) -> Self::ReturnTy {
+        self.before_instruction(code_offset);
         self.gas_visitor.and_imm(d, s, imm);
         ArchVisitor(self).and_imm(d, s, imm);
-        self.after_instruction();
+        self.after_instruction(code_offset);
     }
 
     #[inline(always)]
-    fn xor_imm(&mut self, d: RawReg, s: RawReg, imm: u32) -> Self::ReturnTy {
-        self.before_instruction();
+    fn xor_imm(&mut self, code_offset: u32, _args_length: u32, d: RawReg, s: RawReg, imm: u32) -> Self::ReturnTy {
+        self.before_instruction(code_offset);
         self.gas_visitor.xor_imm(d, s, imm);
         ArchVisitor(self).xor_imm(d, s, imm);
-        self.after_instruction();
+        self.after_instruction(code_offset);
     }
 
     #[inline(always)]
-    fn move_reg(&mut self, d: RawReg, s: RawReg) -> Self::ReturnTy {
-        self.before_instruction();
+    fn move_reg(&mut self, code_offset: u32, _args_length: u32, d: RawReg, s: RawReg) -> Self::ReturnTy {
+        self.before_instruction(code_offset);
         self.gas_visitor.move_reg(d, s);
         ArchVisitor(self).move_reg(d, s);
-        self.after_instruction();
+        self.after_instruction(code_offset);
     }
 
     #[inline(always)]
-    fn cmov_if_zero(&mut self, d: RawReg, s: RawReg, c: RawReg) -> Self::ReturnTy {
-        self.before_instruction();
+    fn cmov_if_zero(&mut self, code_offset: u32, _args_length: u32, d: RawReg, s: RawReg, c: RawReg) -> Self::ReturnTy {
+        self.before_instruction(code_offset);
         self.gas_visitor.cmov_if_zero(d, s, c);
         ArchVisitor(self).cmov_if_zero(d, s, c);
-        self.after_instruction();
+        self.after_instruction(code_offset);
     }
 
     #[inline(always)]
-    fn cmov_if_not_zero(&mut self, d: RawReg, s: RawReg, c: RawReg) -> Self::ReturnTy {
-        self.before_instruction();
+    fn cmov_if_not_zero(&mut self, code_offset: u32, _args_length: u32, d: RawReg, s: RawReg, c: RawReg) -> Self::ReturnTy {
+        self.before_instruction(code_offset);
         self.gas_visitor.cmov_if_not_zero(d, s, c);
         ArchVisitor(self).cmov_if_not_zero(d, s, c);
-        self.after_instruction();
+        self.after_instruction(code_offset);
     }
 
     #[inline(always)]
-    fn cmov_if_zero_imm(&mut self, d: RawReg, c: RawReg, s: u32) -> Self::ReturnTy {
-        self.before_instruction();
+    fn cmov_if_zero_imm(&mut self, code_offset: u32, _args_length: u32, d: RawReg, c: RawReg, s: u32) -> Self::ReturnTy {
+        self.before_instruction(code_offset);
         self.gas_visitor.cmov_if_zero_imm(d, c, s);
         ArchVisitor(self).cmov_if_zero_imm(d, c, s);
-        self.after_instruction();
+        self.after_instruction(code_offset);
     }
 
     #[inline(always)]
-    fn cmov_if_not_zero_imm(&mut self, d: RawReg, c: RawReg, s: u32) -> Self::ReturnTy {
-        self.before_instruction();
+    fn cmov_if_not_zero_imm(&mut self, code_offset: u32, _args_length: u32, d: RawReg, c: RawReg, s: u32) -> Self::ReturnTy {
+        self.before_instruction(code_offset);
         self.gas_visitor.cmov_if_not_zero_imm(d, c, s);
         ArchVisitor(self).cmov_if_not_zero_imm(d, c, s);
-        self.after_instruction();
+        self.after_instruction(code_offset);
     }
 
     #[inline(always)]
-    fn add_imm(&mut self, d: RawReg, s: RawReg, imm: u32) -> Self::ReturnTy {
-        self.before_instruction();
+    fn add_imm(&mut self, code_offset: u32, _args_length: u32, d: RawReg, s: RawReg, imm: u32) -> Self::ReturnTy {
+        self.before_instruction(code_offset);
         self.gas_visitor.add_imm(d, s, imm);
         ArchVisitor(self).add_imm(d, s, imm);
-        self.after_instruction();
+        self.after_instruction(code_offset);
     }
 
     #[inline(always)]
-    fn negate_and_add_imm(&mut self, d: RawReg, s1: RawReg, s2: u32) -> Self::ReturnTy {
-        self.before_instruction();
+    fn negate_and_add_imm(&mut self, code_offset: u32, _args_length: u32, d: RawReg, s1: RawReg, s2: u32) -> Self::ReturnTy {
+        self.before_instruction(code_offset);
         self.gas_visitor.negate_and_add_imm(d, s1, s2);
         ArchVisitor(self).negate_and_add_imm(d, s1, s2);
-        self.after_instruction();
+        self.after_instruction(code_offset);
     }
 
     #[inline(always)]
-    fn store_imm_indirect_u8(&mut self, base: RawReg, offset: u32, value: u32) -> Self::ReturnTy {
-        self.before_instruction();
+    fn store_imm_indirect_u8(&mut self, code_offset: u32, _args_length: u32, base: RawReg, offset: u32, value: u32) -> Self::ReturnTy {
+        self.before_instruction(code_offset);
         self.gas_visitor.store_imm_indirect_u8(base, offset, value);
         ArchVisitor(self).store_imm_indirect_u8(base, offset, value);
-        self.after_instruction();
+        self.after_instruction(code_offset);
     }
 
     #[inline(always)]
-    fn store_imm_indirect_u16(&mut self, base: RawReg, offset: u32, value: u32) -> Self::ReturnTy {
-        self.before_instruction();
+    fn store_imm_indirect_u16(&mut self, code_offset: u32, _args_length: u32, base: RawReg, offset: u32, value: u32) -> Self::ReturnTy {
+        self.before_instruction(code_offset);
         self.gas_visitor.store_imm_indirect_u16(base, offset, value);
         ArchVisitor(self).store_imm_indirect_u16(base, offset, value);
-        self.after_instruction();
+        self.after_instruction(code_offset);
     }
 
     #[inline(always)]
-    fn store_imm_indirect_u32(&mut self, base: RawReg, offset: u32, value: u32) -> Self::ReturnTy {
-        self.before_instruction();
+    fn store_imm_indirect_u32(&mut self, code_offset: u32, _args_length: u32, base: RawReg, offset: u32, value: u32) -> Self::ReturnTy {
+        self.before_instruction(code_offset);
         self.gas_visitor.store_imm_indirect_u32(base, offset, value);
         ArchVisitor(self).store_imm_indirect_u32(base, offset, value);
-        self.after_instruction();
+        self.after_instruction(code_offset);
     }
 
     #[inline(always)]
-    fn store_indirect_u8(&mut self, src: RawReg, base: RawReg, offset: u32) -> Self::ReturnTy {
-        self.before_instruction();
+    fn store_indirect_u8(&mut self, code_offset: u32, _args_length: u32, src: RawReg, base: RawReg, offset: u32) -> Self::ReturnTy {
+        self.before_instruction(code_offset);
         self.gas_visitor.store_indirect_u8(src, base, offset);
         ArchVisitor(self).store_indirect_u8(src, base, offset);
-        self.after_instruction();
+        self.after_instruction(code_offset);
     }
 
     #[inline(always)]
-    fn store_indirect_u16(&mut self, src: RawReg, base: RawReg, offset: u32) -> Self::ReturnTy {
-        self.before_instruction();
+    fn store_indirect_u16(&mut self, code_offset: u32, _args_length: u32, src: RawReg, base: RawReg, offset: u32) -> Self::ReturnTy {
+        self.before_instruction(code_offset);
         self.gas_visitor.store_indirect_u16(src, base, offset);
         ArchVisitor(self).store_indirect_u16(src, base, offset);
-        self.after_instruction();
+        self.after_instruction(code_offset);
     }
 
     #[inline(always)]
-    fn store_indirect_u32(&mut self, src: RawReg, base: RawReg, offset: u32) -> Self::ReturnTy {
-        self.before_instruction();
+    fn store_indirect_u32(&mut self, code_offset: u32, _args_length: u32, src: RawReg, base: RawReg, offset: u32) -> Self::ReturnTy {
+        self.before_instruction(code_offset);
         self.gas_visitor.store_indirect_u32(src, base, offset);
         ArchVisitor(self).store_indirect_u32(src, base, offset);
-        self.after_instruction();
+        self.after_instruction(code_offset);
     }
 
     #[inline(always)]
-    fn store_imm_u8(&mut self, value: u32, offset: u32) -> Self::ReturnTy {
-        self.before_instruction();
+    fn store_imm_u8(&mut self, code_offset: u32, _args_length: u32, value: u32, offset: u32) -> Self::ReturnTy {
+        self.before_instruction(code_offset);
         self.gas_visitor.store_imm_u8(value, offset);
         ArchVisitor(self).store_imm_u8(value, offset);
-        self.after_instruction();
+        self.after_instruction(code_offset);
     }
 
     #[inline(always)]
-    fn store_imm_u16(&mut self, value: u32, offset: u32) -> Self::ReturnTy {
-        self.before_instruction();
+    fn store_imm_u16(&mut self, code_offset: u32, _args_length: u32, value: u32, offset: u32) -> Self::ReturnTy {
+        self.before_instruction(code_offset);
         self.gas_visitor.store_imm_u16(value, offset);
         ArchVisitor(self).store_imm_u16(value, offset);
-        self.after_instruction();
+        self.after_instruction(code_offset);
     }
 
     #[inline(always)]
-    fn store_imm_u32(&mut self, value: u32, offset: u32) -> Self::ReturnTy {
-        self.before_instruction();
+    fn store_imm_u32(&mut self, code_offset: u32, _args_length: u32, value: u32, offset: u32) -> Self::ReturnTy {
+        self.before_instruction(code_offset);
         self.gas_visitor.store_imm_u32(value, offset);
         ArchVisitor(self).store_imm_u32(value, offset);
-        self.after_instruction();
+        self.after_instruction(code_offset);
     }
 
     #[inline(always)]
-    fn store_u8(&mut self, src: RawReg, offset: u32) -> Self::ReturnTy {
-        self.before_instruction();
+    fn store_u8(&mut self, code_offset: u32, _args_length: u32, src: RawReg, offset: u32) -> Self::ReturnTy {
+        self.before_instruction(code_offset);
         self.gas_visitor.store_u8(src, offset);
         ArchVisitor(self).store_u8(src, offset);
-        self.after_instruction();
+        self.after_instruction(code_offset);
     }
 
     #[inline(always)]
-    fn store_u16(&mut self, src: RawReg, offset: u32) -> Self::ReturnTy {
-        self.before_instruction();
+    fn store_u16(&mut self, code_offset: u32, _args_length: u32, src: RawReg, offset: u32) -> Self::ReturnTy {
+        self.before_instruction(code_offset);
         self.gas_visitor.store_u16(src, offset);
         ArchVisitor(self).store_u16(src, offset);
-        self.after_instruction();
+        self.after_instruction(code_offset);
     }
 
     #[inline(always)]
-    fn store_u32(&mut self, src: RawReg, offset: u32) -> Self::ReturnTy {
-        self.before_instruction();
+    fn store_u32(&mut self, code_offset: u32, _args_length: u32, src: RawReg, offset: u32) -> Self::ReturnTy {
+        self.before_instruction(code_offset);
         self.gas_visitor.store_u32(src, offset);
         ArchVisitor(self).store_u32(src, offset);
-        self.after_instruction();
+        self.after_instruction(code_offset);
     }
 
     #[inline(always)]
-    fn load_indirect_u8(&mut self, dst: RawReg, base: RawReg, offset: u32) -> Self::ReturnTy {
-        self.before_instruction();
+    fn load_indirect_u8(&mut self, code_offset: u32, _args_length: u32, dst: RawReg, base: RawReg, offset: u32) -> Self::ReturnTy {
+        self.before_instruction(code_offset);
         self.gas_visitor.load_indirect_u8(dst, base, offset);
         ArchVisitor(self).load_indirect_u8(dst, base, offset);
-        self.after_instruction();
+        self.after_instruction(code_offset);
     }
 
     #[inline(always)]
-    fn load_indirect_i8(&mut self, dst: RawReg, base: RawReg, offset: u32) -> Self::ReturnTy {
-        self.before_instruction();
+    fn load_indirect_i8(&mut self, code_offset: u32, _args_length: u32, dst: RawReg, base: RawReg, offset: u32) -> Self::ReturnTy {
+        self.before_instruction(code_offset);
         self.gas_visitor.load_indirect_i8(dst, base, offset);
         ArchVisitor(self).load_indirect_i8(dst, base, offset);
-        self.after_instruction();
+        self.after_instruction(code_offset);
     }
 
     #[inline(always)]
-    fn load_indirect_u16(&mut self, dst: RawReg, base: RawReg, offset: u32) -> Self::ReturnTy {
-        self.before_instruction();
+    fn load_indirect_u16(&mut self, code_offset: u32, _args_length: u32, dst: RawReg, base: RawReg, offset: u32) -> Self::ReturnTy {
+        self.before_instruction(code_offset);
         self.gas_visitor.load_indirect_u16(dst, base, offset);
         ArchVisitor(self).load_indirect_u16(dst, base, offset);
-        self.after_instruction();
+        self.after_instruction(code_offset);
     }
 
     #[inline(always)]
-    fn load_indirect_i16(&mut self, dst: RawReg, base: RawReg, offset: u32) -> Self::ReturnTy {
-        self.before_instruction();
+    fn load_indirect_i16(&mut self, code_offset: u32, _args_length: u32, dst: RawReg, base: RawReg, offset: u32) -> Self::ReturnTy {
+        self.before_instruction(code_offset);
         self.gas_visitor.load_indirect_i16(dst, base, offset);
         ArchVisitor(self).load_indirect_i16(dst, base, offset);
-        self.after_instruction();
+        self.after_instruction(code_offset);
     }
 
     #[inline(always)]
-    fn load_indirect_u32(&mut self, dst: RawReg, base: RawReg, offset: u32) -> Self::ReturnTy {
-        self.before_instruction();
+    fn load_indirect_u32(&mut self, code_offset: u32, _args_length: u32, dst: RawReg, base: RawReg, offset: u32) -> Self::ReturnTy {
+        self.before_instruction(code_offset);
         self.gas_visitor.load_indirect_u32(dst, base, offset);
         ArchVisitor(self).load_indirect_u32(dst, base, offset);
-        self.after_instruction();
+        self.after_instruction(code_offset);
     }
 
     #[inline(always)]
-    fn load_u8(&mut self, dst: RawReg, offset: u32) -> Self::ReturnTy {
-        self.before_instruction();
+    fn load_u8(&mut self, code_offset: u32, _args_length: u32, dst: RawReg, offset: u32) -> Self::ReturnTy {
+        self.before_instruction(code_offset);
         self.gas_visitor.load_u8(dst, offset);
         ArchVisitor(self).load_u8(dst, offset);
-        self.after_instruction();
+        self.after_instruction(code_offset);
     }
 
     #[inline(always)]
-    fn load_i8(&mut self, dst: RawReg, offset: u32) -> Self::ReturnTy {
-        self.before_instruction();
+    fn load_i8(&mut self, code_offset: u32, _args_length: u32, dst: RawReg, offset: u32) -> Self::ReturnTy {
+        self.before_instruction(code_offset);
         self.gas_visitor.load_i8(dst, offset);
         ArchVisitor(self).load_i8(dst, offset);
-        self.after_instruction();
+        self.after_instruction(code_offset);
     }
 
     #[inline(always)]
-    fn load_u16(&mut self, dst: RawReg, offset: u32) -> Self::ReturnTy {
-        self.before_instruction();
+    fn load_u16(&mut self, code_offset: u32, _args_length: u32, dst: RawReg, offset: u32) -> Self::ReturnTy {
+        self.before_instruction(code_offset);
         self.gas_visitor.load_u16(dst, offset);
         ArchVisitor(self).load_u16(dst, offset);
-        self.after_instruction();
+        self.after_instruction(code_offset);
     }
 
     #[inline(always)]
-    fn load_i16(&mut self, dst: RawReg, offset: u32) -> Self::ReturnTy {
-        self.before_instruction();
+    fn load_i16(&mut self, code_offset: u32, _args_length: u32, dst: RawReg, offset: u32) -> Self::ReturnTy {
+        self.before_instruction(code_offset);
         self.gas_visitor.load_i16(dst, offset);
         ArchVisitor(self).load_i16(dst, offset);
-        self.after_instruction();
+        self.after_instruction(code_offset);
     }
 
     #[inline(always)]
-    fn load_u32(&mut self, dst: RawReg, offset: u32) -> Self::ReturnTy {
-        self.before_instruction();
+    fn load_u32(&mut self, code_offset: u32, _args_length: u32, dst: RawReg, offset: u32) -> Self::ReturnTy {
+        self.before_instruction(code_offset);
         self.gas_visitor.load_u32(dst, offset);
         ArchVisitor(self).load_u32(dst, offset);
-        self.after_instruction();
+        self.after_instruction(code_offset);
     }
 
     #[inline(always)]
-    fn branch_less_unsigned(&mut self, s1: RawReg, s2: RawReg, imm: u32) -> Self::ReturnTy {
-        self.before_instruction();
+    fn branch_less_unsigned(&mut self, code_offset: u32, args_length: u32, s1: RawReg, s2: RawReg, imm: u32) -> Self::ReturnTy {
+        self.before_instruction(code_offset);
         self.gas_visitor.branch_less_unsigned(s1, s2, imm);
         ArchVisitor(self).branch_less_unsigned(s1, s2, imm);
-        self.after_instruction();
-        self.start_new_basic_block::<false>();
+        self.after_instruction(code_offset);
+        self.start_new_basic_block(code_offset, args_length);
     }
 
     #[inline(always)]
-    fn branch_less_signed(&mut self, s1: RawReg, s2: RawReg, imm: u32) -> Self::ReturnTy {
-        self.before_instruction();
+    fn branch_less_signed(&mut self, code_offset: u32, args_length: u32, s1: RawReg, s2: RawReg, imm: u32) -> Self::ReturnTy {
+        self.before_instruction(code_offset);
         self.gas_visitor.branch_less_signed(s1, s2, imm);
         ArchVisitor(self).branch_less_signed(s1, s2, imm);
-        self.after_instruction();
-        self.start_new_basic_block::<false>();
+        self.after_instruction(code_offset);
+        self.start_new_basic_block(code_offset, args_length);
     }
 
     #[inline(always)]
-    fn branch_greater_or_equal_unsigned(&mut self, s1: RawReg, s2: RawReg, imm: u32) -> Self::ReturnTy {
-        self.before_instruction();
+    fn branch_greater_or_equal_unsigned(&mut self, code_offset: u32, args_length: u32, s1: RawReg, s2: RawReg, imm: u32) -> Self::ReturnTy {
+        self.before_instruction(code_offset);
         self.gas_visitor.branch_greater_or_equal_unsigned(s1, s2, imm);
         ArchVisitor(self).branch_greater_or_equal_unsigned(s1, s2, imm);
-        self.after_instruction();
-        self.start_new_basic_block::<false>();
+        self.after_instruction(code_offset);
+        self.start_new_basic_block(code_offset, args_length);
     }
 
     #[inline(always)]
-    fn branch_greater_or_equal_signed(&mut self, s1: RawReg, s2: RawReg, imm: u32) -> Self::ReturnTy {
-        self.before_instruction();
+    fn branch_greater_or_equal_signed(&mut self, code_offset: u32, args_length: u32, s1: RawReg, s2: RawReg, imm: u32) -> Self::ReturnTy {
+        self.before_instruction(code_offset);
         self.gas_visitor.branch_greater_or_equal_signed(s1, s2, imm);
         ArchVisitor(self).branch_greater_or_equal_signed(s1, s2, imm);
-        self.after_instruction();
-        self.start_new_basic_block::<false>();
+        self.after_instruction(code_offset);
+        self.start_new_basic_block(code_offset, args_length);
     }
 
     #[inline(always)]
-    fn branch_eq(&mut self, s1: RawReg, s2: RawReg, imm: u32) -> Self::ReturnTy {
-        self.before_instruction();
+    fn branch_eq(&mut self, code_offset: u32, args_length: u32, s1: RawReg, s2: RawReg, imm: u32) -> Self::ReturnTy {
+        self.before_instruction(code_offset);
         self.gas_visitor.branch_eq(s1, s2, imm);
         ArchVisitor(self).branch_eq(s1, s2, imm);
-        self.after_instruction();
-        self.start_new_basic_block::<false>();
+        self.after_instruction(code_offset);
+        self.start_new_basic_block(code_offset, args_length);
     }
 
     #[inline(always)]
-    fn branch_not_eq(&mut self, s1: RawReg, s2: RawReg, imm: u32) -> Self::ReturnTy {
-        self.before_instruction();
+    fn branch_not_eq(&mut self, code_offset: u32, args_length: u32, s1: RawReg, s2: RawReg, imm: u32) -> Self::ReturnTy {
+        self.before_instruction(code_offset);
         self.gas_visitor.branch_not_eq(s1, s2, imm);
         ArchVisitor(self).branch_not_eq(s1, s2, imm);
-        self.after_instruction();
-        self.start_new_basic_block::<false>();
+        self.after_instruction(code_offset);
+        self.start_new_basic_block(code_offset, args_length);
     }
 
     #[inline(always)]
-    fn branch_eq_imm(&mut self, s1: RawReg, s2: u32, imm: u32) -> Self::ReturnTy {
-        self.before_instruction();
+    fn branch_eq_imm(&mut self, code_offset: u32, args_length: u32, s1: RawReg, s2: u32, imm: u32) -> Self::ReturnTy {
+        self.before_instruction(code_offset);
         self.gas_visitor.branch_eq_imm(s1, s2, imm);
         ArchVisitor(self).branch_eq_imm(s1, s2, imm);
-        self.after_instruction();
-        self.start_new_basic_block::<false>();
+        self.after_instruction(code_offset);
+        self.start_new_basic_block(code_offset, args_length);
     }
 
     #[inline(always)]
-    fn branch_not_eq_imm(&mut self, s1: RawReg, s2: u32, imm: u32) -> Self::ReturnTy {
-        self.before_instruction();
+    fn branch_not_eq_imm(&mut self, code_offset: u32, args_length: u32, s1: RawReg, s2: u32, imm: u32) -> Self::ReturnTy {
+        self.before_instruction(code_offset);
         self.gas_visitor.branch_not_eq_imm(s1, s2, imm);
         ArchVisitor(self).branch_not_eq_imm(s1, s2, imm);
-        self.after_instruction();
-        self.start_new_basic_block::<false>();
+        self.after_instruction(code_offset);
+        self.start_new_basic_block(code_offset, args_length);
     }
 
     #[inline(always)]
-    fn branch_less_unsigned_imm(&mut self, s1: RawReg, s2: u32, imm: u32) -> Self::ReturnTy {
-        self.before_instruction();
+    fn branch_less_unsigned_imm(&mut self, code_offset: u32, args_length: u32, s1: RawReg, s2: u32, imm: u32) -> Self::ReturnTy {
+        self.before_instruction(code_offset);
         self.gas_visitor.branch_less_unsigned_imm(s1, s2, imm);
         ArchVisitor(self).branch_less_unsigned_imm(s1, s2, imm);
-        self.after_instruction();
-        self.start_new_basic_block::<false>();
+        self.after_instruction(code_offset);
+        self.start_new_basic_block(code_offset, args_length);
     }
 
     #[inline(always)]
-    fn branch_less_signed_imm(&mut self, s1: RawReg, s2: u32, imm: u32) -> Self::ReturnTy {
-        self.before_instruction();
+    fn branch_less_signed_imm(&mut self, code_offset: u32, args_length: u32, s1: RawReg, s2: u32, imm: u32) -> Self::ReturnTy {
+        self.before_instruction(code_offset);
         self.gas_visitor.branch_less_signed_imm(s1, s2, imm);
         ArchVisitor(self).branch_less_signed_imm(s1, s2, imm);
-        self.after_instruction();
-        self.start_new_basic_block::<false>();
+        self.after_instruction(code_offset);
+        self.start_new_basic_block(code_offset, args_length);
     }
 
     #[inline(always)]
-    fn branch_greater_or_equal_unsigned_imm(&mut self, s1: RawReg, s2: u32, imm: u32) -> Self::ReturnTy {
-        self.before_instruction();
+    fn branch_greater_or_equal_unsigned_imm(&mut self, code_offset: u32, args_length: u32, s1: RawReg, s2: u32, imm: u32) -> Self::ReturnTy {
+        self.before_instruction(code_offset);
         self.gas_visitor.branch_greater_or_equal_unsigned_imm(s1, s2, imm);
         ArchVisitor(self).branch_greater_or_equal_unsigned_imm(s1, s2, imm);
-        self.after_instruction();
-        self.start_new_basic_block::<false>();
+        self.after_instruction(code_offset);
+        self.start_new_basic_block(code_offset, args_length);
     }
 
     #[inline(always)]
-    fn branch_greater_or_equal_signed_imm(&mut self, s1: RawReg, s2: u32, imm: u32) -> Self::ReturnTy {
-        self.before_instruction();
+    fn branch_greater_or_equal_signed_imm(&mut self, code_offset: u32, args_length: u32, s1: RawReg, s2: u32, imm: u32) -> Self::ReturnTy {
+        self.before_instruction(code_offset);
         self.gas_visitor.branch_greater_or_equal_signed_imm(s1, s2, imm);
         ArchVisitor(self).branch_greater_or_equal_signed_imm(s1, s2, imm);
-        self.after_instruction();
-        self.start_new_basic_block::<false>();
+        self.after_instruction(code_offset);
+        self.start_new_basic_block(code_offset, args_length);
     }
 
     #[inline(always)]
-    fn branch_less_or_equal_unsigned_imm(&mut self, s1: RawReg, s2: u32, imm: u32) -> Self::ReturnTy {
-        self.before_instruction();
+    fn branch_less_or_equal_unsigned_imm(&mut self, code_offset: u32, args_length: u32, s1: RawReg, s2: u32, imm: u32) -> Self::ReturnTy {
+        self.before_instruction(code_offset);
         self.gas_visitor.branch_less_or_equal_unsigned_imm(s1, s2, imm);
         ArchVisitor(self).branch_less_or_equal_unsigned_imm(s1, s2, imm);
-        self.after_instruction();
-        self.start_new_basic_block::<false>();
+        self.after_instruction(code_offset);
+        self.start_new_basic_block(code_offset, args_length);
     }
 
     #[inline(always)]
-    fn branch_less_or_equal_signed_imm(&mut self, s1: RawReg, s2: u32, imm: u32) -> Self::ReturnTy {
-        self.before_instruction();
+    fn branch_less_or_equal_signed_imm(&mut self, code_offset: u32, args_length: u32, s1: RawReg, s2: u32, imm: u32) -> Self::ReturnTy {
+        self.before_instruction(code_offset);
         self.gas_visitor.branch_less_or_equal_signed_imm(s1, s2, imm);
         ArchVisitor(self).branch_less_or_equal_signed_imm(s1, s2, imm);
-        self.after_instruction();
-        self.start_new_basic_block::<false>();
+        self.after_instruction(code_offset);
+        self.start_new_basic_block(code_offset, args_length);
     }
 
     #[inline(always)]
-    fn branch_greater_unsigned_imm(&mut self, s1: RawReg, s2: u32, imm: u32) -> Self::ReturnTy {
-        self.before_instruction();
+    fn branch_greater_unsigned_imm(&mut self, code_offset: u32, args_length: u32, s1: RawReg, s2: u32, imm: u32) -> Self::ReturnTy {
+        self.before_instruction(code_offset);
         self.gas_visitor.branch_greater_unsigned_imm(s1, s2, imm);
         ArchVisitor(self).branch_greater_unsigned_imm(s1, s2, imm);
-        self.after_instruction();
-        self.start_new_basic_block::<false>();
+        self.after_instruction(code_offset);
+        self.start_new_basic_block(code_offset, args_length);
     }
 
     #[inline(always)]
-    fn branch_greater_signed_imm(&mut self, s1: RawReg, s2: u32, imm: u32) -> Self::ReturnTy {
-        self.before_instruction();
+    fn branch_greater_signed_imm(&mut self, code_offset: u32, args_length: u32, s1: RawReg, s2: u32, imm: u32) -> Self::ReturnTy {
+        self.before_instruction(code_offset);
         self.gas_visitor.branch_greater_signed_imm(s1, s2, imm);
         ArchVisitor(self).branch_greater_signed_imm(s1, s2, imm);
-        self.after_instruction();
-        self.start_new_basic_block::<false>();
+        self.after_instruction(code_offset);
+        self.start_new_basic_block(code_offset, args_length);
     }
 
     #[inline(always)]
-    fn load_imm(&mut self, dst: RawReg, value: u32) -> Self::ReturnTy {
-        self.before_instruction();
+    fn load_imm(&mut self, code_offset: u32, _args_length: u32, dst: RawReg, value: u32) -> Self::ReturnTy {
+        self.before_instruction(code_offset);
         self.gas_visitor.load_imm(dst, value);
         ArchVisitor(self).load_imm(dst, value);
-        self.after_instruction();
+        self.after_instruction(code_offset);
     }
 
     #[inline(always)]
-    fn load_imm_and_jump(&mut self, ra: RawReg, value: u32, target: u32) -> Self::ReturnTy {
-        self.before_instruction();
+    fn load_imm_and_jump(&mut self, code_offset: u32, args_length: u32, ra: RawReg, value: u32, target: u32) -> Self::ReturnTy {
+        self.before_instruction(code_offset);
         self.gas_visitor.load_imm_and_jump(ra, value, target);
         ArchVisitor(self).load_imm_and_jump(ra, value, target);
-        self.after_instruction();
-        self.start_new_basic_block::<false>();
+        self.after_instruction(code_offset);
+        self.start_new_basic_block(code_offset, args_length);
     }
 
     #[inline(always)]
-    fn load_imm_and_jump_indirect(&mut self, ra: RawReg, base: RawReg, value: u32, offset: u32) -> Self::ReturnTy {
-        self.before_instruction();
+    fn load_imm_and_jump_indirect(&mut self, code_offset: u32, args_length: u32, ra: RawReg, base: RawReg, value: u32, offset: u32) -> Self::ReturnTy {
+        self.before_instruction(code_offset);
         self.gas_visitor.load_imm_and_jump_indirect(ra, base, value, offset);
         ArchVisitor(self).load_imm_and_jump_indirect(ra, base, value, offset);
-        self.after_instruction();
-        self.start_new_basic_block::<false>();
+        self.after_instruction(code_offset);
+        self.start_new_basic_block(code_offset, args_length);
     }
 
     #[inline(always)]
-    fn jump(&mut self, target: u32) -> Self::ReturnTy {
-        self.before_instruction();
+    fn jump(&mut self, code_offset: u32, args_length: u32, target: u32) -> Self::ReturnTy {
+        self.before_instruction(code_offset);
         self.gas_visitor.jump(target);
         ArchVisitor(self).jump(target);
-        self.after_instruction();
-        self.start_new_basic_block::<false>();
+        self.after_instruction(code_offset);
+        self.start_new_basic_block(code_offset, args_length);
     }
 
     #[inline(always)]
-    fn jump_indirect(&mut self, base: RawReg, offset: u32) -> Self::ReturnTy {
-        self.before_instruction();
+    fn jump_indirect(&mut self, code_offset: u32, args_length: u32, base: RawReg, offset: u32) -> Self::ReturnTy {
+        self.before_instruction(code_offset);
         self.gas_visitor.jump_indirect(base, offset);
         ArchVisitor(self).jump_indirect(base, offset);
-        self.after_instruction();
-        self.start_new_basic_block::<false>();
+        self.after_instruction(code_offset);
+        self.start_new_basic_block(code_offset, args_length);
     }
 }
 
