@@ -6,7 +6,7 @@ use polkavm_assembler::amd64::Reg::rsp;
 use polkavm_assembler::amd64::{Condition, LoadKind, RegSize, Size, MemOp};
 use polkavm_assembler::{ReservedAssembler, Label, U1, U2, U3, U4, NonZero};
 
-use polkavm_common::program::{InstructionVisitor, Reg};
+use polkavm_common::program::{InstructionVisitor, Reg, RawReg};
 use polkavm_common::zygote::VM_ADDR_VMCTX;
 
 use crate::config::GasMeteringKind;
@@ -42,8 +42,8 @@ const fn conv_reg_const(reg: Reg) -> NativeReg {
     }
 }
 
-static REG_MAP: [NativeReg; Reg::ALL.len()] = {
-    let mut output = [NativeReg::rcx; Reg::ALL.len()];
+static REG_MAP: [NativeReg; 16] = {
+    let mut output = [conv_reg_const(Reg::T2); 16];
     let mut index = 0;
     while index < Reg::ALL.len() {
         assert!(Reg::ALL[index] as usize == index);
@@ -54,14 +54,17 @@ static REG_MAP: [NativeReg; Reg::ALL.len()] = {
 };
 
 #[inline]
-fn conv_reg(reg: Reg) -> NativeReg {
-    REG_MAP[reg as usize]
+fn conv_reg(reg: RawReg) -> NativeReg {
+    let native_reg = REG_MAP[reg.raw_unparsed() as usize & 0b1111];
+    debug_assert_eq!(native_reg, conv_reg_const(reg.get()));
+
+    native_reg
 }
 
 #[test]
 fn test_conv_reg() {
     for reg in Reg::ALL {
-        assert_eq!(conv_reg(reg), conv_reg_const(reg));
+        assert_eq!(conv_reg(reg.into()), conv_reg_const(reg));
     }
 }
 
@@ -213,12 +216,12 @@ impl<'r, 'a, S> ArchVisitor<'r, 'a, S> where S: Sandbox {
     }
 
     #[cfg_attr(not(debug_assertions), inline(always))]
-    fn load_immediate(&mut self, dst: Reg, value: u32) {
+    fn load_immediate(&mut self, dst: RawReg, value: u32) {
         self.push(mov_imm(conv_reg(dst), imm32(value)));
     }
 
     #[cfg_attr(not(debug_assertions), inline(always))]
-    fn store(&mut self, src: impl Into<RegImm>, base: Option<Reg>, offset: u32, kind: Size) {
+    fn store(&mut self, src: impl Into<RegImm>, base: Option<RawReg>, offset: u32, kind: Size) {
         let src = src.into();
         load_store_operand!(self, S::KIND, base, offset, |dst| {
             match src {
@@ -236,20 +239,20 @@ impl<'r, 'a, S> ArchVisitor<'r, 'a, S> where S: Sandbox {
     }
 
     #[cfg_attr(not(debug_assertions), inline(always))]
-    fn load(&mut self, dst: Reg, base: Option<Reg>, offset: u32, kind: LoadKind) {
+    fn load(&mut self, dst: RawReg, base: Option<RawReg>, offset: u32, kind: LoadKind) {
         load_store_operand!(self, S::KIND, base, offset, |src| {
             self.push(load(kind, conv_reg(dst), src));
         });
     }
 
     #[cfg_attr(not(debug_assertions), inline(always))]
-    fn clear_reg(&mut self, reg: Reg) {
+    fn clear_reg(&mut self, reg: RawReg) {
         let reg = conv_reg(reg);
         self.push(xor((RegSize::R32, reg, reg)));
     }
 
     #[cfg_attr(not(debug_assertions), inline(always))]
-    fn fill_with_ones(&mut self, reg: Reg) {
+    fn fill_with_ones(&mut self, reg: RawReg) {
         match self.reg_size() {
             RegSize::R32 => {
                 self.push(mov_imm(conv_reg(reg), imm32(0xffffffff)));
@@ -262,7 +265,7 @@ impl<'r, 'a, S> ArchVisitor<'r, 'a, S> where S: Sandbox {
     }
 
     #[cfg_attr(not(debug_assertions), inline(always))]
-    fn compare_reg_reg(&mut self, d: Reg, s1: Reg, s2: Reg, condition: Condition) {
+    fn compare_reg_reg(&mut self, d: RawReg, s1: RawReg, s2: RawReg, condition: Condition) {
         let reg_size = self.reg_size();
         let s1 = conv_reg(s1);
         let s2 = conv_reg(s2);
@@ -280,7 +283,7 @@ impl<'r, 'a, S> ArchVisitor<'r, 'a, S> where S: Sandbox {
     }
 
     #[cfg_attr(not(debug_assertions), inline(always))]
-    fn compare_reg_imm(&mut self, d: Reg, s1: Reg, s2: u32, condition: Condition) {
+    fn compare_reg_imm(&mut self, d: RawReg, s1: RawReg, s2: u32, condition: Condition) {
         let reg_size = self.reg_size();
         let d = conv_reg(d);
         let s1 = conv_reg(s1);
@@ -317,7 +320,7 @@ impl<'r, 'a, S> ArchVisitor<'r, 'a, S> where S: Sandbox {
     }
 
     #[cfg_attr(not(debug_assertions), inline(always))]
-    fn shift_imm(&mut self, d: Reg, s1: Reg, s2: u32, kind: ShiftKind) {
+    fn shift_imm(&mut self, d: RawReg, s1: RawReg, s2: u32, kind: ShiftKind) {
         let reg_size = self.reg_size();
         let d = conv_reg(d);
         let s1 = conv_reg(s1);
@@ -342,7 +345,7 @@ impl<'r, 'a, S> ArchVisitor<'r, 'a, S> where S: Sandbox {
     }
 
     #[cfg_attr(not(debug_assertions), inline(always))]
-    fn shift(&mut self, d: Reg, s1: impl Into<RegImm>, s2: Reg, kind: ShiftKind) {
+    fn shift(&mut self, d: RawReg, s1: impl Into<RegImm>, s2: RawReg, kind: ShiftKind) {
         let reg_size = self.reg_size();
         let d = conv_reg(d);
         let s2 = conv_reg(s2);
@@ -369,7 +372,7 @@ impl<'r, 'a, S> ArchVisitor<'r, 'a, S> where S: Sandbox {
     }
 
     #[cfg_attr(not(debug_assertions), inline(always))]
-    fn mov(&mut self, dst: Reg, src: Reg) {
+    fn mov(&mut self, dst: RawReg, src: RawReg) {
         self.push(mov(self.reg_size(), conv_reg(dst), conv_reg(src)))
     }
 
@@ -391,7 +394,7 @@ impl<'r, 'a, S> ArchVisitor<'r, 'a, S> where S: Sandbox {
     }
 
     #[cfg_attr(not(debug_assertions), inline(always))]
-    fn branch(&mut self, s1: Reg, s2: impl Into<RegImm>, target: u32, condition: Condition) {
+    fn branch(&mut self, s1: RawReg, s2: impl Into<RegImm>, target: u32, condition: Condition) {
         let reg_size = self.reg_size();
         let s1 = conv_reg(s1);
         let label = self.get_or_forward_declare_label(target);
@@ -406,7 +409,7 @@ impl<'r, 'a, S> ArchVisitor<'r, 'a, S> where S: Sandbox {
     }
 
     #[cfg_attr(not(debug_assertions), inline(always))]
-    fn cmov(&mut self, d: Reg, s: Reg, c: Reg, condition: Condition) {
+    fn cmov(&mut self, d: RawReg, s: RawReg, c: RawReg, condition: Condition) {
         if d == s {
             return;
         }
@@ -423,7 +426,7 @@ impl<'r, 'a, S> ArchVisitor<'r, 'a, S> where S: Sandbox {
     }
 
     #[cfg_attr(not(debug_assertions), inline(always))]
-    fn cmov_imm(&mut self, d: Reg, s: u32, c: Reg, condition: Condition) {
+    fn cmov_imm(&mut self, d: RawReg, s: u32, c: RawReg, condition: Condition) {
         let reg_size = self.reg_size();
         let d = conv_reg(d);
         let c = conv_reg(c);
@@ -435,7 +438,7 @@ impl<'r, 'a, S> ArchVisitor<'r, 'a, S> where S: Sandbox {
         asm.assert_reserved_exactly_as_needed();
     }
 
-    fn div_rem(&mut self, d: Reg, s1: Reg, s2: Reg, div_rem: DivRem, kind: Signedness) {
+    fn div_rem(&mut self, d: RawReg, s1: RawReg, s2: RawReg, div_rem: DivRem, kind: Signedness) {
         // Unlike most other architectures RISC-V doesn't trap on division by zero
         // nor on division with overflow, and has well defined results in such cases.
 
@@ -548,14 +551,14 @@ impl<'r, 'a, S> ArchVisitor<'r, 'a, S> where S: Sandbox {
     fn save_registers_to_vmctx(&mut self) {
         let regs_base = self.load_vmctx_field_address(S::vmctx_regs_offset());
         for (nth, reg) in Reg::ALL.iter().copied().enumerate() {
-            self.push(store(Size::U32, reg_indirect(RegSize::R64, regs_base + nth as i32 * 4), conv_reg(reg)));
+            self.push(store(Size::U32, reg_indirect(RegSize::R64, regs_base + nth as i32 * 4), conv_reg(reg.into())));
         }
     }
 
     fn restore_registers_from_vmctx(&mut self) {
         let regs_base = self.load_vmctx_field_address(S::vmctx_regs_offset());
         for (nth, reg) in Reg::ALL.iter().copied().enumerate() {
-            self.push(load(LoadKind::U32, conv_reg(reg), reg_indirect(RegSize::R64, regs_base + nth as i32 * 4)));
+            self.push(load(LoadKind::U32, conv_reg(reg.into()), reg_indirect(RegSize::R64, regs_base + nth as i32 * 4)));
         }
     }
 
@@ -672,7 +675,7 @@ impl<'r, 'a, S> ArchVisitor<'r, 'a, S> where S: Sandbox {
     }
 
     #[cfg_attr(not(debug_assertions), inline(always))]
-    fn jump_indirect_impl(&mut self, load_imm: Option<(Reg, u32)>, base: Reg, offset: u32) {
+    fn jump_indirect_impl(&mut self, load_imm: Option<(RawReg, u32)>, base: RawReg, offset: u32) {
         match S::KIND {
             SandboxKind::Linux => {
                 use polkavm_assembler::amd64::{SegReg, Scale};
@@ -737,7 +740,7 @@ impl<'r, 'a, S> InstructionVisitor for ArchVisitor<'r, 'a, S> where S: Sandbox {
     }
 
     #[inline(always)]
-    fn sbrk(&mut self, dst: Reg, size: Reg) -> Self::ReturnTy {
+    fn sbrk(&mut self, dst: RawReg, size: RawReg) -> Self::ReturnTy {
         let label_bump_only = self.asm.forward_declare_label();
         let label_continue = self.asm.forward_declare_label();
         let sbrk_label = self.sbrk_label;
@@ -783,67 +786,67 @@ impl<'r, 'a, S> InstructionVisitor for ArchVisitor<'r, 'a, S> where S: Sandbox {
     }
 
     #[inline(always)]
-    fn set_less_than_unsigned(&mut self, d: Reg, s1: Reg, s2: Reg) -> Self::ReturnTy {
+    fn set_less_than_unsigned(&mut self, d: RawReg, s1: RawReg, s2: RawReg) -> Self::ReturnTy {
         self.compare_reg_reg(d, s1, s2, Condition::Below);
     }
 
     #[inline(always)]
-    fn set_less_than_unsigned_imm(&mut self, d: Reg, s1: Reg, s2: u32) -> Self::ReturnTy {
+    fn set_less_than_unsigned_imm(&mut self, d: RawReg, s1: RawReg, s2: u32) -> Self::ReturnTy {
         self.compare_reg_imm(d, s1, s2, Condition::Below);
     }
 
     #[inline(always)]
-    fn set_greater_than_unsigned_imm(&mut self, d: Reg, s1: Reg, s2: u32) -> Self::ReturnTy {
+    fn set_greater_than_unsigned_imm(&mut self, d: RawReg, s1: RawReg, s2: u32) -> Self::ReturnTy {
         self.compare_reg_imm(d, s1, s2, Condition::Above);
     }
 
     #[inline(always)]
-    fn set_less_than_signed(&mut self, d: Reg, s1: Reg, s2: Reg) -> Self::ReturnTy {
+    fn set_less_than_signed(&mut self, d: RawReg, s1: RawReg, s2: RawReg) -> Self::ReturnTy {
         self.compare_reg_reg(d, s1, s2, Condition::Less);
     }
 
     #[inline(always)]
-    fn set_less_than_signed_imm(&mut self, d: Reg, s1: Reg, s2: u32) -> Self::ReturnTy {
+    fn set_less_than_signed_imm(&mut self, d: RawReg, s1: RawReg, s2: u32) -> Self::ReturnTy {
         self.compare_reg_imm(d, s1, s2, Condition::Less);
     }
 
     #[inline(always)]
-    fn set_greater_than_signed_imm(&mut self, d: Reg, s1: Reg, s2: u32) -> Self::ReturnTy {
+    fn set_greater_than_signed_imm(&mut self, d: RawReg, s1: RawReg, s2: u32) -> Self::ReturnTy {
         self.compare_reg_imm(d, s1, s2, Condition::Greater);
     }
 
     #[inline(always)]
-    fn shift_logical_right(&mut self, d: Reg, s1: Reg, s2: Reg) -> Self::ReturnTy {
+    fn shift_logical_right(&mut self, d: RawReg, s1: RawReg, s2: RawReg) -> Self::ReturnTy {
         self.shift(d, s1, s2, ShiftKind::LogicalRight);
     }
 
     #[inline(always)]
-    fn shift_arithmetic_right(&mut self, d: Reg, s1: Reg, s2: Reg) -> Self::ReturnTy {
+    fn shift_arithmetic_right(&mut self, d: RawReg, s1: RawReg, s2: RawReg) -> Self::ReturnTy {
         self.shift(d, s1, s2, ShiftKind::ArithmeticRight);
     }
 
     #[inline(always)]
-    fn shift_logical_left(&mut self, d: Reg, s1: Reg, s2: Reg) -> Self::ReturnTy {
+    fn shift_logical_left(&mut self, d: RawReg, s1: RawReg, s2: RawReg) -> Self::ReturnTy {
         self.shift(d, s1, s2, ShiftKind::LogicalLeft);
     }
 
     #[inline(always)]
-    fn shift_logical_right_imm_alt(&mut self, d: Reg, s2: Reg, s1: u32) -> Self::ReturnTy {
+    fn shift_logical_right_imm_alt(&mut self, d: RawReg, s2: RawReg, s1: u32) -> Self::ReturnTy {
         self.shift(d, s1, s2, ShiftKind::LogicalRight);
     }
 
     #[inline(always)]
-    fn shift_arithmetic_right_imm_alt(&mut self, d: Reg, s2: Reg, s1: u32) -> Self::ReturnTy  {
+    fn shift_arithmetic_right_imm_alt(&mut self, d: RawReg, s2: RawReg, s1: u32) -> Self::ReturnTy  {
         self.shift(d, s1, s2, ShiftKind::ArithmeticRight);
     }
 
     #[inline(always)]
-    fn shift_logical_left_imm_alt(&mut self, d: Reg, s2: Reg, s1: u32) -> Self::ReturnTy  {
+    fn shift_logical_left_imm_alt(&mut self, d: RawReg, s2: RawReg, s1: u32) -> Self::ReturnTy  {
         self.shift(d, s1, s2, ShiftKind::LogicalLeft);
     }
 
     #[inline(always)]
-    fn xor(&mut self, d: Reg, s1: Reg, s2: Reg) -> Self::ReturnTy {
+    fn xor(&mut self, d: RawReg, s1: RawReg, s2: RawReg) -> Self::ReturnTy {
         let reg_size = self.reg_size();
         let d = conv_reg(d);
         let s1 = conv_reg(s1);
@@ -864,7 +867,7 @@ impl<'r, 'a, S> InstructionVisitor for ArchVisitor<'r, 'a, S> where S: Sandbox {
     }
 
     #[inline(always)]
-    fn and(&mut self, d: Reg, s1: Reg, s2: Reg) -> Self::ReturnTy {
+    fn and(&mut self, d: RawReg, s1: RawReg, s2: RawReg) -> Self::ReturnTy {
         let reg_size = self.reg_size();
         let d = conv_reg(d);
         let s1 = conv_reg(s1);
@@ -885,7 +888,7 @@ impl<'r, 'a, S> InstructionVisitor for ArchVisitor<'r, 'a, S> where S: Sandbox {
     }
 
     #[inline(always)]
-    fn or(&mut self, d: Reg, s1: Reg, s2: Reg) -> Self::ReturnTy {
+    fn or(&mut self, d: RawReg, s1: RawReg, s2: RawReg) -> Self::ReturnTy {
         let reg_size = self.reg_size();
         let d = conv_reg(d);
         let s1 = conv_reg(s1);
@@ -906,7 +909,7 @@ impl<'r, 'a, S> InstructionVisitor for ArchVisitor<'r, 'a, S> where S: Sandbox {
     }
 
     #[inline(always)]
-    fn add(&mut self, d: Reg, s1: Reg, s2: Reg) -> Self::ReturnTy {
+    fn add(&mut self, d: RawReg, s1: RawReg, s2: RawReg) -> Self::ReturnTy {
         let reg_size = self.reg_size();
         let d = conv_reg(d);
         let s1 = conv_reg(s1);
@@ -927,7 +930,7 @@ impl<'r, 'a, S> InstructionVisitor for ArchVisitor<'r, 'a, S> where S: Sandbox {
     }
 
     #[inline(always)]
-    fn sub(&mut self, d: Reg, s1: Reg, s2: Reg) -> Self::ReturnTy {
+    fn sub(&mut self, d: RawReg, s1: RawReg, s2: RawReg) -> Self::ReturnTy {
         let reg_size = self.reg_size();
         let d = conv_reg(d);
         let s1 = conv_reg(s1);
@@ -951,7 +954,7 @@ impl<'r, 'a, S> InstructionVisitor for ArchVisitor<'r, 'a, S> where S: Sandbox {
     }
 
     #[inline(always)]
-    fn negate_and_add_imm(&mut self, d: Reg, s1: Reg, s2: u32) -> Self::ReturnTy {
+    fn negate_and_add_imm(&mut self, d: RawReg, s1: RawReg, s2: u32) -> Self::ReturnTy {
         let reg_size = self.reg_size();
         let d = conv_reg(d);
         let s1 = conv_reg(s1);
@@ -978,7 +981,7 @@ impl<'r, 'a, S> InstructionVisitor for ArchVisitor<'r, 'a, S> where S: Sandbox {
     }
 
     #[inline(always)]
-    fn mul(&mut self, d: Reg, s1: Reg, s2: Reg) -> Self::ReturnTy {
+    fn mul(&mut self, d: RawReg, s1: RawReg, s2: RawReg) -> Self::ReturnTy {
         let reg_size = self.reg_size();
         let d = conv_reg(d);
         let s1 = conv_reg(s1);
@@ -999,12 +1002,12 @@ impl<'r, 'a, S> InstructionVisitor for ArchVisitor<'r, 'a, S> where S: Sandbox {
     }
 
     #[inline(always)]
-    fn mul_imm(&mut self, d: Reg, s1: Reg, s2: u32) -> Self::ReturnTy {
+    fn mul_imm(&mut self, d: RawReg, s1: RawReg, s2: u32) -> Self::ReturnTy {
         self.push(imul_imm(RegSize::R32, conv_reg(d), conv_reg(s1), s2 as i32));
     }
 
     #[inline(always)]
-    fn mul_upper_signed_signed(&mut self, d: Reg, s1: Reg, s2: Reg) -> Self::ReturnTy {
+    fn mul_upper_signed_signed(&mut self, d: RawReg, s1: RawReg, s2: RawReg) -> Self::ReturnTy {
         let asm = self.asm.reserve::<U4>();
         let asm = asm.push(movsxd_32_to_64(TMP_REG, conv_reg(s2)));
         let asm = asm.push(movsxd_32_to_64(conv_reg(d), conv_reg(s1)));
@@ -1014,7 +1017,7 @@ impl<'r, 'a, S> InstructionVisitor for ArchVisitor<'r, 'a, S> where S: Sandbox {
     }
 
     #[inline(always)]
-    fn mul_upper_signed_signed_imm(&mut self, d: Reg, s1: Reg, s2: u32) -> Self::ReturnTy {
+    fn mul_upper_signed_signed_imm(&mut self, d: RawReg, s1: RawReg, s2: u32) -> Self::ReturnTy {
         let asm = self.asm.reserve::<U4>();
         let asm = asm.push(mov_imm(TMP_REG, imm64(s2 as i32)));
         let asm = asm.push(movsxd_32_to_64(conv_reg(d), conv_reg(s1)));
@@ -1024,7 +1027,7 @@ impl<'r, 'a, S> InstructionVisitor for ArchVisitor<'r, 'a, S> where S: Sandbox {
     }
 
     #[inline(always)]
-    fn mul_upper_unsigned_unsigned(&mut self, d: Reg, s1: Reg, s2: Reg) -> Self::ReturnTy {
+    fn mul_upper_unsigned_unsigned(&mut self, d: RawReg, s1: RawReg, s2: RawReg) -> Self::ReturnTy {
         let asm = self.asm.reserve::<U3>();
         let asm = if d == s1 {
             // d = d * s2
@@ -1043,7 +1046,7 @@ impl<'r, 'a, S> InstructionVisitor for ArchVisitor<'r, 'a, S> where S: Sandbox {
     }
 
     #[inline(always)]
-    fn mul_upper_unsigned_unsigned_imm(&mut self, d: Reg, s1: Reg, s2: u32) -> Self::ReturnTy {
+    fn mul_upper_unsigned_unsigned_imm(&mut self, d: RawReg, s1: RawReg, s2: u32) -> Self::ReturnTy {
         let asm = self.asm.reserve::<U4>();
         let asm = asm.push(mov_imm(TMP_REG, imm32(s2)));
         let asm = asm.push_if(d != s1, mov(RegSize::R32, conv_reg(d), conv_reg(s1)));
@@ -1053,7 +1056,7 @@ impl<'r, 'a, S> InstructionVisitor for ArchVisitor<'r, 'a, S> where S: Sandbox {
     }
 
     #[inline(always)]
-    fn mul_upper_signed_unsigned(&mut self, d: Reg, s1: Reg, s2: Reg) -> Self::ReturnTy {
+    fn mul_upper_signed_unsigned(&mut self, d: RawReg, s1: RawReg, s2: RawReg) -> Self::ReturnTy {
         // This instruction is equivalent to:
         //   let s1: i32;
         //   let s2: u32;
@@ -1085,42 +1088,42 @@ impl<'r, 'a, S> InstructionVisitor for ArchVisitor<'r, 'a, S> where S: Sandbox {
     }
 
     #[inline(always)]
-    fn div_unsigned(&mut self, d: Reg, s1: Reg, s2: Reg) -> Self::ReturnTy {
+    fn div_unsigned(&mut self, d: RawReg, s1: RawReg, s2: RawReg) -> Self::ReturnTy {
         self.div_rem(d, s1, s2, DivRem::Div, Signedness::Unsigned);
     }
 
     #[inline(always)]
-    fn div_signed(&mut self, d: Reg, s1: Reg, s2: Reg) -> Self::ReturnTy {
+    fn div_signed(&mut self, d: RawReg, s1: RawReg, s2: RawReg) -> Self::ReturnTy {
         self.div_rem(d, s1, s2, DivRem::Div, Signedness::Signed);
     }
 
     #[inline(always)]
-    fn rem_unsigned(&mut self, d: Reg, s1: Reg, s2: Reg) -> Self::ReturnTy {
+    fn rem_unsigned(&mut self, d: RawReg, s1: RawReg, s2: RawReg) -> Self::ReturnTy {
         self.div_rem(d, s1, s2, DivRem::Rem, Signedness::Unsigned);
     }
 
     #[inline(always)]
-    fn rem_signed(&mut self, d: Reg, s1: Reg, s2: Reg) -> Self::ReturnTy {
+    fn rem_signed(&mut self, d: RawReg, s1: RawReg, s2: RawReg) -> Self::ReturnTy {
         self.div_rem(d, s1, s2, DivRem::Rem, Signedness::Signed);
     }
 
     #[inline(always)]
-    fn shift_logical_right_imm(&mut self, d: Reg, s1: Reg, s2: u32) -> Self::ReturnTy {
+    fn shift_logical_right_imm(&mut self, d: RawReg, s1: RawReg, s2: u32) -> Self::ReturnTy {
         self.shift_imm(d, s1, s2, ShiftKind::LogicalRight);
     }
 
     #[inline(always)]
-    fn shift_arithmetic_right_imm(&mut self, d: Reg, s1: Reg, s2: u32) -> Self::ReturnTy {
+    fn shift_arithmetic_right_imm(&mut self, d: RawReg, s1: RawReg, s2: u32) -> Self::ReturnTy {
         self.shift_imm(d, s1, s2, ShiftKind::ArithmeticRight);
     }
 
     #[inline(always)]
-    fn shift_logical_left_imm(&mut self, d: Reg, s1: Reg, s2: u32) -> Self::ReturnTy {
+    fn shift_logical_left_imm(&mut self, d: RawReg, s1: RawReg, s2: u32) -> Self::ReturnTy {
         self.shift_imm(d, s1, s2, ShiftKind::LogicalLeft);
     }
 
     #[inline(always)]
-    fn or_imm(&mut self, d: Reg, s1: Reg, s2: u32) -> Self::ReturnTy {
+    fn or_imm(&mut self, d: RawReg, s1: RawReg, s2: u32) -> Self::ReturnTy {
         let reg_size = self.reg_size();
         let d = conv_reg(d);
         let s1 = conv_reg(s1);
@@ -1134,7 +1137,7 @@ impl<'r, 'a, S> InstructionVisitor for ArchVisitor<'r, 'a, S> where S: Sandbox {
     }
 
     #[inline(always)]
-    fn and_imm(&mut self, d: Reg, s1: Reg, s2: u32) -> Self::ReturnTy {
+    fn and_imm(&mut self, d: RawReg, s1: RawReg, s2: u32) -> Self::ReturnTy {
         let reg_size = self.reg_size();
         let d = conv_reg(d);
         let s1 = conv_reg(s1);
@@ -1148,7 +1151,7 @@ impl<'r, 'a, S> InstructionVisitor for ArchVisitor<'r, 'a, S> where S: Sandbox {
     }
 
     #[inline(always)]
-    fn xor_imm(&mut self, d: Reg, s1: Reg, s2: u32) -> Self::ReturnTy {
+    fn xor_imm(&mut self, d: RawReg, s1: RawReg, s2: u32) -> Self::ReturnTy {
         let reg_size = self.reg_size();
         let d = conv_reg(d);
         let s1 = conv_reg(s1);
@@ -1165,37 +1168,37 @@ impl<'r, 'a, S> InstructionVisitor for ArchVisitor<'r, 'a, S> where S: Sandbox {
     }
 
     #[inline(always)]
-    fn load_imm(&mut self, dst: Reg, s2: u32) -> Self::ReturnTy {
+    fn load_imm(&mut self, dst: RawReg, s2: u32) -> Self::ReturnTy {
         self.load_immediate(dst, s2);
     }
 
     #[inline(always)]
-    fn move_reg(&mut self, d: Reg, s: Reg) -> Self::ReturnTy {
+    fn move_reg(&mut self, d: RawReg, s: RawReg) -> Self::ReturnTy {
         self.mov(d, s);
     }
 
     #[inline(always)]
-    fn cmov_if_zero(&mut self, d: Reg, s: Reg, c: Reg) -> Self::ReturnTy {
+    fn cmov_if_zero(&mut self, d: RawReg, s: RawReg, c: RawReg) -> Self::ReturnTy {
         self.cmov(d, s, c, Condition::Equal);
     }
 
     #[inline(always)]
-    fn cmov_if_not_zero(&mut self, d: Reg, s: Reg, c: Reg) -> Self::ReturnTy {
+    fn cmov_if_not_zero(&mut self, d: RawReg, s: RawReg, c: RawReg) -> Self::ReturnTy {
         self.cmov(d, s, c, Condition::NotEqual);
     }
 
     #[inline(always)]
-    fn cmov_if_zero_imm(&mut self, d: Reg, c: Reg, s: u32) -> Self::ReturnTy {
+    fn cmov_if_zero_imm(&mut self, d: RawReg, c: RawReg, s: u32) -> Self::ReturnTy {
         self.cmov_imm(d, s, c, Condition::Equal);
     }
 
     #[inline(always)]
-    fn cmov_if_not_zero_imm(&mut self, d: Reg, c: Reg, s: u32) -> Self::ReturnTy {
+    fn cmov_if_not_zero_imm(&mut self, d: RawReg, c: RawReg, s: u32) -> Self::ReturnTy {
         self.cmov_imm(d, s, c, Condition::NotEqual);
     }
 
     #[inline(always)]
-    fn add_imm(&mut self, d: Reg, s1: Reg, s2: u32) -> Self::ReturnTy {
+    fn add_imm(&mut self, d: RawReg, s1: RawReg, s2: u32) -> Self::ReturnTy {
         let reg_size = self.reg_size();
         let d = conv_reg(d);
         let s1 = conv_reg(s1);
@@ -1213,47 +1216,47 @@ impl<'r, 'a, S> InstructionVisitor for ArchVisitor<'r, 'a, S> where S: Sandbox {
     }
 
     #[inline(always)]
-    fn store_u8(&mut self, src: Reg, offset: u32) -> Self::ReturnTy {
+    fn store_u8(&mut self, src: RawReg, offset: u32) -> Self::ReturnTy {
         self.store(src, None, offset, Size::U8);
     }
 
     #[inline(always)]
-    fn store_u16(&mut self, src: Reg, offset: u32) -> Self::ReturnTy {
+    fn store_u16(&mut self, src: RawReg, offset: u32) -> Self::ReturnTy {
         self.store(src, None, offset, Size::U16);
     }
 
     #[inline(always)]
-    fn store_u32(&mut self, src: Reg, offset: u32) -> Self::ReturnTy {
+    fn store_u32(&mut self, src: RawReg, offset: u32) -> Self::ReturnTy {
         self.store(src, None, offset, Size::U32);
     }
 
     #[inline(always)]
-    fn store_indirect_u8(&mut self, src: Reg, base: Reg, offset: u32) -> Self::ReturnTy {
+    fn store_indirect_u8(&mut self, src: RawReg, base: RawReg, offset: u32) -> Self::ReturnTy {
         self.store(src, Some(base), offset, Size::U8);
     }
 
     #[inline(always)]
-    fn store_indirect_u16(&mut self, src: Reg, base: Reg, offset: u32) -> Self::ReturnTy {
+    fn store_indirect_u16(&mut self, src: RawReg, base: RawReg, offset: u32) -> Self::ReturnTy {
         self.store(src, Some(base), offset, Size::U16);
     }
 
     #[inline(always)]
-    fn store_indirect_u32(&mut self, src: Reg, base: Reg, offset: u32) -> Self::ReturnTy {
+    fn store_indirect_u32(&mut self, src: RawReg, base: RawReg, offset: u32) -> Self::ReturnTy {
         self.store(src, Some(base), offset, Size::U32);
     }
 
     #[inline(always)]
-    fn store_imm_indirect_u8(&mut self, base: Reg, offset: u32, value: u32) -> Self::ReturnTy {
+    fn store_imm_indirect_u8(&mut self, base: RawReg, offset: u32, value: u32) -> Self::ReturnTy {
         self.store(value, Some(base), offset, Size::U8);
     }
 
     #[inline(always)]
-    fn store_imm_indirect_u16(&mut self, base: Reg, offset: u32, value: u32) -> Self::ReturnTy {
+    fn store_imm_indirect_u16(&mut self, base: RawReg, offset: u32, value: u32) -> Self::ReturnTy {
         self.store(value, Some(base), offset, Size::U16);
     }
 
     #[inline(always)]
-    fn store_imm_indirect_u32(&mut self, base: Reg, offset: u32, value: u32) -> Self::ReturnTy {
+    fn store_imm_indirect_u32(&mut self, base: RawReg, offset: u32, value: u32) -> Self::ReturnTy {
         self.store(value, Some(base), offset, Size::U32);
     }
 
@@ -1273,132 +1276,132 @@ impl<'r, 'a, S> InstructionVisitor for ArchVisitor<'r, 'a, S> where S: Sandbox {
     }
 
     #[inline(always)]
-    fn load_indirect_u8(&mut self, dst: Reg, base: Reg, offset: u32) -> Self::ReturnTy {
+    fn load_indirect_u8(&mut self, dst: RawReg, base: RawReg, offset: u32) -> Self::ReturnTy {
         self.load(dst, Some(base), offset, LoadKind::U8);
     }
 
     #[inline(always)]
-    fn load_indirect_i8(&mut self, dst: Reg, base: Reg, offset: u32) -> Self::ReturnTy {
+    fn load_indirect_i8(&mut self, dst: RawReg, base: RawReg, offset: u32) -> Self::ReturnTy {
         self.load(dst, Some(base), offset, LoadKind::I8);
     }
 
     #[inline(always)]
-    fn load_indirect_u16(&mut self, dst: Reg, base: Reg, offset: u32) -> Self::ReturnTy {
+    fn load_indirect_u16(&mut self, dst: RawReg, base: RawReg, offset: u32) -> Self::ReturnTy {
         self.load(dst, Some(base), offset, LoadKind::U16);
     }
 
     #[inline(always)]
-    fn load_indirect_i16(&mut self, dst: Reg, base: Reg, offset: u32) -> Self::ReturnTy {
+    fn load_indirect_i16(&mut self, dst: RawReg, base: RawReg, offset: u32) -> Self::ReturnTy {
         self.load(dst, Some(base), offset, LoadKind::I16);
     }
 
     #[inline(always)]
-    fn load_indirect_u32(&mut self, dst: Reg, base: Reg, offset: u32) -> Self::ReturnTy {
+    fn load_indirect_u32(&mut self, dst: RawReg, base: RawReg, offset: u32) -> Self::ReturnTy {
         self.load(dst, Some(base), offset, LoadKind::U32);
     }
 
     #[inline(always)]
-    fn load_u8(&mut self, dst: Reg, offset: u32) -> Self::ReturnTy {
+    fn load_u8(&mut self, dst: RawReg, offset: u32) -> Self::ReturnTy {
         self.load(dst, None, offset, LoadKind::U8);
     }
 
     #[inline(always)]
-    fn load_i8(&mut self, dst: Reg, offset: u32) -> Self::ReturnTy {
+    fn load_i8(&mut self, dst: RawReg, offset: u32) -> Self::ReturnTy {
         self.load(dst, None, offset, LoadKind::I8);
     }
 
     #[inline(always)]
-    fn load_u16(&mut self, dst: Reg, offset: u32) -> Self::ReturnTy {
+    fn load_u16(&mut self, dst: RawReg, offset: u32) -> Self::ReturnTy {
         self.load(dst, None, offset, LoadKind::U16);
     }
 
     #[inline(always)]
-    fn load_i16(&mut self, dst: Reg, offset: u32) -> Self::ReturnTy {
+    fn load_i16(&mut self, dst: RawReg, offset: u32) -> Self::ReturnTy {
         self.load(dst, None, offset, LoadKind::I16);
     }
 
     #[inline(always)]
-    fn load_u32(&mut self, dst: Reg, offset: u32) -> Self::ReturnTy {
+    fn load_u32(&mut self, dst: RawReg, offset: u32) -> Self::ReturnTy {
         self.load(dst, None, offset, LoadKind::U32);
     }
 
     #[inline(always)]
-    fn branch_less_unsigned(&mut self, s1: Reg, s2: Reg, target: u32) -> Self::ReturnTy {
+    fn branch_less_unsigned(&mut self, s1: RawReg, s2: RawReg, target: u32) -> Self::ReturnTy {
         self.branch(s1, s2, target, Condition::Below);
     }
 
     #[inline(always)]
-    fn branch_less_signed(&mut self, s1: Reg, s2: Reg, target: u32) -> Self::ReturnTy {
+    fn branch_less_signed(&mut self, s1: RawReg, s2: RawReg, target: u32) -> Self::ReturnTy {
         self.branch(s1, s2, target, Condition::Less);
     }
 
     #[inline(always)]
-    fn branch_greater_or_equal_unsigned(&mut self, s1: Reg, s2: Reg, target: u32) -> Self::ReturnTy {
+    fn branch_greater_or_equal_unsigned(&mut self, s1: RawReg, s2: RawReg, target: u32) -> Self::ReturnTy {
         self.branch(s1, s2, target, Condition::AboveOrEqual);
     }
 
     #[inline(always)]
-    fn branch_greater_or_equal_signed(&mut self, s1: Reg, s2: Reg, target: u32) -> Self::ReturnTy {
+    fn branch_greater_or_equal_signed(&mut self, s1: RawReg, s2: RawReg, target: u32) -> Self::ReturnTy {
         self.branch(s1, s2, target, Condition::GreaterOrEqual);
     }
 
     #[inline(always)]
-    fn branch_eq(&mut self, s1: Reg, s2: Reg, target: u32) -> Self::ReturnTy {
+    fn branch_eq(&mut self, s1: RawReg, s2: RawReg, target: u32) -> Self::ReturnTy {
         self.branch(s1, s2, target, Condition::Equal);
     }
 
     #[inline(always)]
-    fn branch_not_eq(&mut self, s1: Reg, s2: Reg, target: u32) -> Self::ReturnTy {
+    fn branch_not_eq(&mut self, s1: RawReg, s2: RawReg, target: u32) -> Self::ReturnTy {
         self.branch(s1, s2, target, Condition::NotEqual);
     }
 
     #[inline(always)]
-    fn branch_eq_imm(&mut self, s1: Reg, s2: u32, target: u32) -> Self::ReturnTy {
+    fn branch_eq_imm(&mut self, s1: RawReg, s2: u32, target: u32) -> Self::ReturnTy {
         self.branch(s1, s2, target, Condition::Equal);
     }
 
     #[inline(always)]
-    fn branch_not_eq_imm(&mut self, s1: Reg, s2: u32, target: u32) -> Self::ReturnTy {
+    fn branch_not_eq_imm(&mut self, s1: RawReg, s2: u32, target: u32) -> Self::ReturnTy {
         self.branch(s1, s2, target, Condition::NotEqual);
     }
 
     #[inline(always)]
-    fn branch_less_unsigned_imm(&mut self, s1: Reg, s2: u32, target: u32) -> Self::ReturnTy {
+    fn branch_less_unsigned_imm(&mut self, s1: RawReg, s2: u32, target: u32) -> Self::ReturnTy {
         self.branch(s1, s2, target, Condition::Below);
     }
 
     #[inline(always)]
-    fn branch_less_signed_imm(&mut self, s1: Reg, s2: u32, target: u32) -> Self::ReturnTy {
+    fn branch_less_signed_imm(&mut self, s1: RawReg, s2: u32, target: u32) -> Self::ReturnTy {
         self.branch(s1, s2, target, Condition::Less);
     }
 
     #[inline(always)]
-    fn branch_greater_or_equal_unsigned_imm(&mut self, s1: Reg, s2: u32, target: u32) -> Self::ReturnTy {
+    fn branch_greater_or_equal_unsigned_imm(&mut self, s1: RawReg, s2: u32, target: u32) -> Self::ReturnTy {
         self.branch(s1, s2, target, Condition::AboveOrEqual);
     }
 
     #[inline(always)]
-    fn branch_greater_or_equal_signed_imm(&mut self, s1: Reg, s2: u32, target: u32) -> Self::ReturnTy {
+    fn branch_greater_or_equal_signed_imm(&mut self, s1: RawReg, s2: u32, target: u32) -> Self::ReturnTy {
         self.branch(s1, s2, target, Condition::GreaterOrEqual);
     }
 
     #[inline(always)]
-    fn branch_less_or_equal_unsigned_imm(&mut self, s1: Reg, s2: u32, target: u32) -> Self::ReturnTy {
+    fn branch_less_or_equal_unsigned_imm(&mut self, s1: RawReg, s2: u32, target: u32) -> Self::ReturnTy {
         self.branch(s1, s2, target, Condition::BelowOrEqual);
     }
 
     #[inline(always)]
-    fn branch_less_or_equal_signed_imm(&mut self, s1: Reg, s2: u32, target: u32) -> Self::ReturnTy {
+    fn branch_less_or_equal_signed_imm(&mut self, s1: RawReg, s2: u32, target: u32) -> Self::ReturnTy {
         self.branch(s1, s2, target, Condition::LessOrEqual);
     }
 
     #[inline(always)]
-    fn branch_greater_unsigned_imm(&mut self, s1: Reg, s2: u32, target: u32) -> Self::ReturnTy {
+    fn branch_greater_unsigned_imm(&mut self, s1: RawReg, s2: u32, target: u32) -> Self::ReturnTy {
         self.branch(s1, s2, target, Condition::Above);
     }
 
     #[inline(always)]
-    fn branch_greater_signed_imm(&mut self, s1: Reg, s2: u32, target: u32) -> Self::ReturnTy {
+    fn branch_greater_signed_imm(&mut self, s1: RawReg, s2: u32, target: u32) -> Self::ReturnTy {
         self.branch(s1, s2, target, Condition::Greater);
     }
 
@@ -1409,7 +1412,7 @@ impl<'r, 'a, S> InstructionVisitor for ArchVisitor<'r, 'a, S> where S: Sandbox {
     }
 
     #[inline(always)]
-    fn load_imm_and_jump(&mut self, ra: Reg, value: u32, target: u32) -> Self::ReturnTy {
+    fn load_imm_and_jump(&mut self, ra: RawReg, value: u32, target: u32) -> Self::ReturnTy {
         let label = self.get_or_forward_declare_label(target);
         let asm = self.asm.reserve::<U2>();
         let asm = asm.push(mov_imm(conv_reg(ra), imm32(value)));
@@ -1418,12 +1421,12 @@ impl<'r, 'a, S> InstructionVisitor for ArchVisitor<'r, 'a, S> where S: Sandbox {
     }
 
     #[inline(always)]
-    fn jump_indirect(&mut self, base: Reg, offset: u32) -> Self::ReturnTy {
+    fn jump_indirect(&mut self, base: RawReg, offset: u32) -> Self::ReturnTy {
         self.jump_indirect_impl(None, base, offset)
     }
 
     #[inline(always)]
-    fn load_imm_and_jump_indirect(&mut self, ra: Reg, base: Reg, value: u32, offset: u32) -> Self::ReturnTy {
+    fn load_imm_and_jump_indirect(&mut self, ra: RawReg, base: RawReg, value: u32, offset: u32) -> Self::ReturnTy {
         self.jump_indirect_impl(Some((ra, value)), base, offset)
     }
 }

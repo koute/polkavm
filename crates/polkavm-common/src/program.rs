@@ -3,6 +3,61 @@ use crate::utils::CowBytes;
 use crate::varint::{read_simple_varint_fast, read_varint, read_varint_fast, write_simple_varint, write_varint, MAX_VARINT_LENGTH};
 use core::ops::Range;
 
+#[derive(Copy, Clone, Debug)]
+#[repr(transparent)]
+pub struct RawReg(u32);
+
+impl Eq for RawReg {}
+impl PartialEq for RawReg {
+    fn eq(&self, rhs: &Self) -> bool {
+        self.get() == rhs.get()
+    }
+}
+
+impl RawReg {
+    #[inline]
+    pub const fn get(self) -> Reg {
+        let mut value = self.0 & 0b1111;
+        if value > 12 {
+            value = 12;
+        }
+
+        match value {
+            0 => Reg::RA,
+            1 => Reg::SP,
+            2 => Reg::T0,
+            3 => Reg::T1,
+            4 => Reg::T2,
+            5 => Reg::S0,
+            6 => Reg::S1,
+            7 => Reg::A0,
+            8 => Reg::A1,
+            9 => Reg::A2,
+            10 => Reg::A3,
+            11 => Reg::A4,
+            12 => Reg::A5,
+            _ => unreachable!(),
+        }
+    }
+
+    #[inline]
+    pub const fn raw_unparsed(self) -> u32 {
+        self.0
+    }
+}
+
+impl From<Reg> for RawReg {
+    fn from(reg: Reg) -> Self {
+        Self(reg as u32)
+    }
+}
+
+impl core::fmt::Display for RawReg {
+    fn fmt(&self, fmt: &mut core::fmt::Formatter) -> core::fmt::Result {
+        self.get().fmt(fmt)
+    }
+}
+
 #[derive(Copy, Clone, PartialEq, Eq, Debug, Hash)]
 #[repr(u32)]
 pub enum Reg {
@@ -23,23 +78,8 @@ pub enum Reg {
 
 impl Reg {
     #[inline]
-    pub const fn from_u8(value: u8) -> Option<Reg> {
-        match value {
-            0 => Some(Reg::RA),
-            1 => Some(Reg::SP),
-            2 => Some(Reg::T0),
-            3 => Some(Reg::T1),
-            4 => Some(Reg::T2),
-            5 => Some(Reg::S0),
-            6 => Some(Reg::S1),
-            7 => Some(Reg::A0),
-            8 => Some(Reg::A1),
-            9 => Some(Reg::A2),
-            10 => Some(Reg::A3),
-            11 => Some(Reg::A4),
-            12 => Some(Reg::A5),
-            _ => None,
-        }
+    pub const fn raw(self) -> RawReg {
+        RawReg(self as u32)
     }
 
     pub const fn name(self) -> &'static str {
@@ -98,16 +138,16 @@ macro_rules! skip {
 
 macro_rules! read_reg {
     ($chunk:ident) => {{
-        let reg = Reg::from_u8($chunk as u8)?;
+        let reg = RawReg($chunk as u32);
         (reg, skip!($chunk, 1))
     }};
 }
 
 macro_rules! read_reg2 {
     ($chunk:ident) => {{
-        let value = $chunk as u8;
-        let reg1 = Reg::from_u8(value & 0b1111)?;
-        let reg2 = Reg::from_u8(value >> 4)?;
+        let value = $chunk as u32;
+        let reg1 = RawReg(value);
+        let reg2 = RawReg(value >> 4);
         (reg1, reg2, skip!($chunk, 1))
     }};
 }
@@ -247,7 +287,7 @@ impl<T> VisitorHelper<T> {
     }
 
     #[inline(always)]
-    pub fn read_args_reg_imm(&mut self) -> Option<(Reg, u32)> {
+    pub fn read_args_reg_imm(&mut self) -> Option<(RawReg, u32)> {
         let chunk = self.chunk;
         let (reg, chunk) = read_reg!(chunk);
         let (imm, _) = read_simple_varint!(chunk, self.args_length - 1);
@@ -255,7 +295,7 @@ impl<T> VisitorHelper<T> {
     }
 
     #[inline(always)]
-    pub fn read_args_reg_imm_offset(&mut self) -> Option<(Reg, u32, u32)> {
+    pub fn read_args_reg_imm_offset(&mut self) -> Option<(RawReg, u32, u32)> {
         let chunk = self.chunk;
         let (reg, chunk) = read_reg!(chunk);
         let (imm1, chunk, imm1_length) = read_varint!(chunk);
@@ -265,7 +305,7 @@ impl<T> VisitorHelper<T> {
     }
 
     #[inline(always)]
-    pub fn read_args_reg_imm2(&mut self) -> Option<(Reg, u32, u32)> {
+    pub fn read_args_reg_imm2(&mut self) -> Option<(RawReg, u32, u32)> {
         let chunk = self.chunk;
         let (reg, chunk) = read_reg!(chunk);
         let (imm1, chunk, imm1_length) = read_varint!(chunk);
@@ -274,7 +314,7 @@ impl<T> VisitorHelper<T> {
     }
 
     #[inline(always)]
-    pub fn read_args_regs2_imm2(&mut self) -> Option<(Reg, Reg, u32, u32)> {
+    pub fn read_args_regs2_imm2(&mut self) -> Option<(RawReg, RawReg, u32, u32)> {
         let chunk = self.chunk;
         let (reg1, reg2, chunk) = read_reg2!(chunk);
         let (imm1, chunk, imm1_length) = read_varint!(chunk);
@@ -283,7 +323,7 @@ impl<T> VisitorHelper<T> {
     }
 
     #[inline(always)]
-    pub fn read_args_regs2_imm(&mut self) -> Option<(Reg, Reg, u32)> {
+    pub fn read_args_regs2_imm(&mut self) -> Option<(RawReg, RawReg, u32)> {
         let chunk = self.chunk;
         let (reg1, reg2, chunk) = read_reg2!(chunk);
         let (imm, _) = read_simple_varint!(chunk, self.args_length - 1);
@@ -291,7 +331,7 @@ impl<T> VisitorHelper<T> {
     }
 
     #[inline(always)]
-    pub fn read_args_regs2_offset(&mut self) -> Option<(Reg, Reg, u32)> {
+    pub fn read_args_regs2_offset(&mut self) -> Option<(RawReg, RawReg, u32)> {
         let chunk = self.chunk;
         let (reg1, reg2, chunk) = read_reg2!(chunk);
         let (imm, _) = read_simple_varint!(chunk, self.args_length - 1);
@@ -300,18 +340,18 @@ impl<T> VisitorHelper<T> {
     }
 
     #[inline(always)]
-    pub fn read_args_regs3(&mut self) -> Option<(Reg, Reg, Reg)> {
+    pub fn read_args_regs3(&mut self) -> (RawReg, RawReg, RawReg) {
         let chunk = self.chunk;
         let (reg1, reg2, chunk) = read_reg2!(chunk);
         let (reg3, _) = read_reg!(chunk);
-        Some((reg1, reg2, reg3))
+        (reg1, reg2, reg3)
     }
 
     #[inline(always)]
-    pub fn read_args_regs2(&mut self) -> Option<(Reg, Reg)> {
+    pub fn read_args_regs2(&mut self) -> (RawReg, RawReg) {
         let chunk = self.chunk;
         let (reg1, reg2, _) = read_reg2!(chunk);
-        Some((reg1, reg2))
+        (reg1, reg2)
     }
 }
 
@@ -394,17 +434,17 @@ macro_rules! define_opcodes {
             type ReturnTy;
 
             $(fn $name_argless(&mut self) -> Self::ReturnTy;)+
-            $(fn $name_reg_imm(&mut self, reg: Reg, imm: u32) -> Self::ReturnTy;)+
-            $(fn $name_reg_imm_offset(&mut self, reg: Reg, imm1: u32, imm2: u32) -> Self::ReturnTy;)+
-            $(fn $name_reg_imm_imm(&mut self, reg: Reg, imm1: u32, imm2: u32) -> Self::ReturnTy;)+
-            $(fn $name_reg_reg_imm(&mut self, reg1: Reg, reg2: Reg, imm: u32) -> Self::ReturnTy;)+
-            $(fn $name_reg_reg_offset(&mut self, reg1: Reg, reg2: Reg, imm: u32) -> Self::ReturnTy;)+
-            $(fn $name_reg_reg_reg(&mut self, reg1: Reg, reg2: Reg, reg3: Reg) -> Self::ReturnTy;)+
+            $(fn $name_reg_imm(&mut self, reg: RawReg, imm: u32) -> Self::ReturnTy;)+
+            $(fn $name_reg_imm_offset(&mut self, reg: RawReg, imm1: u32, imm2: u32) -> Self::ReturnTy;)+
+            $(fn $name_reg_imm_imm(&mut self, reg: RawReg, imm1: u32, imm2: u32) -> Self::ReturnTy;)+
+            $(fn $name_reg_reg_imm(&mut self, reg1: RawReg, reg2: RawReg, imm: u32) -> Self::ReturnTy;)+
+            $(fn $name_reg_reg_offset(&mut self, reg1: RawReg, reg2: RawReg, imm: u32) -> Self::ReturnTy;)+
+            $(fn $name_reg_reg_reg(&mut self, reg1: RawReg, reg2: RawReg, reg3: RawReg) -> Self::ReturnTy;)+
             $(fn $name_offset(&mut self, imm: u32) -> Self::ReturnTy;)+
             $(fn $name_imm(&mut self, imm: u32) -> Self::ReturnTy;)+
             $(fn $name_imm_imm(&mut self, imm1: u32, imm2: u32) -> Self::ReturnTy;)+
-            $(fn $name_reg_reg(&mut self, reg1: Reg, reg2: Reg) -> Self::ReturnTy;)+
-            $(fn $name_reg_reg_imm_imm(&mut self, reg1: Reg, reg2: Reg, imm1: u32, imm2: u32) -> Self::ReturnTy;)+
+            $(fn $name_reg_reg(&mut self, reg1: RawReg, reg2: RawReg) -> Self::ReturnTy;)+
+            $(fn $name_reg_reg_imm_imm(&mut self, reg1: RawReg, reg2: RawReg, imm1: u32, imm2: u32) -> Self::ReturnTy;)+
 
             #[inline(never)]
             #[cold]
@@ -466,17 +506,17 @@ macro_rules! define_opcodes {
         #[repr(u32)]
         pub enum Instruction {
             $($name_argless = $value_argless,)+
-            $($name_reg_imm(Reg, u32) = $value_reg_imm,)+
-            $($name_reg_imm_offset(Reg, u32, u32) = $value_reg_imm_offset,)+
-            $($name_reg_imm_imm(Reg, u32, u32) = $value_reg_imm_imm,)+
-            $($name_reg_reg_imm(Reg, Reg, u32) = $value_reg_reg_imm,)+
-            $($name_reg_reg_offset(Reg, Reg, u32) = $value_reg_reg_offset,)+
-            $($name_reg_reg_reg(Reg, Reg, Reg) = $value_reg_reg_reg,)+
+            $($name_reg_imm(RawReg, u32) = $value_reg_imm,)+
+            $($name_reg_imm_offset(RawReg, u32, u32) = $value_reg_imm_offset,)+
+            $($name_reg_imm_imm(RawReg, u32, u32) = $value_reg_imm_imm,)+
+            $($name_reg_reg_imm(RawReg, RawReg, u32) = $value_reg_reg_imm,)+
+            $($name_reg_reg_offset(RawReg, RawReg, u32) = $value_reg_reg_offset,)+
+            $($name_reg_reg_reg(RawReg, RawReg, RawReg) = $value_reg_reg_reg,)+
             $($name_offset(u32) = $value_offset,)+
             $($name_imm(u32) = $value_imm,)+
             $($name_imm_imm(u32, u32) = $value_imm_imm,)+
-            $($name_reg_reg(Reg, Reg) = $value_reg_reg,)+
-            $($name_reg_reg_imm_imm(Reg, Reg, u32, u32) = $value_reg_reg_imm_imm,)+
+            $($name_reg_reg(RawReg, RawReg) = $value_reg_reg,)+
+            $($name_reg_reg_imm_imm(RawReg, RawReg, u32, u32) = $value_reg_reg_imm_imm,)+
             invalid(u8) = 88,
         }
 
@@ -554,37 +594,37 @@ macro_rules! define_opcodes {
 
             $(
                 pub fn $name_reg_imm(reg: Reg, imm: u32) -> Instruction {
-                    Instruction::$name_reg_imm(reg, imm)
+                    Instruction::$name_reg_imm(reg.into(), imm)
                 }
             )+
 
             $(
                 pub fn $name_reg_imm_offset(reg: Reg, imm1: u32, imm2: u32) -> Instruction {
-                    Instruction::$name_reg_imm_offset(reg, imm1, imm2)
+                    Instruction::$name_reg_imm_offset(reg.into(), imm1, imm2)
                 }
             )+
 
             $(
                 pub fn $name_reg_imm_imm(reg: Reg, imm1: u32, imm2: u32) -> Instruction {
-                    Instruction::$name_reg_imm_imm(reg, imm1, imm2)
+                    Instruction::$name_reg_imm_imm(reg.into(), imm1, imm2)
                 }
             )+
 
             $(
                 pub fn $name_reg_reg_imm(reg1: Reg, reg2: Reg, imm: u32) -> Instruction {
-                    Instruction::$name_reg_reg_imm(reg1, reg2, imm)
+                    Instruction::$name_reg_reg_imm(reg1.into(), reg2.into(), imm)
                 }
             )+
 
             $(
                 pub fn $name_reg_reg_offset(reg1: Reg, reg2: Reg, imm: u32) -> Instruction {
-                    Instruction::$name_reg_reg_offset(reg1, reg2, imm)
+                    Instruction::$name_reg_reg_offset(reg1.into(), reg2.into(), imm)
                 }
             )+
 
             $(
                 pub fn $name_reg_reg_reg(reg1: Reg, reg2: Reg, reg3: Reg) -> Instruction {
-                    Instruction::$name_reg_reg_reg(reg1, reg2, reg3)
+                    Instruction::$name_reg_reg_reg(reg1.into(), reg2.into(), reg3.into())
                 }
             )+
 
@@ -608,13 +648,13 @@ macro_rules! define_opcodes {
 
             $(
                 pub fn $name_reg_reg(reg1: Reg, reg2: Reg) -> Instruction {
-                    Instruction::$name_reg_reg(reg1, reg2)
+                    Instruction::$name_reg_reg(reg1.into(), reg2.into())
                 }
             )+
 
             $(
                 pub fn $name_reg_reg_imm_imm(reg1: Reg, reg2: Reg, imm1: u32, imm2: u32) -> Instruction {
-                    Instruction::$name_reg_reg_imm_imm(reg1, reg2, imm1, imm2)
+                    Instruction::$name_reg_reg_imm_imm(reg1.into(), reg2.into(), imm1, imm2)
                 }
             )+
 
@@ -718,11 +758,8 @@ macro_rules! define_opcodes {
                     $({
                         #[cfg_attr(target_os = "linux", link_section = concat!(".text.", stringify!($table_name)))]
                         fn $name_reg_reg_reg<$d($visitor_ty_params),*>(state: &mut VisitorHelper<$visitor_ty<$d($visitor_ty_params),*>>) -> ReturnTy<$d($visitor_ty_params),*>{
-                            if let Some((reg1, reg2, reg3)) = state.read_args_regs3() {
-                                return state.visitor.$name_reg_reg_reg(reg1, reg2, reg3);
-                            }
-
-                            state.visitor.invalid($value_reg_reg_reg)
+                            let (reg1, reg2, reg3) = state.read_args_regs3();
+                            state.visitor.$name_reg_reg_reg(reg1, reg2, reg3)
                         }
 
                         table[$value_reg_reg_reg] = $name_reg_reg_reg;
@@ -770,11 +807,8 @@ macro_rules! define_opcodes {
                     $({
                         #[cfg_attr(target_os = "linux", link_section = concat!(".text.", stringify!($table_name)))]
                         fn $name_reg_reg<$d($visitor_ty_params),*>(state: &mut VisitorHelper<$visitor_ty<$d($visitor_ty_params),*>>) -> ReturnTy<$d($visitor_ty_params),*>{
-                            if let Some((reg1, reg2)) = state.read_args_regs2() {
-                                return state.visitor.$name_reg_reg(reg1, reg2);
-                            }
-
-                            state.visitor.invalid($value_reg_reg)
+                            let (reg1, reg2) = state.read_args_regs2();
+                            state.visitor.$name_reg_reg(reg1, reg2)
                         }
 
                         table[$value_reg_reg] = $name_reg_reg;
@@ -840,22 +874,22 @@ macro_rules! define_opcodes {
             $(fn $name_argless(&mut self) -> Self::ReturnTy {
                 Instruction::$name_argless
             })+
-            $(fn $name_reg_imm(&mut self, reg: Reg, imm: u32) -> Self::ReturnTy {
+            $(fn $name_reg_imm(&mut self, reg: RawReg, imm: u32) -> Self::ReturnTy {
                 Instruction::$name_reg_imm(reg, imm)
             })+
-            $(fn $name_reg_imm_offset(&mut self, reg: Reg, imm1: u32, imm2: u32) -> Self::ReturnTy {
+            $(fn $name_reg_imm_offset(&mut self, reg: RawReg, imm1: u32, imm2: u32) -> Self::ReturnTy {
                 Instruction::$name_reg_imm_offset(reg, imm1, imm2)
             })+
-            $(fn $name_reg_imm_imm(&mut self, reg: Reg, imm1: u32, imm2: u32) -> Self::ReturnTy {
+            $(fn $name_reg_imm_imm(&mut self, reg: RawReg, imm1: u32, imm2: u32) -> Self::ReturnTy {
                 Instruction::$name_reg_imm_imm(reg, imm1, imm2)
             })+
-            $(fn $name_reg_reg_imm(&mut self, reg1: Reg, reg2: Reg, imm: u32) -> Self::ReturnTy {
+            $(fn $name_reg_reg_imm(&mut self, reg1: RawReg, reg2: RawReg, imm: u32) -> Self::ReturnTy {
                 Instruction::$name_reg_reg_imm(reg1, reg2, imm)
             })+
-            $(fn $name_reg_reg_offset(&mut self, reg1: Reg, reg2: Reg, imm: u32) -> Self::ReturnTy {
+            $(fn $name_reg_reg_offset(&mut self, reg1: RawReg, reg2: RawReg, imm: u32) -> Self::ReturnTy {
                 Instruction::$name_reg_reg_offset(reg1, reg2, imm)
             })+
-            $(fn $name_reg_reg_reg(&mut self, reg1: Reg, reg2: Reg, reg3: Reg) -> Self::ReturnTy {
+            $(fn $name_reg_reg_reg(&mut self, reg1: RawReg, reg2: RawReg, reg3: RawReg) -> Self::ReturnTy {
                 Instruction::$name_reg_reg_reg(reg1, reg2, reg3)
             })+
             $(fn $name_offset(&mut self, imm: u32) -> Self::ReturnTy {
@@ -867,10 +901,10 @@ macro_rules! define_opcodes {
             $(fn $name_imm_imm(&mut self, imm1: u32, imm2: u32) -> Self::ReturnTy {
                 Instruction::$name_imm_imm(imm1, imm2)
             })+
-            $(fn $name_reg_reg(&mut self, reg1: Reg, reg2: Reg) -> Self::ReturnTy {
+            $(fn $name_reg_reg(&mut self, reg1: RawReg, reg2: RawReg) -> Self::ReturnTy {
                 Instruction::$name_reg_reg(reg1, reg2)
             })+
-            $(fn $name_reg_reg_imm_imm(&mut self, reg1: Reg, reg2: Reg, imm1: u32, imm2: u32) -> Self::ReturnTy {
+            $(fn $name_reg_reg_imm_imm(&mut self, reg1: RawReg, reg2: RawReg, imm1: u32, imm2: u32) -> Self::ReturnTy {
                 Instruction::$name_reg_reg_imm_imm(reg1, reg2, imm1, imm2)
             })+
         }
@@ -1099,56 +1133,56 @@ impl Instruction {
         1
     }
 
-    fn serialize_reg_imm_offset(buffer: &mut [u8], position: u32, opcode: Opcode, reg: Reg, imm1: u32, imm2: u32) -> usize {
+    fn serialize_reg_imm_offset(buffer: &mut [u8], position: u32, opcode: Opcode, reg: RawReg, imm1: u32, imm2: u32) -> usize {
         let imm2 = imm2.wrapping_sub(position);
         buffer[0] = opcode as u8;
-        buffer[1] = reg as u8;
+        buffer[1] = reg.0 as u8;
         let mut position = 2;
         position += write_varint(imm1, &mut buffer[position..]);
         position += write_simple_varint(imm2, &mut buffer[position..]);
         position
     }
 
-    fn serialize_reg_imm_imm(buffer: &mut [u8], opcode: Opcode, reg: Reg, imm1: u32, imm2: u32) -> usize {
+    fn serialize_reg_imm_imm(buffer: &mut [u8], opcode: Opcode, reg: RawReg, imm1: u32, imm2: u32) -> usize {
         buffer[0] = opcode as u8;
-        buffer[1] = reg as u8;
+        buffer[1] = reg.0 as u8;
         let mut position = 2;
         position += write_varint(imm1, &mut buffer[position..]);
         position += write_simple_varint(imm2, &mut buffer[position..]);
         position
     }
-    fn serialize_reg_reg_imm_imm(buffer: &mut [u8], opcode: Opcode, reg1: Reg, reg2: Reg, imm1: u32, imm2: u32) -> usize {
+    fn serialize_reg_reg_imm_imm(buffer: &mut [u8], opcode: Opcode, reg1: RawReg, reg2: RawReg, imm1: u32, imm2: u32) -> usize {
         buffer[0] = opcode as u8;
-        buffer[1] = reg1 as u8 | (reg2 as u8) << 4;
+        buffer[1] = reg1.0 as u8 | (reg2.0 as u8) << 4;
         let mut position = 2;
         position += write_varint(imm1, &mut buffer[position..]);
         position += write_simple_varint(imm2, &mut buffer[position..]);
         position
     }
 
-    fn serialize_reg_reg_reg(buffer: &mut [u8], opcode: Opcode, reg1: Reg, reg2: Reg, reg3: Reg) -> usize {
+    fn serialize_reg_reg_reg(buffer: &mut [u8], opcode: Opcode, reg1: RawReg, reg2: RawReg, reg3: RawReg) -> usize {
         buffer[0] = opcode as u8;
-        buffer[1] = reg1 as u8 | (reg2 as u8) << 4;
-        buffer[2] = reg3 as u8;
+        buffer[1] = reg1.0 as u8 | (reg2.0 as u8) << 4;
+        buffer[2] = reg3.0 as u8;
         3
     }
 
-    fn serialize_reg_reg_imm(buffer: &mut [u8], opcode: Opcode, reg1: Reg, reg2: Reg, imm: u32) -> usize {
+    fn serialize_reg_reg_imm(buffer: &mut [u8], opcode: Opcode, reg1: RawReg, reg2: RawReg, imm: u32) -> usize {
         buffer[0] = opcode as u8;
-        buffer[1] = reg1 as u8 | (reg2 as u8) << 4;
+        buffer[1] = reg1.0 as u8 | (reg2.0 as u8) << 4;
         write_simple_varint(imm, &mut buffer[2..]) + 2
     }
 
-    fn serialize_reg_reg_offset(buffer: &mut [u8], position: u32, opcode: Opcode, reg1: Reg, reg2: Reg, imm: u32) -> usize {
+    fn serialize_reg_reg_offset(buffer: &mut [u8], position: u32, opcode: Opcode, reg1: RawReg, reg2: RawReg, imm: u32) -> usize {
         let imm = imm.wrapping_sub(position);
         buffer[0] = opcode as u8;
-        buffer[1] = reg1 as u8 | (reg2 as u8) << 4;
+        buffer[1] = reg1.0 as u8 | (reg2.0 as u8) << 4;
         write_simple_varint(imm, &mut buffer[2..]) + 2
     }
 
-    fn serialize_reg_imm(buffer: &mut [u8], opcode: Opcode, reg: Reg, imm: u32) -> usize {
+    fn serialize_reg_imm(buffer: &mut [u8], opcode: Opcode, reg: RawReg, imm: u32) -> usize {
         buffer[0] = opcode as u8;
-        buffer[1] = reg as u8;
+        buffer[1] = reg.0 as u8;
         write_simple_varint(imm, &mut buffer[2..]) + 2
     }
 
@@ -1171,9 +1205,9 @@ impl Instruction {
         position
     }
 
-    fn serialize_reg_reg(buffer: &mut [u8], opcode: Opcode, reg1: Reg, reg2: Reg) -> usize {
+    fn serialize_reg_reg(buffer: &mut [u8], opcode: Opcode, reg1: RawReg, reg2: RawReg) -> usize {
         buffer[0] = opcode as u8;
-        buffer[1] = reg1 as u8 | (reg2 as u8) << 4;
+        buffer[1] = reg1.0 as u8 | (reg2.0 as u8) << 4;
         2
     }
 }
@@ -1191,7 +1225,7 @@ impl<'a> InstructionVisitor for core::fmt::Formatter<'a> {
         write!(self, "fallthrough")
     }
 
-    fn sbrk(&mut self, d: Reg, s: Reg) -> Self::ReturnTy {
+    fn sbrk(&mut self, d: RawReg, s: RawReg) -> Self::ReturnTy {
         write!(self, "{d} = sbrk {s}")
     }
 
@@ -1199,167 +1233,167 @@ impl<'a> InstructionVisitor for core::fmt::Formatter<'a> {
         write!(self, "ecalli {nth_import}")
     }
 
-    fn set_less_than_unsigned(&mut self, d: Reg, s1: Reg, s2: Reg) -> Self::ReturnTy {
+    fn set_less_than_unsigned(&mut self, d: RawReg, s1: RawReg, s2: RawReg) -> Self::ReturnTy {
         write!(self, "{d} = {s1} <u {s2}")
     }
 
-    fn set_less_than_signed(&mut self, d: Reg, s1: Reg, s2: Reg) -> Self::ReturnTy {
+    fn set_less_than_signed(&mut self, d: RawReg, s1: RawReg, s2: RawReg) -> Self::ReturnTy {
         write!(self, "{d} = {s1} <s {s2}")
     }
 
-    fn shift_logical_right(&mut self, d: Reg, s1: Reg, s2: Reg) -> Self::ReturnTy {
+    fn shift_logical_right(&mut self, d: RawReg, s1: RawReg, s2: RawReg) -> Self::ReturnTy {
         write!(self, "{d} = {s1} >> {s2}")
     }
 
-    fn shift_arithmetic_right(&mut self, d: Reg, s1: Reg, s2: Reg) -> Self::ReturnTy {
+    fn shift_arithmetic_right(&mut self, d: RawReg, s1: RawReg, s2: RawReg) -> Self::ReturnTy {
         write!(self, "{d} = {s1} >>a {s2}")
     }
 
-    fn shift_logical_left(&mut self, d: Reg, s1: Reg, s2: Reg) -> Self::ReturnTy {
+    fn shift_logical_left(&mut self, d: RawReg, s1: RawReg, s2: RawReg) -> Self::ReturnTy {
         write!(self, "{d} = {s1} << {s2}")
     }
 
-    fn xor(&mut self, d: Reg, s1: Reg, s2: Reg) -> Self::ReturnTy {
+    fn xor(&mut self, d: RawReg, s1: RawReg, s2: RawReg) -> Self::ReturnTy {
         write!(self, "{d} = {s1} ^ {s2}")
     }
 
-    fn and(&mut self, d: Reg, s1: Reg, s2: Reg) -> Self::ReturnTy {
+    fn and(&mut self, d: RawReg, s1: RawReg, s2: RawReg) -> Self::ReturnTy {
         write!(self, "{d} = {s1} & {s2}")
     }
 
-    fn or(&mut self, d: Reg, s1: Reg, s2: Reg) -> Self::ReturnTy {
+    fn or(&mut self, d: RawReg, s1: RawReg, s2: RawReg) -> Self::ReturnTy {
         write!(self, "{d} = {s1} | {s2}")
     }
 
-    fn add(&mut self, d: Reg, s1: Reg, s2: Reg) -> Self::ReturnTy {
+    fn add(&mut self, d: RawReg, s1: RawReg, s2: RawReg) -> Self::ReturnTy {
         write!(self, "{d} = {s1} + {s2}")
     }
 
-    fn sub(&mut self, d: Reg, s1: Reg, s2: Reg) -> Self::ReturnTy {
+    fn sub(&mut self, d: RawReg, s1: RawReg, s2: RawReg) -> Self::ReturnTy {
         write!(self, "{d} = {s1} - {s2}")
     }
 
-    fn mul(&mut self, d: Reg, s1: Reg, s2: Reg) -> Self::ReturnTy {
+    fn mul(&mut self, d: RawReg, s1: RawReg, s2: RawReg) -> Self::ReturnTy {
         write!(self, "{d} = {s1} * {s2}")
     }
 
-    fn mul_imm(&mut self, d: Reg, s1: Reg, s2: u32) -> Self::ReturnTy {
+    fn mul_imm(&mut self, d: RawReg, s1: RawReg, s2: u32) -> Self::ReturnTy {
         write!(self, "{d} = {s1} * {s2}")
     }
 
-    fn mul_upper_signed_signed(&mut self, d: Reg, s1: Reg, s2: Reg) -> Self::ReturnTy {
+    fn mul_upper_signed_signed(&mut self, d: RawReg, s1: RawReg, s2: RawReg) -> Self::ReturnTy {
         write!(self, "{d} = ({s1} as i64 * {s2} as i64) >> 32")
     }
 
-    fn mul_upper_signed_signed_imm(&mut self, d: Reg, s1: Reg, s2: u32) -> Self::ReturnTy {
+    fn mul_upper_signed_signed_imm(&mut self, d: RawReg, s1: RawReg, s2: u32) -> Self::ReturnTy {
         write!(self, "{d} = ({s1} as i64 * {s2} as i64) >> 32", s2 = s2 as i32)
     }
 
-    fn mul_upper_unsigned_unsigned(&mut self, d: Reg, s1: Reg, s2: Reg) -> Self::ReturnTy {
+    fn mul_upper_unsigned_unsigned(&mut self, d: RawReg, s1: RawReg, s2: RawReg) -> Self::ReturnTy {
         write!(self, "{d} = ({s1} as u64 * {s2} as u64) >> 32")
     }
 
-    fn mul_upper_unsigned_unsigned_imm(&mut self, d: Reg, s1: Reg, s2: u32) -> Self::ReturnTy {
+    fn mul_upper_unsigned_unsigned_imm(&mut self, d: RawReg, s1: RawReg, s2: u32) -> Self::ReturnTy {
         write!(self, "{d} = ({s1} as u64 * {s2} as u64) >> 32")
     }
 
-    fn mul_upper_signed_unsigned(&mut self, d: Reg, s1: Reg, s2: Reg) -> Self::ReturnTy {
+    fn mul_upper_signed_unsigned(&mut self, d: RawReg, s1: RawReg, s2: RawReg) -> Self::ReturnTy {
         write!(self, "{d} = ({s1} as i64 * {s2} as u64) >> 32")
     }
 
-    fn div_unsigned(&mut self, d: Reg, s1: Reg, s2: Reg) -> Self::ReturnTy {
+    fn div_unsigned(&mut self, d: RawReg, s1: RawReg, s2: RawReg) -> Self::ReturnTy {
         write!(self, "{d} = {s1} /u {s2}")
     }
 
-    fn div_signed(&mut self, d: Reg, s1: Reg, s2: Reg) -> Self::ReturnTy {
+    fn div_signed(&mut self, d: RawReg, s1: RawReg, s2: RawReg) -> Self::ReturnTy {
         write!(self, "{d} = {s1} /s {s2}")
     }
 
-    fn rem_unsigned(&mut self, d: Reg, s1: Reg, s2: Reg) -> Self::ReturnTy {
+    fn rem_unsigned(&mut self, d: RawReg, s1: RawReg, s2: RawReg) -> Self::ReturnTy {
         write!(self, "{d} = {s1} %u {s2}")
     }
 
-    fn rem_signed(&mut self, d: Reg, s1: Reg, s2: Reg) -> Self::ReturnTy {
+    fn rem_signed(&mut self, d: RawReg, s1: RawReg, s2: RawReg) -> Self::ReturnTy {
         write!(self, "{d} = {s1} %s {s2}")
     }
 
-    fn set_less_than_unsigned_imm(&mut self, d: Reg, s1: Reg, s2: u32) -> Self::ReturnTy {
+    fn set_less_than_unsigned_imm(&mut self, d: RawReg, s1: RawReg, s2: u32) -> Self::ReturnTy {
         write!(self, "{d} = {s1} <u 0x{s2:x}")
     }
 
-    fn set_greater_than_unsigned_imm(&mut self, d: Reg, s1: Reg, s2: u32) -> Self::ReturnTy {
+    fn set_greater_than_unsigned_imm(&mut self, d: RawReg, s1: RawReg, s2: u32) -> Self::ReturnTy {
         write!(self, "{d} = {s1} >u 0x{s2:x}")
     }
 
-    fn set_less_than_signed_imm(&mut self, d: Reg, s1: Reg, s2: u32) -> Self::ReturnTy {
+    fn set_less_than_signed_imm(&mut self, d: RawReg, s1: RawReg, s2: u32) -> Self::ReturnTy {
         write!(self, "{d} = {s1} <s {s2}", s2 = s2 as i32)
     }
 
-    fn set_greater_than_signed_imm(&mut self, d: Reg, s1: Reg, s2: u32) -> Self::ReturnTy {
+    fn set_greater_than_signed_imm(&mut self, d: RawReg, s1: RawReg, s2: u32) -> Self::ReturnTy {
         write!(self, "{d} = {s1} >s {s2}", s2 = s2 as i32)
     }
 
-    fn shift_logical_right_imm(&mut self, d: Reg, s1: Reg, s2: u32) -> Self::ReturnTy {
+    fn shift_logical_right_imm(&mut self, d: RawReg, s1: RawReg, s2: u32) -> Self::ReturnTy {
         write!(self, "{d} = {s1} >> {s2}")
     }
 
-    fn shift_logical_right_imm_alt(&mut self, d: Reg, s2: Reg, s1: u32) -> Self::ReturnTy {
+    fn shift_logical_right_imm_alt(&mut self, d: RawReg, s2: RawReg, s1: u32) -> Self::ReturnTy {
         write!(self, "{d} = {s1} >> {s2}")
     }
 
-    fn shift_arithmetic_right_imm(&mut self, d: Reg, s1: Reg, s2: u32) -> Self::ReturnTy {
+    fn shift_arithmetic_right_imm(&mut self, d: RawReg, s1: RawReg, s2: u32) -> Self::ReturnTy {
         write!(self, "{d} = {s1} >>a {s2}")
     }
 
-    fn shift_arithmetic_right_imm_alt(&mut self, d: Reg, s2: Reg, s1: u32) -> Self::ReturnTy {
+    fn shift_arithmetic_right_imm_alt(&mut self, d: RawReg, s2: RawReg, s1: u32) -> Self::ReturnTy {
         write!(self, "{d} = {s1} >>a {s2}")
     }
 
-    fn shift_logical_left_imm(&mut self, d: Reg, s1: Reg, s2: u32) -> Self::ReturnTy {
+    fn shift_logical_left_imm(&mut self, d: RawReg, s1: RawReg, s2: u32) -> Self::ReturnTy {
         write!(self, "{d} = {s1} << {s2}")
     }
 
-    fn shift_logical_left_imm_alt(&mut self, d: Reg, s2: Reg, s1: u32) -> Self::ReturnTy {
+    fn shift_logical_left_imm_alt(&mut self, d: RawReg, s2: RawReg, s1: u32) -> Self::ReturnTy {
         write!(self, "{d} = {s1} << {s2}")
     }
 
-    fn or_imm(&mut self, d: Reg, s1: Reg, s2: u32) -> Self::ReturnTy {
+    fn or_imm(&mut self, d: RawReg, s1: RawReg, s2: u32) -> Self::ReturnTy {
         write!(self, "{d} = {s1} | 0x{s2:x}")
     }
 
-    fn and_imm(&mut self, d: Reg, s1: Reg, s2: u32) -> Self::ReturnTy {
+    fn and_imm(&mut self, d: RawReg, s1: RawReg, s2: u32) -> Self::ReturnTy {
         write!(self, "{d} = {s1} & 0x{s2:x}")
     }
 
-    fn xor_imm(&mut self, d: Reg, s1: Reg, s2: u32) -> Self::ReturnTy {
+    fn xor_imm(&mut self, d: RawReg, s1: RawReg, s2: u32) -> Self::ReturnTy {
         write!(self, "{d} = {s1} ^ 0x{s2:x}")
     }
 
-    fn load_imm(&mut self, d: Reg, a: u32) -> Self::ReturnTy {
+    fn load_imm(&mut self, d: RawReg, a: u32) -> Self::ReturnTy {
         write!(self, "{d} = 0x{a:x}")
     }
 
-    fn move_reg(&mut self, d: Reg, s: Reg) -> Self::ReturnTy {
+    fn move_reg(&mut self, d: RawReg, s: RawReg) -> Self::ReturnTy {
         write!(self, "{d} = {s}")
     }
 
-    fn cmov_if_zero(&mut self, d: Reg, s: Reg, c: Reg) -> Self::ReturnTy {
+    fn cmov_if_zero(&mut self, d: RawReg, s: RawReg, c: RawReg) -> Self::ReturnTy {
         write!(self, "{d} = {s} if {c} == 0")
     }
 
-    fn cmov_if_not_zero(&mut self, d: Reg, s: Reg, c: Reg) -> Self::ReturnTy {
+    fn cmov_if_not_zero(&mut self, d: RawReg, s: RawReg, c: RawReg) -> Self::ReturnTy {
         write!(self, "{d} = {s} if {c} != 0")
     }
 
-    fn cmov_if_zero_imm(&mut self, d: Reg, c: Reg, s: u32) -> Self::ReturnTy {
+    fn cmov_if_zero_imm(&mut self, d: RawReg, c: RawReg, s: u32) -> Self::ReturnTy {
         write!(self, "{d} = {s} if {c} == 0")
     }
 
-    fn cmov_if_not_zero_imm(&mut self, d: Reg, c: Reg, s: u32) -> Self::ReturnTy {
+    fn cmov_if_not_zero_imm(&mut self, d: RawReg, c: RawReg, s: u32) -> Self::ReturnTy {
         write!(self, "{d} = {s} if {c} != 0")
     }
 
-    fn add_imm(&mut self, d: Reg, s1: Reg, s2: u32) -> Self::ReturnTy {
+    fn add_imm(&mut self, d: RawReg, s1: RawReg, s2: u32) -> Self::ReturnTy {
         if (s2 as i32) < 0 && (s2 as i32) > -4096 {
             write!(self, "{d} = {s1} - {s2}", s2 = -(s2 as i32))
         } else {
@@ -1367,7 +1401,7 @@ impl<'a> InstructionVisitor for core::fmt::Formatter<'a> {
         }
     }
 
-    fn negate_and_add_imm(&mut self, d: Reg, s1: Reg, s2: u32) -> Self::ReturnTy {
+    fn negate_and_add_imm(&mut self, d: RawReg, s1: RawReg, s2: u32) -> Self::ReturnTy {
         if s2 == 0 {
             write!(self, "{d} = -{s1}")
         } else {
@@ -1375,19 +1409,19 @@ impl<'a> InstructionVisitor for core::fmt::Formatter<'a> {
         }
     }
 
-    fn store_imm_indirect_u8(&mut self, base: Reg, offset: u32, value: u32) -> Self::ReturnTy {
+    fn store_imm_indirect_u8(&mut self, base: RawReg, offset: u32, value: u32) -> Self::ReturnTy {
         write!(self, "u8 [{base} + {offset}] = {value}")
     }
 
-    fn store_imm_indirect_u16(&mut self, base: Reg, offset: u32, value: u32) -> Self::ReturnTy {
+    fn store_imm_indirect_u16(&mut self, base: RawReg, offset: u32, value: u32) -> Self::ReturnTy {
         write!(self, "u16 [{base} + {offset}] = {value}")
     }
 
-    fn store_imm_indirect_u32(&mut self, base: Reg, offset: u32, value: u32) -> Self::ReturnTy {
+    fn store_imm_indirect_u32(&mut self, base: RawReg, offset: u32, value: u32) -> Self::ReturnTy {
         write!(self, "u32 [{base} + {offset}] = {value}")
     }
 
-    fn store_indirect_u8(&mut self, src: Reg, base: Reg, offset: u32) -> Self::ReturnTy {
+    fn store_indirect_u8(&mut self, src: RawReg, base: RawReg, offset: u32) -> Self::ReturnTy {
         if offset != 0 {
             write!(self, "u8 [{base} + {offset}] = {src}")
         } else {
@@ -1395,7 +1429,7 @@ impl<'a> InstructionVisitor for core::fmt::Formatter<'a> {
         }
     }
 
-    fn store_indirect_u16(&mut self, src: Reg, base: Reg, offset: u32) -> Self::ReturnTy {
+    fn store_indirect_u16(&mut self, src: RawReg, base: RawReg, offset: u32) -> Self::ReturnTy {
         if offset != 0 {
             write!(self, "u16 [{base} + {offset}] = {src}")
         } else {
@@ -1403,7 +1437,7 @@ impl<'a> InstructionVisitor for core::fmt::Formatter<'a> {
         }
     }
 
-    fn store_indirect_u32(&mut self, src: Reg, base: Reg, offset: u32) -> Self::ReturnTy {
+    fn store_indirect_u32(&mut self, src: RawReg, base: RawReg, offset: u32) -> Self::ReturnTy {
         if offset != 0 {
             write!(self, "u32 [{base} + {offset}] = {src}")
         } else {
@@ -1423,19 +1457,19 @@ impl<'a> InstructionVisitor for core::fmt::Formatter<'a> {
         write!(self, "u32 [0x{offset:x}] = {value}")
     }
 
-    fn store_u8(&mut self, src: Reg, offset: u32) -> Self::ReturnTy {
+    fn store_u8(&mut self, src: RawReg, offset: u32) -> Self::ReturnTy {
         write!(self, "u8 [0x{offset:x}] = {src}")
     }
 
-    fn store_u16(&mut self, src: Reg, offset: u32) -> Self::ReturnTy {
+    fn store_u16(&mut self, src: RawReg, offset: u32) -> Self::ReturnTy {
         write!(self, "u16 [0x{offset:x}] = {src}")
     }
 
-    fn store_u32(&mut self, src: Reg, offset: u32) -> Self::ReturnTy {
+    fn store_u32(&mut self, src: RawReg, offset: u32) -> Self::ReturnTy {
         write!(self, "u32 [0x{offset:x}] = {src}")
     }
 
-    fn load_indirect_u8(&mut self, dst: Reg, base: Reg, offset: u32) -> Self::ReturnTy {
+    fn load_indirect_u8(&mut self, dst: RawReg, base: RawReg, offset: u32) -> Self::ReturnTy {
         if offset != 0 {
             write!(self, "{} = u8 [{} + {}]", dst, base, offset)
         } else {
@@ -1443,7 +1477,7 @@ impl<'a> InstructionVisitor for core::fmt::Formatter<'a> {
         }
     }
 
-    fn load_indirect_i8(&mut self, dst: Reg, base: Reg, offset: u32) -> Self::ReturnTy {
+    fn load_indirect_i8(&mut self, dst: RawReg, base: RawReg, offset: u32) -> Self::ReturnTy {
         if offset != 0 {
             write!(self, "{} = i8 [{} + {}]", dst, base, offset)
         } else {
@@ -1451,7 +1485,7 @@ impl<'a> InstructionVisitor for core::fmt::Formatter<'a> {
         }
     }
 
-    fn load_indirect_u16(&mut self, dst: Reg, base: Reg, offset: u32) -> Self::ReturnTy {
+    fn load_indirect_u16(&mut self, dst: RawReg, base: RawReg, offset: u32) -> Self::ReturnTy {
         if offset != 0 {
             write!(self, "{} = u16 [{} + {}]", dst, base, offset)
         } else {
@@ -1459,7 +1493,7 @@ impl<'a> InstructionVisitor for core::fmt::Formatter<'a> {
         }
     }
 
-    fn load_indirect_i16(&mut self, dst: Reg, base: Reg, offset: u32) -> Self::ReturnTy {
+    fn load_indirect_i16(&mut self, dst: RawReg, base: RawReg, offset: u32) -> Self::ReturnTy {
         if offset != 0 {
             write!(self, "{} = i16 [{} + {}]", dst, base, offset)
         } else {
@@ -1467,7 +1501,7 @@ impl<'a> InstructionVisitor for core::fmt::Formatter<'a> {
         }
     }
 
-    fn load_indirect_u32(&mut self, dst: Reg, base: Reg, offset: u32) -> Self::ReturnTy {
+    fn load_indirect_u32(&mut self, dst: RawReg, base: RawReg, offset: u32) -> Self::ReturnTy {
         if offset != 0 {
             write!(self, "{} = u32 [{} + {}]", dst, base, offset)
         } else {
@@ -1475,87 +1509,87 @@ impl<'a> InstructionVisitor for core::fmt::Formatter<'a> {
         }
     }
 
-    fn load_u8(&mut self, dst: Reg, offset: u32) -> Self::ReturnTy {
+    fn load_u8(&mut self, dst: RawReg, offset: u32) -> Self::ReturnTy {
         write!(self, "{} = u8 [0x{:x}]", dst, offset)
     }
 
-    fn load_i8(&mut self, dst: Reg, offset: u32) -> Self::ReturnTy {
+    fn load_i8(&mut self, dst: RawReg, offset: u32) -> Self::ReturnTy {
         write!(self, "{} = i8 [0x{:x}]", dst, offset)
     }
 
-    fn load_u16(&mut self, dst: Reg, offset: u32) -> Self::ReturnTy {
+    fn load_u16(&mut self, dst: RawReg, offset: u32) -> Self::ReturnTy {
         write!(self, "{} = u16 [0x{:x}]", dst, offset)
     }
 
-    fn load_i16(&mut self, dst: Reg, offset: u32) -> Self::ReturnTy {
+    fn load_i16(&mut self, dst: RawReg, offset: u32) -> Self::ReturnTy {
         write!(self, "{} = i16 [0x{:x}]", dst, offset)
     }
 
-    fn load_u32(&mut self, dst: Reg, offset: u32) -> Self::ReturnTy {
+    fn load_u32(&mut self, dst: RawReg, offset: u32) -> Self::ReturnTy {
         write!(self, "{} = u32 [0x{:x}]", dst, offset)
     }
 
-    fn branch_less_unsigned(&mut self, s1: Reg, s2: Reg, imm: u32) -> Self::ReturnTy {
+    fn branch_less_unsigned(&mut self, s1: RawReg, s2: RawReg, imm: u32) -> Self::ReturnTy {
         write!(self, "jump {} if {} <u {}", imm, s1, s2)
     }
 
-    fn branch_less_signed(&mut self, s1: Reg, s2: Reg, imm: u32) -> Self::ReturnTy {
+    fn branch_less_signed(&mut self, s1: RawReg, s2: RawReg, imm: u32) -> Self::ReturnTy {
         write!(self, "jump {} if {} <s {}", imm, s1, s2)
     }
 
-    fn branch_less_unsigned_imm(&mut self, s1: Reg, s2: u32, imm: u32) -> Self::ReturnTy {
+    fn branch_less_unsigned_imm(&mut self, s1: RawReg, s2: u32, imm: u32) -> Self::ReturnTy {
         write!(self, "jump {} if {} <u {}", imm, s1, s2)
     }
 
-    fn branch_less_signed_imm(&mut self, s1: Reg, s2: u32, imm: u32) -> Self::ReturnTy {
+    fn branch_less_signed_imm(&mut self, s1: RawReg, s2: u32, imm: u32) -> Self::ReturnTy {
         write!(self, "jump {} if {} <s {}", imm, s1, s2)
     }
 
-    fn branch_greater_or_equal_unsigned(&mut self, s1: Reg, s2: Reg, imm: u32) -> Self::ReturnTy {
+    fn branch_greater_or_equal_unsigned(&mut self, s1: RawReg, s2: RawReg, imm: u32) -> Self::ReturnTy {
         write!(self, "jump {} if {} >=u {}", imm, s1, s2)
     }
 
-    fn branch_greater_or_equal_signed(&mut self, s1: Reg, s2: Reg, imm: u32) -> Self::ReturnTy {
+    fn branch_greater_or_equal_signed(&mut self, s1: RawReg, s2: RawReg, imm: u32) -> Self::ReturnTy {
         write!(self, "jump {} if {} >=s {}", imm, s1, s2)
     }
 
-    fn branch_greater_or_equal_unsigned_imm(&mut self, s1: Reg, s2: u32, imm: u32) -> Self::ReturnTy {
+    fn branch_greater_or_equal_unsigned_imm(&mut self, s1: RawReg, s2: u32, imm: u32) -> Self::ReturnTy {
         write!(self, "jump {} if {} >=u {}", imm, s1, s2)
     }
 
-    fn branch_greater_or_equal_signed_imm(&mut self, s1: Reg, s2: u32, imm: u32) -> Self::ReturnTy {
+    fn branch_greater_or_equal_signed_imm(&mut self, s1: RawReg, s2: u32, imm: u32) -> Self::ReturnTy {
         write!(self, "jump {} if {} >=s {}", imm, s1, s2)
     }
 
-    fn branch_eq(&mut self, s1: Reg, s2: Reg, imm: u32) -> Self::ReturnTy {
+    fn branch_eq(&mut self, s1: RawReg, s2: RawReg, imm: u32) -> Self::ReturnTy {
         write!(self, "jump {} if {} == {}", imm, s1, s2)
     }
 
-    fn branch_not_eq(&mut self, s1: Reg, s2: Reg, imm: u32) -> Self::ReturnTy {
+    fn branch_not_eq(&mut self, s1: RawReg, s2: RawReg, imm: u32) -> Self::ReturnTy {
         write!(self, "jump {} if {} != {}", imm, s1, s2)
     }
 
-    fn branch_eq_imm(&mut self, s1: Reg, s2: u32, imm: u32) -> Self::ReturnTy {
+    fn branch_eq_imm(&mut self, s1: RawReg, s2: u32, imm: u32) -> Self::ReturnTy {
         write!(self, "jump {} if {} == {}", imm, s1, s2)
     }
 
-    fn branch_not_eq_imm(&mut self, s1: Reg, s2: u32, imm: u32) -> Self::ReturnTy {
+    fn branch_not_eq_imm(&mut self, s1: RawReg, s2: u32, imm: u32) -> Self::ReturnTy {
         write!(self, "jump {} if {} != {}", imm, s1, s2)
     }
 
-    fn branch_less_or_equal_unsigned_imm(&mut self, s1: Reg, s2: u32, imm: u32) -> Self::ReturnTy {
+    fn branch_less_or_equal_unsigned_imm(&mut self, s1: RawReg, s2: u32, imm: u32) -> Self::ReturnTy {
         write!(self, "jump {} if {} <=u {}", imm, s1, s2)
     }
 
-    fn branch_less_or_equal_signed_imm(&mut self, s1: Reg, s2: u32, imm: u32) -> Self::ReturnTy {
+    fn branch_less_or_equal_signed_imm(&mut self, s1: RawReg, s2: u32, imm: u32) -> Self::ReturnTy {
         write!(self, "jump {} if {} <=s {}", imm, s1, s2)
     }
 
-    fn branch_greater_unsigned_imm(&mut self, s1: Reg, s2: u32, imm: u32) -> Self::ReturnTy {
+    fn branch_greater_unsigned_imm(&mut self, s1: RawReg, s2: u32, imm: u32) -> Self::ReturnTy {
         write!(self, "jump {} if {} >u {}", imm, s1, s2)
     }
 
-    fn branch_greater_signed_imm(&mut self, s1: Reg, s2: u32, imm: u32) -> Self::ReturnTy {
+    fn branch_greater_signed_imm(&mut self, s1: RawReg, s2: u32, imm: u32) -> Self::ReturnTy {
         write!(self, "jump {} if {} >s {}", imm, s1, s2)
     }
 
@@ -1563,20 +1597,19 @@ impl<'a> InstructionVisitor for core::fmt::Formatter<'a> {
         write!(self, "jump {}", target)
     }
 
-    fn load_imm_and_jump(&mut self, ra: Reg, value: u32, target: u32) -> Self::ReturnTy {
+    fn load_imm_and_jump(&mut self, ra: RawReg, value: u32, target: u32) -> Self::ReturnTy {
         write!(self, "{ra} = {value}, jump {target}")
     }
 
-    fn jump_indirect(&mut self, base: Reg, offset: u32) -> Self::ReturnTy {
-        use Reg::*;
+    fn jump_indirect(&mut self, base: RawReg, offset: u32) -> Self::ReturnTy {
         match (base, offset) {
-            (RA, 0) => write!(self, "ret"),
+            (_, 0) if base == Reg::RA.into() => write!(self, "ret"),
             (_, 0) => write!(self, "jump [{}]", base),
             (_, _) => write!(self, "jump [{} + {}]", base, offset),
         }
     }
 
-    fn load_imm_and_jump_indirect(&mut self, ra: Reg, base: Reg, value: u32, offset: u32) -> Self::ReturnTy {
+    fn load_imm_and_jump_indirect(&mut self, ra: RawReg, base: RawReg, value: u32, offset: u32) -> Self::ReturnTy {
         if offset == 0 {
             write!(self, "jump [{base}], {ra} = {value}")
         } else {

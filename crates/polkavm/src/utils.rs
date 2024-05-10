@@ -1,15 +1,15 @@
 use alloc::vec::Vec;
-use polkavm_common::program::Reg;
+use polkavm_common::program::RawReg;
 
 #[derive(Copy, Clone)]
 pub enum RegImm {
-    Reg(Reg),
+    Reg(RawReg),
     Imm(u32),
 }
 
-impl From<Reg> for RegImm {
+impl From<RawReg> for RegImm {
     #[inline]
-    fn from(reg: Reg) -> Self {
+    fn from(reg: RawReg) -> Self {
         RegImm::Reg(reg)
     }
 }
