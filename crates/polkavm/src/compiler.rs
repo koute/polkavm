@@ -349,15 +349,19 @@ impl<'a, S> CompilerVisitor<'a, S> where S: Sandbox {
         log::trace!("Compiling {}", self.current_instruction(code_offset));
     }
 
-    fn get_or_forward_declare_label(&mut self, code_offset: u32) -> Label {
+    fn get_or_forward_declare_label(&mut self, code_offset: u32) -> Option<Label> {
         match self.code_offset_to_label.get(code_offset) {
-            Some(label) => label,
+            Some(label) => Some(label),
             None => {
+                if code_offset > self.code_offset_to_label.len() {
+                    return None;
+                }
+
                 let label = self.asm.forward_declare_label();
                 log::trace!("Label: {label} -> {code_offset} (forward declare)");
 
                 self.code_offset_to_label.insert(code_offset, label);
-                label
+                Some(label)
             }
         }
     }

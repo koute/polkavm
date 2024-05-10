@@ -59,6 +59,11 @@ where
     }
 
     #[inline]
+    pub fn len(&self) -> u32 {
+        self.inner.len() as u32
+    }
+
+    #[inline]
     pub fn insert(&mut self, key: u32, value: T) {
         self.inner[key as usize] = Some(value);
     }
