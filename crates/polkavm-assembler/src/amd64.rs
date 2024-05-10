@@ -573,16 +573,16 @@ impl Inst {
 
                 self.modrm |= base.modrm_rm_bits();
 
-                if offset != 0 || matches!(base, Reg::rbp | Reg::r13) {
-                    if offset <= i8::MAX as i32 && offset >= i8::MIN as i32 {
-                        self.modrm |= 0b01000000;
-                        self.displacement = offset as u8 as u32;
-                        self.displacement_length = 8;
-                    } else {
-                        self.modrm |= 0b10000000;
-                        self.displacement = offset as u32;
-                        self.displacement_length = 32;
-                    }
+                let set_displacement = (offset != 0) | matches!(base, Reg::rbp | Reg::r13);
+                let set_displacement_mask = (-(set_displacement as i32)) as u32;
+                if offset <= i8::MAX as i32 && offset >= i8::MIN as i32 {
+                    self.modrm |= 0b01000000 & set_displacement_mask as u8;
+                    self.displacement = (offset as u8 as u32) & set_displacement_mask;
+                    self.displacement_length = 8 & set_displacement_mask;
+                } else {
+                    self.modrm |= 0b10000000 & set_displacement_mask as u8;
+                    self.displacement = (offset as u32) & set_displacement_mask;
+                    self.displacement_length = 32 & set_displacement_mask;
                 }
 
                 self.override_segment = segment;
@@ -602,16 +602,16 @@ impl Inst {
                 self.sib |= base.modrm_rm_bits();
                 self.sib |= ((scale as usize) << 6) as u8;
 
-                if offset != 0 || matches!(base, Reg::rbp | Reg::r13) {
-                    if offset <= i8::MAX as i32 && offset >= i8::MIN as i32 {
-                        self.modrm |= 0b01000000;
-                        self.displacement = offset as u8 as u32;
-                        self.displacement_length = 8;
-                    } else {
-                        self.modrm |= 0b10000000;
-                        self.displacement = offset as u32;
-                        self.displacement_length = 32;
-                    }
+                let set_displacement = (offset != 0) | matches!(base, Reg::rbp | Reg::r13);
+                let set_displacement_mask = (-(set_displacement as i32)) as u32;
+                if offset <= i8::MAX as i32 && offset >= i8::MIN as i32 {
+                    self.modrm |= 0b01000000 & set_displacement_mask as u8;
+                    self.displacement = (offset as u8 as u32) & set_displacement_mask;
+                    self.displacement_length = 8 & set_displacement_mask;
+                } else {
+                    self.modrm |= 0b10000000 & set_displacement_mask as u8;
+                    self.displacement = (offset as u32) & set_displacement_mask;
+                    self.displacement_length = 32 & set_displacement_mask;
                 }
 
                 self.override_segment = segment;
