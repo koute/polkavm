@@ -5107,7 +5107,7 @@ fn emit_code(
     is_optimized: bool,
 ) -> Result<Vec<(SourceStack, Instruction)>, ProgramFromElfError> {
     use polkavm_common::program::Reg as PReg;
-    fn conv_reg(reg: Reg) -> PReg {
+    fn conv_reg(reg: Reg) -> polkavm_common::program::RawReg {
         match reg {
             Reg::RA => PReg::RA,
             Reg::SP => PReg::SP,
@@ -5126,6 +5126,7 @@ fn emit_code(
                 unreachable!("internal error: temporary register was not spilled into memory");
             }
         }
+        .into()
     }
 
     let can_fallthrough_to_next_block = calculate_whether_can_fallthrough(all_blocks, used_blocks);

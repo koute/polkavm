@@ -4,7 +4,7 @@ use std::sync::Mutex;
 use core::marker::PhantomData;
 
 use polkavm_assembler::{Assembler, Label};
-use polkavm_common::program::{ParsedInstruction, ProgramExport, Instructions, JumpTable, Reg};
+use polkavm_common::program::{ParsedInstruction, ProgramExport, Instructions, JumpTable, RawReg};
 use polkavm_common::zygote::{
     VM_COMPILER_MAXIMUM_EPILOGUE_LENGTH, VM_COMPILER_MAXIMUM_INSTRUCTION_LENGTH,
 };
@@ -402,7 +402,7 @@ impl<'a, S> polkavm_common::program::InstructionVisitor for CompilerVisitor<'a, 
     }
 
     #[inline(always)]
-    fn sbrk(&mut self, d: Reg, s: Reg) -> Self::ReturnTy {
+    fn sbrk(&mut self, d: RawReg, s: RawReg) -> Self::ReturnTy {
         self.before_instruction();
         self.gas_visitor.sbrk(d, s);
         ArchVisitor(self).sbrk(d, s);
@@ -418,7 +418,7 @@ impl<'a, S> polkavm_common::program::InstructionVisitor for CompilerVisitor<'a, 
     }
 
     #[inline(always)]
-    fn set_less_than_unsigned(&mut self, d: Reg, s1: Reg, s2: Reg) -> Self::ReturnTy {
+    fn set_less_than_unsigned(&mut self, d: RawReg, s1: RawReg, s2: RawReg) -> Self::ReturnTy {
         self.before_instruction();
         self.gas_visitor.set_less_than_unsigned(d, s1, s2);
         ArchVisitor(self).set_less_than_unsigned(d, s1, s2);
@@ -426,7 +426,7 @@ impl<'a, S> polkavm_common::program::InstructionVisitor for CompilerVisitor<'a, 
     }
 
     #[inline(always)]
-    fn set_less_than_signed(&mut self, d: Reg, s1: Reg, s2: Reg) -> Self::ReturnTy {
+    fn set_less_than_signed(&mut self, d: RawReg, s1: RawReg, s2: RawReg) -> Self::ReturnTy {
         self.before_instruction();
         self.gas_visitor.set_less_than_signed(d, s1, s2);
         ArchVisitor(self).set_less_than_signed(d, s1, s2);
@@ -434,7 +434,7 @@ impl<'a, S> polkavm_common::program::InstructionVisitor for CompilerVisitor<'a, 
     }
 
     #[inline(always)]
-    fn shift_logical_right(&mut self, d: Reg, s1: Reg, s2: Reg) -> Self::ReturnTy {
+    fn shift_logical_right(&mut self, d: RawReg, s1: RawReg, s2: RawReg) -> Self::ReturnTy {
         self.before_instruction();
         self.gas_visitor.shift_logical_right(d, s1, s2);
         ArchVisitor(self).shift_logical_right(d, s1, s2);
@@ -442,7 +442,7 @@ impl<'a, S> polkavm_common::program::InstructionVisitor for CompilerVisitor<'a, 
     }
 
     #[inline(always)]
-    fn shift_arithmetic_right(&mut self, d: Reg, s1: Reg, s2: Reg) -> Self::ReturnTy {
+    fn shift_arithmetic_right(&mut self, d: RawReg, s1: RawReg, s2: RawReg) -> Self::ReturnTy {
         self.before_instruction();
         self.gas_visitor.shift_arithmetic_right(d, s1, s2);
         ArchVisitor(self).shift_arithmetic_right(d, s1, s2);
@@ -450,7 +450,7 @@ impl<'a, S> polkavm_common::program::InstructionVisitor for CompilerVisitor<'a, 
     }
 
     #[inline(always)]
-    fn shift_logical_left(&mut self, d: Reg, s1: Reg, s2: Reg) -> Self::ReturnTy {
+    fn shift_logical_left(&mut self, d: RawReg, s1: RawReg, s2: RawReg) -> Self::ReturnTy {
         self.before_instruction();
         self.gas_visitor.shift_logical_left(d, s1, s2);
         ArchVisitor(self).shift_logical_left(d, s1, s2);
@@ -458,7 +458,7 @@ impl<'a, S> polkavm_common::program::InstructionVisitor for CompilerVisitor<'a, 
     }
 
     #[inline(always)]
-    fn xor(&mut self, d: Reg, s1: Reg, s2: Reg) -> Self::ReturnTy {
+    fn xor(&mut self, d: RawReg, s1: RawReg, s2: RawReg) -> Self::ReturnTy {
         self.before_instruction();
         self.gas_visitor.xor(d, s1, s2);
         ArchVisitor(self).xor(d, s1, s2);
@@ -466,7 +466,7 @@ impl<'a, S> polkavm_common::program::InstructionVisitor for CompilerVisitor<'a, 
     }
 
     #[inline(always)]
-    fn and(&mut self, d: Reg, s1: Reg, s2: Reg) -> Self::ReturnTy {
+    fn and(&mut self, d: RawReg, s1: RawReg, s2: RawReg) -> Self::ReturnTy {
         self.before_instruction();
         self.gas_visitor.and(d, s1, s2);
         ArchVisitor(self).and(d, s1, s2);
@@ -474,7 +474,7 @@ impl<'a, S> polkavm_common::program::InstructionVisitor for CompilerVisitor<'a, 
     }
 
     #[inline(always)]
-    fn or(&mut self, d: Reg, s1: Reg, s2: Reg) -> Self::ReturnTy {
+    fn or(&mut self, d: RawReg, s1: RawReg, s2: RawReg) -> Self::ReturnTy {
         self.before_instruction();
         self.gas_visitor.or(d, s1, s2);
         ArchVisitor(self).or(d, s1, s2);
@@ -482,7 +482,7 @@ impl<'a, S> polkavm_common::program::InstructionVisitor for CompilerVisitor<'a, 
     }
 
     #[inline(always)]
-    fn add(&mut self, d: Reg, s1: Reg, s2: Reg) -> Self::ReturnTy {
+    fn add(&mut self, d: RawReg, s1: RawReg, s2: RawReg) -> Self::ReturnTy {
         self.before_instruction();
         self.gas_visitor.add(d, s1, s2);
         ArchVisitor(self).add(d, s1, s2);
@@ -490,7 +490,7 @@ impl<'a, S> polkavm_common::program::InstructionVisitor for CompilerVisitor<'a, 
     }
 
     #[inline(always)]
-    fn sub(&mut self, d: Reg, s1: Reg, s2: Reg) -> Self::ReturnTy {
+    fn sub(&mut self, d: RawReg, s1: RawReg, s2: RawReg) -> Self::ReturnTy {
         self.before_instruction();
         self.gas_visitor.sub(d, s1, s2);
         ArchVisitor(self).sub(d, s1, s2);
@@ -498,7 +498,7 @@ impl<'a, S> polkavm_common::program::InstructionVisitor for CompilerVisitor<'a, 
     }
 
     #[inline(always)]
-    fn mul(&mut self, d: Reg, s1: Reg, s2: Reg) -> Self::ReturnTy {
+    fn mul(&mut self, d: RawReg, s1: RawReg, s2: RawReg) -> Self::ReturnTy {
         self.before_instruction();
         self.gas_visitor.mul(d, s1, s2);
         ArchVisitor(self).mul(d, s1, s2);
@@ -506,7 +506,7 @@ impl<'a, S> polkavm_common::program::InstructionVisitor for CompilerVisitor<'a, 
     }
 
     #[inline(always)]
-    fn mul_upper_signed_signed(&mut self, d: Reg, s1: Reg, s2: Reg) -> Self::ReturnTy {
+    fn mul_upper_signed_signed(&mut self, d: RawReg, s1: RawReg, s2: RawReg) -> Self::ReturnTy {
         self.before_instruction();
         self.gas_visitor.mul_upper_signed_signed(d, s1, s2);
         ArchVisitor(self).mul_upper_signed_signed(d, s1, s2);
@@ -514,7 +514,7 @@ impl<'a, S> polkavm_common::program::InstructionVisitor for CompilerVisitor<'a, 
     }
 
     #[inline(always)]
-    fn mul_upper_unsigned_unsigned(&mut self, d: Reg, s1: Reg, s2: Reg) -> Self::ReturnTy {
+    fn mul_upper_unsigned_unsigned(&mut self, d: RawReg, s1: RawReg, s2: RawReg) -> Self::ReturnTy {
         self.before_instruction();
         self.gas_visitor.mul_upper_unsigned_unsigned(d, s1, s2);
         ArchVisitor(self).mul_upper_unsigned_unsigned(d, s1, s2);
@@ -522,7 +522,7 @@ impl<'a, S> polkavm_common::program::InstructionVisitor for CompilerVisitor<'a, 
     }
 
     #[inline(always)]
-    fn mul_upper_signed_unsigned(&mut self, d: Reg, s1: Reg, s2: Reg) -> Self::ReturnTy {
+    fn mul_upper_signed_unsigned(&mut self, d: RawReg, s1: RawReg, s2: RawReg) -> Self::ReturnTy {
         self.before_instruction();
         self.gas_visitor.mul_upper_signed_unsigned(d, s1, s2);
         ArchVisitor(self).mul_upper_signed_unsigned(d, s1, s2);
@@ -530,7 +530,7 @@ impl<'a, S> polkavm_common::program::InstructionVisitor for CompilerVisitor<'a, 
     }
 
     #[inline(always)]
-    fn div_unsigned(&mut self, d: Reg, s1: Reg, s2: Reg) -> Self::ReturnTy {
+    fn div_unsigned(&mut self, d: RawReg, s1: RawReg, s2: RawReg) -> Self::ReturnTy {
         self.before_instruction();
         self.gas_visitor.div_unsigned(d, s1, s2);
         ArchVisitor(self).div_unsigned(d, s1, s2);
@@ -538,7 +538,7 @@ impl<'a, S> polkavm_common::program::InstructionVisitor for CompilerVisitor<'a, 
     }
 
     #[inline(always)]
-    fn div_signed(&mut self, d: Reg, s1: Reg, s2: Reg) -> Self::ReturnTy {
+    fn div_signed(&mut self, d: RawReg, s1: RawReg, s2: RawReg) -> Self::ReturnTy {
         self.before_instruction();
         self.gas_visitor.div_signed(d, s1, s2);
         ArchVisitor(self).div_signed(d, s1, s2);
@@ -546,7 +546,7 @@ impl<'a, S> polkavm_common::program::InstructionVisitor for CompilerVisitor<'a, 
     }
 
     #[inline(always)]
-    fn rem_unsigned(&mut self, d: Reg, s1: Reg, s2: Reg) -> Self::ReturnTy {
+    fn rem_unsigned(&mut self, d: RawReg, s1: RawReg, s2: RawReg) -> Self::ReturnTy {
         self.before_instruction();
         self.gas_visitor.rem_unsigned(d, s1, s2);
         ArchVisitor(self).rem_unsigned(d, s1, s2);
@@ -554,7 +554,7 @@ impl<'a, S> polkavm_common::program::InstructionVisitor for CompilerVisitor<'a, 
     }
 
     #[inline(always)]
-    fn rem_signed(&mut self, d: Reg, s1: Reg, s2: Reg) -> Self::ReturnTy {
+    fn rem_signed(&mut self, d: RawReg, s1: RawReg, s2: RawReg) -> Self::ReturnTy {
         self.before_instruction();
         self.gas_visitor.rem_signed(d, s1, s2);
         ArchVisitor(self).rem_signed(d, s1, s2);
@@ -562,7 +562,7 @@ impl<'a, S> polkavm_common::program::InstructionVisitor for CompilerVisitor<'a, 
     }
 
     #[inline(always)]
-    fn mul_imm(&mut self, d: Reg, s1: Reg, s2: u32) -> Self::ReturnTy {
+    fn mul_imm(&mut self, d: RawReg, s1: RawReg, s2: u32) -> Self::ReturnTy {
         self.before_instruction();
         self.gas_visitor.mul_imm(d, s1, s2);
         ArchVisitor(self).mul_imm(d, s1, s2);
@@ -570,7 +570,7 @@ impl<'a, S> polkavm_common::program::InstructionVisitor for CompilerVisitor<'a, 
     }
 
     #[inline(always)]
-    fn mul_upper_signed_signed_imm(&mut self, d: Reg, s1: Reg, s2: u32) -> Self::ReturnTy {
+    fn mul_upper_signed_signed_imm(&mut self, d: RawReg, s1: RawReg, s2: u32) -> Self::ReturnTy {
         self.before_instruction();
         self.gas_visitor.mul_upper_signed_signed_imm(d, s1, s2);
         ArchVisitor(self).mul_upper_signed_signed_imm(d, s1, s2);
@@ -578,7 +578,7 @@ impl<'a, S> polkavm_common::program::InstructionVisitor for CompilerVisitor<'a, 
     }
 
     #[inline(always)]
-    fn mul_upper_unsigned_unsigned_imm(&mut self, d: Reg, s1: Reg, s2: u32) -> Self::ReturnTy {
+    fn mul_upper_unsigned_unsigned_imm(&mut self, d: RawReg, s1: RawReg, s2: u32) -> Self::ReturnTy {
         self.before_instruction();
         self.gas_visitor.mul_upper_unsigned_unsigned_imm(d, s1, s2);
         ArchVisitor(self).mul_upper_unsigned_unsigned_imm(d, s1, s2);
@@ -586,7 +586,7 @@ impl<'a, S> polkavm_common::program::InstructionVisitor for CompilerVisitor<'a, 
     }
 
     #[inline(always)]
-    fn set_less_than_unsigned_imm(&mut self, d: Reg, s1: Reg, s2: u32) -> Self::ReturnTy {
+    fn set_less_than_unsigned_imm(&mut self, d: RawReg, s1: RawReg, s2: u32) -> Self::ReturnTy {
         self.before_instruction();
         self.gas_visitor.set_less_than_unsigned_imm(d, s1, s2);
         ArchVisitor(self).set_less_than_unsigned_imm(d, s1, s2);
@@ -594,7 +594,7 @@ impl<'a, S> polkavm_common::program::InstructionVisitor for CompilerVisitor<'a, 
     }
 
     #[inline(always)]
-    fn set_less_than_signed_imm(&mut self, d: Reg, s1: Reg, s2: u32) -> Self::ReturnTy {
+    fn set_less_than_signed_imm(&mut self, d: RawReg, s1: RawReg, s2: u32) -> Self::ReturnTy {
         self.before_instruction();
         self.gas_visitor.set_less_than_signed_imm(d, s1, s2);
         ArchVisitor(self).set_less_than_signed_imm(d, s1, s2);
@@ -602,7 +602,7 @@ impl<'a, S> polkavm_common::program::InstructionVisitor for CompilerVisitor<'a, 
     }
 
     #[inline(always)]
-    fn set_greater_than_unsigned_imm(&mut self, d: Reg, s1: Reg, s2: u32) -> Self::ReturnTy {
+    fn set_greater_than_unsigned_imm(&mut self, d: RawReg, s1: RawReg, s2: u32) -> Self::ReturnTy {
         self.before_instruction();
         self.gas_visitor.set_greater_than_unsigned_imm(d, s1, s2);
         ArchVisitor(self).set_greater_than_unsigned_imm(d, s1, s2);
@@ -610,7 +610,7 @@ impl<'a, S> polkavm_common::program::InstructionVisitor for CompilerVisitor<'a, 
     }
 
     #[inline(always)]
-    fn set_greater_than_signed_imm(&mut self, d: Reg, s1: Reg, s2: u32) -> Self::ReturnTy {
+    fn set_greater_than_signed_imm(&mut self, d: RawReg, s1: RawReg, s2: u32) -> Self::ReturnTy {
         self.before_instruction();
         self.gas_visitor.set_greater_than_signed_imm(d, s1, s2);
         ArchVisitor(self).set_greater_than_signed_imm(d, s1, s2);
@@ -618,7 +618,7 @@ impl<'a, S> polkavm_common::program::InstructionVisitor for CompilerVisitor<'a, 
     }
 
     #[inline(always)]
-    fn shift_logical_right_imm(&mut self, d: Reg, s1: Reg, s2: u32) -> Self::ReturnTy {
+    fn shift_logical_right_imm(&mut self, d: RawReg, s1: RawReg, s2: u32) -> Self::ReturnTy {
         self.before_instruction();
         self.gas_visitor.shift_logical_right_imm(d, s1, s2);
         ArchVisitor(self).shift_logical_right_imm(d, s1, s2);
@@ -626,7 +626,7 @@ impl<'a, S> polkavm_common::program::InstructionVisitor for CompilerVisitor<'a, 
     }
 
     #[inline(always)]
-    fn shift_arithmetic_right_imm(&mut self, d: Reg, s1: Reg, s2: u32) -> Self::ReturnTy {
+    fn shift_arithmetic_right_imm(&mut self, d: RawReg, s1: RawReg, s2: u32) -> Self::ReturnTy {
         self.before_instruction();
         self.gas_visitor.shift_arithmetic_right_imm(d, s1, s2);
         ArchVisitor(self).shift_arithmetic_right_imm(d, s1, s2);
@@ -634,7 +634,7 @@ impl<'a, S> polkavm_common::program::InstructionVisitor for CompilerVisitor<'a, 
     }
 
     #[inline(always)]
-    fn shift_logical_left_imm(&mut self, d: Reg, s1: Reg, s2: u32) -> Self::ReturnTy {
+    fn shift_logical_left_imm(&mut self, d: RawReg, s1: RawReg, s2: u32) -> Self::ReturnTy {
         self.before_instruction();
         self.gas_visitor.shift_logical_left_imm(d, s1, s2);
         ArchVisitor(self).shift_logical_left_imm(d, s1, s2);
@@ -642,7 +642,7 @@ impl<'a, S> polkavm_common::program::InstructionVisitor for CompilerVisitor<'a, 
     }
 
     #[inline(always)]
-    fn shift_logical_right_imm_alt(&mut self, d: Reg, s2: Reg, s1: u32) -> Self::ReturnTy {
+    fn shift_logical_right_imm_alt(&mut self, d: RawReg, s2: RawReg, s1: u32) -> Self::ReturnTy {
         self.before_instruction();
         self.gas_visitor.shift_logical_right_imm_alt(d, s2, s1);
         ArchVisitor(self).shift_logical_right_imm_alt(d, s2, s1);
@@ -650,7 +650,7 @@ impl<'a, S> polkavm_common::program::InstructionVisitor for CompilerVisitor<'a, 
     }
 
     #[inline(always)]
-    fn shift_arithmetic_right_imm_alt(&mut self, d: Reg, s2: Reg, s1: u32) -> Self::ReturnTy {
+    fn shift_arithmetic_right_imm_alt(&mut self, d: RawReg, s2: RawReg, s1: u32) -> Self::ReturnTy {
         self.before_instruction();
         self.gas_visitor.shift_arithmetic_right_imm_alt(d, s2, s1);
         ArchVisitor(self).shift_arithmetic_right_imm_alt(d, s2, s1);
@@ -658,7 +658,7 @@ impl<'a, S> polkavm_common::program::InstructionVisitor for CompilerVisitor<'a, 
     }
 
     #[inline(always)]
-    fn shift_logical_left_imm_alt(&mut self, d: Reg, s2: Reg, s1: u32) -> Self::ReturnTy {
+    fn shift_logical_left_imm_alt(&mut self, d: RawReg, s2: RawReg, s1: u32) -> Self::ReturnTy {
         self.before_instruction();
         self.gas_visitor.shift_logical_left_imm_alt(d, s2, s1);
         ArchVisitor(self).shift_logical_left_imm_alt(d, s2, s1);
@@ -666,7 +666,7 @@ impl<'a, S> polkavm_common::program::InstructionVisitor for CompilerVisitor<'a, 
     }
 
     #[inline(always)]
-    fn or_imm(&mut self, d: Reg, s: Reg, imm: u32) -> Self::ReturnTy {
+    fn or_imm(&mut self, d: RawReg, s: RawReg, imm: u32) -> Self::ReturnTy {
         self.before_instruction();
         self.gas_visitor.or_imm(d, s, imm);
         ArchVisitor(self).or_imm(d, s, imm);
@@ -674,7 +674,7 @@ impl<'a, S> polkavm_common::program::InstructionVisitor for CompilerVisitor<'a, 
     }
 
     #[inline(always)]
-    fn and_imm(&mut self, d: Reg, s: Reg, imm: u32) -> Self::ReturnTy {
+    fn and_imm(&mut self, d: RawReg, s: RawReg, imm: u32) -> Self::ReturnTy {
         self.before_instruction();
         self.gas_visitor.and_imm(d, s, imm);
         ArchVisitor(self).and_imm(d, s, imm);
@@ -682,7 +682,7 @@ impl<'a, S> polkavm_common::program::InstructionVisitor for CompilerVisitor<'a, 
     }
 
     #[inline(always)]
-    fn xor_imm(&mut self, d: Reg, s: Reg, imm: u32) -> Self::ReturnTy {
+    fn xor_imm(&mut self, d: RawReg, s: RawReg, imm: u32) -> Self::ReturnTy {
         self.before_instruction();
         self.gas_visitor.xor_imm(d, s, imm);
         ArchVisitor(self).xor_imm(d, s, imm);
@@ -690,7 +690,7 @@ impl<'a, S> polkavm_common::program::InstructionVisitor for CompilerVisitor<'a, 
     }
 
     #[inline(always)]
-    fn move_reg(&mut self, d: Reg, s: Reg) -> Self::ReturnTy {
+    fn move_reg(&mut self, d: RawReg, s: RawReg) -> Self::ReturnTy {
         self.before_instruction();
         self.gas_visitor.move_reg(d, s);
         ArchVisitor(self).move_reg(d, s);
@@ -698,7 +698,7 @@ impl<'a, S> polkavm_common::program::InstructionVisitor for CompilerVisitor<'a, 
     }
 
     #[inline(always)]
-    fn cmov_if_zero(&mut self, d: Reg, s: Reg, c: Reg) -> Self::ReturnTy {
+    fn cmov_if_zero(&mut self, d: RawReg, s: RawReg, c: RawReg) -> Self::ReturnTy {
         self.before_instruction();
         self.gas_visitor.cmov_if_zero(d, s, c);
         ArchVisitor(self).cmov_if_zero(d, s, c);
@@ -706,7 +706,7 @@ impl<'a, S> polkavm_common::program::InstructionVisitor for CompilerVisitor<'a, 
     }
 
     #[inline(always)]
-    fn cmov_if_not_zero(&mut self, d: Reg, s: Reg, c: Reg) -> Self::ReturnTy {
+    fn cmov_if_not_zero(&mut self, d: RawReg, s: RawReg, c: RawReg) -> Self::ReturnTy {
         self.before_instruction();
         self.gas_visitor.cmov_if_not_zero(d, s, c);
         ArchVisitor(self).cmov_if_not_zero(d, s, c);
@@ -714,7 +714,7 @@ impl<'a, S> polkavm_common::program::InstructionVisitor for CompilerVisitor<'a, 
     }
 
     #[inline(always)]
-    fn cmov_if_zero_imm(&mut self, d: Reg, c: Reg, s: u32) -> Self::ReturnTy {
+    fn cmov_if_zero_imm(&mut self, d: RawReg, c: RawReg, s: u32) -> Self::ReturnTy {
         self.before_instruction();
         self.gas_visitor.cmov_if_zero_imm(d, c, s);
         ArchVisitor(self).cmov_if_zero_imm(d, c, s);
@@ -722,7 +722,7 @@ impl<'a, S> polkavm_common::program::InstructionVisitor for CompilerVisitor<'a, 
     }
 
     #[inline(always)]
-    fn cmov_if_not_zero_imm(&mut self, d: Reg, c: Reg, s: u32) -> Self::ReturnTy {
+    fn cmov_if_not_zero_imm(&mut self, d: RawReg, c: RawReg, s: u32) -> Self::ReturnTy {
         self.before_instruction();
         self.gas_visitor.cmov_if_not_zero_imm(d, c, s);
         ArchVisitor(self).cmov_if_not_zero_imm(d, c, s);
@@ -730,7 +730,7 @@ impl<'a, S> polkavm_common::program::InstructionVisitor for CompilerVisitor<'a, 
     }
 
     #[inline(always)]
-    fn add_imm(&mut self, d: Reg, s: Reg, imm: u32) -> Self::ReturnTy {
+    fn add_imm(&mut self, d: RawReg, s: RawReg, imm: u32) -> Self::ReturnTy {
         self.before_instruction();
         self.gas_visitor.add_imm(d, s, imm);
         ArchVisitor(self).add_imm(d, s, imm);
@@ -738,7 +738,7 @@ impl<'a, S> polkavm_common::program::InstructionVisitor for CompilerVisitor<'a, 
     }
 
     #[inline(always)]
-    fn negate_and_add_imm(&mut self, d: Reg, s1: Reg, s2: u32) -> Self::ReturnTy {
+    fn negate_and_add_imm(&mut self, d: RawReg, s1: RawReg, s2: u32) -> Self::ReturnTy {
         self.before_instruction();
         self.gas_visitor.negate_and_add_imm(d, s1, s2);
         ArchVisitor(self).negate_and_add_imm(d, s1, s2);
@@ -746,7 +746,7 @@ impl<'a, S> polkavm_common::program::InstructionVisitor for CompilerVisitor<'a, 
     }
 
     #[inline(always)]
-    fn store_imm_indirect_u8(&mut self, base: Reg, offset: u32, value: u32) -> Self::ReturnTy {
+    fn store_imm_indirect_u8(&mut self, base: RawReg, offset: u32, value: u32) -> Self::ReturnTy {
         self.before_instruction();
         self.gas_visitor.store_imm_indirect_u8(base, offset, value);
         ArchVisitor(self).store_imm_indirect_u8(base, offset, value);
@@ -754,7 +754,7 @@ impl<'a, S> polkavm_common::program::InstructionVisitor for CompilerVisitor<'a, 
     }
 
     #[inline(always)]
-    fn store_imm_indirect_u16(&mut self, base: Reg, offset: u32, value: u32) -> Self::ReturnTy {
+    fn store_imm_indirect_u16(&mut self, base: RawReg, offset: u32, value: u32) -> Self::ReturnTy {
         self.before_instruction();
         self.gas_visitor.store_imm_indirect_u16(base, offset, value);
         ArchVisitor(self).store_imm_indirect_u16(base, offset, value);
@@ -762,7 +762,7 @@ impl<'a, S> polkavm_common::program::InstructionVisitor for CompilerVisitor<'a, 
     }
 
     #[inline(always)]
-    fn store_imm_indirect_u32(&mut self, base: Reg, offset: u32, value: u32) -> Self::ReturnTy {
+    fn store_imm_indirect_u32(&mut self, base: RawReg, offset: u32, value: u32) -> Self::ReturnTy {
         self.before_instruction();
         self.gas_visitor.store_imm_indirect_u32(base, offset, value);
         ArchVisitor(self).store_imm_indirect_u32(base, offset, value);
@@ -770,7 +770,7 @@ impl<'a, S> polkavm_common::program::InstructionVisitor for CompilerVisitor<'a, 
     }
 
     #[inline(always)]
-    fn store_indirect_u8(&mut self, src: Reg, base: Reg, offset: u32) -> Self::ReturnTy {
+    fn store_indirect_u8(&mut self, src: RawReg, base: RawReg, offset: u32) -> Self::ReturnTy {
         self.before_instruction();
         self.gas_visitor.store_indirect_u8(src, base, offset);
         ArchVisitor(self).store_indirect_u8(src, base, offset);
@@ -778,7 +778,7 @@ impl<'a, S> polkavm_common::program::InstructionVisitor for CompilerVisitor<'a, 
     }
 
     #[inline(always)]
-    fn store_indirect_u16(&mut self, src: Reg, base: Reg, offset: u32) -> Self::ReturnTy {
+    fn store_indirect_u16(&mut self, src: RawReg, base: RawReg, offset: u32) -> Self::ReturnTy {
         self.before_instruction();
         self.gas_visitor.store_indirect_u16(src, base, offset);
         ArchVisitor(self).store_indirect_u16(src, base, offset);
@@ -786,7 +786,7 @@ impl<'a, S> polkavm_common::program::InstructionVisitor for CompilerVisitor<'a, 
     }
 
     #[inline(always)]
-    fn store_indirect_u32(&mut self, src: Reg, base: Reg, offset: u32) -> Self::ReturnTy {
+    fn store_indirect_u32(&mut self, src: RawReg, base: RawReg, offset: u32) -> Self::ReturnTy {
         self.before_instruction();
         self.gas_visitor.store_indirect_u32(src, base, offset);
         ArchVisitor(self).store_indirect_u32(src, base, offset);
@@ -818,7 +818,7 @@ impl<'a, S> polkavm_common::program::InstructionVisitor for CompilerVisitor<'a, 
     }
 
     #[inline(always)]
-    fn store_u8(&mut self, src: Reg, offset: u32) -> Self::ReturnTy {
+    fn store_u8(&mut self, src: RawReg, offset: u32) -> Self::ReturnTy {
         self.before_instruction();
         self.gas_visitor.store_u8(src, offset);
         ArchVisitor(self).store_u8(src, offset);
@@ -826,7 +826,7 @@ impl<'a, S> polkavm_common::program::InstructionVisitor for CompilerVisitor<'a, 
     }
 
     #[inline(always)]
-    fn store_u16(&mut self, src: Reg, offset: u32) -> Self::ReturnTy {
+    fn store_u16(&mut self, src: RawReg, offset: u32) -> Self::ReturnTy {
         self.before_instruction();
         self.gas_visitor.store_u16(src, offset);
         ArchVisitor(self).store_u16(src, offset);
@@ -834,7 +834,7 @@ impl<'a, S> polkavm_common::program::InstructionVisitor for CompilerVisitor<'a, 
     }
 
     #[inline(always)]
-    fn store_u32(&mut self, src: Reg, offset: u32) -> Self::ReturnTy {
+    fn store_u32(&mut self, src: RawReg, offset: u32) -> Self::ReturnTy {
         self.before_instruction();
         self.gas_visitor.store_u32(src, offset);
         ArchVisitor(self).store_u32(src, offset);
@@ -842,7 +842,7 @@ impl<'a, S> polkavm_common::program::InstructionVisitor for CompilerVisitor<'a, 
     }
 
     #[inline(always)]
-    fn load_indirect_u8(&mut self, dst: Reg, base: Reg, offset: u32) -> Self::ReturnTy {
+    fn load_indirect_u8(&mut self, dst: RawReg, base: RawReg, offset: u32) -> Self::ReturnTy {
         self.before_instruction();
         self.gas_visitor.load_indirect_u8(dst, base, offset);
         ArchVisitor(self).load_indirect_u8(dst, base, offset);
@@ -850,7 +850,7 @@ impl<'a, S> polkavm_common::program::InstructionVisitor for CompilerVisitor<'a, 
     }
 
     #[inline(always)]
-    fn load_indirect_i8(&mut self, dst: Reg, base: Reg, offset: u32) -> Self::ReturnTy {
+    fn load_indirect_i8(&mut self, dst: RawReg, base: RawReg, offset: u32) -> Self::ReturnTy {
         self.before_instruction();
         self.gas_visitor.load_indirect_i8(dst, base, offset);
         ArchVisitor(self).load_indirect_i8(dst, base, offset);
@@ -858,7 +858,7 @@ impl<'a, S> polkavm_common::program::InstructionVisitor for CompilerVisitor<'a, 
     }
 
     #[inline(always)]
-    fn load_indirect_u16(&mut self, dst: Reg, base: Reg, offset: u32) -> Self::ReturnTy {
+    fn load_indirect_u16(&mut self, dst: RawReg, base: RawReg, offset: u32) -> Self::ReturnTy {
         self.before_instruction();
         self.gas_visitor.load_indirect_u16(dst, base, offset);
         ArchVisitor(self).load_indirect_u16(dst, base, offset);
@@ -866,7 +866,7 @@ impl<'a, S> polkavm_common::program::InstructionVisitor for CompilerVisitor<'a, 
     }
 
     #[inline(always)]
-    fn load_indirect_i16(&mut self, dst: Reg, base: Reg, offset: u32) -> Self::ReturnTy {
+    fn load_indirect_i16(&mut self, dst: RawReg, base: RawReg, offset: u32) -> Self::ReturnTy {
         self.before_instruction();
         self.gas_visitor.load_indirect_i16(dst, base, offset);
         ArchVisitor(self).load_indirect_i16(dst, base, offset);
@@ -874,7 +874,7 @@ impl<'a, S> polkavm_common::program::InstructionVisitor for CompilerVisitor<'a, 
     }
 
     #[inline(always)]
-    fn load_indirect_u32(&mut self, dst: Reg, base: Reg, offset: u32) -> Self::ReturnTy {
+    fn load_indirect_u32(&mut self, dst: RawReg, base: RawReg, offset: u32) -> Self::ReturnTy {
         self.before_instruction();
         self.gas_visitor.load_indirect_u32(dst, base, offset);
         ArchVisitor(self).load_indirect_u32(dst, base, offset);
@@ -882,7 +882,7 @@ impl<'a, S> polkavm_common::program::InstructionVisitor for CompilerVisitor<'a, 
     }
 
     #[inline(always)]
-    fn load_u8(&mut self, dst: Reg, offset: u32) -> Self::ReturnTy {
+    fn load_u8(&mut self, dst: RawReg, offset: u32) -> Self::ReturnTy {
         self.before_instruction();
         self.gas_visitor.load_u8(dst, offset);
         ArchVisitor(self).load_u8(dst, offset);
@@ -890,7 +890,7 @@ impl<'a, S> polkavm_common::program::InstructionVisitor for CompilerVisitor<'a, 
     }
 
     #[inline(always)]
-    fn load_i8(&mut self, dst: Reg, offset: u32) -> Self::ReturnTy {
+    fn load_i8(&mut self, dst: RawReg, offset: u32) -> Self::ReturnTy {
         self.before_instruction();
         self.gas_visitor.load_i8(dst, offset);
         ArchVisitor(self).load_i8(dst, offset);
@@ -898,7 +898,7 @@ impl<'a, S> polkavm_common::program::InstructionVisitor for CompilerVisitor<'a, 
     }
 
     #[inline(always)]
-    fn load_u16(&mut self, dst: Reg, offset: u32) -> Self::ReturnTy {
+    fn load_u16(&mut self, dst: RawReg, offset: u32) -> Self::ReturnTy {
         self.before_instruction();
         self.gas_visitor.load_u16(dst, offset);
         ArchVisitor(self).load_u16(dst, offset);
@@ -906,7 +906,7 @@ impl<'a, S> polkavm_common::program::InstructionVisitor for CompilerVisitor<'a, 
     }
 
     #[inline(always)]
-    fn load_i16(&mut self, dst: Reg, offset: u32) -> Self::ReturnTy {
+    fn load_i16(&mut self, dst: RawReg, offset: u32) -> Self::ReturnTy {
         self.before_instruction();
         self.gas_visitor.load_i16(dst, offset);
         ArchVisitor(self).load_i16(dst, offset);
@@ -914,7 +914,7 @@ impl<'a, S> polkavm_common::program::InstructionVisitor for CompilerVisitor<'a, 
     }
 
     #[inline(always)]
-    fn load_u32(&mut self, dst: Reg, offset: u32) -> Self::ReturnTy {
+    fn load_u32(&mut self, dst: RawReg, offset: u32) -> Self::ReturnTy {
         self.before_instruction();
         self.gas_visitor.load_u32(dst, offset);
         ArchVisitor(self).load_u32(dst, offset);
@@ -922,7 +922,7 @@ impl<'a, S> polkavm_common::program::InstructionVisitor for CompilerVisitor<'a, 
     }
 
     #[inline(always)]
-    fn branch_less_unsigned(&mut self, s1: Reg, s2: Reg, imm: u32) -> Self::ReturnTy {
+    fn branch_less_unsigned(&mut self, s1: RawReg, s2: RawReg, imm: u32) -> Self::ReturnTy {
         self.before_instruction();
         self.gas_visitor.branch_less_unsigned(s1, s2, imm);
         ArchVisitor(self).branch_less_unsigned(s1, s2, imm);
@@ -931,7 +931,7 @@ impl<'a, S> polkavm_common::program::InstructionVisitor for CompilerVisitor<'a, 
     }
 
     #[inline(always)]
-    fn branch_less_signed(&mut self, s1: Reg, s2: Reg, imm: u32) -> Self::ReturnTy {
+    fn branch_less_signed(&mut self, s1: RawReg, s2: RawReg, imm: u32) -> Self::ReturnTy {
         self.before_instruction();
         self.gas_visitor.branch_less_signed(s1, s2, imm);
         ArchVisitor(self).branch_less_signed(s1, s2, imm);
@@ -940,7 +940,7 @@ impl<'a, S> polkavm_common::program::InstructionVisitor for CompilerVisitor<'a, 
     }
 
     #[inline(always)]
-    fn branch_greater_or_equal_unsigned(&mut self, s1: Reg, s2: Reg, imm: u32) -> Self::ReturnTy {
+    fn branch_greater_or_equal_unsigned(&mut self, s1: RawReg, s2: RawReg, imm: u32) -> Self::ReturnTy {
         self.before_instruction();
         self.gas_visitor.branch_greater_or_equal_unsigned(s1, s2, imm);
         ArchVisitor(self).branch_greater_or_equal_unsigned(s1, s2, imm);
@@ -949,7 +949,7 @@ impl<'a, S> polkavm_common::program::InstructionVisitor for CompilerVisitor<'a, 
     }
 
     #[inline(always)]
-    fn branch_greater_or_equal_signed(&mut self, s1: Reg, s2: Reg, imm: u32) -> Self::ReturnTy {
+    fn branch_greater_or_equal_signed(&mut self, s1: RawReg, s2: RawReg, imm: u32) -> Self::ReturnTy {
         self.before_instruction();
         self.gas_visitor.branch_greater_or_equal_signed(s1, s2, imm);
         ArchVisitor(self).branch_greater_or_equal_signed(s1, s2, imm);
@@ -958,7 +958,7 @@ impl<'a, S> polkavm_common::program::InstructionVisitor for CompilerVisitor<'a, 
     }
 
     #[inline(always)]
-    fn branch_eq(&mut self, s1: Reg, s2: Reg, imm: u32) -> Self::ReturnTy {
+    fn branch_eq(&mut self, s1: RawReg, s2: RawReg, imm: u32) -> Self::ReturnTy {
         self.before_instruction();
         self.gas_visitor.branch_eq(s1, s2, imm);
         ArchVisitor(self).branch_eq(s1, s2, imm);
@@ -967,7 +967,7 @@ impl<'a, S> polkavm_common::program::InstructionVisitor for CompilerVisitor<'a, 
     }
 
     #[inline(always)]
-    fn branch_not_eq(&mut self, s1: Reg, s2: Reg, imm: u32) -> Self::ReturnTy {
+    fn branch_not_eq(&mut self, s1: RawReg, s2: RawReg, imm: u32) -> Self::ReturnTy {
         self.before_instruction();
         self.gas_visitor.branch_not_eq(s1, s2, imm);
         ArchVisitor(self).branch_not_eq(s1, s2, imm);
@@ -976,7 +976,7 @@ impl<'a, S> polkavm_common::program::InstructionVisitor for CompilerVisitor<'a, 
     }
 
     #[inline(always)]
-    fn branch_eq_imm(&mut self, s1: Reg, s2: u32, imm: u32) -> Self::ReturnTy {
+    fn branch_eq_imm(&mut self, s1: RawReg, s2: u32, imm: u32) -> Self::ReturnTy {
         self.before_instruction();
         self.gas_visitor.branch_eq_imm(s1, s2, imm);
         ArchVisitor(self).branch_eq_imm(s1, s2, imm);
@@ -985,7 +985,7 @@ impl<'a, S> polkavm_common::program::InstructionVisitor for CompilerVisitor<'a, 
     }
 
     #[inline(always)]
-    fn branch_not_eq_imm(&mut self, s1: Reg, s2: u32, imm: u32) -> Self::ReturnTy {
+    fn branch_not_eq_imm(&mut self, s1: RawReg, s2: u32, imm: u32) -> Self::ReturnTy {
         self.before_instruction();
         self.gas_visitor.branch_not_eq_imm(s1, s2, imm);
         ArchVisitor(self).branch_not_eq_imm(s1, s2, imm);
@@ -994,7 +994,7 @@ impl<'a, S> polkavm_common::program::InstructionVisitor for CompilerVisitor<'a, 
     }
 
     #[inline(always)]
-    fn branch_less_unsigned_imm(&mut self, s1: Reg, s2: u32, imm: u32) -> Self::ReturnTy {
+    fn branch_less_unsigned_imm(&mut self, s1: RawReg, s2: u32, imm: u32) -> Self::ReturnTy {
         self.before_instruction();
         self.gas_visitor.branch_less_unsigned_imm(s1, s2, imm);
         ArchVisitor(self).branch_less_unsigned_imm(s1, s2, imm);
@@ -1003,7 +1003,7 @@ impl<'a, S> polkavm_common::program::InstructionVisitor for CompilerVisitor<'a, 
     }
 
     #[inline(always)]
-    fn branch_less_signed_imm(&mut self, s1: Reg, s2: u32, imm: u32) -> Self::ReturnTy {
+    fn branch_less_signed_imm(&mut self, s1: RawReg, s2: u32, imm: u32) -> Self::ReturnTy {
         self.before_instruction();
         self.gas_visitor.branch_less_signed_imm(s1, s2, imm);
         ArchVisitor(self).branch_less_signed_imm(s1, s2, imm);
@@ -1012,7 +1012,7 @@ impl<'a, S> polkavm_common::program::InstructionVisitor for CompilerVisitor<'a, 
     }
 
     #[inline(always)]
-    fn branch_greater_or_equal_unsigned_imm(&mut self, s1: Reg, s2: u32, imm: u32) -> Self::ReturnTy {
+    fn branch_greater_or_equal_unsigned_imm(&mut self, s1: RawReg, s2: u32, imm: u32) -> Self::ReturnTy {
         self.before_instruction();
         self.gas_visitor.branch_greater_or_equal_unsigned_imm(s1, s2, imm);
         ArchVisitor(self).branch_greater_or_equal_unsigned_imm(s1, s2, imm);
@@ -1021,7 +1021,7 @@ impl<'a, S> polkavm_common::program::InstructionVisitor for CompilerVisitor<'a, 
     }
 
     #[inline(always)]
-    fn branch_greater_or_equal_signed_imm(&mut self, s1: Reg, s2: u32, imm: u32) -> Self::ReturnTy {
+    fn branch_greater_or_equal_signed_imm(&mut self, s1: RawReg, s2: u32, imm: u32) -> Self::ReturnTy {
         self.before_instruction();
         self.gas_visitor.branch_greater_or_equal_signed_imm(s1, s2, imm);
         ArchVisitor(self).branch_greater_or_equal_signed_imm(s1, s2, imm);
@@ -1030,7 +1030,7 @@ impl<'a, S> polkavm_common::program::InstructionVisitor for CompilerVisitor<'a, 
     }
 
     #[inline(always)]
-    fn branch_less_or_equal_unsigned_imm(&mut self, s1: Reg, s2: u32, imm: u32) -> Self::ReturnTy {
+    fn branch_less_or_equal_unsigned_imm(&mut self, s1: RawReg, s2: u32, imm: u32) -> Self::ReturnTy {
         self.before_instruction();
         self.gas_visitor.branch_less_or_equal_unsigned_imm(s1, s2, imm);
         ArchVisitor(self).branch_less_or_equal_unsigned_imm(s1, s2, imm);
@@ -1039,7 +1039,7 @@ impl<'a, S> polkavm_common::program::InstructionVisitor for CompilerVisitor<'a, 
     }
 
     #[inline(always)]
-    fn branch_less_or_equal_signed_imm(&mut self, s1: Reg, s2: u32, imm: u32) -> Self::ReturnTy {
+    fn branch_less_or_equal_signed_imm(&mut self, s1: RawReg, s2: u32, imm: u32) -> Self::ReturnTy {
         self.before_instruction();
         self.gas_visitor.branch_less_or_equal_signed_imm(s1, s2, imm);
         ArchVisitor(self).branch_less_or_equal_signed_imm(s1, s2, imm);
@@ -1048,7 +1048,7 @@ impl<'a, S> polkavm_common::program::InstructionVisitor for CompilerVisitor<'a, 
     }
 
     #[inline(always)]
-    fn branch_greater_unsigned_imm(&mut self, s1: Reg, s2: u32, imm: u32) -> Self::ReturnTy {
+    fn branch_greater_unsigned_imm(&mut self, s1: RawReg, s2: u32, imm: u32) -> Self::ReturnTy {
         self.before_instruction();
         self.gas_visitor.branch_greater_unsigned_imm(s1, s2, imm);
         ArchVisitor(self).branch_greater_unsigned_imm(s1, s2, imm);
@@ -1057,7 +1057,7 @@ impl<'a, S> polkavm_common::program::InstructionVisitor for CompilerVisitor<'a, 
     }
 
     #[inline(always)]
-    fn branch_greater_signed_imm(&mut self, s1: Reg, s2: u32, imm: u32) -> Self::ReturnTy {
+    fn branch_greater_signed_imm(&mut self, s1: RawReg, s2: u32, imm: u32) -> Self::ReturnTy {
         self.before_instruction();
         self.gas_visitor.branch_greater_signed_imm(s1, s2, imm);
         ArchVisitor(self).branch_greater_signed_imm(s1, s2, imm);
@@ -1066,7 +1066,7 @@ impl<'a, S> polkavm_common::program::InstructionVisitor for CompilerVisitor<'a, 
     }
 
     #[inline(always)]
-    fn load_imm(&mut self, dst: Reg, value: u32) -> Self::ReturnTy {
+    fn load_imm(&mut self, dst: RawReg, value: u32) -> Self::ReturnTy {
         self.before_instruction();
         self.gas_visitor.load_imm(dst, value);
         ArchVisitor(self).load_imm(dst, value);
@@ -1074,7 +1074,7 @@ impl<'a, S> polkavm_common::program::InstructionVisitor for CompilerVisitor<'a, 
     }
 
     #[inline(always)]
-    fn load_imm_and_jump(&mut self, ra: Reg, value: u32, target: u32) -> Self::ReturnTy {
+    fn load_imm_and_jump(&mut self, ra: RawReg, value: u32, target: u32) -> Self::ReturnTy {
         self.before_instruction();
         self.gas_visitor.load_imm_and_jump(ra, value, target);
         ArchVisitor(self).load_imm_and_jump(ra, value, target);
@@ -1083,7 +1083,7 @@ impl<'a, S> polkavm_common::program::InstructionVisitor for CompilerVisitor<'a, 
     }
 
     #[inline(always)]
-    fn load_imm_and_jump_indirect(&mut self, ra: Reg, base: Reg, value: u32, offset: u32) -> Self::ReturnTy {
+    fn load_imm_and_jump_indirect(&mut self, ra: RawReg, base: RawReg, value: u32, offset: u32) -> Self::ReturnTy {
         self.before_instruction();
         self.gas_visitor.load_imm_and_jump_indirect(ra, base, value, offset);
         ArchVisitor(self).load_imm_and_jump_indirect(ra, base, value, offset);
@@ -1101,7 +1101,7 @@ impl<'a, S> polkavm_common::program::InstructionVisitor for CompilerVisitor<'a, 
     }
 
     #[inline(always)]
-    fn jump_indirect(&mut self, base: Reg, offset: u32) -> Self::ReturnTy {
+    fn jump_indirect(&mut self, base: RawReg, offset: u32) -> Self::ReturnTy {
         self.before_instruction();
         self.gas_visitor.jump_indirect(base, offset);
         ArchVisitor(self).jump_indirect(base, offset);
