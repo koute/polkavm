@@ -1,9 +1,9 @@
 use crate::abi::{VM_CODE_ADDRESS_ALIGNMENT, VM_MAXIMUM_CODE_SIZE, VM_MAXIMUM_IMPORT_COUNT, VM_MAXIMUM_JUMP_TABLE_ENTRIES};
 use crate::utils::CowBytes;
-use crate::varint::{read_simple_varint_fast, read_varint, read_varint_fast, write_simple_varint, write_varint, MAX_VARINT_LENGTH};
+use crate::varint::{read_simple_varint, read_simple_varint_length_minus_1, read_varint, write_simple_varint, MAX_VARINT_LENGTH};
 use core::ops::Range;
 
-#[derive(Copy, Clone, Debug)]
+#[derive(Copy, Clone)]
 #[repr(transparent)]
 pub struct RawReg(u32);
 
@@ -49,6 +49,12 @@ impl RawReg {
 impl From<Reg> for RawReg {
     fn from(reg: Reg) -> Self {
         Self(reg as u32)
+    }
+}
+
+impl core::fmt::Debug for RawReg {
+    fn fmt(&self, fmt: &mut core::fmt::Formatter) -> core::fmt::Result {
+        write!(fmt, "{} (0x{:x})", self.get(), self.0)
     }
 }
 
@@ -123,48 +129,7 @@ impl core::fmt::Display for Reg {
 #[allow(clippy::partial_pub_fields)]
 #[doc(hidden)]
 pub struct VisitorHelper<T> {
-    chunk: u128,
     pub visitor: T,
-    args_length: usize,
-    instruction_offset: u32,
-    opcode: u8,
-}
-
-macro_rules! skip {
-    ($chunk:expr, $count:expr) => {
-        $chunk >> ($count << 3)
-    };
-}
-
-macro_rules! read_reg {
-    ($chunk:ident) => {{
-        let reg = RawReg($chunk as u32);
-        (reg, skip!($chunk, 1))
-    }};
-}
-
-macro_rules! read_reg2 {
-    ($chunk:ident) => {{
-        let value = $chunk as u32;
-        let reg1 = RawReg(value);
-        let reg2 = RawReg(value >> 4);
-        (reg1, reg2, skip!($chunk, 1))
-    }};
-}
-
-macro_rules! read_simple_varint {
-    ($chunk:expr, $length:expr) => {{
-        let imm = read_simple_varint_fast($chunk as u32, $length as u32);
-        (imm, skip!($chunk, $length))
-    }};
-}
-
-macro_rules! read_varint {
-    ($chunk:ident) => {{
-        let (imm_length, imm) = read_varint_fast($chunk as u64)?;
-        let imm_length = imm_length as usize;
-        (imm, skip!($chunk, imm_length), imm_length)
-    }};
 }
 
 impl<T> VisitorHelper<T> {
@@ -174,28 +139,28 @@ impl<T> VisitorHelper<T> {
     fn step_slow(
         &mut self,
         code: &[u8],
+        bitmask: &[u8],
         instruction_offset: usize,
-        instruction_length: usize,
-        decode_table: &[fn(state: &mut Self) -> <T as InstructionVisitor>::ReturnTy],
-    ) -> Option<<T as InstructionVisitor>::ReturnTy>
+        decode_table: &[fn(state: &mut Self, chunk: u128, instruction_offset: u32, args_length: u32) -> <T as ParsingVisitor>::ReturnTy],
+    ) -> Option<(usize, <T as ParsingVisitor>::ReturnTy)>
     where
         T: ParsingVisitor,
     {
-        let chunk = code.get(instruction_offset..instruction_offset + instruction_length)?;
+        let (next_offset, args_length) = parse_bitmask_slow(bitmask, instruction_offset)?;
+        let chunk_length = core::cmp::min(16, args_length + 1);
+        let chunk = code.get(instruction_offset..instruction_offset + chunk_length)?;
         let opcode = chunk[0];
-        let args = &chunk[1..instruction_length];
+
         let mut t: [u8; 16] = [0; 16];
-        t[..instruction_length].copy_from_slice(chunk);
-        self.chunk = u128::from_le_bytes([
+        t[..chunk_length].copy_from_slice(chunk);
+        let chunk = u128::from_le_bytes([
             t[0], t[1], t[2], t[3], t[4], t[5], t[6], t[7], t[8], t[9], t[10], t[11], t[12], t[13], t[14], t[15],
         ]) >> 8;
 
-        self.opcode = opcode;
-        self.args_length = args.len();
-        self.instruction_offset = instruction_offset as u32;
-
-        self.visitor.on_pre_visit(instruction_offset, instruction_length, opcode);
-        Some(decode_table[opcode as usize](self))
+        Some((
+            next_offset,
+            decode_table[opcode as usize](self, chunk, instruction_offset as u32, args_length as u32),
+        ))
     }
 
     #[allow(clippy::type_complexity)]
@@ -204,51 +169,46 @@ impl<T> VisitorHelper<T> {
         &mut self,
         code: &[u8],
         bitmask: &[u8],
-        offset: &mut usize,
-        decode_table: &[fn(state: &mut Self) -> <T as InstructionVisitor>::ReturnTy],
-    ) -> Option<<T as InstructionVisitor>::ReturnTy>
+        instruction_offset: usize,
+        decode_table: &[fn(state: &mut Self, chunk: u128, instruction_offset: u32, args_length: u32) -> <T as ParsingVisitor>::ReturnTy],
+    ) -> Option<(usize, <T as ParsingVisitor>::ReturnTy)>
     where
         T: ParsingVisitor,
     {
-        let instruction_offset = *offset;
-        let args_length = parse_bitmask(bitmask, offset)?;
-        let instruction_length = args_length + 1;
+        if let Some((next_offset, args_length)) = parse_bitmask_fast(bitmask, instruction_offset) {
+            debug_assert!(args_length <= 31);
+            if let Some(chunk) = code.get(instruction_offset..instruction_offset + 32) {
+                assert!(chunk.len() >= 32);
+                let opcode = chunk[0];
 
-        let padded_length = core::cmp::max(instruction_length, 16);
-        let Some(chunk) = code.get(instruction_offset..instruction_offset + padded_length) else {
-            return self.step_slow(code, instruction_offset, instruction_length, decode_table);
-        };
+                // NOTE: This should produce the same assembly as the unsafe `read_unaligned`.
+                let chunk = u128::from_le_bytes([
+                    chunk[1], chunk[2], chunk[3], chunk[4], chunk[5], chunk[6], chunk[7], chunk[8], chunk[9], chunk[10], chunk[11],
+                    chunk[12], chunk[13], chunk[14], chunk[15], chunk[16],
+                ]);
 
-        assert!(chunk.len() >= 16);
-        let opcode = chunk[0];
+                return Some((
+                    next_offset,
+                    decode_table[opcode as usize](self, chunk, instruction_offset as u32, args_length as u32),
+                ));
+            }
+        }
 
-        // NOTE: This should produce the same assembly as the unsafe `read_unaligned`.
-        self.chunk = u128::from_le_bytes([
-            chunk[0], chunk[1], chunk[2], chunk[3], chunk[4], chunk[5], chunk[6], chunk[7], chunk[8], chunk[9], chunk[10], chunk[11],
-            chunk[12], chunk[13], chunk[14], chunk[15],
-        ]) >> 8;
-
-        self.opcode = opcode;
-        self.args_length = instruction_length - 1;
-        self.instruction_offset = instruction_offset as u32;
-
-        self.visitor.on_pre_visit(instruction_offset, instruction_length, opcode);
-        Some(decode_table[opcode as usize](self))
+        self.step_slow(code, bitmask, instruction_offset, decode_table)
     }
 
     #[inline]
     pub fn new(visitor: T) -> Self {
-        VisitorHelper {
-            chunk: 0,
-            visitor,
-            args_length: 0,
-            instruction_offset: 0,
-            opcode: 0,
-        }
+        VisitorHelper { visitor }
     }
 
+    #[allow(clippy::type_complexity)]
     #[inline]
-    pub fn run(mut self, blob: &ProgramBlob, decode_table: &[fn(&mut Self) -> <T as InstructionVisitor>::ReturnTy; 256]) -> T
+    pub fn run(
+        mut self,
+        blob: &ProgramBlob,
+        decode_table: &[fn(&mut Self, chunk: u128, instruction_offset: u32, args_length: u32) -> <T as ParsingVisitor>::ReturnTy; 256],
+    ) -> T
     where
         T: ParsingVisitor<ReturnTy = ()>,
     {
@@ -257,101 +217,128 @@ impl<T> VisitorHelper<T> {
         debug_assert_eq!(bitmask[0] & 0b1, 1);
 
         let mut offset = 0;
-        while self.step(code, bitmask, &mut offset, decode_table).is_some() {}
+        loop {
+            let Some((next_offset, ())) = self.step(code, bitmask, offset, decode_table) else {
+                break;
+            };
+            offset = next_offset;
+        }
+
         self.visitor
     }
 
-    #[inline]
-    pub fn opcode(&self) -> u8 {
-        self.opcode
+    #[inline(always)]
+    pub fn read_args_offset(&mut self, chunk: u128, instruction_offset: u32, args_length: u32) -> Option<u32> {
+        let imm = read_simple_varint(chunk as u32, args_length);
+        Some(instruction_offset.wrapping_add(imm))
     }
 
     #[inline(always)]
-    pub fn read_args_offset(&mut self) -> Option<u32> {
-        let (imm, _) = read_simple_varint!(self.chunk, self.args_length);
-        Some(self.instruction_offset.wrapping_add(imm))
-    }
-
-    #[inline(always)]
-    pub fn read_args_imm(&mut self) -> Option<u32> {
-        let (imm, _) = read_simple_varint!(self.chunk, self.args_length);
+    pub fn read_args_imm(&mut self, chunk: u128, args_length: u32) -> Option<u32> {
+        let imm = read_simple_varint(chunk as u32, args_length);
         Some(imm)
     }
 
     #[inline(always)]
-    pub fn read_args_imm2(&mut self) -> Option<(u32, u32)> {
-        let chunk = self.chunk;
-        let (imm1, chunk, imm1_length) = read_varint!(chunk);
-        let (imm2, _) = read_simple_varint!(chunk, self.args_length - imm1_length);
+    pub fn read_args_imm2(&mut self, chunk: u128, args_length: u32) -> Option<(u32, u32)> {
+        let imm1_length = u32::from(chunk as u8);
+        let chunk = chunk >> 8;
+        let chunk = chunk as u64;
+        let imm1 = read_simple_varint(chunk as u32, imm1_length);
+        let chunk = chunk >> (imm1_length << 3);
+        let imm2 = read_simple_varint_length_minus_1(chunk as u32, args_length.wrapping_sub(imm1_length));
         Some((imm1, imm2))
     }
 
     #[inline(always)]
-    pub fn read_args_reg_imm(&mut self) -> Option<(RawReg, u32)> {
-        let chunk = self.chunk;
-        let (reg, chunk) = read_reg!(chunk);
-        let (imm, _) = read_simple_varint!(chunk, self.args_length - 1);
+    pub fn read_args_reg_imm(&mut self, chunk: u128, args_length: u32) -> Option<(RawReg, u32)> {
+        let chunk = chunk as u64;
+        let reg = RawReg(chunk as u32);
+        let chunk = chunk >> 8;
+        let imm = read_simple_varint_length_minus_1(chunk as u32, args_length);
         Some((reg, imm))
     }
 
     #[inline(always)]
-    pub fn read_args_reg_imm_offset(&mut self) -> Option<(RawReg, u32, u32)> {
-        let chunk = self.chunk;
-        let (reg, chunk) = read_reg!(chunk);
-        let (imm1, chunk, imm1_length) = read_varint!(chunk);
-        let (imm2, _) = read_simple_varint!(chunk, self.args_length - 1 - imm1_length);
-        let imm2 = self.instruction_offset.wrapping_add(imm2);
+    pub fn read_args_reg_imm_offset(&mut self, chunk: u128, instruction_offset: u32, args_length: u32) -> Option<(RawReg, u32, u32)> {
+        let (reg, imm1_length) = {
+            let value = chunk as u32;
+            (RawReg(value), (value >> 4) & 0b1111)
+        };
+        let chunk = chunk >> 8;
+        let chunk = chunk as u64;
+        let imm1 = read_simple_varint(chunk as u32, imm1_length);
+        let chunk = chunk >> (imm1_length << 3);
+        let imm2 = read_simple_varint_length_minus_1(chunk as u32, args_length.wrapping_sub(imm1_length));
+        let imm2 = instruction_offset.wrapping_add(imm2);
         Some((reg, imm1, imm2))
     }
 
     #[inline(always)]
-    pub fn read_args_reg_imm2(&mut self) -> Option<(RawReg, u32, u32)> {
-        let chunk = self.chunk;
-        let (reg, chunk) = read_reg!(chunk);
-        let (imm1, chunk, imm1_length) = read_varint!(chunk);
-        let (imm2, _) = read_simple_varint!(chunk, self.args_length - 1 - imm1_length);
+    pub fn read_args_reg_imm2(&mut self, chunk: u128, args_length: u32) -> Option<(RawReg, u32, u32)> {
+        let (reg, imm1_length) = {
+            let value = chunk as u32;
+            (RawReg(value), (value >> 4) & 0b1111)
+        };
+        let chunk = chunk >> 8;
+        let chunk = chunk as u64;
+        let imm1 = read_simple_varint(chunk as u32, imm1_length);
+        let chunk = chunk >> (imm1_length << 3);
+        let imm2 = read_simple_varint_length_minus_1(chunk as u32, args_length.wrapping_sub(imm1_length));
         Some((reg, imm1, imm2))
     }
 
     #[inline(always)]
-    pub fn read_args_regs2_imm2(&mut self) -> Option<(RawReg, RawReg, u32, u32)> {
-        let chunk = self.chunk;
-        let (reg1, reg2, chunk) = read_reg2!(chunk);
-        let (imm1, chunk, imm1_length) = read_varint!(chunk);
-        let (imm2, _) = read_simple_varint!(chunk, self.args_length - 1 - imm1_length);
+    pub fn read_args_regs2_imm2(&mut self, chunk: u128, args_length: u32) -> Option<(RawReg, RawReg, u32, u32)> {
+        let (reg1, reg2, imm1_length) = {
+            let value = chunk as u32;
+            (RawReg(value), RawReg(value >> 4), u32::from((value >> 8) as u8))
+        };
+        let chunk = chunk >> 16;
+        let chunk = chunk as u64;
+        let imm1 = read_simple_varint(chunk as u32, imm1_length);
+        let chunk = chunk >> (imm1_length << 3);
+        let imm2 = read_simple_varint_length_minus_1(chunk as u32, args_length.wrapping_sub(imm1_length + 1));
         Some((reg1, reg2, imm1, imm2))
     }
 
     #[inline(always)]
-    pub fn read_args_regs2_imm(&mut self) -> Option<(RawReg, RawReg, u32)> {
-        let chunk = self.chunk;
-        let (reg1, reg2, chunk) = read_reg2!(chunk);
-        let (imm, _) = read_simple_varint!(chunk, self.args_length - 1);
+    pub fn read_args_regs2_imm(&mut self, chunk: u128, args_length: u32) -> Option<(RawReg, RawReg, u32)> {
+        let chunk = chunk as u64;
+        let (reg1, reg2) = {
+            let value = chunk as u32;
+            (RawReg(value), RawReg(value >> 4))
+        };
+        let chunk = chunk >> 8;
+        let imm = read_simple_varint_length_minus_1(chunk as u32, args_length);
         Some((reg1, reg2, imm))
     }
 
     #[inline(always)]
-    pub fn read_args_regs2_offset(&mut self) -> Option<(RawReg, RawReg, u32)> {
-        let chunk = self.chunk;
-        let (reg1, reg2, chunk) = read_reg2!(chunk);
-        let (imm, _) = read_simple_varint!(chunk, self.args_length - 1);
-        let imm = self.instruction_offset.wrapping_add(imm);
+    pub fn read_args_regs2_offset(&mut self, chunk: u128, instruction_offset: u32, args_length: u32) -> Option<(RawReg, RawReg, u32)> {
+        let chunk = chunk as u64;
+        let (reg1, reg2) = {
+            let value = chunk as u32;
+            (RawReg(value), RawReg(value >> 4))
+        };
+        let chunk = chunk >> 8;
+        let imm = read_simple_varint_length_minus_1(chunk as u32, args_length);
+        let imm = instruction_offset.wrapping_add(imm);
         Some((reg1, reg2, imm))
     }
 
     #[inline(always)]
-    pub fn read_args_regs3(&mut self) -> (RawReg, RawReg, RawReg) {
-        let chunk = self.chunk;
-        let (reg1, reg2, chunk) = read_reg2!(chunk);
-        let (reg3, _) = read_reg!(chunk);
-        (reg1, reg2, reg3)
+    pub fn read_args_regs3(&mut self, chunk: u128) -> Option<(RawReg, RawReg, RawReg)> {
+        let chunk = chunk as u32;
+        let (reg1, reg2, reg3) = (RawReg(chunk), RawReg(chunk >> 4), RawReg(chunk >> 8));
+        Some((reg1, reg2, reg3))
     }
 
     #[inline(always)]
-    pub fn read_args_regs2(&mut self) -> (RawReg, RawReg) {
-        let chunk = self.chunk;
-        let (reg1, reg2, _) = read_reg2!(chunk);
-        (reg1, reg2)
+    pub fn read_args_regs2(&mut self, chunk: u128) -> Option<(RawReg, RawReg)> {
+        let chunk = chunk as u32;
+        let (reg1, reg2) = (RawReg(chunk), RawReg(chunk >> 4));
+        Some((reg1, reg2))
     }
 }
 
@@ -426,8 +413,27 @@ macro_rules! define_opcodes {
         [$($name_reg_reg:ident = $value_reg_reg:expr,)+]
         [$($name_reg_reg_imm_imm:ident = $value_reg_reg_imm_imm:expr,)+]
     ) => {
-        pub trait ParsingVisitor: InstructionVisitor {
-            fn on_pre_visit(&mut self, _offset: usize, _length: usize, _opcode: u8);
+        pub trait ParsingVisitor {
+            type ReturnTy;
+
+            $(fn $name_argless(&mut self, offset: u32, args_length: u32) -> Self::ReturnTy;)+
+            $(fn $name_reg_imm(&mut self, offset: u32, args_length: u32, reg: RawReg, imm: u32) -> Self::ReturnTy;)+
+            $(fn $name_reg_imm_offset(&mut self, offset: u32, args_length: u32, reg: RawReg, imm1: u32, imm2: u32) -> Self::ReturnTy;)+
+            $(fn $name_reg_imm_imm(&mut self, offset: u32, args_length: u32, reg: RawReg, imm1: u32, imm2: u32) -> Self::ReturnTy;)+
+            $(fn $name_reg_reg_imm(&mut self, offset: u32, args_length: u32, reg1: RawReg, reg2: RawReg, imm: u32) -> Self::ReturnTy;)+
+            $(fn $name_reg_reg_offset(&mut self, offset: u32, args_length: u32, reg1: RawReg, reg2: RawReg, imm: u32) -> Self::ReturnTy;)+
+            $(fn $name_reg_reg_reg(&mut self, offset: u32, args_length: u32, reg1: RawReg, reg2: RawReg, reg3: RawReg) -> Self::ReturnTy;)+
+            $(fn $name_offset(&mut self, offset: u32, args_length: u32, imm: u32) -> Self::ReturnTy;)+
+            $(fn $name_imm(&mut self, offset: u32, args_length: u32, imm: u32) -> Self::ReturnTy;)+
+            $(fn $name_imm_imm(&mut self, offset: u32, args_length: u32, imm1: u32, imm2: u32) -> Self::ReturnTy;)+
+            $(fn $name_reg_reg(&mut self, offset: u32, args_length: u32, reg1: RawReg, reg2: RawReg) -> Self::ReturnTy;)+
+            $(fn $name_reg_reg_imm_imm(&mut self, offset: u32, args_length: u32, reg1: RawReg, reg2: RawReg, imm1: u32, imm2: u32) -> Self::ReturnTy;)+
+
+            #[inline(never)]
+            #[cold]
+            fn invalid(&mut self, offset: u32, args_length: u32) -> Self::ReturnTy {
+                self.trap(offset, args_length)
+            }
         }
 
         pub trait InstructionVisitor {
@@ -448,58 +454,10 @@ macro_rules! define_opcodes {
 
             #[inline(never)]
             #[cold]
-            fn invalid(&mut self, _opcode: u8) -> Self::ReturnTy {
+            fn invalid(&mut self) -> Self::ReturnTy {
                 self.trap()
             }
         }
-
-        #[macro_export]
-        macro_rules! implement_instruction_visitor {
-            (impl<$d($visitor_ty_params:tt),*> $visitor_ty:ty, $method:ident) => {
-                impl<$d($visitor_ty_params),*> polkavm_common::program::InstructionVisitor for $visitor_ty {
-                    type ReturnTy = ();
-
-                    $(fn $name_argless(&mut self) -> Self::ReturnTy {
-                        self.$method(polkavm_common::program::Instruction::$name_argless);
-                    })+
-                    $(fn $name_reg_imm(&mut self, reg: Reg, imm: u32) -> Self::ReturnTy {
-                        self.$method(polkavm_common::program::Instruction::$name_reg_imm(reg, imm));
-                    })+
-                    $(fn $name_reg_imm_offset(&mut self, reg: Reg, imm1: u32, imm2: u32) -> Self::ReturnTy {
-                        self.$method(polkavm_common::program::Instruction::$name_reg_imm_offset(reg, imm1, imm2));
-                    })+
-                    $(fn $name_reg_imm_imm(&mut self, reg: Reg, imm1: u32, imm2: u32) -> Self::ReturnTy {
-                        self.$method(polkavm_common::program::Instruction::$name_reg_imm_imm(reg, imm1, imm2));
-                    })+
-                    $(fn $name_reg_reg_imm(&mut self, reg1: Reg, reg2: Reg, imm: u32) -> Self::ReturnTy {
-                        self.$method(polkavm_common::program::Instruction::$name_reg_reg_imm(reg1, reg2, imm));
-                    })+
-                    $(fn $name_reg_reg_offset(&mut self, reg1: Reg, reg2: Reg, imm: u32) -> Self::ReturnTy {
-                        self.$method(polkavm_common::program::Instruction::$name_reg_reg_offset(reg1, reg2, imm));
-                    })+
-                    $(fn $name_reg_reg_reg(&mut self, reg1: Reg, reg2: Reg, reg3: Reg) -> Self::ReturnTy {
-                        self.$method(polkavm_common::program::Instruction::$name_reg_reg_reg(reg1, reg2, reg3));
-                    })+
-                    $(fn $name_offset(&mut self, imm: u32) -> Self::ReturnTy {
-                        self.$method(polkavm_common::program::Instruction::$name_offset(imm));
-                    })+
-                    $(fn $name_imm(&mut self, imm: u32) -> Self::ReturnTy {
-                        self.$method(polkavm_common::program::Instruction::$name_imm(imm));
-                    })+
-                    $(fn $name_imm_imm(&mut self, imm1: u32, imm2: u32) -> Self::ReturnTy {
-                        self.$method(polkavm_common::program::Instruction::$name_imm_imm(imm1, imm2));
-                    })+
-                    $(fn $name_reg_reg(&mut self, reg1: Reg, reg2: Reg) -> Self::ReturnTy {
-                        self.$method(polkavm_common::program::Instruction::$name_reg_reg(reg1, reg2));
-                    })+
-                    $(fn $name_reg_reg_imm_imm(&mut self, reg1: Reg, reg2: Reg, imm1: u32, imm2: u32) -> Self::ReturnTy {
-                        self.$method(polkavm_common::program::Instruction::$name_reg_reg_imm_imm(reg1, reg2, imm1, imm2));
-                    })+
-                }
-            }
-        }
-
-        pub use implement_instruction_visitor;
 
         #[derive(Copy, Clone, PartialEq, Eq, Debug)]
         #[allow(non_camel_case_types)]
@@ -517,7 +475,7 @@ macro_rules! define_opcodes {
             $($name_imm_imm(u32, u32) = $value_imm_imm,)+
             $($name_reg_reg(RawReg, RawReg) = $value_reg_reg,)+
             $($name_reg_reg_imm_imm(RawReg, RawReg, u32, u32) = $value_reg_reg_imm_imm,)+
-            invalid(u8) = 88,
+            invalid = 88,
         }
 
         impl Instruction {
@@ -535,7 +493,7 @@ macro_rules! define_opcodes {
                     $(Self::$name_imm_imm(imm1, imm2) => visitor.$name_imm_imm(imm1, imm2),)+
                     $(Self::$name_reg_reg(reg1, reg2) => visitor.$name_reg_reg(reg1, reg2),)+
                     $(Self::$name_reg_reg_imm_imm(reg1, reg2, imm1, imm2) => visitor.$name_reg_reg_imm_imm(reg1, reg2, imm1, imm2),)+
-                    Self::invalid(opcode) => visitor.invalid(opcode),
+                    Self::invalid => visitor.invalid(),
                 }
             }
 
@@ -553,7 +511,7 @@ macro_rules! define_opcodes {
                     $(Self::$name_imm_imm(imm1, imm2) => Self::serialize_imm_imm(buffer, Opcode::$name_imm_imm, imm1, imm2),)+
                     $(Self::$name_reg_reg(reg1, reg2) => Self::serialize_reg_reg(buffer, Opcode::$name_reg_reg, reg1, reg2),)+
                     $(Self::$name_reg_reg_imm_imm(reg1, reg2, imm1, imm2) => Self::serialize_reg_reg_imm_imm(buffer, Opcode::$name_reg_reg_imm_imm, reg1, reg2, imm1, imm2),)+
-                    Self::invalid(..) => Self::serialize_argless(buffer, Opcode::trap),
+                    Self::invalid => Self::serialize_argless(buffer, Opcode::trap),
 
                 }
             }
@@ -572,14 +530,8 @@ macro_rules! define_opcodes {
                     $(Self::$name_imm_imm(..) => Opcode::$name_imm_imm,)+
                     $(Self::$name_reg_reg(..) => Opcode::$name_reg_reg,)+
                     $(Self::$name_reg_reg_imm_imm(..) => Opcode::$name_reg_reg_imm_imm,)+
-                    Self::invalid(..) => Opcode::trap,
+                    Self::invalid => Opcode::trap,
                 }
-            }
-        }
-
-        impl core::fmt::Display for Instruction {
-            fn fmt(&self, fmt: &mut core::fmt::Formatter) -> core::fmt::Result {
-                self.visit(fmt)
             }
         }
 
@@ -667,12 +619,12 @@ macro_rules! define_opcodes {
         macro_rules! prepare_visitor {
             (@define_table $table_name:ident, $visitor_ty:ident<$d($visitor_ty_params:tt),*>) => {
                 use $crate::program::{
-                    InstructionVisitor,
+                    ParsingVisitor,
                     VisitorHelper,
                 };
 
-                type ReturnTy<$d($visitor_ty_params),*> = <$visitor_ty<$d($visitor_ty_params),*> as InstructionVisitor>::ReturnTy;
-                type VisitFn<$d($visitor_ty_params),*> = fn(state: &mut VisitorHelper<$visitor_ty<$d($visitor_ty_params),*>>) -> ReturnTy<$d($visitor_ty_params),*>;
+                type ReturnTy<$d($visitor_ty_params),*> = <$visitor_ty<$d($visitor_ty_params),*> as ParsingVisitor>::ReturnTy;
+                type VisitFn<$d($visitor_ty_params),*> = fn(state: &mut VisitorHelper<$visitor_ty<$d($visitor_ty_params),*>>, chunk: u128, instruction_offset: u32, args_length: u32) -> ReturnTy<$d($visitor_ty_params),*>;
 
                 #[allow(unsafe_code)]
                 static $table_name: [VisitFn; 256] = {
@@ -683,8 +635,8 @@ macro_rules! define_opcodes {
                         // compiler and the linker to put all of this code near each other, minimizing
                         // instruction cache misses.
                         #[cfg_attr(target_os = "linux", link_section = concat!(".text.", stringify!($table_name)))]
-                        fn $name_argless<$d($visitor_ty_params),*>(state: &mut VisitorHelper<$visitor_ty<$d($visitor_ty_params),*>>) -> ReturnTy<$d($visitor_ty_params),*>{
-                            state.visitor.$name_argless()
+                        fn $name_argless<$d($visitor_ty_params),*>(state: &mut VisitorHelper<$visitor_ty<$d($visitor_ty_params),*>>, _chunk: u128, instruction_offset: u32, args_length: u32) -> ReturnTy<$d($visitor_ty_params),*>{
+                            state.visitor.$name_argless(instruction_offset, args_length)
                         }
 
                         table[$value_argless] = $name_argless;
@@ -692,12 +644,9 @@ macro_rules! define_opcodes {
 
                     $({
                         #[cfg_attr(target_os = "linux", link_section = concat!(".text.", stringify!($table_name)))]
-                        fn $name_reg_imm<$d($visitor_ty_params),*>(state: &mut VisitorHelper<$visitor_ty<$d($visitor_ty_params),*>>) -> ReturnTy<$d($visitor_ty_params),*>{
-                            if let Some((reg, imm)) = state.read_args_reg_imm() {
-                                return state.visitor.$name_reg_imm(reg, imm);
-                            };
-
-                            state.visitor.invalid($value_reg_imm)
+                        fn $name_reg_imm<$d($visitor_ty_params),*>(state: &mut VisitorHelper<$visitor_ty<$d($visitor_ty_params),*>>, chunk: u128, instruction_offset: u32, args_length: u32) -> ReturnTy<$d($visitor_ty_params),*>{
+                            let Some((reg, imm)) = state.read_args_reg_imm(chunk, args_length) else { return state.visitor.invalid(instruction_offset, args_length) };
+                            state.visitor.$name_reg_imm(instruction_offset, args_length, reg, imm)
                         }
 
                         table[$value_reg_imm] = $name_reg_imm;
@@ -705,12 +654,9 @@ macro_rules! define_opcodes {
 
                     $({
                         #[cfg_attr(target_os = "linux", link_section = concat!(".text.", stringify!($table_name)))]
-                        fn $name_reg_imm_offset<$d($visitor_ty_params),*>(state: &mut VisitorHelper<$visitor_ty<$d($visitor_ty_params),*>>) -> ReturnTy<$d($visitor_ty_params),*>{
-                            if let Some((reg, imm1, imm2)) = state.read_args_reg_imm_offset() {
-                                return state.visitor.$name_reg_imm_offset(reg, imm1, imm2);
-                            }
-
-                            state.visitor.invalid($value_reg_imm_offset)
+                        fn $name_reg_imm_offset<$d($visitor_ty_params),*>(state: &mut VisitorHelper<$visitor_ty<$d($visitor_ty_params),*>>, chunk: u128, instruction_offset: u32, args_length: u32) -> ReturnTy<$d($visitor_ty_params),*>{
+                            let Some((reg, imm1, imm2)) = state.read_args_reg_imm_offset(chunk, instruction_offset, args_length) else { return state.visitor.invalid(instruction_offset, args_length) };
+                            state.visitor.$name_reg_imm_offset(instruction_offset, args_length, reg, imm1, imm2)
                         }
 
                         table[$value_reg_imm_offset] = $name_reg_imm_offset;
@@ -718,12 +664,9 @@ macro_rules! define_opcodes {
 
                     $({
                         #[cfg_attr(target_os = "linux", link_section = concat!(".text.", stringify!($table_name)))]
-                        fn $name_reg_imm_imm<$d($visitor_ty_params),*>(state: &mut VisitorHelper<$visitor_ty<$d($visitor_ty_params),*>>) -> ReturnTy<$d($visitor_ty_params),*>{
-                            if let Some((reg, imm1, imm2)) = state.read_args_reg_imm2() {
-                                return state.visitor.$name_reg_imm_imm(reg, imm1, imm2);
-                            }
-
-                            state.visitor.invalid($value_reg_imm_imm)
+                        fn $name_reg_imm_imm<$d($visitor_ty_params),*>(state: &mut VisitorHelper<$visitor_ty<$d($visitor_ty_params),*>>, chunk: u128, instruction_offset: u32, args_length: u32) -> ReturnTy<$d($visitor_ty_params),*>{
+                            let Some((reg, imm1, imm2)) = state.read_args_reg_imm2(chunk, args_length) else { return state.visitor.invalid(instruction_offset, args_length) };
+                            state.visitor.$name_reg_imm_imm(instruction_offset, args_length, reg, imm1, imm2)
                         }
 
                         table[$value_reg_imm_imm] = $name_reg_imm_imm;
@@ -731,12 +674,9 @@ macro_rules! define_opcodes {
 
                     $({
                         #[cfg_attr(target_os = "linux", link_section = concat!(".text.", stringify!($table_name)))]
-                        fn $name_reg_reg_imm<$d($visitor_ty_params),*>(state: &mut VisitorHelper<$visitor_ty<$d($visitor_ty_params),*>>) -> ReturnTy<$d($visitor_ty_params),*>{
-                            if let Some((reg1, reg2, imm)) = state.read_args_regs2_imm() {
-                                return state.visitor.$name_reg_reg_imm(reg1, reg2, imm);
-                            }
-
-                            state.visitor.invalid($value_reg_reg_imm)
+                        fn $name_reg_reg_imm<$d($visitor_ty_params),*>(state: &mut VisitorHelper<$visitor_ty<$d($visitor_ty_params),*>>, chunk: u128, instruction_offset: u32, args_length: u32) -> ReturnTy<$d($visitor_ty_params),*>{
+                            let Some((reg1, reg2, imm)) = state.read_args_regs2_imm(chunk, args_length) else { return state.visitor.invalid(instruction_offset, args_length) };
+                            state.visitor.$name_reg_reg_imm(instruction_offset, args_length, reg1, reg2, imm)
                         }
 
                         table[$value_reg_reg_imm] = $name_reg_reg_imm;
@@ -744,12 +684,9 @@ macro_rules! define_opcodes {
 
                     $({
                         #[cfg_attr(target_os = "linux", link_section = concat!(".text.", stringify!($table_name)))]
-                        fn $name_reg_reg_offset<$d($visitor_ty_params),*>(state: &mut VisitorHelper<$visitor_ty<$d($visitor_ty_params),*>>) -> ReturnTy<$d($visitor_ty_params),*>{
-                            if let Some((reg1, reg2, imm)) = state.read_args_regs2_offset() {
-                                return state.visitor.$name_reg_reg_offset(reg1, reg2, imm);
-                            }
-
-                            state.visitor.invalid($value_reg_reg_offset)
+                        fn $name_reg_reg_offset<$d($visitor_ty_params),*>(state: &mut VisitorHelper<$visitor_ty<$d($visitor_ty_params),*>>, chunk: u128, instruction_offset: u32, args_length: u32) -> ReturnTy<$d($visitor_ty_params),*>{
+                            let Some((reg1, reg2, imm)) = state.read_args_regs2_offset(chunk, instruction_offset, args_length) else { return state.visitor.invalid(instruction_offset, args_length) };
+                            state.visitor.$name_reg_reg_offset(instruction_offset, args_length, reg1, reg2, imm)
                         }
 
                         table[$value_reg_reg_offset] = $name_reg_reg_offset;
@@ -757,9 +694,9 @@ macro_rules! define_opcodes {
 
                     $({
                         #[cfg_attr(target_os = "linux", link_section = concat!(".text.", stringify!($table_name)))]
-                        fn $name_reg_reg_reg<$d($visitor_ty_params),*>(state: &mut VisitorHelper<$visitor_ty<$d($visitor_ty_params),*>>) -> ReturnTy<$d($visitor_ty_params),*>{
-                            let (reg1, reg2, reg3) = state.read_args_regs3();
-                            state.visitor.$name_reg_reg_reg(reg1, reg2, reg3)
+                        fn $name_reg_reg_reg<$d($visitor_ty_params),*>(state: &mut VisitorHelper<$visitor_ty<$d($visitor_ty_params),*>>, chunk: u128, instruction_offset: u32, args_length: u32) -> ReturnTy<$d($visitor_ty_params),*>{
+                            let Some((reg1, reg2, reg3)) = state.read_args_regs3(chunk) else { return state.visitor.invalid(instruction_offset, args_length) };
+                            state.visitor.$name_reg_reg_reg(instruction_offset, args_length, reg1, reg2, reg3)
                         }
 
                         table[$value_reg_reg_reg] = $name_reg_reg_reg;
@@ -767,12 +704,9 @@ macro_rules! define_opcodes {
 
                     $({
                         #[cfg_attr(target_os = "linux", link_section = concat!(".text.", stringify!($table_name)))]
-                        fn $name_offset<$d($visitor_ty_params),*>(state: &mut VisitorHelper<$visitor_ty<$d($visitor_ty_params),*>>) -> ReturnTy<$d($visitor_ty_params),*>{
-                            if let Some(imm) = state.read_args_offset() {
-                                return state.visitor.$name_offset(imm);
-                            }
-
-                            state.visitor.invalid($value_offset)
+                        fn $name_offset<$d($visitor_ty_params),*>(state: &mut VisitorHelper<$visitor_ty<$d($visitor_ty_params),*>>, chunk: u128, instruction_offset: u32, args_length: u32) -> ReturnTy<$d($visitor_ty_params),*>{
+                            let Some(imm) = state.read_args_offset(chunk, instruction_offset, args_length) else { return state.visitor.invalid(instruction_offset, args_length) };
+                            state.visitor.$name_offset(instruction_offset, args_length, imm)
                         }
 
                         table[$value_offset] = $name_offset;
@@ -780,12 +714,9 @@ macro_rules! define_opcodes {
 
                     $({
                         #[cfg_attr(target_os = "linux", link_section = concat!(".text.", stringify!($table_name)))]
-                        fn $name_imm<$d($visitor_ty_params),*>(state: &mut VisitorHelper<$visitor_ty<$d($visitor_ty_params),*>>) -> ReturnTy<$d($visitor_ty_params),*>{
-                            if let Some(imm) = state.read_args_imm() {
-                                return state.visitor.$name_imm(imm);
-                            }
-
-                            state.visitor.invalid($value_imm)
+                        fn $name_imm<$d($visitor_ty_params),*>(state: &mut VisitorHelper<$visitor_ty<$d($visitor_ty_params),*>>, chunk: u128, instruction_offset: u32, args_length: u32) -> ReturnTy<$d($visitor_ty_params),*>{
+                            let Some(imm) = state.read_args_imm(chunk, args_length) else { return state.visitor.invalid(instruction_offset, args_length) };
+                            state.visitor.$name_imm(instruction_offset, args_length, imm)
                         }
 
                         table[$value_imm] = $name_imm;
@@ -793,12 +724,9 @@ macro_rules! define_opcodes {
 
                     $({
                         #[cfg_attr(target_os = "linux", link_section = concat!(".text.", stringify!($table_name)))]
-                        fn $name_imm_imm<$d($visitor_ty_params),*>(state: &mut VisitorHelper<$visitor_ty<$d($visitor_ty_params),*>>) -> ReturnTy<$d($visitor_ty_params),*>{
-                            if let Some((imm1, imm2)) = state.read_args_imm2() {
-                                return state.visitor.$name_imm_imm(imm1, imm2);
-                            }
-
-                            state.visitor.invalid($value_imm_imm)
+                        fn $name_imm_imm<$d($visitor_ty_params),*>(state: &mut VisitorHelper<$visitor_ty<$d($visitor_ty_params),*>>, chunk: u128, instruction_offset: u32, args_length: u32) -> ReturnTy<$d($visitor_ty_params),*>{
+                            let Some((imm1, imm2)) = state.read_args_imm2(chunk, args_length) else { return state.visitor.invalid(instruction_offset, args_length) };
+                            state.visitor.$name_imm_imm(instruction_offset, args_length, imm1, imm2)
                         }
 
                         table[$value_imm_imm] = $name_imm_imm;
@@ -806,9 +734,9 @@ macro_rules! define_opcodes {
 
                     $({
                         #[cfg_attr(target_os = "linux", link_section = concat!(".text.", stringify!($table_name)))]
-                        fn $name_reg_reg<$d($visitor_ty_params),*>(state: &mut VisitorHelper<$visitor_ty<$d($visitor_ty_params),*>>) -> ReturnTy<$d($visitor_ty_params),*>{
-                            let (reg1, reg2) = state.read_args_regs2();
-                            state.visitor.$name_reg_reg(reg1, reg2)
+                        fn $name_reg_reg<$d($visitor_ty_params),*>(state: &mut VisitorHelper<$visitor_ty<$d($visitor_ty_params),*>>, chunk: u128, instruction_offset: u32, args_length: u32) -> ReturnTy<$d($visitor_ty_params),*>{
+                            let Some((reg1, reg2)) = state.read_args_regs2(chunk) else { return state.visitor.invalid(instruction_offset, args_length) };
+                            state.visitor.$name_reg_reg(instruction_offset, args_length, reg1, reg2)
                         }
 
                         table[$value_reg_reg] = $name_reg_reg;
@@ -816,12 +744,9 @@ macro_rules! define_opcodes {
 
                     $({
                         #[cfg_attr(target_os = "linux", link_section = concat!(".text.", stringify!($table_name)))]
-                        fn $name_reg_reg_imm_imm<$d($visitor_ty_params),*>(state: &mut VisitorHelper<$visitor_ty<$d($visitor_ty_params),*>>) -> ReturnTy<$d($visitor_ty_params),*>{
-                            if let Some((reg1, reg2, imm1, imm2)) = state.read_args_regs2_imm2() {
-                                return state.visitor.$name_reg_reg_imm_imm(reg1, reg2, imm1, imm2);
-                            }
-
-                            state.visitor.invalid($value_reg_reg_imm_imm)
+                        fn $name_reg_reg_imm_imm<$d($visitor_ty_params),*>(state: &mut VisitorHelper<$visitor_ty<$d($visitor_ty_params),*>>, chunk: u128, instruction_offset: u32, args_length: u32) -> ReturnTy<$d($visitor_ty_params),*>{
+                            let Some((reg1, reg2, imm1, imm2)) = state.read_args_regs2_imm2(chunk, args_length) else { return state.visitor.invalid(instruction_offset, args_length) };
+                            state.visitor.$name_reg_reg_imm_imm(instruction_offset, args_length, reg1, reg2, imm1, imm2)
                         }
 
                         table[$value_reg_reg_imm_imm] = $name_reg_reg_imm_imm;
@@ -829,8 +754,8 @@ macro_rules! define_opcodes {
 
                     #[cfg_attr(target_os = "linux", link_section = concat!(".text.", stringify!($table_name)))]
                     #[cold]
-                    fn invalid_instruction<$d($visitor_ty_params),*>(state: &mut VisitorHelper<$visitor_ty<$d($visitor_ty_params),*>>) -> ReturnTy<$d($visitor_ty_params),*>{
-                        state.visitor.invalid(state.opcode())
+                    fn invalid_instruction<$d($visitor_ty_params),*>(state: &mut VisitorHelper<$visitor_ty<$d($visitor_ty_params),*>>, _chunk: u128, instruction_offset: u32, args_length: u32) -> ReturnTy<$d($visitor_ty_params),*>{
+                        state.visitor.invalid(instruction_offset, args_length)
                     }
 
                     table
@@ -862,73 +787,57 @@ macro_rules! define_opcodes {
 
         pub use prepare_visitor;
 
-        struct ToEnumVisitor<'a>(core::marker::PhantomData<&'a ()>);
-
         impl<'a> ParsingVisitor for ToEnumVisitor<'a> {
-            fn on_pre_visit(&mut self, _offset: usize, _length: usize, _opcode: u8) {}
-        }
-
-        impl<'a> InstructionVisitor for ToEnumVisitor<'a> {
             type ReturnTy = Instruction;
 
-            $(fn $name_argless(&mut self) -> Self::ReturnTy {
+            $(fn $name_argless(&mut self, _offset: u32, args_length: u32) -> Self::ReturnTy {
+                self.args_length = args_length;
                 Instruction::$name_argless
             })+
-            $(fn $name_reg_imm(&mut self, reg: RawReg, imm: u32) -> Self::ReturnTy {
+            $(fn $name_reg_imm(&mut self, _offset: u32, args_length: u32, reg: RawReg, imm: u32) -> Self::ReturnTy {
+                self.args_length = args_length;
                 Instruction::$name_reg_imm(reg, imm)
             })+
-            $(fn $name_reg_imm_offset(&mut self, reg: RawReg, imm1: u32, imm2: u32) -> Self::ReturnTy {
+            $(fn $name_reg_imm_offset(&mut self, _offset: u32, args_length: u32, reg: RawReg, imm1: u32, imm2: u32) -> Self::ReturnTy {
+                self.args_length = args_length;
                 Instruction::$name_reg_imm_offset(reg, imm1, imm2)
             })+
-            $(fn $name_reg_imm_imm(&mut self, reg: RawReg, imm1: u32, imm2: u32) -> Self::ReturnTy {
+            $(fn $name_reg_imm_imm(&mut self, _offset: u32, args_length: u32, reg: RawReg, imm1: u32, imm2: u32) -> Self::ReturnTy {
+                self.args_length = args_length;
                 Instruction::$name_reg_imm_imm(reg, imm1, imm2)
             })+
-            $(fn $name_reg_reg_imm(&mut self, reg1: RawReg, reg2: RawReg, imm: u32) -> Self::ReturnTy {
+            $(fn $name_reg_reg_imm(&mut self, _offset: u32, args_length: u32, reg1: RawReg, reg2: RawReg, imm: u32) -> Self::ReturnTy {
+                self.args_length = args_length;
                 Instruction::$name_reg_reg_imm(reg1, reg2, imm)
             })+
-            $(fn $name_reg_reg_offset(&mut self, reg1: RawReg, reg2: RawReg, imm: u32) -> Self::ReturnTy {
+            $(fn $name_reg_reg_offset(&mut self, _offset: u32, args_length: u32, reg1: RawReg, reg2: RawReg, imm: u32) -> Self::ReturnTy {
+                self.args_length = args_length;
                 Instruction::$name_reg_reg_offset(reg1, reg2, imm)
             })+
-            $(fn $name_reg_reg_reg(&mut self, reg1: RawReg, reg2: RawReg, reg3: RawReg) -> Self::ReturnTy {
+            $(fn $name_reg_reg_reg(&mut self, _offset: u32, args_length: u32, reg1: RawReg, reg2: RawReg, reg3: RawReg) -> Self::ReturnTy {
+                self.args_length = args_length;
                 Instruction::$name_reg_reg_reg(reg1, reg2, reg3)
             })+
-            $(fn $name_offset(&mut self, imm: u32) -> Self::ReturnTy {
+            $(fn $name_offset(&mut self, _offset: u32, args_length: u32, imm: u32) -> Self::ReturnTy {
+                self.args_length = args_length;
                 Instruction::$name_offset(imm)
             })+
-            $(fn $name_imm(&mut self, imm: u32) -> Self::ReturnTy {
+            $(fn $name_imm(&mut self, _offset: u32, args_length: u32, imm: u32) -> Self::ReturnTy {
+                self.args_length = args_length;
                 Instruction::$name_imm(imm)
             })+
-            $(fn $name_imm_imm(&mut self, imm1: u32, imm2: u32) -> Self::ReturnTy {
+            $(fn $name_imm_imm(&mut self, _offset: u32, args_length: u32, imm1: u32, imm2: u32) -> Self::ReturnTy {
+                self.args_length = args_length;
                 Instruction::$name_imm_imm(imm1, imm2)
             })+
-            $(fn $name_reg_reg(&mut self, reg1: RawReg, reg2: RawReg) -> Self::ReturnTy {
+            $(fn $name_reg_reg(&mut self, _offset: u32, args_length: u32, reg1: RawReg, reg2: RawReg) -> Self::ReturnTy {
+                self.args_length = args_length;
                 Instruction::$name_reg_reg(reg1, reg2)
             })+
-            $(fn $name_reg_reg_imm_imm(&mut self, reg1: RawReg, reg2: RawReg, imm1: u32, imm2: u32) -> Self::ReturnTy {
+            $(fn $name_reg_reg_imm_imm(&mut self, _offset: u32, args_length: u32, reg1: RawReg, reg2: RawReg, imm1: u32, imm2: u32) -> Self::ReturnTy {
+                self.args_length = args_length;
                 Instruction::$name_reg_reg_imm_imm(reg1, reg2, imm1, imm2)
             })+
-        }
-
-        #[inline]
-        fn parse_instruction(code: &[u8], bitmask: &[u8], offset: &mut usize) -> Option<ParsedInstruction> {
-            prepare_visitor!(@define_table TO_ENUM_VISITOR, ToEnumVisitor<'a>);
-
-            let decode_table: &[VisitFn; 256] = &TO_ENUM_VISITOR;
-
-            #[allow(unsafe_code)]
-            // SAFETY: Here we transmute the lifetimes which were unnecessarily extended to be 'static due to the table here being a `static`.
-            let decode_table: &[VisitFn; 256] = unsafe { core::mem::transmute(decode_table) };
-
-            let mut helper = VisitorHelper::new(ToEnumVisitor(core::marker::PhantomData));
-            let origin = *offset;
-            let instruction = helper.step(code, bitmask, offset, decode_table)?;
-            let length = helper.args_length + 1;
-
-            Some(ParsedInstruction {
-                kind: instruction,
-                offset: origin as u32,
-                length: length as u32,
-            })
         }
 
         define_opcodes!(
@@ -947,6 +856,147 @@ macro_rules! define_opcodes {
             $($name_reg_reg_imm_imm = $value_reg_reg_imm_imm,)+
         );
     }
+}
+
+struct ToEnumVisitor<'a> {
+    args_length: u32,
+    phantom: core::marker::PhantomData<&'a ()>,
+}
+
+#[inline]
+fn parse_instruction(code: &[u8], bitmask: &[u8], offset: &mut usize) -> Option<ParsedInstruction> {
+    prepare_visitor!(@define_table TO_ENUM_VISITOR, ToEnumVisitor<'a>);
+
+    let decode_table: &[VisitFn; 256] = &TO_ENUM_VISITOR;
+
+    #[allow(unsafe_code)]
+    // SAFETY: Here we transmute the lifetimes which were unnecessarily extended to be 'static due to the table here being a `static`.
+    let decode_table: &[VisitFn; 256] = unsafe { core::mem::transmute(decode_table) };
+
+    let mut helper = VisitorHelper::new(ToEnumVisitor {
+        args_length: 0,
+        phantom: core::marker::PhantomData,
+    });
+
+    let origin = *offset;
+    let (next_offset, instruction) = helper.step(code, bitmask, origin, decode_table)?;
+    *offset = next_offset;
+
+    let length = helper.visitor.args_length + 1;
+    Some(ParsedInstruction {
+        kind: instruction,
+        offset: origin as u32,
+        length,
+    })
+}
+
+#[test]
+fn test_parse_instruction() {
+    // Instruction with no arguments.
+    assert_eq!(
+        parse_instruction(&[Opcode::fallthrough as u8], &[0b11111111], &mut 0),
+        Some(ParsedInstruction {
+            kind: Instruction::fallthrough,
+            offset: 0,
+            length: 1
+        })
+    );
+
+    // Instruction with no arguments, overparametrized.
+    assert_eq!(
+        parse_instruction(&[Opcode::fallthrough as u8, 0xff], &[0b00000101], &mut 0),
+        Some(ParsedInstruction {
+            kind: Instruction::fallthrough,
+            offset: 0,
+            length: 2
+        })
+    );
+
+    // Instruction with no arguments, overparametrized, truncated code.
+    assert_eq!(parse_instruction(&[Opcode::fallthrough as u8], &[0b00000101], &mut 0), None);
+
+    // Instruction with no arguments, overparametrized until end of code.
+    assert_eq!(
+        parse_instruction(
+            &[Opcode::fallthrough as u8, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff],
+            &[0b00000001],
+            &mut 0
+        ),
+        Some(ParsedInstruction {
+            kind: Instruction::fallthrough,
+            offset: 0,
+            length: 8
+        })
+    );
+
+    // Instruction with one immediate argument.
+    assert_eq!(
+        parse_instruction(&[Opcode::ecalli as u8], &[0b00000011], &mut 0),
+        Some(ParsedInstruction {
+            kind: Instruction::ecalli(0),
+            offset: 0,
+            length: 1
+        })
+    );
+
+    assert_eq!(
+        parse_instruction(&[Opcode::ecalli as u8, 0xff, 0xff, 0xff, 0xff], &[0b00100001], &mut 0),
+        Some(ParsedInstruction {
+            kind: Instruction::ecalli(0x80000000),
+            offset: 0,
+            length: 5
+        })
+    );
+
+    // Instruction with one immediate argument, overparametrized.
+    assert_eq!(
+        parse_instruction(&[Opcode::ecalli as u8, 0xff, 0xff, 0xff, 0xff, 0x66], &[0b01000001], &mut 0),
+        Some(ParsedInstruction {
+            kind: Instruction::ecalli(0x80000000),
+            offset: 0,
+            length: 6
+        })
+    );
+
+    // Instruction with two registers and one immediate argument.
+    assert_eq!(
+        parse_instruction(&[Opcode::add_imm as u8, 0x00, 0xff, 0xff, 0xff, 0xff], &[0b01000001], &mut 0),
+        Some(ParsedInstruction {
+            kind: Instruction::add_imm(Reg::RA.into(), Reg::RA.into(), 0x80000000),
+            offset: 0,
+            length: 6
+        })
+    );
+
+    // Instruction with two registers and one immediate argument, overparametrized.
+    assert_eq!(
+        parse_instruction(&[Opcode::add_imm as u8, 0x00, 0xff, 0xff, 0xff, 0xff, 0x66], &[0b10000001], &mut 0),
+        Some(ParsedInstruction {
+            kind: Instruction::add_imm(Reg::RA.into(), Reg::RA.into(), 0x80000000),
+            offset: 0,
+            length: 7
+        })
+    );
+
+    extern crate alloc;
+    use alloc::vec;
+    use alloc::vec::Vec;
+
+    let length = 512;
+    let mut bitmask = vec![0; length / 8];
+    bitmask[0] = 0b00000001;
+    let mut code = Vec::new();
+    code.resize(length, 0xff);
+    code[0] = Opcode::add_imm as u8;
+    code[1] = 0x00;
+    assert_eq!(
+        parse_instruction(&code, &bitmask, &mut 0),
+        Some(ParsedInstruction {
+            kind: Instruction::add_imm(Reg::RA.into(), Reg::RA.into(), 0x80000000),
+            offset: 0,
+            length: 512
+        })
+    );
 }
 
 // NOTE: The opcodes here are assigned roughly in the order of how common a given instruction is,
@@ -1123,6 +1173,12 @@ impl Opcode {
     }
 }
 
+impl core::fmt::Display for Instruction {
+    fn fmt(&self, fmt: &mut core::fmt::Formatter) -> core::fmt::Result {
+        self.visit(fmt)
+    }
+}
+
 impl Instruction {
     pub fn starts_new_basic_block(self) -> bool {
         self.opcode().starts_new_basic_block()
@@ -1136,26 +1192,30 @@ impl Instruction {
     fn serialize_reg_imm_offset(buffer: &mut [u8], position: u32, opcode: Opcode, reg: RawReg, imm1: u32, imm2: u32) -> usize {
         let imm2 = imm2.wrapping_sub(position);
         buffer[0] = opcode as u8;
-        buffer[1] = reg.0 as u8;
         let mut position = 2;
-        position += write_varint(imm1, &mut buffer[position..]);
+        let imm1_length = write_simple_varint(imm1, &mut buffer[position..]);
+        position += imm1_length;
+        buffer[1] = reg.0 as u8 | (imm1_length << 4) as u8;
         position += write_simple_varint(imm2, &mut buffer[position..]);
         position
     }
 
     fn serialize_reg_imm_imm(buffer: &mut [u8], opcode: Opcode, reg: RawReg, imm1: u32, imm2: u32) -> usize {
         buffer[0] = opcode as u8;
-        buffer[1] = reg.0 as u8;
         let mut position = 2;
-        position += write_varint(imm1, &mut buffer[position..]);
+        let imm1_length = write_simple_varint(imm1, &mut buffer[position..]);
+        position += imm1_length;
+        buffer[1] = reg.0 as u8 | (imm1_length << 4) as u8;
         position += write_simple_varint(imm2, &mut buffer[position..]);
         position
     }
     fn serialize_reg_reg_imm_imm(buffer: &mut [u8], opcode: Opcode, reg1: RawReg, reg2: RawReg, imm1: u32, imm2: u32) -> usize {
         buffer[0] = opcode as u8;
         buffer[1] = reg1.0 as u8 | (reg2.0 as u8) << 4;
-        let mut position = 2;
-        position += write_varint(imm1, &mut buffer[position..]);
+        let mut position = 3;
+        let imm1_length = write_simple_varint(imm1, &mut buffer[position..]);
+        buffer[2] = imm1_length as u8;
+        position += imm1_length;
         position += write_simple_varint(imm2, &mut buffer[position..]);
         position
     }
@@ -1199,8 +1259,10 @@ impl Instruction {
 
     fn serialize_imm_imm(buffer: &mut [u8], opcode: Opcode, imm1: u32, imm2: u32) -> usize {
         buffer[0] = opcode as u8;
-        let mut position = 1;
-        position += write_varint(imm1, &mut buffer[position..]);
+        let mut position = 2;
+        let imm1_length = write_simple_varint(imm1, &mut buffer[position..]);
+        buffer[1] = imm1_length as u8;
+        position += imm1_length;
         position += write_simple_varint(imm2, &mut buffer[position..]);
         position
     }
@@ -1617,8 +1679,8 @@ impl<'a> InstructionVisitor for core::fmt::Formatter<'a> {
         }
     }
 
-    fn invalid(&mut self, opcode: u8) -> Self::ReturnTy {
-        write!(self, "invalid 0x{opcode:02x}")
+    fn invalid(&mut self) -> Self::ReturnTy {
+        write!(self, "invalid")
     }
 }
 
@@ -2066,12 +2128,12 @@ impl<'a> Iterator for JumpTableIter<'a> {
 
 #[inline(never)]
 #[cold]
-fn parse_bitmask_slow(bitmask: &[u8], code_offset: &mut usize) -> Option<usize> {
+fn parse_bitmask_slow(bitmask: &[u8], mut offset: usize) -> Option<(usize, usize)> {
     if bitmask.is_empty() {
         return None;
     }
 
-    let mut offset = *code_offset + 1;
+    offset += 1;
     let mut args_length = 0;
     while let Some(&byte) = bitmask.get(offset >> 3) {
         let shift = offset & 7;
@@ -2092,47 +2154,54 @@ fn parse_bitmask_slow(bitmask: &[u8], code_offset: &mut usize) -> Option<usize> 
         offset += length;
     }
 
-    *code_offset = offset;
-    Some(args_length)
+    Some((offset, args_length))
 }
 
 #[cfg_attr(not(debug_assertions), inline(always))]
-pub(crate) fn parse_bitmask(bitmask: &[u8], code_offset: &mut usize) -> Option<usize> {
-    let mut offset = *code_offset + 1;
+pub(crate) fn parse_bitmask_fast(bitmask: &[u8], mut offset: usize) -> Option<(usize, usize)> {
+    offset += 1;
     let Some(bitmask) = bitmask.get(offset >> 3..(offset >> 3) + 4) else {
-        return parse_bitmask_slow(bitmask, code_offset);
+        return None;
     };
 
     let shift = offset & 7;
     let mask = u32::from_le_bytes([bitmask[0], bitmask[1], bitmask[2], bitmask[3]]) >> shift;
-
     if mask == 0 {
-        return parse_bitmask_slow(bitmask, code_offset);
+        return None;
     }
 
     let args_length = mask.trailing_zeros() as usize;
     offset += args_length;
-    *code_offset = offset;
 
-    Some(args_length)
+    Some((offset, args_length))
 }
 
 #[test]
 fn test_parse_bitmask() {
-    fn p(bitmask: &[u8]) -> (Option<usize>, usize) {
-        let mut offset = 0;
-        (parse_bitmask(bitmask, &mut offset), offset)
+    fn p(bitmask: &[u8]) -> Option<(usize, usize)> {
+        let result_fast = parse_bitmask_fast(bitmask, 0);
+        let result_slow = parse_bitmask_slow(bitmask, 0);
+        if result_fast.is_some() {
+            assert_eq!(result_fast, result_slow);
+        }
+
+        result_slow
     }
 
-    assert_eq!(p(&[0b00000001, 0, 0, 0]), (Some(31), 32));
-    assert_eq!(p(&[0b00000001, 0, 0]), (Some(23), 24));
-    assert_eq!(p(&[0b00000001, 0]), (Some(15), 16));
-    assert_eq!(p(&[0b00000001]), (Some(7), 8));
-    assert_eq!(p(&[0b00000011]), (Some(0), 1));
-    assert_eq!(p(&[0b00000011, 0]), (Some(0), 1));
-    assert_eq!(p(&[0b00000101]), (Some(1), 2));
-    assert_eq!(p(&[0b10000001]), (Some(6), 7));
-    assert_eq!(p(&[0b00000001, 1]), (Some(7), 8));
+    assert_eq!(p(&[0b00000001, 0, 0, 0]), Some((32, 31)));
+    assert_eq!(p(&[0b00000001, 0, 0]), Some((24, 23)));
+    assert_eq!(p(&[0b00000001, 0]), Some((16, 15)));
+    assert_eq!(p(&[0b00000001]), Some((8, 7)));
+    assert_eq!(p(&[0b00000011]), Some((1, 0)));
+    assert_eq!(p(&[0b00000011, 0]), Some((1, 0)));
+    assert_eq!(p(&[0b00000101]), Some((2, 1)));
+    assert_eq!(p(&[0b10000001]), Some((7, 6)));
+    assert_eq!(p(&[0b00000001, 1]), Some((8, 7)));
+
+    assert_eq!(parse_bitmask_fast(&[1, 0, 1, 0, 0, 0, 0, 0], 0), Some((16, 15)));
+    assert_eq!(parse_bitmask_fast(&[1, 0, 0, 1, 0, 0, 0, 0], 0), Some((24, 23)));
+    assert_eq!(parse_bitmask_fast(&[1, 0, 0, 0b10000000, 0, 0, 0, 0], 0), Some((31, 30)));
+    assert_eq!(parse_bitmask_fast(&[1, 0, 0, 0, 1, 0, 0, 0], 0), None);
 }
 
 #[derive(Clone)]
@@ -2142,7 +2211,7 @@ pub struct Instructions<'a> {
     offset: usize,
 }
 
-#[derive(Copy, Clone, Debug)]
+#[derive(Copy, Clone, PartialEq, Eq, Debug)]
 pub struct ParsedInstruction {
     pub kind: Instruction,
     pub offset: u32,

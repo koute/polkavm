@@ -654,8 +654,7 @@ impl<'r, 'a, S> ArchVisitor<'r, 'a, S> where S: Sandbox {
 
     #[inline(never)]
     #[cold]
-    pub(crate) fn trace_execution(&mut self) {
-        let code_offset = self.current_code_offset;
+    pub(crate) fn trace_execution(&mut self, code_offset: u32) {
         self.push(mov_imm(TMP_REG, imm32(code_offset)));
         self.call_to_label(self.trace_label);
     }
@@ -730,8 +729,8 @@ impl<'r, 'a, S> InstructionVisitor for ArchVisitor<'r, 'a, S> where S: Sandbox {
 
     #[inline(always)]
     #[cold]
-    fn invalid(&mut self, opcode: u8) -> Self::ReturnTy {
-        log::debug!("Encountered invalid instruction: opcode = {opcode}");
+    fn invalid(&mut self) -> Self::ReturnTy {
+        log::debug!("Encountered invalid instruction");
         self.trap()
     }
 
