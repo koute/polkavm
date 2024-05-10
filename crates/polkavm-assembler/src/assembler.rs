@@ -48,6 +48,107 @@ impl<'a> Drop for AssembledCode<'a> {
     }
 }
 
+/// # Safety
+///
+/// `VALUE` must be non-zero, and `Self::Next::VALUE` must be `VALUE - 1` if `Self::Next` is `NonZero`.
+pub unsafe trait NonZero {
+    const VALUE: usize;
+    type Next;
+}
+
+pub struct U0;
+
+macro_rules! impl_non_zero {
+    ($(($name:ident = $value:expr, $next:ident))*) => {
+        $(
+            pub struct $name;
+
+            const _: () = {
+                assert!($value != 0);
+            };
+
+            /// SAFETY: `VALUE` is non-zero.
+            unsafe impl NonZero for $name {
+                const VALUE: usize = $value;
+                type Next = $next;
+            }
+        )*
+    }
+}
+
+impl_non_zero! {
+    (U1 = 1, U0)
+    (U2 = 2, U1)
+    (U3 = 3, U2)
+    (U4 = 4, U3)
+    (U5 = 5, U4)
+    (U6 = 6, U5)
+}
+
+#[repr(transparent)]
+pub struct ReservedAssembler<'a, R>(&'a mut Assembler, core::marker::PhantomData<R>);
+
+impl<'a> ReservedAssembler<'a, U0> {
+    #[allow(clippy::unused_self)]
+    #[cfg_attr(not(debug_assertions), inline(always))]
+    pub fn assert_reserved_exactly_as_needed(self) {}
+}
+
+impl<'a, R> ReservedAssembler<'a, R> {
+    #[cfg_attr(not(debug_assertions), inline(always))]
+    pub fn push<T>(self, instruction: Instruction<T>) -> ReservedAssembler<'a, R::Next>
+    where
+        R: NonZero,
+        T: core::fmt::Display,
+    {
+        // SAFETY: `R: NonZero`, so we still have space in the buffer.
+        unsafe {
+            self.0.push_unchecked(instruction);
+        }
+
+        ReservedAssembler(self.0, core::marker::PhantomData)
+    }
+
+    #[cfg_attr(not(debug_assertions), inline(always))]
+    pub fn push_if<T>(self, condition: bool, instruction: Instruction<T>) -> ReservedAssembler<'a, R::Next>
+    where
+        R: NonZero,
+        T: core::fmt::Display,
+    {
+        if condition {
+            // SAFETY: `R: NonZero`, so we still have space in the buffer.
+            unsafe {
+                self.0.push_unchecked(instruction);
+            }
+        }
+
+        ReservedAssembler(self.0, core::marker::PhantomData)
+    }
+
+    #[cfg_attr(not(debug_assertions), inline(always))]
+    pub fn push_none(self) -> ReservedAssembler<'a, R::Next>
+    where
+        R: NonZero,
+    {
+        ReservedAssembler(self.0, core::marker::PhantomData)
+    }
+
+    #[cfg_attr(not(debug_assertions), inline(always))]
+    pub fn get_label_origin_offset(&self, label: Label) -> Option<isize> {
+        self.0.get_label_origin_offset(label)
+    }
+
+    #[cfg_attr(not(debug_assertions), inline(always))]
+    pub fn len(&self) -> usize {
+        self.0.len()
+    }
+
+    #[cfg_attr(not(debug_assertions), inline(always))]
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+}
+
 impl Assembler {
     pub const fn new() -> Self {
         Assembler {
@@ -140,9 +241,14 @@ impl Assembler {
     }
 
     #[inline(always)]
-    pub fn reserve<const INSTRUCTIONS: usize>(&mut self) {
-        InstBuf::reserve::<INSTRUCTIONS>(&mut self.code);
-        self.guaranteed_capacity = INSTRUCTIONS;
+    pub fn reserve<T>(&mut self) -> ReservedAssembler<T>
+    where
+        T: NonZero,
+    {
+        InstBuf::reserve(&mut self.code, T::VALUE);
+
+        self.guaranteed_capacity = T::VALUE;
+        ReservedAssembler(self, core::marker::PhantomData)
     }
 
     #[cfg_attr(not(debug_assertions), inline(always))]
@@ -150,17 +256,28 @@ impl Assembler {
     where
         T: core::fmt::Display,
     {
-        #[cfg(debug_assertions)]
-        log::trace!("{:08x}: {}", self.origin + self.code.len() as u64, instruction);
-
         if self.guaranteed_capacity == 0 {
-            InstBuf::reserve::<1>(&mut self.code);
+            InstBuf::reserve_const::<1>(&mut self.code);
             self.guaranteed_capacity = 1;
         }
 
+        // SAFETY: We've reserved space for at least one instruction.
+        unsafe { self.push_unchecked(instruction) }
+    }
+
+    // SAFETY: The buffer *must* have space for at least one instruction.
+    #[cfg_attr(not(debug_assertions), inline(always))]
+    unsafe fn push_unchecked<T>(&mut self, instruction: Instruction<T>) -> &mut Self
+    where
+        T: core::fmt::Display,
+    {
+        #[cfg(debug_assertions)]
+        log::trace!("{:08x}: {}", self.origin + self.code.len() as u64, instruction);
+
+        debug_assert!(self.guaranteed_capacity > 0);
         let instruction_offset = self.code.len();
 
-        // SAFETY: We've reserved space for at least one instruction.
+        // SAFETY: The caller reserved space for at least one instruction.
         unsafe {
             instruction.bytes.encode_into_vec_unsafe(&mut self.code);
         }
@@ -404,8 +521,13 @@ impl InstBuf {
     }
 
     #[inline(always)]
-    fn reserve<const INSTRUCTIONS: usize>(output: &mut Vec<u8>) {
-        let count = INSTRUCTIONS.checked_mul(MAXIMUM_INSTRUCTION_SIZE).unwrap();
+    fn reserve_const<const INSTRUCTIONS: usize>(output: &mut Vec<u8>) {
+        Self::reserve(output, INSTRUCTIONS);
+    }
+
+    #[inline(always)]
+    fn reserve(output: &mut Vec<u8>, count: usize) {
+        let count = count.checked_mul(MAXIMUM_INSTRUCTION_SIZE).unwrap();
         if output.spare_capacity_mut().len() < count {
             Self::reserve_impl(output, count);
             if output.spare_capacity_mut().len() < count {

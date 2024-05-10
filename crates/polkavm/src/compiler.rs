@@ -309,8 +309,6 @@ impl<'a, S> CompilerVisitor<'a, S> where S: Sandbox {
         if self.debug_trace_execution {
             ArchVisitor(self).trace_execution();
         }
-
-        self.asm.reserve::<8>();
     }
 
     fn after_instruction(&mut self) {
