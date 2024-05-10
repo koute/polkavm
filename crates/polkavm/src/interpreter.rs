@@ -1056,15 +1056,15 @@ impl<'a, 'b, const DEBUG: bool> InstructionVisitor for Visitor<'a, 'b, DEBUG> {
         self.set3(d, s1, s2, u32::wrapping_add)
     }
 
-    fn store_imm_u8(&mut self, value: u32, offset: u32) -> Self::ReturnTy {
+    fn store_imm_u8(&mut self, offset: u32, value: u32) -> Self::ReturnTy {
         self.store::<u8>(value, None, offset)
     }
 
-    fn store_imm_u16(&mut self, value: u32, offset: u32) -> Self::ReturnTy {
+    fn store_imm_u16(&mut self, offset: u32, value: u32) -> Self::ReturnTy {
         self.store::<u16>(value, None, offset)
     }
 
-    fn store_imm_u32(&mut self, value: u32, offset: u32) -> Self::ReturnTy {
+    fn store_imm_u32(&mut self, offset: u32, value: u32) -> Self::ReturnTy {
         self.store::<u32>(value, None, offset)
     }
 

@@ -96,7 +96,7 @@ fn basic_test_blob() -> ProgramBlob<'static> {
     builder.add_import("hostcall".into());
     builder.set_code(
         &[
-            asm::store_imm_u32(0x12345678, memory_map.rw_data_address()),
+            asm::store_imm_u32(memory_map.rw_data_address(), 0x12345678),
             asm::add(S0, A0, A1),
             asm::ecalli(0),
             asm::add(A0, A0, S0),

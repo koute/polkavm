@@ -281,17 +281,17 @@ impl polkavm_common::program::InstructionVisitor for GasVisitor {
     }
 
     #[inline(always)]
-    fn store_imm_u8(&mut self, _value: u32, _offset: u32) -> Self::ReturnTy {
+    fn store_imm_u8(&mut self, _offset: u32, _value: u32) -> Self::ReturnTy {
         self.cost += 1;
     }
 
     #[inline(always)]
-    fn store_imm_u16(&mut self, _value: u32, _offset: u32) -> Self::ReturnTy {
+    fn store_imm_u16(&mut self, _offset: u32, _value: u32) -> Self::ReturnTy {
         self.cost += 1;
     }
 
     #[inline(always)]
-    fn store_imm_u32(&mut self, _value: u32, _offset: u32) -> Self::ReturnTy {
+    fn store_imm_u32(&mut self, _offset: u32, _value: u32) -> Self::ReturnTy {
         self.cost += 1;
     }
 

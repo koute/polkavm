@@ -1445,15 +1445,15 @@ impl<'a> InstructionVisitor for core::fmt::Formatter<'a> {
         }
     }
 
-    fn store_imm_u8(&mut self, value: u32, offset: u32) -> Self::ReturnTy {
+    fn store_imm_u8(&mut self, offset: u32, value: u32) -> Self::ReturnTy {
         write!(self, "u8 [0x{offset:x}] = {value}")
     }
 
-    fn store_imm_u16(&mut self, value: u32, offset: u32) -> Self::ReturnTy {
+    fn store_imm_u16(&mut self, offset: u32, value: u32) -> Self::ReturnTy {
         write!(self, "u16 [0x{offset:x}] = {value}")
     }
 
-    fn store_imm_u32(&mut self, value: u32, offset: u32) -> Self::ReturnTy {
+    fn store_imm_u32(&mut self, offset: u32, value: u32) -> Self::ReturnTy {
         write!(self, "u32 [0x{offset:x}] = {value}")
     }
 

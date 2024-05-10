@@ -5217,7 +5217,7 @@ fn emit_code(
                         }
                         RegImm::Imm(value) => {
                             codegen! {
-                                args = (value, target),
+                                args = (target, value),
                                 kind = kind,
                                 {
                                     StoreKind::U32 => store_imm_u32,
