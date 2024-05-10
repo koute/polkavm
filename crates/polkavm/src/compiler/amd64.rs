@@ -4,7 +4,7 @@ use polkavm_assembler::amd64::RegIndex as NativeReg;
 use polkavm_assembler::amd64::RegIndex::*;
 use polkavm_assembler::amd64::Reg::rsp;
 use polkavm_assembler::amd64::{Condition, LoadKind, RegSize, Size, MemOp};
-use polkavm_assembler::Label;
+use polkavm_assembler::{ReservedAssembler, Label, U1, U2, U3, U4, NonZero};
 
 use polkavm_common::program::{InstructionVisitor, Reg};
 use polkavm_common::zygote::VM_ADDR_VMCTX;
@@ -149,6 +149,55 @@ enum ShiftKind {
     ArithmeticRight,
 }
 
+#[cfg_attr(not(debug_assertions), inline(always))]
+fn calculate_label_offset(asm_len: usize, rel8_len: usize, rel32_len: usize, offset: isize) -> Result<i8, i32> {
+    let offset_near = offset - (asm_len as isize + rel8_len as isize);
+    if offset_near <= i8::MAX as isize && offset_near >= i8::MIN as isize {
+        Ok(offset_near as i8)
+    } else {
+        let offset = offset - (asm_len as isize + rel32_len as isize);
+        Err(offset as i32)
+    }
+}
+
+#[cfg_attr(not(debug_assertions), inline(always))]
+fn branch_to_label<R>(asm: ReservedAssembler<R>, condition: Condition, label: Label) -> ReservedAssembler<R::Next> where R: NonZero {
+    if let Some(offset) = asm.get_label_origin_offset(label) {
+        let offset = calculate_label_offset(
+            asm.len(),
+            jcc_rel8(condition, i8::MAX).len(),
+            jcc_rel32(condition, i32::MAX).len(),
+            offset
+        );
+
+        match offset {
+            Ok(offset) => asm.push(jcc_rel8(condition, offset)),
+            Err(offset) => asm.push(jcc_rel32(condition, offset))
+        }
+    } else {
+        asm.push(jcc_label32(condition, label))
+    }
+}
+
+#[cfg_attr(not(debug_assertions), inline(always))]
+fn jump_to_label<R>(asm: ReservedAssembler<R>, label: Label) -> ReservedAssembler<R::Next> where R: NonZero {
+    if let Some(offset) = asm.get_label_origin_offset(label) {
+        let offset = calculate_label_offset(
+            asm.len(),
+            jmp_rel8(i8::MAX).len(),
+            jmp_rel32(i32::MAX).len(),
+            offset
+        );
+
+        match offset {
+            Ok(offset) => asm.push(jmp_rel8(offset)),
+            Err(offset) => asm.push(jmp_rel32(offset))
+        }
+    } else {
+        asm.push(jmp_label32(label))
+    }
+}
+
 impl<'r, 'a, S> ArchVisitor<'r, 'a, S> where S: Sandbox {
     pub const PADDING_BYTE: u8 = 0x90; // NOP
 
@@ -214,90 +263,109 @@ impl<'r, 'a, S> ArchVisitor<'r, 'a, S> where S: Sandbox {
 
     #[cfg_attr(not(debug_assertions), inline(always))]
     fn compare_reg_reg(&mut self, d: Reg, s1: Reg, s2: Reg, condition: Condition) {
+        let reg_size = self.reg_size();
+        let s1 = conv_reg(s1);
+        let s2 = conv_reg(s2);
+        let d = conv_reg(d);
+        let asm = self.asm.reserve::<U3>();
         if d == s1 || d == s2 {
-            self.push(cmp((self.reg_size(), conv_reg(s1), conv_reg(s2))));
-            self.push(setcc(condition, conv_reg(d)));
-            self.push(and((conv_reg(d), imm32(1))));
+            let asm = asm.push(cmp((reg_size, s1, s2)));
+            let asm = asm.push(setcc(condition, d));
+            asm.push(and((d, imm32(1))));
         } else {
-            self.clear_reg(d);
-            self.push(cmp((self.reg_size(), conv_reg(s1), conv_reg(s2))));
-            self.push(setcc(condition, conv_reg(d)));
+            let asm = asm.push(xor((RegSize::R32, d, d)));
+            let asm = asm.push(cmp((reg_size, s1, s2)));
+            asm.push(setcc(condition, d));
         }
     }
 
     #[cfg_attr(not(debug_assertions), inline(always))]
     fn compare_reg_imm(&mut self, d: Reg, s1: Reg, s2: u32, condition: Condition) {
-        if d != s1 {
-            self.clear_reg(d);
-        }
+        let reg_size = self.reg_size();
+        let d = conv_reg(d);
+        let s1 = conv_reg(s1);
 
-        if condition == Condition::Below && s2 == 1 {
+        let asm = self.asm.reserve::<U4>();
+        let asm = if d != s1 {
+            asm.push(xor((RegSize::R32, d, d)))
+        } else {
+            asm.push_none()
+        };
+
+        let asm = if condition == Condition::Below && s2 == 1 {
             // d = s1 <u 1  =>  d = s1 == 0
-            self.push(test((self.reg_size(), conv_reg(s1), conv_reg(s1))));
-            self.push(setcc(Condition::Equal, conv_reg(d)));
+            let asm = asm.push(test((reg_size, s1, s1)));
+            asm.push(setcc(Condition::Equal, d))
         } else if condition == Condition::Above && s2 == 0 {
             // d = s1 >u 0  =>  d = s1 != 0
-            self.push(test((self.reg_size(), conv_reg(s1), conv_reg(s1))));
-            self.push(setcc(Condition::NotEqual, conv_reg(d)));
+            let asm = asm.push(test((reg_size, s1, s1)));
+            asm.push(setcc(Condition::NotEqual, d))
         } else {
-            match self.reg_size() {
+            let asm = match reg_size {
                 RegSize::R32 => {
-                    self.push(cmp((conv_reg(s1), imm32(s2))));
+                    asm.push(cmp((s1, imm32(s2))))
                 },
                 RegSize::R64 => {
-                    self.push(cmp((conv_reg(s1), imm64(s2 as i32))));
+                    asm.push(cmp((s1, imm64(s2 as i32))))
                 }
-            }
-            self.push(setcc(condition, conv_reg(d)));
-        }
+            };
+            asm.push(setcc(condition, d))
+        };
 
-        if d == s1 {
-            self.push(and((conv_reg(d), imm32(1))));
-        }
+        let asm = asm.push_if(d == s1, and((d, imm32(1))));
+        asm.assert_reserved_exactly_as_needed();
     }
 
     #[cfg_attr(not(debug_assertions), inline(always))]
     fn shift_imm(&mut self, d: Reg, s1: Reg, s2: u32, kind: ShiftKind) {
+        let reg_size = self.reg_size();
+        let d = conv_reg(d);
+        let s1 = conv_reg(s1);
+        let asm = self.asm.reserve::<polkavm_assembler::U2>();
+
         if s2 >= 32 {
             // d = s << 32+
-            self.clear_reg(d);
+            asm.push(xor((RegSize::R32, d, d)));
             return;
         }
 
-        if d != s1 {
-            self.mov(d, s1);
-        }
+        let asm = asm.push_if(d != s1, mov(reg_size, d, s1));
 
         // d = d << s2
-        match kind {
-            ShiftKind::LogicalLeft => self.push(shl_imm(self.reg_size(), conv_reg(d), s2 as u8)),
-            ShiftKind::LogicalRight => self.push(shr_imm(self.reg_size(), conv_reg(d), s2 as u8)),
-            ShiftKind::ArithmeticRight => self.push(sar_imm(self.reg_size(), conv_reg(d), s2 as u8)),
-        }
+        let asm = match kind {
+            ShiftKind::LogicalLeft => asm.push(shl_imm(reg_size, d, s2 as u8)),
+            ShiftKind::LogicalRight => asm.push(shr_imm(reg_size, d, s2 as u8)),
+            ShiftKind::ArithmeticRight => asm.push(sar_imm(reg_size, d, s2 as u8)),
+        };
+
+        asm.assert_reserved_exactly_as_needed();
     }
 
     #[cfg_attr(not(debug_assertions), inline(always))]
     fn shift(&mut self, d: Reg, s1: impl Into<RegImm>, s2: Reg, kind: ShiftKind) {
-        // TODO: Consider using shlx/shrx/sarx when BMI2 is available.
-        self.push(mov(self.reg_size(), rcx, conv_reg(s2)));
+        let reg_size = self.reg_size();
+        let d = conv_reg(d);
+        let s2 = conv_reg(s2);
+        let asm = self.asm.reserve::<polkavm_assembler::U3>();
 
-        match s1.into() {
+        // TODO: Consider using shlx/shrx/sarx when BMI2 is available.
+        let asm = asm.push(mov(reg_size, rcx, s2));
+        let asm = match s1.into() {
             RegImm::Reg(s1) => {
-                if s1 != d {
-                    self.mov(d, s1);
-                }
+                let s1 = conv_reg(s1);
+                asm.push_if(d != s1, mov(reg_size, d, s1))
             },
             RegImm::Imm(s1) => {
-                self.load_immediate(d, s1);
+                asm.push(mov_imm(d, imm32(s1)))
             }
-        }
+        };
 
         // d = d << s2
         match kind {
-            ShiftKind::LogicalLeft => self.push(shl_cl(self.reg_size(), conv_reg(d))),
-            ShiftKind::LogicalRight => self.push(shr_cl(self.reg_size(), conv_reg(d))),
-            ShiftKind::ArithmeticRight => self.push(sar_cl(self.reg_size(), conv_reg(d))),
-        }
+            ShiftKind::LogicalLeft => asm.push(shl_cl(reg_size, d)),
+            ShiftKind::LogicalRight => asm.push(shr_cl(reg_size, d)),
+            ShiftKind::ArithmeticRight => asm.push(sar_cl(reg_size, d)),
+        }.assert_reserved_exactly_as_needed()
     }
 
     #[cfg_attr(not(debug_assertions), inline(always))]
@@ -306,32 +374,9 @@ impl<'r, 'a, S> ArchVisitor<'r, 'a, S> where S: Sandbox {
     }
 
     #[cfg_attr(not(debug_assertions), inline(always))]
-    fn calculate_label_offset(&self, rel8_len: usize, rel32_len: usize, offset: isize) -> Result<i8, i32> {
-        let offset_near = offset - (self.asm.len() as isize + rel8_len as isize);
-        if offset_near <= i8::MAX as isize && offset_near >= i8::MIN as isize {
-            Ok(offset_near as i8)
-        } else {
-            let offset = offset - (self.asm.len() as isize + rel32_len as isize);
-            Err(offset as i32)
-        }
-    }
-
-    #[cfg_attr(not(debug_assertions), inline(always))]
     fn jump_to_label(&mut self, label: Label) {
-        if let Some(offset) = self.asm.get_label_origin_offset(label) {
-            let offset = self.calculate_label_offset(
-                jmp_rel8(i8::MAX).len(),
-                jmp_rel32(i32::MAX).len(),
-                offset
-            );
-
-            match offset {
-                Ok(offset) => self.push(jmp_rel8(offset)),
-                Err(offset) => self.push(jmp_rel32(offset))
-            }
-        } else {
-            self.push(jmp_label32(label));
-        }
+        let asm = self.asm.reserve::<U1>();
+        jump_to_label(asm, label).assert_reserved_exactly_as_needed();
     }
 
     #[cfg_attr(not(debug_assertions), inline(always))]
@@ -341,31 +386,23 @@ impl<'r, 'a, S> ArchVisitor<'r, 'a, S> where S: Sandbox {
 
     #[cfg_attr(not(debug_assertions), inline(always))]
     fn branch_to_label(&mut self, condition: Condition, label: Label) {
-        if let Some(offset) = self.asm.get_label_origin_offset(label) {
-            let offset = self.calculate_label_offset(
-                jcc_rel8(condition, i8::MAX).len(),
-                jcc_rel32(condition, i32::MAX).len(),
-                offset
-            );
-
-            match offset {
-                Ok(offset) => self.push(jcc_rel8(condition, offset)),
-                Err(offset) => self.push(jcc_rel32(condition, offset))
-            }
-        } else {
-            self.push(jcc_label32(condition, label));
-        }
+        let asm = self.asm.reserve::<U1>();
+        branch_to_label(asm, condition, label).assert_reserved_exactly_as_needed();
     }
 
     #[cfg_attr(not(debug_assertions), inline(always))]
     fn branch(&mut self, s1: Reg, s2: impl Into<RegImm>, target: u32, condition: Condition) {
-        match s2.into() {
-            RegImm::Reg(s2) => self.push(cmp((self.reg_size(), conv_reg(s1), conv_reg(s2)))),
-            RegImm::Imm(s2) => self.push(cmp((conv_reg(s1), imm32(s2)))),
-        }
-
+        let reg_size = self.reg_size();
+        let s1 = conv_reg(s1);
         let label = self.get_or_forward_declare_label(target);
-        self.branch_to_label(condition, label);
+
+        let asm = self.asm.reserve::<U2>();
+        let asm = match s2.into() {
+            RegImm::Reg(s2) => asm.push(cmp((reg_size, s1, conv_reg(s2)))),
+            RegImm::Imm(s2) => asm.push(cmp((s1, imm32(s2)))),
+        };
+
+        branch_to_label(asm, condition, label).assert_reserved_exactly_as_needed();
     }
 
     #[cfg_attr(not(debug_assertions), inline(always))]
@@ -374,22 +411,28 @@ impl<'r, 'a, S> ArchVisitor<'r, 'a, S> where S: Sandbox {
             return;
         }
 
+        let reg_size = self.reg_size();
         let d = conv_reg(d);
         let s = conv_reg(s);
         let c = conv_reg(c);
 
-        self.push(test((self.reg_size(), c, c)));
-        self.push(cmov(condition, self.reg_size(), d, s));
+        let asm = self.asm.reserve::<U2>();
+        let asm = asm.push(test((reg_size, c, c)));
+        let asm = asm.push(cmov(condition, reg_size, d, s));
+        asm.assert_reserved_exactly_as_needed();
     }
 
     #[cfg_attr(not(debug_assertions), inline(always))]
     fn cmov_imm(&mut self, d: Reg, s: u32, c: Reg, condition: Condition) {
+        let reg_size = self.reg_size();
         let d = conv_reg(d);
         let c = conv_reg(c);
 
-        self.push(test((self.reg_size(), c, c)));
-        self.push(mov_imm(TMP_REG, imm32(s)));
-        self.push(cmov(condition, self.reg_size(), d, TMP_REG));
+        let asm = self.asm.reserve::<U3>();
+        let asm = asm.push(test((reg_size, c, c)));
+        let asm = asm.push(mov_imm(TMP_REG, imm32(s)));
+        let asm = asm.push(cmov(condition, reg_size, d, TMP_REG));
+        asm.assert_reserved_exactly_as_needed();
     }
 
     fn div_rem(&mut self, d: Reg, s1: Reg, s2: Reg, div_rem: DivRem, kind: Signedness) {
@@ -634,18 +677,22 @@ impl<'r, 'a, S> ArchVisitor<'r, 'a, S> where S: Sandbox {
             SandboxKind::Linux => {
                 use polkavm_assembler::amd64::{SegReg, Scale};
 
-                let target = if offset != 0 || load_imm.map_or(false, |(t, _)| t == base) {
-                    self.push(lea(RegSize::R32, TMP_REG, reg_indirect(RegSize::R32, conv_reg(base) + offset as i32)));
-                    TMP_REG
+                let asm = self.asm.reserve::<U3>();
+                let (asm, target) = if offset != 0 || load_imm.map_or(false, |(t, _)| t == base) {
+                    let asm = asm.push(lea(RegSize::R32, TMP_REG, reg_indirect(RegSize::R32, conv_reg(base) + offset as i32)));
+                    (asm, TMP_REG)
                 } else {
-                    conv_reg(base)
+                    (asm.push_none(), conv_reg(base))
                 };
 
-                if let Some((return_register, return_address)) = load_imm {
-                    self.load_immediate(return_register, return_address);
-                }
+                let asm = if let Some((return_register, return_address)) = load_imm {
+                    asm.push(mov_imm(conv_reg(return_register), imm32(return_address)))
+                } else {
+                    asm.push_none()
+                };
 
-                self.asm.push(jmp(MemOp::IndexScaleOffset(Some(SegReg::gs), RegSize::R64, target, Scale::x8, 0)));
+                let asm = asm.push(jmp(MemOp::IndexScaleOffset(Some(SegReg::gs), RegSize::R64, target, Scale::x8, 0)));
+                asm.assert_reserved_exactly_as_needed();
             },
             SandboxKind::Generic => {
                 // TODO: This also could be more efficient.
@@ -728,8 +775,11 @@ impl<'r, 'a, S> InstructionVisitor for ArchVisitor<'r, 'a, S> where S: Sandbox {
 
     #[inline(always)]
     fn ecalli(&mut self, imm: u32) -> Self::ReturnTy {
-        self.push(mov_imm(TMP_REG, imm32(imm)));
-        self.call_to_label(self.ecall_label);
+        let ecall_label = self.ecall_label;
+        let asm = self.asm.reserve::<U2>();
+        let asm = asm.push(mov_imm(TMP_REG, imm32(imm)));
+        let asm = asm.push(call_label32(ecall_label));
+        asm.assert_reserved_exactly_as_needed();
     }
 
     #[inline(always)]
@@ -795,122 +845,157 @@ impl<'r, 'a, S> InstructionVisitor for ArchVisitor<'r, 'a, S> where S: Sandbox {
     #[inline(always)]
     fn xor(&mut self, d: Reg, s1: Reg, s2: Reg) -> Self::ReturnTy {
         let reg_size = self.reg_size();
+        let d = conv_reg(d);
+        let s1 = conv_reg(s1);
+        let s2 = conv_reg(s2);
+
+        let asm = self.asm.reserve::<U2>();
         match (d, s1, s2) {
             // d = d ^ s2
-            (_, _, _) if d == s1 => self.push(xor((reg_size, conv_reg(d), conv_reg(s2)))),
+            (_, _, _) if d == s1 => asm.push(xor((reg_size, d, s2))).push_none(),
             // d = s1 ^ d
-            (_, _, _) if d == s2 => self.push(xor((reg_size, conv_reg(d), conv_reg(s1)))),
+            (_, _, _) if d == s2 => asm.push(xor((reg_size, d, s1))).push_none(),
             // d = s1 ^ s2
             _ => {
-                self.mov(d, s1);
-                self.push(xor((reg_size, conv_reg(d), conv_reg(s2))));
+                let asm = asm.push(mov(reg_size, d, s1));
+                asm.push(xor((reg_size, d, s2)))
             }
-        }
+        }.assert_reserved_exactly_as_needed();
     }
 
     #[inline(always)]
     fn and(&mut self, d: Reg, s1: Reg, s2: Reg) -> Self::ReturnTy {
         let reg_size = self.reg_size();
+        let d = conv_reg(d);
+        let s1 = conv_reg(s1);
+        let s2 = conv_reg(s2);
+
+        let asm = self.asm.reserve::<U2>();
         match (d, s1, s2) {
             // d = d & s2
-            (_, _, _) if d == s1 => self.push(and((reg_size, conv_reg(d), conv_reg(s2)))),
+            (_, _, _) if d == s1 => asm.push(and((reg_size, d, s2))).push_none(),
             // d = s1 & d
-            (_, _, _) if d == s2 => self.push(and((reg_size, conv_reg(d), conv_reg(s1)))),
+            (_, _, _) if d == s2 => asm.push(and((reg_size, d, s1))).push_none(),
             // d = s1 & s2
             _ => {
-                self.mov(d, s1);
-                self.push(and((reg_size, conv_reg(d), conv_reg(s2))));
+                let asm = asm.push(mov(reg_size, d, s1));
+                asm.push(and((reg_size, d, s2)))
             }
-        }
+        }.assert_reserved_exactly_as_needed();
     }
 
     #[inline(always)]
     fn or(&mut self, d: Reg, s1: Reg, s2: Reg) -> Self::ReturnTy {
         let reg_size = self.reg_size();
+        let d = conv_reg(d);
+        let s1 = conv_reg(s1);
+        let s2 = conv_reg(s2);
+
+        let asm = self.asm.reserve::<U2>();
         match (d, s1, s2) {
             // d = d | s2
-            (_, _, _) if d == s1 => self.push(or((reg_size, conv_reg(d), conv_reg(s2)))),
+            (_, _, _) if d == s1 => asm.push(or((reg_size, d, s2))).push_none(),
             // d = s1 | d
-            (_, _, _) if d == s2 => self.push(or((reg_size, conv_reg(d), conv_reg(s1)))),
+            (_, _, _) if d == s2 => asm.push(or((reg_size, d, s1))).push_none(),
             // d = s1 | s2
             _ => {
-                self.mov(d, s1);
-                self.push(or((reg_size, conv_reg(d), conv_reg(s2))));
+                let asm = asm.push(mov(reg_size, d, s1));
+                asm.push(or((reg_size, d, s2)))
             }
-        }
+        }.assert_reserved_exactly_as_needed();
     }
 
     #[inline(always)]
     fn add(&mut self, d: Reg, s1: Reg, s2: Reg) -> Self::ReturnTy {
         let reg_size = self.reg_size();
+        let d = conv_reg(d);
+        let s1 = conv_reg(s1);
+        let s2 = conv_reg(s2);
+
+        let asm = self.asm.reserve::<U2>();
         match (d, s1, s2) {
             // d = d + s2
-            (_, _, _) if d == s1 => self.push(add((reg_size, conv_reg(d), conv_reg(s2)))),
+            (_, _, _) if d == s1 => asm.push(add((reg_size, d, s2))).push_none(),
             // d = s1 + d
-            (_, _, _) if d == s2 => self.push(add((reg_size, conv_reg(d), conv_reg(s1)))),
+            (_, _, _) if d == s2 => asm.push(add((reg_size, d, s1))).push_none(),
             // d = s1 + s2
             _ => {
-                if d != s1 {
-                    self.mov(d, s1);
-                }
-                self.push(add((reg_size, conv_reg(d), conv_reg(s2))));
+                let asm = asm.push_if(d != s1, mov(reg_size, d, s1));
+                asm.push(add((reg_size, d, s2)))
             }
-        }
+        }.assert_reserved_exactly_as_needed();
     }
 
     #[inline(always)]
     fn sub(&mut self, d: Reg, s1: Reg, s2: Reg) -> Self::ReturnTy {
         let reg_size = self.reg_size();
+        let d = conv_reg(d);
+        let s1 = conv_reg(s1);
+        let s2 = conv_reg(s2);
+
+        let asm = self.asm.reserve::<U2>();
         match (d, s1, s2) {
             // d = d - s2
-            (_, _, _) if d == s1 => self.push(sub((reg_size, conv_reg(d), conv_reg(s2)))),
+            (_, _, _) if d == s1 => asm.push(sub((reg_size, d, s2))).push_none(),
             // d = s1 - d
             (_, _, _) if d == s2 => {
-                self.push(neg(reg_size, conv_reg(d)));
-                self.push(add((reg_size, conv_reg(d), conv_reg(s1))));
+                let asm = asm.push(neg(reg_size, d));
+                asm.push(add((reg_size, d, s1)))
             }
             // d = s1 - s2
             _ => {
-                self.mov(d, s1);
-                self.push(sub((reg_size, conv_reg(d), conv_reg(s2))));
+                let asm = asm.push(mov(reg_size, d, s1));
+                asm.push(sub((reg_size, d, s2)))
             }
-        }
+        }.assert_reserved_exactly_as_needed();
     }
 
     #[inline(always)]
     fn negate_and_add_imm(&mut self, d: Reg, s1: Reg, s2: u32) -> Self::ReturnTy {
+        let reg_size = self.reg_size();
+        let d = conv_reg(d);
+        let s1 = conv_reg(s1);
+
+        let asm = self.asm.reserve::<U2>();
         if d == s1 {
             // d = -d + s2
-            self.push(neg(RegSize::R32, conv_reg(d)));
+            let asm = asm.push(neg(RegSize::R32, d));
             if s2 != 0 {
-                self.push(add((conv_reg(d), imm32(s2))));
+                asm.push(add((d, imm32(s2))))
+            } else {
+                asm.push_none()
             }
         } else {
             // d = -s1 + s2  =>  d = s2 - s1
             if s2 == 0 {
-                self.mov(d, s1);
-                self.push(neg(RegSize::R32, conv_reg(d)));
+                let asm = asm.push(mov(reg_size, d, s1));
+                asm.push(neg(RegSize::R32, d))
             } else {
-                self.push(mov_imm(conv_reg(d), imm32(s2)));
-                self.push(sub((RegSize::R32, conv_reg(d), conv_reg(s1))));
+                let asm = asm.push(mov_imm(d, imm32(s2)));
+                asm.push(sub((RegSize::R32, d, s1)))
             }
-        }
+        }.assert_reserved_exactly_as_needed();
     }
 
     #[inline(always)]
     fn mul(&mut self, d: Reg, s1: Reg, s2: Reg) -> Self::ReturnTy {
         let reg_size = self.reg_size();
+        let d = conv_reg(d);
+        let s1 = conv_reg(s1);
+        let s2 = conv_reg(s2);
+
+        let asm = self.asm.reserve::<U2>();
         if d == s1 {
             // d = d * s2
-            self.push(imul(reg_size, conv_reg(d), conv_reg(s2)))
+            asm.push(imul(reg_size, d, s2)).push_none()
         } else if d == s2 {
             // d = s1 * d
-            self.push(imul(reg_size, conv_reg(d), conv_reg(s1)))
+            asm.push(imul(reg_size, d, s1)).push_none()
         } else {
             // d = s1 * s2
-            self.mov(d, s1);
-            self.push(imul(reg_size, conv_reg(d), conv_reg(s2)));
-        }
+            let asm = asm.push(mov(reg_size, d, s1));
+            asm.push(imul(reg_size, d, s2))
+        }.assert_reserved_exactly_as_needed();
     }
 
     #[inline(always)]
@@ -920,46 +1005,51 @@ impl<'r, 'a, S> InstructionVisitor for ArchVisitor<'r, 'a, S> where S: Sandbox {
 
     #[inline(always)]
     fn mul_upper_signed_signed(&mut self, d: Reg, s1: Reg, s2: Reg) -> Self::ReturnTy {
-        self.push(movsxd_32_to_64(TMP_REG, conv_reg(s2)));
-        self.push(movsxd_32_to_64(conv_reg(d), conv_reg(s1)));
-        self.push(imul(RegSize::R64, conv_reg(d), TMP_REG));
-        self.push(shr_imm(RegSize::R64, conv_reg(d), 32));
+        let asm = self.asm.reserve::<U4>();
+        let asm = asm.push(movsxd_32_to_64(TMP_REG, conv_reg(s2)));
+        let asm = asm.push(movsxd_32_to_64(conv_reg(d), conv_reg(s1)));
+        let asm = asm.push(imul(RegSize::R64, conv_reg(d), TMP_REG));
+        let asm = asm.push(shr_imm(RegSize::R64, conv_reg(d), 32));
+        asm.assert_reserved_exactly_as_needed();
     }
 
     #[inline(always)]
     fn mul_upper_signed_signed_imm(&mut self, d: Reg, s1: Reg, s2: u32) -> Self::ReturnTy {
-        self.push(mov_imm(TMP_REG, imm64(s2 as i32)));
-        self.push(movsxd_32_to_64(conv_reg(d), conv_reg(s1)));
-        self.push(imul(RegSize::R64, conv_reg(d), TMP_REG));
-        self.push(shr_imm(RegSize::R64, conv_reg(d), 32));
+        let asm = self.asm.reserve::<U4>();
+        let asm = asm.push(mov_imm(TMP_REG, imm64(s2 as i32)));
+        let asm = asm.push(movsxd_32_to_64(conv_reg(d), conv_reg(s1)));
+        let asm = asm.push(imul(RegSize::R64, conv_reg(d), TMP_REG));
+        let asm = asm.push(shr_imm(RegSize::R64, conv_reg(d), 32));
+        asm.assert_reserved_exactly_as_needed();
     }
 
     #[inline(always)]
     fn mul_upper_unsigned_unsigned(&mut self, d: Reg, s1: Reg, s2: Reg) -> Self::ReturnTy {
-        if d == s1 {
+        let asm = self.asm.reserve::<U3>();
+        let asm = if d == s1 {
             // d = d * s2
-            self.push(imul(RegSize::R64, conv_reg(d), conv_reg(s2)));
+            asm.push(imul(RegSize::R64, conv_reg(d), conv_reg(s2))).push_none()
         } else if d == s2 {
             // d = s1 * d
-            self.push(imul(RegSize::R64, conv_reg(d), conv_reg(s1)));
+            asm.push(imul(RegSize::R64, conv_reg(d), conv_reg(s1))).push_none()
         } else {
             // d = s1 * s2
-            self.push(mov(RegSize::R32, conv_reg(d), conv_reg(s1)));
-            self.push(imul(RegSize::R64, conv_reg(d), conv_reg(s2)));
-        }
+            let asm = asm.push(mov(RegSize::R32, conv_reg(d), conv_reg(s1)));
+            asm.push(imul(RegSize::R64, conv_reg(d), conv_reg(s2)))
+        };
 
-        self.push(shr_imm(RegSize::R64, conv_reg(d), 32));
+        let asm = asm.push(shr_imm(RegSize::R64, conv_reg(d), 32));
+        asm.assert_reserved_exactly_as_needed();
     }
 
     #[inline(always)]
     fn mul_upper_unsigned_unsigned_imm(&mut self, d: Reg, s1: Reg, s2: u32) -> Self::ReturnTy {
-        self.push(mov_imm(TMP_REG, imm32(s2)));
-        if d != s1 {
-            self.push(mov(RegSize::R32, conv_reg(d), conv_reg(s1)));
-        }
-
-        self.push(imul(RegSize::R64, conv_reg(d), TMP_REG));
-        self.push(shr_imm(RegSize::R64, conv_reg(d), 32));
+        let asm = self.asm.reserve::<U4>();
+        let asm = asm.push(mov_imm(TMP_REG, imm32(s2)));
+        let asm = asm.push_if(d != s1, mov(RegSize::R32, conv_reg(d), conv_reg(s1)));
+        let asm = asm.push(imul(RegSize::R64, conv_reg(d), TMP_REG));
+        let asm = asm.push(shr_imm(RegSize::R64, conv_reg(d), 32));
+        asm.assert_reserved_exactly_as_needed();
     }
 
     #[inline(always)]
@@ -977,18 +1067,21 @@ impl<'r, 'a, S> InstructionVisitor for ArchVisitor<'r, 'a, S> where S: Sandbox {
         //   3) multiply,
         //   4) return the upper 32-bits.
 
-        if d == s2 {
+        let asm = self.asm.reserve::<U4>();
+        let asm = if d == s2 {
             // d = s1 * d
-            self.push(mov(RegSize::R32, TMP_REG, conv_reg(s2)));
-            self.push(movsxd_32_to_64(conv_reg(d), conv_reg(s1)));
-            self.push(imul(RegSize::R64, conv_reg(d), TMP_REG));
+            let asm = asm.push(mov(RegSize::R32, TMP_REG, conv_reg(s2)));
+            let asm = asm.push(movsxd_32_to_64(conv_reg(d), conv_reg(s1)));
+            asm.push(imul(RegSize::R64, conv_reg(d), TMP_REG))
         } else {
             // d = s1 * s2
-            self.push(movsxd_32_to_64(conv_reg(d), conv_reg(s1)));
-            self.push(imul(RegSize::R64, conv_reg(d), conv_reg(s2)));
-        }
+            let asm = asm.push(movsxd_32_to_64(conv_reg(d), conv_reg(s1)));
+            let asm = asm.push(imul(RegSize::R64, conv_reg(d), conv_reg(s2)));
+            asm.push_none()
+        };
 
-        self.push(shr_imm(RegSize::R64, conv_reg(d), 32));
+        let asm = asm.push(shr_imm(RegSize::R64, conv_reg(d), 32));
+        asm.assert_reserved_exactly_as_needed();
     }
 
     #[inline(always)]
@@ -1028,38 +1121,47 @@ impl<'r, 'a, S> InstructionVisitor for ArchVisitor<'r, 'a, S> where S: Sandbox {
 
     #[inline(always)]
     fn or_imm(&mut self, d: Reg, s1: Reg, s2: u32) -> Self::ReturnTy {
-        if d != s1 {
-            self.mov(d, s1);
-        }
+        let reg_size = self.reg_size();
+        let d = conv_reg(d);
+        let s1 = conv_reg(s1);
+
+        let asm = self.asm.reserve::<U2>();
+        let asm = asm.push_if(d != s1, mov(reg_size, d, s1));
 
         // d = s1 | s2
-        self.push(or((conv_reg(d), imm32(s2))));
+        let asm = asm.push(or((d, imm32(s2))));
+        asm.assert_reserved_exactly_as_needed();
     }
 
     #[inline(always)]
     fn and_imm(&mut self, d: Reg, s1: Reg, s2: u32) -> Self::ReturnTy {
-        if d != s1 {
-            self.mov(d, s1);
-        }
+        let reg_size = self.reg_size();
+        let d = conv_reg(d);
+        let s1 = conv_reg(s1);
+
+        let asm = self.asm.reserve::<U2>();
+        let asm = asm.push_if(d != s1, mov(reg_size, d, s1));
 
         // d = s1 & s2
-        self.push(and((conv_reg(d), imm32(s2))));
+        let asm = asm.push(and((d, imm32(s2))));
+        asm.assert_reserved_exactly_as_needed();
     }
 
     #[inline(always)]
     fn xor_imm(&mut self, d: Reg, s1: Reg, s2: u32) -> Self::ReturnTy {
         let reg_size = self.reg_size();
-        if d != s1 {
-            self.mov(d, s1);
-        }
+        let d = conv_reg(d);
+        let s1 = conv_reg(s1);
+        let asm = self.asm.reserve::<U2>();
+        let asm = asm.push_if(d != s1, mov(reg_size, d, s1));
 
         if s2 != !0 {
             // d = s1 ^ s2
-            self.push(xor((conv_reg(d), imm32(s2))));
+            asm.push(xor((d, imm32(s2))))
         } else {
             // d = s1 ^ 0xfffffff
-            self.push(not(reg_size, conv_reg(d)));
-        }
+            asm.push(not(reg_size, d))
+        }.assert_reserved_exactly_as_needed();
     }
 
     #[inline(always)]
@@ -1097,16 +1199,17 @@ impl<'r, 'a, S> InstructionVisitor for ArchVisitor<'r, 'a, S> where S: Sandbox {
         let reg_size = self.reg_size();
         let d = conv_reg(d);
         let s1 = conv_reg(s1);
-        match (d, s1, s2) {
-            // d = d + 1
-            (_, _, 1) if d == s1 => self.push(inc(reg_size, d)),
-            // d = d + s2
-            (_, _, _) if d == s1 => self.push(add((d, imm32(s2)))),
-            // d = s1 + s2
-            (_, _, _) => {
-                self.push(lea(reg_size, d, reg_indirect(reg_size, s1 + s2 as i32)));
+
+        let asm = self.asm.reserve::<U1>();
+        if d == s1 {
+            if s2 == 1 {
+                asm.push(inc(reg_size, d))
+            } else {
+                asm.push(add((d, imm32(s2))))
             }
-        }
+        } else {
+            asm.push(lea(reg_size, d, reg_indirect(reg_size, s1 + s2 as i32)))
+        }.assert_reserved_exactly_as_needed();
     }
 
     #[inline(always)]
@@ -1308,8 +1411,10 @@ impl<'r, 'a, S> InstructionVisitor for ArchVisitor<'r, 'a, S> where S: Sandbox {
     #[inline(always)]
     fn load_imm_and_jump(&mut self, ra: Reg, value: u32, target: u32) -> Self::ReturnTy {
         let label = self.get_or_forward_declare_label(target);
-        self.load_immediate(ra, value);
-        self.jump_to_label(label);
+        let asm = self.asm.reserve::<U2>();
+        let asm = asm.push(mov_imm(conv_reg(ra), imm32(value)));
+        let asm = jump_to_label(asm, label);
+        asm.assert_reserved_exactly_as_needed();
     }
 
     #[inline(always)]

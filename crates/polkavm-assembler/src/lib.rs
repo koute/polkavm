@@ -8,4 +8,4 @@ mod assembler;
 
 extern crate alloc;
 
-pub use crate::assembler::{Assembler, Instruction, Label};
+pub use crate::assembler::{Assembler, Instruction, Label, NonZero, ReservedAssembler, U0, U1, U2, U3, U4, U5, U6};
