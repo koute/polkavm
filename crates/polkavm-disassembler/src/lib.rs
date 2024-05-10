@@ -193,6 +193,22 @@ impl<'a, 'blob> Disassembler<'a, 'blob> {
             assert!(jump_table_map.insert(target_code_offset, jump_table_index).is_none());
         }
 
+        macro_rules! w {
+            ($($arg:tt)*) => {{
+                if let Err(error) = writeln!(&mut writer, $($arg)*) {
+                    return Err(format!("failed to write to output: {error}").into());
+                }
+            }}
+        }
+
+        w!("// RO data = {}/{} bytes", self.blob.ro_data().len(), self.blob.ro_data_size());
+        w!("// RW data = {}/{} bytes", self.blob.rw_data().len(), self.blob.rw_data_size());
+        w!("// Stack size = {} bytes", self.blob.stack_size());
+        w!();
+        w!("// Instructions = {}", instructions.len());
+        w!("// Code size = {} bytes", self.blob.code().len());
+        w!();
+
         let format_jump_target = |target_offset: u32, basic_block_counter: u32| {
             use core::fmt::Write;
 
@@ -276,10 +292,7 @@ impl<'a, 'blob> Disassembler<'a, 'blob> {
                             .to_string();
 
                             if last_full_name != full_name {
-                                if let Err(error) = writeln!(&mut writer, "<{}>:", full_name) {
-                                    return Err(format!("failed to write to output: {error}").into());
-                                }
-
+                                w!("<{}>:", full_name);
                                 last_full_name = full_name;
                             }
 
@@ -300,18 +313,14 @@ impl<'a, 'blob> Disassembler<'a, 'blob> {
 
             if pending_label {
                 pending_label = false;
-                let result = if !matches!(self.format, DisassemblyFormat::DiffFriendly) {
+                if !matches!(self.format, DisassemblyFormat::DiffFriendly) {
                     if self.show_raw_bytes {
-                        writeln!(&mut writer, "      : {:24} {}", "", format_jump_target(offset, basic_block_counter))
+                        w!("      : {:24} {}", "", format_jump_target(offset, basic_block_counter))
                     } else {
-                        writeln!(&mut writer, "      : {}", format_jump_target(offset, basic_block_counter))
+                        w!("      : {}", format_jump_target(offset, basic_block_counter))
                     }
                 } else {
-                    writeln!(&mut writer, "    {}", format_jump_target(offset, basic_block_counter))
-                };
-
-                if let Err(error) = result {
-                    return Err(format!("failed to write to output: {error}").into());
+                    w!("    {}", format_jump_target(offset, basic_block_counter))
                 }
             }
 
@@ -334,19 +343,13 @@ impl<'a, 'blob> Disassembler<'a, 'blob> {
                     string.replace_range(index_1..=index_2, "[_]");
                 }
 
-                if let Err(error) = writeln!(&mut writer, "    {}", string) {
-                    return Err(format!("failed to write to output: {error}").into());
-                }
+                w!("    {}", string);
             } else if matches!(self.format, DisassemblyFormat::Guest | DisassemblyFormat::GuestAndNative) {
-                let result = if self.show_raw_bytes {
+                if self.show_raw_bytes {
                     let raw_bytes = raw_bytes.iter().map(|byte| format!("{byte:02x}")).collect::<Vec<_>>().join(" ");
-                    writeln!(&mut writer, "{offset:6}: {raw_bytes:24} {instruction_s}")
+                    w!("{offset:6}: {raw_bytes:24} {instruction_s}")
                 } else {
-                    writeln!(&mut writer, "{offset:6}: {instruction_s}")
-                };
-
-                if let Err(error) = result {
-                    return Err(format!("failed to write to output: {error}").into());
+                    w!("{offset:6}: {instruction_s}")
                 }
             }
 
@@ -441,6 +444,13 @@ mod tests {
         let assembly_bytes = disassemble_with_gas(&blob, DisassemblyFormat::Guest);
         let assembly_text = String::from_utf8(assembly_bytes).unwrap();
         let expected = &[
+            "// RO data = 0/0 bytes",
+            "// RW data = 0/16384 bytes",
+            "// Stack size = 0 bytes",
+            "",
+            "// Instructions = 5",
+            "// Code size = 18 bytes",
+            "",
             "      : @0 [export #0: 'main'] (gas: 5)",
             "     0: u32 [0x20000] = 305419896",
             "     9: s0 = a0 + a1",
