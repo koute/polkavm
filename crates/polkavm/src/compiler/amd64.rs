@@ -397,7 +397,7 @@ impl<'r, 'a, S> ArchVisitor<'r, 'a, S> where S: Sandbox {
     fn branch(&mut self, s1: RawReg, s2: impl Into<RegImm>, target: u32, condition: Condition) {
         let reg_size = self.reg_size();
         let s1 = conv_reg(s1);
-        let label = self.get_or_forward_declare_label(target);
+        let label = self.get_or_forward_declare_label(target).unwrap_or(self.trap_label);
 
         let asm = self.asm.reserve::<U2>();
         let asm = match s2.into() {
@@ -580,7 +580,7 @@ impl<'r, 'a, S> ArchVisitor<'r, 'a, S> where S: Sandbox {
                 self.branch_to_label(Condition::Sign, self.trap_label);
             }
 
-            let target_label = self.get_or_forward_declare_label(export.target_code_offset());
+            let target_label = self.get_or_forward_declare_label(export.target_code_offset()).unwrap_or(self.trap_label);
             self.jump_to_label(target_label);
         }
     }
@@ -1406,13 +1406,13 @@ impl<'r, 'a, S> InstructionVisitor for ArchVisitor<'r, 'a, S> where S: Sandbox {
 
     #[inline(always)]
     fn jump(&mut self, target: u32) -> Self::ReturnTy {
-        let label = self.get_or_forward_declare_label(target);
+        let label = self.get_or_forward_declare_label(target).unwrap_or(self.trap_label);
         self.jump_to_label(label);
     }
 
     #[inline(always)]
     fn load_imm_and_jump(&mut self, ra: RawReg, value: u32, target: u32) -> Self::ReturnTy {
-        let label = self.get_or_forward_declare_label(target);
+        let label = self.get_or_forward_declare_label(target).unwrap_or(self.trap_label);
         let asm = self.asm.reserve::<U2>();
         let asm = asm.push(mov_imm(conv_reg(ra), imm32(value)));
         let asm = jump_to_label(asm, label);

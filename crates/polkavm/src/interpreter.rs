@@ -424,7 +424,7 @@ impl InterpretedInstance {
             self.compiled_offset = (compiled_offset.get() - 1) as usize;
         } else {
             self.compiled_offset = self.compiled_instructions.len();
-            self.compile_block::<DEBUG>();
+            self.compile_block::<DEBUG>()?;
         }
 
         if self.gas_remaining.is_some() {
@@ -469,10 +469,11 @@ impl InterpretedInstance {
 
     #[inline(never)]
     #[cold]
-    fn compile_block<const DEBUG: bool>(&mut self) {
+    fn compile_block<const DEBUG: bool>(&mut self) -> Result<(), ExecutionError> {
         let Some(instructions) = self.module.blob().instructions_at(self.instruction_offset) else {
-            return;
+            return Err(ExecutionError::Trap(Default::default()));
         };
+
         if DEBUG {
             log::debug!("Compiling block at {}:", self.instruction_offset);
         }
@@ -496,6 +497,8 @@ impl InterpretedInstance {
 
         self.compiled_offset_for_block
             .insert(self.instruction_offset, NonZeroU32::new((starting_offset + 1) as u32).unwrap());
+
+        Ok(())
     }
 
     fn check_gas(&mut self) -> Result<(), ExecutionError> {
