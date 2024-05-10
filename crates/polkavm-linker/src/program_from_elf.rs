@@ -1009,10 +1009,12 @@ fn process_sections(
         base_address_for_section.insert(section.index(), section_base_address);
 
         *current_address += section.size();
-        chunks.push(DataRef::Section {
-            section_index: section.index(),
-            range: 0..section.data().len(),
-        });
+        if !section.data().is_empty() {
+            chunks.push(DataRef::Section {
+                section_index: section.index(),
+                range: 0..section.data().len(),
+            });
+        }
 
         let padding = section.size() - section.data().len() as u64;
         if padding > 0 {
