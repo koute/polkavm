@@ -955,7 +955,7 @@ fn split_function_name(name: &str) -> (String, String) {
     (String::new(), with_hash)
 }
 
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 enum DataRef {
     Section { section_index: SectionIndex, range: Range<usize> },
     Padding(usize),
@@ -970,6 +970,7 @@ impl DataRef {
     }
 }
 
+#[derive(Debug)]
 struct MemoryConfig {
     ro_data: Vec<DataRef>,
     rw_data: Vec<DataRef>,
@@ -6735,6 +6736,8 @@ pub fn program_from_elf(config: Config, data: &[u8]) -> Result<ProgramBlob, Prog
         &sections_min_stack_size,
         &mut base_address_for_section,
     )?;
+
+    log::trace!("Memory configuration: {:#?}", memory_config);
 
     let (jump_table, jump_target_for_block) = build_jump_table(all_blocks.len(), &used_blocks, &reachability_graph);
     let code = emit_code(
