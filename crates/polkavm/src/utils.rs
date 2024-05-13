@@ -54,6 +54,13 @@ where
     }
 
     #[inline]
+    pub fn new_reusing_memory(mut memory: Self, capacity: u32) -> Self {
+        memory.inner.clear();
+        memory.inner.resize_with(capacity as usize, || None);
+        memory
+    }
+
+    #[inline]
     pub fn get(&self, key: u32) -> Option<T> {
         self.inner.get(key as usize).and_then(|value| *value)
     }
@@ -66,5 +73,10 @@ where
     #[inline]
     pub fn insert(&mut self, key: u32, value: T) {
         self.inner[key as usize] = Some(value);
+    }
+
+    #[inline]
+    pub fn clear(&mut self) {
+        self.inner.clear();
     }
 }

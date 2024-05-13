@@ -1,6 +1,6 @@
 use alloc::borrow::Cow;
 use std::collections::HashMap;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use core::marker::PhantomData;
 
 use polkavm_assembler::{Assembler, Label};
@@ -20,17 +20,28 @@ use crate::gas::GasVisitor;
 #[cfg(target_arch = "x86_64")]
 mod amd64;
 
-struct Cached {
+struct CachePerCompilation {
     assembler: Assembler,
+    code_offset_to_label: FlatMap<Label>,
+    native_jump_table: Vec<usize>,
+    gas_metering_stub_offsets: Vec<usize>,
+    gas_cost_for_basic_block: Vec<u32>,
+    export_to_label: HashMap<u32, Label>,
+}
+
+struct CachePerModule {
+    code_offset_to_native_code_offset: Vec<(u32, u32)>,
+    export_trampolines: HashMap<u32, u64>,
 }
 
 #[derive(Default)]
 struct Cache {
-    cached: Vec<Cached>
+    per_compilation: Vec<CachePerCompilation>,
+    per_module: Vec<CachePerModule>,
 }
 
-#[derive(Default)]
-pub(crate) struct CompilerCache(Mutex<Cache>);
+#[derive(Clone, Default)]
+pub(crate) struct CompilerCache(Arc<Mutex<Cache>>);
 
 pub(crate) struct CompilerVisitor<'a, S> where S: Sandbox {
     init: GuestInit<'a>,
@@ -53,6 +64,10 @@ pub(crate) struct CompilerVisitor<'a, S> where S: Sandbox {
     sbrk_label: Label,
     trace_label: Label,
     trap_label: Label,
+
+    // Not used during compilation, but smuggled until the compilation is finished.
+    native_jump_table: Vec<usize>,
+    export_trampolines: HashMap<u32, u64>,
 
     _phantom: PhantomData<S>,
 }
@@ -94,18 +109,46 @@ impl<'a, S> CompilerVisitor<'a, S> where S: Sandbox {
         let address_space = S::reserve_address_space().map_err(Error::from_display)?;
         let native_code_address = crate::sandbox::SandboxAddressSpace::native_code_address(&address_space);
 
-        let mut asm = Assembler::new();
-        let cached = {
+        let (per_compilation_cache, per_module_cache) = {
             let mut cache = match cache.0.lock() {
                 Ok(cache) => cache,
                 Err(poison) => poison.into_inner(),
             };
 
-            cache.cached.pop()
+            (cache.per_compilation.pop(), cache.per_module.pop())
         };
 
-        if let Some(cached) = cached {
-            asm = cached.assembler;
+        let mut asm;
+        let mut gas_metering_stub_offsets: Vec<usize>;
+        let mut gas_cost_for_basic_block: Vec<u32>;
+        let code_offset_to_label;
+        let native_jump_table;
+        let export_to_label;
+
+        if let Some(per_compilation_cache) = per_compilation_cache {
+            asm = per_compilation_cache.assembler;
+            code_offset_to_label = FlatMap::new_reusing_memory(per_compilation_cache.code_offset_to_label, code_length);
+            native_jump_table = per_compilation_cache.native_jump_table;
+            gas_metering_stub_offsets = per_compilation_cache.gas_metering_stub_offsets;
+            gas_cost_for_basic_block = per_compilation_cache.gas_cost_for_basic_block;
+            export_to_label = per_compilation_cache.export_to_label;
+        } else {
+            asm = Assembler::new();
+            code_offset_to_label = FlatMap::new(code_length);
+            native_jump_table = Vec::new();
+            gas_metering_stub_offsets = Vec::new();
+            gas_cost_for_basic_block = Vec::new();
+            export_to_label = HashMap::new();
+        }
+
+        let code_offset_to_native_code_offset: Vec<(u32, u32)>;
+        let export_trampolines;
+        if let Some(per_module_cache) = per_module_cache {
+            code_offset_to_native_code_offset = per_module_cache.code_offset_to_native_code_offset;
+            export_trampolines = per_module_cache.export_trampolines;
+        } else {
+            code_offset_to_native_code_offset = Vec::with_capacity(code_length as usize);
+            export_trampolines = HashMap::with_capacity(exports.len());
         }
 
         let ecall_label = asm.forward_declare_label();
@@ -114,12 +157,7 @@ impl<'a, S> CompilerVisitor<'a, S> where S: Sandbox {
         let jump_table_label = asm.forward_declare_label();
         let sbrk_label = asm.forward_declare_label();
 
-        let code_offset_to_label = FlatMap::new(code_length);
-        let code_offset_to_native_code_offset: Vec<(u32, u32)> = Vec::with_capacity(code_length as usize);
         polkavm_common::static_assert!(polkavm_common::zygote::VM_SANDBOX_MAXIMUM_NATIVE_CODE_SIZE < u32::MAX);
-
-        let mut gas_metering_stub_offsets: Vec<usize> = Vec::new();
-        let mut gas_cost_for_basic_block: Vec<u32> = Vec::new();
 
         if config.gas_metering.is_some() {
             gas_metering_stub_offsets.reserve(code_length as usize);
@@ -137,7 +175,7 @@ impl<'a, S> CompilerVisitor<'a, S> where S: Sandbox {
             jump_table,
             code,
             bitmask,
-            export_to_label: Default::default(),
+            export_to_label,
             ecall_label,
             trap_label,
             trace_label,
@@ -149,6 +187,8 @@ impl<'a, S> CompilerVisitor<'a, S> where S: Sandbox {
             gas_metering_stub_offsets,
             gas_cost_for_basic_block,
             code_length,
+            native_jump_table,
+            export_trampolines,
             _phantom: PhantomData,
         };
 
@@ -169,12 +209,12 @@ impl<'a, S> CompilerVisitor<'a, S> where S: Sandbox {
         self.code_offset_to_native_code_offset.push((self.code_length, epilogue_start as u32));
         self.code_offset_to_native_code_offset.shrink_to_fit();
 
+        let mut gas_metering_stub_offsets = core::mem::take(&mut self.gas_metering_stub_offsets);
+        let mut gas_cost_for_basic_block = core::mem::take(&mut self.gas_cost_for_basic_block);
         if self.gas_metering.is_some() {
             log::trace!("Finalizing block costs...");
-            let gas_metering_stub_offsets = core::mem::take(&mut self.gas_metering_stub_offsets);
-            let gas_cost_for_basic_block = core::mem::take(&mut self.gas_cost_for_basic_block);
             assert_eq!(gas_metering_stub_offsets.len(), gas_cost_for_basic_block.len());
-            for (native_code_offset, cost) in gas_metering_stub_offsets.into_iter().zip(gas_cost_for_basic_block.into_iter()) {
+            for (&native_code_offset, &cost) in gas_metering_stub_offsets.iter().zip(gas_cost_for_basic_block.iter()) {
                 ArchVisitor(&mut self).emit_weight(native_code_offset, cost);
             }
         }
@@ -183,24 +223,26 @@ impl<'a, S> CompilerVisitor<'a, S> where S: Sandbox {
         ArchVisitor(&mut self).emit_export_trampolines();
 
         let label_sysreturn = ArchVisitor(&mut self).emit_sysreturn();
-
         let native_code_address = self.asm.origin();
-        let native_pointer_size = core::mem::size_of::<usize>();
-        let jump_table_entry_size = native_pointer_size * VM_CODE_ADDRESS_ALIGNMENT as usize;
 
-        let mut native_jump_table = vec![0; (self.jump_table.len() as usize + 1) * jump_table_entry_size];
+        let mut native_jump_table = self.native_jump_table;
+        assert!(native_jump_table.is_empty());
+        native_jump_table.resize((self.jump_table.len() as usize + 1) * VM_CODE_ADDRESS_ALIGNMENT as usize, 0);
+        native_jump_table[..VM_CODE_ADDRESS_ALIGNMENT as usize].fill(0); // First entry is always invalid.
+
         for (jump_table_index, code_offset) in self.jump_table.iter().enumerate() {
-            let Some(label) = self.code_offset_to_label.get(code_offset) else { continue };
-            let Some(native_code_offset) = self.asm.get_label_origin_offset(label) else { continue };
-            let jump_table_offset = (jump_table_index + 1) * jump_table_entry_size;
-            let range = jump_table_offset..jump_table_offset + native_pointer_size;
-            let address = native_code_address.checked_add_signed(native_code_offset as i64).expect("overflow");
+            let mut address = 0;
+            if let Some(label) = self.code_offset_to_label.get(code_offset) {
+                if let Some(native_code_offset) = self.asm.get_label_origin_offset(label) {
+                    address = native_code_address.checked_add_signed(native_code_offset as i64).expect("overflow") as usize;
+                }
+            }
 
-            log::trace!("Jump table: [{}] = 0x{:x}", jump_table_index + 1, address);
-            native_jump_table[range].copy_from_slice(&address.to_ne_bytes());
+            native_jump_table[(jump_table_index + 1) * VM_CODE_ADDRESS_ALIGNMENT as usize] = address;
         }
 
-        let mut export_trampolines = HashMap::with_capacity(self.exports.len());
+        let mut export_trampolines = self.export_trampolines;
+        assert!(export_trampolines.is_empty());
         for export in self.exports {
             let label = self.export_to_label.get(&export.target_code_offset()).unwrap();
             let native_address = native_code_address
@@ -232,11 +274,19 @@ impl<'a, S> CompilerVisitor<'a, S> where S: Sandbox {
             }
         }
 
+        #[inline(always)]
+        fn as_bytes(slice: &[usize]) -> &[u8] {
+            // SAFETY: Casting a &[usize] into a &[u8] is always safe as `u8` doesn't have any alignment requirements.
+            unsafe {
+                core::slice::from_raw_parts(slice.as_ptr().cast(), core::mem::size_of_val(slice))
+            }
+        }
+
         let module = {
             let init = SandboxInit {
                 guest_init: self.init,
                 code: &self.asm.finalize(),
-                jump_table: &native_jump_table,
+                jump_table: as_bytes(&native_jump_table),
                 sysreturn_address,
             };
 
@@ -244,7 +294,8 @@ impl<'a, S> CompilerVisitor<'a, S> where S: Sandbox {
             CompiledModule {
                 sandbox_program,
                 export_trampolines,
-                code_offset_to_native_code_offset: self.code_offset_to_native_code_offset
+                code_offset_to_native_code_offset: self.code_offset_to_native_code_offset,
+                cache: cache.clone(),
             }
         };
 
@@ -254,9 +305,21 @@ impl<'a, S> CompilerVisitor<'a, S> where S: Sandbox {
                 Err(poison) => poison.into_inner(),
             };
 
-            if cache.cached.is_empty() {
-                cache.cached.push(Cached {
+            if cache.per_compilation.is_empty() {
+                self.asm.clear();
+                self.code_offset_to_label.clear();
+                self.export_to_label.clear();
+                native_jump_table.clear();
+                gas_metering_stub_offsets.clear();
+                gas_cost_for_basic_block.clear();
+
+                cache.per_compilation.push(CachePerCompilation {
                     assembler: self.asm,
+                    code_offset_to_label: self.code_offset_to_label,
+                    export_to_label: self.export_to_label,
+                    native_jump_table,
+                    gas_metering_stub_offsets,
+                    gas_cost_for_basic_block,
                 });
             }
         }
@@ -1106,6 +1169,7 @@ pub(crate) struct CompiledModule<S> where S: Sandbox {
     pub(crate) sandbox_program: S::Program,
     pub(crate) export_trampolines: HashMap<u32, u64>,
     code_offset_to_native_code_offset: Vec<(u32, u32)>,
+    cache: CompilerCache,
 }
 
 impl<S> CompiledModule<S> where S: Sandbox {
@@ -1115,5 +1179,27 @@ impl<S> CompiledModule<S> where S: Sandbox {
 
     pub fn code_offset_to_native_code_offset(&self) -> &[(u32, u32)] {
         &self.code_offset_to_native_code_offset
+    }
+}
+
+impl<S> Drop for CompiledModule<S> where S: Sandbox {
+    fn drop(&mut self) {
+        let mut code_offset_to_native_code_offset = core::mem::take(&mut self.code_offset_to_native_code_offset);
+        let mut export_trampolines = core::mem::take(&mut self.export_trampolines);
+        {
+            let mut cache = match self.cache.0.lock() {
+                Ok(cache) => cache,
+                Err(poison) => poison.into_inner(),
+            };
+
+            if cache.per_module.is_empty() {
+                code_offset_to_native_code_offset.clear();
+                export_trampolines.clear();
+                cache.per_module.push(CachePerModule {
+                    code_offset_to_native_code_offset,
+                    export_trampolines
+                });
+            }
+        }
     }
 }
