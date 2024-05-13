@@ -1,5 +1,5 @@
 use crate::abi::{VM_CODE_ADDRESS_ALIGNMENT, VM_MAXIMUM_CODE_SIZE, VM_MAXIMUM_IMPORT_COUNT, VM_MAXIMUM_JUMP_TABLE_ENTRIES};
-use crate::utils::CowBytes;
+use crate::utils::ArcBytes;
 use crate::varint::{read_simple_varint, read_simple_varint_length_minus_1, read_varint, write_simple_varint, MAX_VARINT_LENGTH};
 use core::ops::Range;
 
@@ -1773,13 +1773,16 @@ impl core::fmt::Display for ProgramParseError {
 impl std::error::Error for ProgramParseError {}
 
 #[derive(Clone, PartialEq, Eq, Debug)]
-pub struct ProgramExport<'a> {
+pub struct ProgramExport<T> {
     target_code_offset: u32,
-    symbol: ProgramSymbol<'a>,
+    symbol: ProgramSymbol<T>,
 }
 
-impl<'a> ProgramExport<'a> {
-    pub fn new(target_code_offset: u32, symbol: ProgramSymbol<'a>) -> Self {
+impl<T> ProgramExport<T>
+where
+    T: AsRef<[u8]>,
+{
+    pub fn new(target_code_offset: u32, symbol: ProgramSymbol<T>) -> Self {
         Self {
             target_code_offset,
             symbol,
@@ -1790,77 +1793,44 @@ impl<'a> ProgramExport<'a> {
         self.target_code_offset
     }
 
-    pub fn symbol(&self) -> &ProgramSymbol<'a> {
+    pub fn symbol(&self) -> &ProgramSymbol<T> {
         &self.symbol
-    }
-
-    #[cfg(feature = "alloc")]
-    pub fn into_owned(self) -> ProgramExport<'static> {
-        ProgramExport {
-            target_code_offset: self.target_code_offset,
-            symbol: self.symbol.into_owned(),
-        }
     }
 }
 
 #[derive(Clone, PartialEq, Eq, Debug)]
-pub struct ProgramSymbol<'a>(CowBytes<'a>);
+pub struct ProgramSymbol<T>(T);
 
-impl<'a> ProgramSymbol<'a> {
-    pub fn new(bytes: CowBytes<'a>) -> Self {
+impl<T> ProgramSymbol<T>
+where
+    T: AsRef<[u8]>,
+{
+    pub fn new(bytes: T) -> Self {
         Self(bytes)
     }
 
-    pub fn into_inner(self) -> CowBytes<'a> {
+    pub fn into_inner(self) -> T {
         self.0
     }
 
-    pub fn as_bytes(&'a self) -> &'a [u8] {
-        &self.0
-    }
-
-    #[cfg(feature = "alloc")]
-    pub fn into_owned(self) -> ProgramSymbol<'static> {
-        ProgramSymbol(self.0.into_owned())
+    pub fn as_bytes(&self) -> &[u8] {
+        self.0.as_ref()
     }
 }
 
-impl<'a> From<&'a [u8]> for ProgramSymbol<'a> {
-    fn from(symbol: &'a [u8]) -> Self {
-        ProgramSymbol(symbol.into())
-    }
-}
-
-impl<'a> From<&'a str> for ProgramSymbol<'a> {
-    fn from(symbol: &'a str) -> Self {
-        ProgramSymbol(symbol.into())
-    }
-}
-
-#[cfg(feature = "alloc")]
-impl<'a> From<alloc::vec::Vec<u8>> for ProgramSymbol<'a> {
-    fn from(symbol: alloc::vec::Vec<u8>) -> Self {
-        ProgramSymbol(symbol.into())
-    }
-}
-
-impl<'a> core::ops::Deref for ProgramSymbol<'a> {
-    type Target = CowBytes<'a>;
-
-    fn deref(&self) -> &Self::Target {
-        &self.0
-    }
-}
-
-impl<'a> core::fmt::Display for ProgramSymbol<'a> {
+impl<T> core::fmt::Display for ProgramSymbol<T>
+where
+    T: AsRef<[u8]>,
+{
     fn fmt(&self, fmt: &mut core::fmt::Formatter) -> core::fmt::Result {
-        if let Ok(ident) = core::str::from_utf8(&self.0) {
+        let bytes = self.0.as_ref();
+        if let Ok(ident) = core::str::from_utf8(bytes) {
             fmt.write_str("'")?;
             fmt.write_str(ident)?;
             fmt.write_str("'")?;
         } else {
             fmt.write_str("0x")?;
-            for &byte in self.0.iter() {
+            for &byte in bytes.iter() {
                 core::write!(fmt, "{:02x}", byte)?;
             }
         }
@@ -1871,35 +1841,50 @@ impl<'a> core::fmt::Display for ProgramSymbol<'a> {
 
 /// A partially deserialized PolkaVM program.
 #[derive(Clone, Default)]
-pub struct ProgramBlob<'a> {
-    blob: CowBytes<'a>,
-
+pub struct ProgramBlob {
     ro_data_size: u32,
     rw_data_size: u32,
     stack_size: u32,
 
-    ro_data: Range<usize>,
-    rw_data: Range<usize>,
-    exports: Range<usize>,
-    import_offsets: Range<usize>,
-    import_symbols: Range<usize>,
-    code: Range<usize>,
-    jump_table: Range<usize>,
+    ro_data: ArcBytes,
+    rw_data: ArcBytes,
+    code: ArcBytes,
+    jump_table: ArcBytes,
     jump_table_entry_size: u8,
-    bitmask: Range<usize>,
+    bitmask: ArcBytes,
+    import_offsets: ArcBytes,
+    import_symbols: ArcBytes,
+    exports: ArcBytes,
 
-    debug_strings: Range<usize>,
-    debug_line_program_ranges: Range<usize>,
-    debug_line_programs: Range<usize>,
+    debug_strings: ArcBytes,
+    debug_line_program_ranges: ArcBytes,
+    debug_line_programs: ArcBytes,
 }
 
-#[derive(Clone)]
-struct Reader<'a> {
-    blob: &'a [u8],
+struct Reader<'a, T>
+where
+    T: ?Sized,
+{
+    blob: &'a T,
     position: usize,
 }
 
-impl<'a> Reader<'a> {
+impl<'a, T> Clone for Reader<'a, T>
+where
+    T: ?Sized,
+{
+    fn clone(&self) -> Self {
+        Reader {
+            blob: self.blob,
+            position: self.position,
+        }
+    }
+}
+
+impl<'a, T> Reader<'a, T>
+where
+    T: ?Sized + AsRef<[u8]>,
+{
     fn skip(&mut self, count: usize) -> Result<(), ProgramParseError> {
         self.read_slice_as_range(count).map(|_| ())
     }
@@ -1911,24 +1896,23 @@ impl<'a> Reader<'a> {
 
     #[inline(always)]
     fn read_slice(&mut self, length: usize) -> Result<&'a [u8], ProgramParseError> {
-        let Some(slice) = self.blob.get(..length) else {
-            return Err(ProgramParseError::unexpected_end_of_file(self.position, length, self.blob.len()));
+        let blob = &self.blob.as_ref()[self.position..];
+        let Some(slice) = blob.get(..length) else {
+            return Err(ProgramParseError::unexpected_end_of_file(self.position, length, blob.len()));
         };
 
         self.position += length;
-        self.blob = &self.blob[length..];
         Ok(slice)
     }
 
     #[inline(always)]
     fn read_varint(&mut self) -> Result<u32, ProgramParseError> {
         let first_byte = self.read_byte()?;
-        let Some((length, value)) = read_varint(self.blob, first_byte) else {
+        let Some((length, value)) = read_varint(&self.blob.as_ref()[self.position..], first_byte) else {
             return Err(ProgramParseError::failed_to_read_varint(self.position - 1));
         };
 
         self.position += length;
-        self.blob = &self.blob[length..];
         Ok(value)
     }
 
@@ -1947,29 +1931,33 @@ impl<'a> Reader<'a> {
     }
 
     fn read_slice_as_range(&mut self, count: usize) -> Result<Range<usize>, ProgramParseError> {
-        if self.blob.len() < count {
-            return Err(ProgramParseError::unexpected_end_of_file(self.position, count, self.blob.len()));
+        let blob = &self.blob.as_ref()[self.position..];
+        if blob.len() < count {
+            return Err(ProgramParseError::unexpected_end_of_file(self.position, count, blob.len()));
         };
 
         let range = self.position..self.position + count;
         self.position += count;
-        self.blob = &self.blob[count..];
         Ok(range)
     }
+}
 
-    fn read_section_range_into(
-        &mut self,
-        out_section: &mut u8,
-        out_range: &mut Range<usize>,
-        expected_section: u8,
-    ) -> Result<(), ProgramParseError> {
-        if *out_section == expected_section {
-            let section_length = self.read_varint()? as usize;
-            *out_range = self.read_slice_as_range(section_length)?;
-            *out_section = self.read_byte()?;
+impl<'a> Reader<'a, ArcBytes> {
+    fn read_slice_as_bytes(&mut self, length: usize) -> Result<ArcBytes, ProgramParseError> {
+        let range = self.read_slice_as_range(length)?;
+        Ok(self.blob.subslice(range))
+    }
+
+    fn read_section_as_bytes(&mut self, out_section: &mut u8, expected_section: u8) -> Result<ArcBytes, ProgramParseError> {
+        if *out_section != expected_section {
+            return Ok(ArcBytes::default());
         }
 
-        Ok(())
+        let section_length = self.read_varint()? as usize;
+        let range = self.read_slice_as_range(section_length)?;
+        *out_section = self.read_byte()?;
+
+        Ok(self.blob.subslice(range))
     }
 }
 
@@ -1988,7 +1976,7 @@ impl<'a> Imports<'a> {
         (self.offsets.len() / 4) as u32
     }
 
-    pub fn get(&self, index: u32) -> Option<ProgramSymbol<'a>> {
+    pub fn get(&self, index: u32) -> Option<ProgramSymbol<&'a [u8]>> {
         let offset_start = index.checked_mul(4)?;
         let offset_end = offset_start.checked_add(4)?;
         let xs = self.offsets.get(offset_start as usize..offset_end as usize)?;
@@ -1999,7 +1987,7 @@ impl<'a> Imports<'a> {
             .map_or(self.symbols.len(), |xs| u32::from_le_bytes([xs[0], xs[1], xs[2], xs[3]]) as usize);
 
         let symbol = self.symbols.get(offset..next_offset)?;
-        Some(ProgramSymbol::new(symbol.into()))
+        Some(ProgramSymbol::new(symbol))
     }
 
     pub fn iter(&self) -> ImportsIter<'a> {
@@ -2008,7 +1996,7 @@ impl<'a> Imports<'a> {
 }
 
 impl<'a> IntoIterator for Imports<'a> {
-    type Item = Option<ProgramSymbol<'a>>;
+    type Item = Option<ProgramSymbol<&'a [u8]>>;
     type IntoIter = ImportsIter<'a>;
 
     fn into_iter(self) -> Self::IntoIter {
@@ -2017,7 +2005,7 @@ impl<'a> IntoIterator for Imports<'a> {
 }
 
 impl<'a> IntoIterator for &'a Imports<'a> {
-    type Item = Option<ProgramSymbol<'a>>;
+    type Item = Option<ProgramSymbol<&'a [u8]>>;
     type IntoIter = ImportsIter<'a>;
 
     fn into_iter(self) -> Self::IntoIter {
@@ -2031,7 +2019,7 @@ pub struct ImportsIter<'a> {
 }
 
 impl<'a> Iterator for ImportsIter<'a> {
-    type Item = Option<ProgramSymbol<'a>>;
+    type Item = Option<ProgramSymbol<&'a [u8]>>;
     fn next(&mut self) -> Option<Self::Item> {
         if self.index >= self.imports.len() {
             None
@@ -2270,32 +2258,35 @@ impl<'a> Iterator for Instructions<'a> {
     }
 }
 
-impl<'a> ProgramBlob<'a> {
-    /// Parses the given bytes into a program blob.
-    pub fn parse(bytes: impl Into<CowBytes<'a>>) -> Result<Self, ProgramParseError> {
-        Self::parse_impl(bytes.into())
-    }
+#[derive(Default)]
+#[non_exhaustive]
+pub struct ProgramParts {
+    pub ro_data_size: u32,
+    pub rw_data_size: u32,
+    pub stack_size: u32,
 
-    /// Returns the original bytes from which this program blob was created from.
-    pub fn as_bytes(&self) -> &[u8] {
-        &self.blob
-    }
+    pub ro_data: ArcBytes,
+    pub rw_data: ArcBytes,
+    pub code_and_jump_table: ArcBytes,
+    pub import_offsets: ArcBytes,
+    pub import_symbols: ArcBytes,
+    pub exports: ArcBytes,
 
-    #[inline(never)]
-    fn parse_impl(blob: CowBytes<'a>) -> Result<Self, ProgramParseError> {
+    pub debug_strings: ArcBytes,
+    pub debug_line_program_ranges: ArcBytes,
+    pub debug_line_programs: ArcBytes,
+}
+
+impl ProgramParts {
+    pub fn from_bytes(blob: ArcBytes) -> Result<Self, ProgramParseError> {
         if !blob.starts_with(&BLOB_MAGIC) {
             return Err(ProgramParseError(ProgramParseErrorKind::Other(
                 "blob doesn't start with the expected magic bytes",
             )));
         }
 
-        let mut program = ProgramBlob {
-            blob,
-            ..ProgramBlob::default()
-        };
-
         let mut reader = Reader {
-            blob: &program.blob[BLOB_MAGIC.len()..],
+            blob: &blob,
             position: BLOB_MAGIC.len(),
         };
 
@@ -2306,13 +2297,15 @@ impl<'a> ProgramBlob<'a> {
             }));
         }
 
+        let mut parts = ProgramParts::default();
+
         let mut section = reader.read_byte()?;
         if section == SECTION_MEMORY_CONFIG {
             let section_length = reader.read_varint()?;
             let position = reader.position;
-            program.ro_data_size = reader.read_varint()?;
-            program.rw_data_size = reader.read_varint()?;
-            program.stack_size = reader.read_varint()?;
+            parts.ro_data_size = reader.read_varint()?;
+            parts.rw_data_size = reader.read_varint()?;
+            parts.stack_size = reader.read_varint()?;
             if position + section_length as usize != reader.position {
                 return Err(ProgramParseError(ProgramParseErrorKind::Other(
                     "the memory config section contains more data than expected",
@@ -2321,8 +2314,8 @@ impl<'a> ProgramBlob<'a> {
             section = reader.read_byte()?;
         }
 
-        reader.read_section_range_into(&mut section, &mut program.ro_data, SECTION_RO_DATA)?;
-        reader.read_section_range_into(&mut section, &mut program.rw_data, SECTION_RW_DATA)?;
+        parts.ro_data = reader.read_section_as_bytes(&mut section, SECTION_RO_DATA)?;
+        parts.rw_data = reader.read_section_as_bytes(&mut section, SECTION_RW_DATA)?;
 
         if section == SECTION_IMPORTS {
             let section_length = reader.read_varint()? as usize;
@@ -2336,75 +2329,20 @@ impl<'a> ProgramBlob<'a> {
                 return Err(ProgramParseError(ProgramParseErrorKind::Other("the imports section is invalid")));
             };
 
-            program.import_offsets = reader.read_slice_as_range(import_offsets_size as usize)?;
+            parts.import_offsets = reader.read_slice_as_bytes(import_offsets_size as usize)?;
             let Some(import_symbols_size) = section_length.checked_sub(reader.position - section_start) else {
                 return Err(ProgramParseError(ProgramParseErrorKind::Other("the imports section is invalid")));
             };
 
-            program.import_symbols = reader.read_slice_as_range(import_symbols_size)?;
+            parts.import_symbols = reader.read_slice_as_bytes(import_symbols_size)?;
             section = reader.read_byte()?;
         }
 
-        reader.read_section_range_into(&mut section, &mut program.exports, SECTION_EXPORTS)?;
-
-        if program.ro_data.len() > program.ro_data_size as usize {
-            return Err(ProgramParseError(ProgramParseErrorKind::Other(
-                "size of the read-only data payload exceeds the declared size of the section",
-            )));
-        }
-
-        if program.rw_data.len() > program.rw_data_size as usize {
-            return Err(ProgramParseError(ProgramParseErrorKind::Other(
-                "size of the read-write data payload exceeds the declared size of the section",
-            )));
-        }
-
-        if section == SECTION_CODE {
-            let section_length = reader.read_varint()?;
-            let initial_position = reader.position;
-            let jump_table_entry_count = reader.read_varint()?;
-            if jump_table_entry_count > VM_MAXIMUM_JUMP_TABLE_ENTRIES {
-                return Err(ProgramParseError(ProgramParseErrorKind::Other(
-                    "the jump table section is too long",
-                )));
-            }
-
-            let jump_table_entry_size = reader.read_byte()?;
-            let code_length = reader.read_varint()?;
-            if code_length > VM_MAXIMUM_CODE_SIZE {
-                return Err(ProgramParseError(ProgramParseErrorKind::Other("the code section is too long")));
-            }
-
-            let header_size = (reader.position - initial_position) as u32;
-            if section_length < header_size {
-                return Err(ProgramParseError(ProgramParseErrorKind::Other("the code section is too short")));
-            }
-
-            if !matches!(jump_table_entry_size, 0..=4) {
-                return Err(ProgramParseError(ProgramParseErrorKind::Other("invalid jump table entry size")));
-            }
-
-            let Some(jump_table_length) = jump_table_entry_count.checked_mul(u32::from(jump_table_entry_size)) else {
-                return Err(ProgramParseError(ProgramParseErrorKind::Other("the jump table is too long")));
-            };
-
-            program.jump_table = reader.read_slice_as_range(jump_table_length as usize)?;
-            program.jump_table_entry_size = jump_table_entry_size;
-            program.code = reader.read_slice_as_range(code_length as usize)?;
-
-            let bitmask_length = section_length - (reader.position - initial_position) as u32;
-            program.bitmask = reader.read_slice_as_range(bitmask_length as usize)?;
-
-            section = reader.read_byte()?;
-        }
-
-        reader.read_section_range_into(&mut section, &mut program.debug_strings, SECTION_OPT_DEBUG_STRINGS)?;
-        reader.read_section_range_into(&mut section, &mut program.debug_line_programs, SECTION_OPT_DEBUG_LINE_PROGRAMS)?;
-        reader.read_section_range_into(
-            &mut section,
-            &mut program.debug_line_program_ranges,
-            SECTION_OPT_DEBUG_LINE_PROGRAM_RANGES,
-        )?;
+        parts.exports = reader.read_section_as_bytes(&mut section, SECTION_EXPORTS)?;
+        parts.code_and_jump_table = reader.read_section_as_bytes(&mut section, SECTION_CODE_AND_JUMP_TABLE)?;
+        parts.debug_strings = reader.read_section_as_bytes(&mut section, SECTION_OPT_DEBUG_STRINGS)?;
+        parts.debug_line_programs = reader.read_section_as_bytes(&mut section, SECTION_OPT_DEBUG_LINE_PROGRAMS)?;
+        parts.debug_line_program_ranges = reader.read_section_as_bytes(&mut section, SECTION_OPT_DEBUG_LINE_PROGRAM_RANGES)?;
 
         while (section & 0b10000000) != 0 {
             // We don't know this section, but it's optional, so just skip it.
@@ -2422,31 +2360,116 @@ impl<'a> ProgramBlob<'a> {
             }));
         }
 
-        let mut expected_bitmask_length = program.code.len() / 8;
-        if program.code.len() % 8 != 0 {
-            expected_bitmask_length += 1;
-        }
+        Ok(parts)
+    }
+}
 
-        if program.bitmask.len() != expected_bitmask_length {
+impl ProgramBlob {
+    /// Parses the given bytes into a program blob.
+    pub fn parse(bytes: ArcBytes) -> Result<Self, ProgramParseError> {
+        let parts = ProgramParts::from_bytes(bytes)?;
+        Self::from_parts(parts)
+    }
+
+    /// Creates a program blob from parts.
+    pub fn from_parts(parts: ProgramParts) -> Result<Self, ProgramParseError> {
+        let mut blob = ProgramBlob {
+            ro_data_size: parts.ro_data_size,
+            rw_data_size: parts.rw_data_size,
+            stack_size: parts.stack_size,
+
+            ro_data: parts.ro_data,
+            rw_data: parts.rw_data,
+            exports: parts.exports,
+            import_symbols: parts.import_symbols,
+            import_offsets: parts.import_offsets,
+            code: Default::default(),
+            jump_table: Default::default(),
+            jump_table_entry_size: Default::default(),
+            bitmask: Default::default(),
+
+            debug_strings: parts.debug_strings,
+            debug_line_program_ranges: parts.debug_line_program_ranges,
+            debug_line_programs: parts.debug_line_programs,
+        };
+
+        if blob.ro_data.len() > blob.ro_data_size as usize {
             return Err(ProgramParseError(ProgramParseErrorKind::Other(
-                "the bitmask length doesn't match the code length",
+                "size of the read-only data payload exceeds the declared size of the section",
             )));
         }
 
-        if !program.bitmask.is_empty() && program.blob[program.bitmask.clone()][0] & 1 != 1 {
+        if blob.rw_data.len() > blob.rw_data_size as usize {
             return Err(ProgramParseError(ProgramParseErrorKind::Other(
-                "the bitmask doesn't start with a 1",
+                "size of the read-write data payload exceeds the declared size of the section",
             )));
         }
 
-        Ok(program)
+        if parts.code_and_jump_table.is_empty() {
+            return Err(ProgramParseError(ProgramParseErrorKind::Other("no code found")));
+        }
+
+        {
+            let mut reader = Reader {
+                blob: &parts.code_and_jump_table,
+                position: 0,
+            };
+
+            let initial_position = reader.position;
+            let jump_table_entry_count = reader.read_varint()?;
+            if jump_table_entry_count > VM_MAXIMUM_JUMP_TABLE_ENTRIES {
+                return Err(ProgramParseError(ProgramParseErrorKind::Other(
+                    "the jump table section is too long",
+                )));
+            }
+
+            let jump_table_entry_size = reader.read_byte()?;
+            let code_length = reader.read_varint()?;
+            if code_length > VM_MAXIMUM_CODE_SIZE {
+                return Err(ProgramParseError(ProgramParseErrorKind::Other("the code section is too long")));
+            }
+
+            if !matches!(jump_table_entry_size, 0..=4) {
+                return Err(ProgramParseError(ProgramParseErrorKind::Other("invalid jump table entry size")));
+            }
+
+            let Some(jump_table_length) = jump_table_entry_count.checked_mul(u32::from(jump_table_entry_size)) else {
+                return Err(ProgramParseError(ProgramParseErrorKind::Other("the jump table is too long")));
+            };
+
+            blob.jump_table_entry_size = jump_table_entry_size;
+            blob.jump_table = reader.read_slice_as_bytes(jump_table_length as usize)?;
+            blob.code = reader.read_slice_as_bytes(code_length as usize)?;
+
+            let bitmask_length = parts.code_and_jump_table.len() - (reader.position - initial_position);
+            blob.bitmask = reader.read_slice_as_bytes(bitmask_length)?;
+
+            let mut expected_bitmask_length = blob.code.len() / 8;
+            if blob.code.len() % 8 != 0 {
+                expected_bitmask_length += 1;
+            }
+
+            if blob.bitmask.len() != expected_bitmask_length {
+                return Err(ProgramParseError(ProgramParseErrorKind::Other(
+                    "the bitmask length doesn't match the code length",
+                )));
+            }
+
+            if blob.bitmask[0] & 1 != 1 {
+                return Err(ProgramParseError(ProgramParseErrorKind::Other(
+                    "the bitmask doesn't start with a 1",
+                )));
+            }
+        }
+
+        Ok(blob)
     }
 
     /// Returns the contents of the read-only data section.
     ///
     /// This only covers the initial non-zero portion of the section; use `ro_data_size` to get the full size.
     pub fn ro_data(&self) -> &[u8] {
-        &self.blob[self.ro_data.clone()]
+        &self.ro_data
     }
 
     /// Returns the size of the read-only data section.
@@ -2460,7 +2483,7 @@ impl<'a> ProgramBlob<'a> {
     ///
     /// This only covers the initial non-zero portion of the section; use `rw_data_size` to get the full size.
     pub fn rw_data(&self) -> &[u8] {
-        &self.blob[self.rw_data.clone()]
+        &self.rw_data
     }
 
     /// Returns the size of the read-write data section.
@@ -2477,30 +2500,23 @@ impl<'a> ProgramBlob<'a> {
 
     /// Returns the program code in its raw form.
     pub fn code(&self) -> &[u8] {
-        &self.blob[self.code.clone()]
+        &self.code
     }
 
     /// Returns the code bitmask in its raw form.
     pub fn bitmask(&self) -> &[u8] {
-        &self.blob[self.bitmask.clone()]
-    }
-
-    fn get_section_reader(&self, range: Range<usize>) -> Reader {
-        Reader {
-            blob: &self.blob[range.start..range.end],
-            position: range.start,
-        }
+        &self.bitmask
     }
 
     pub fn imports(&self) -> Imports {
         Imports {
-            offsets: &self.blob[self.import_offsets.clone()],
-            symbols: &self.blob[self.import_symbols.clone()],
+            offsets: &self.import_offsets,
+            symbols: &self.import_symbols,
         }
     }
 
     /// Returns an iterator over program exports.
-    pub fn exports(&'_ self) -> impl Iterator<Item = ProgramExport> + Clone + '_ {
+    pub fn exports(&self) -> impl Iterator<Item = ProgramExport<&[u8]>> + Clone {
         #[derive(Clone)]
         enum State {
             Uninitialized,
@@ -2511,11 +2527,11 @@ impl<'a> ProgramBlob<'a> {
         #[derive(Clone)]
         struct ExportIterator<'a> {
             state: State,
-            reader: Reader<'a>,
+            reader: Reader<'a, [u8]>,
         }
 
         impl<'a> Iterator for ExportIterator<'a> {
-            type Item = ProgramExport<'a>;
+            type Item = ProgramExport<&'a [u8]>;
             fn next(&mut self) -> Option<Self::Item> {
                 let remaining = match core::mem::replace(&mut self.state, State::Finished) {
                     State::Uninitialized => self.reader.read_varint().ok()?,
@@ -2531,7 +2547,7 @@ impl<'a> ProgramBlob<'a> {
                 let symbol = self.reader.read_bytes_with_length().ok()?;
                 let export = ProgramExport {
                     target_code_offset,
-                    symbol: symbol.into(),
+                    symbol: ProgramSymbol::new(symbol),
                 };
 
                 self.state = State::Pending(remaining - 1);
@@ -2540,17 +2556,20 @@ impl<'a> ProgramBlob<'a> {
         }
 
         ExportIterator {
-            state: if self.exports != (0_usize..0_usize) {
+            state: if !self.exports.is_empty() {
                 State::Uninitialized
             } else {
                 State::Finished
             },
-            reader: self.get_section_reader(self.exports.clone()),
+            reader: Reader {
+                blob: &self.exports,
+                position: 0,
+            },
         }
     }
 
     #[inline]
-    pub fn instructions(&'a self) -> Instructions<'a> {
+    pub fn instructions(&self) -> Instructions {
         Instructions {
             code: self.code(),
             bitmask: self.bitmask(),
@@ -2559,7 +2578,7 @@ impl<'a> ProgramBlob<'a> {
     }
 
     #[inline]
-    pub fn instructions_at(&'a self, offset: u32) -> Option<Instructions<'a>> {
+    pub fn instructions_at(&self, offset: u32) -> Option<Instructions> {
         let bitmask = self.bitmask();
         if (bitmask.get(offset as usize >> 3)? >> (offset as usize & 7)) & 1 == 0 {
             None
@@ -2575,18 +2594,17 @@ impl<'a> ProgramBlob<'a> {
     /// Returns a jump table.
     pub fn jump_table(&self) -> JumpTable {
         JumpTable {
-            blob: if self.jump_table_entry_size == 0 {
-                &[]
-            } else {
-                &self.blob[self.jump_table.clone()]
-            },
+            blob: &self.jump_table,
             entry_size: u32::from(self.jump_table_entry_size),
         }
     }
 
     /// Returns the debug string for the given relative offset.
     pub fn get_debug_string(&self, offset: u32) -> Result<&str, ProgramParseError> {
-        let mut reader = self.get_section_reader(self.debug_strings.clone());
+        let mut reader = Reader {
+            blob: &self.debug_strings,
+            position: 0,
+        };
         reader.skip(offset as usize)?;
         reader.read_string_with_length()
     }
@@ -2597,7 +2615,7 @@ impl<'a> ProgramBlob<'a> {
             return Ok(None);
         }
 
-        if self.blob[self.debug_line_programs.start] != VERSION_DEBUG_LINE_PROGRAM_V1 {
+        if self.debug_line_programs[0] != VERSION_DEBUG_LINE_PROGRAM_V1 {
             return Err(ProgramParseError(ProgramParseErrorKind::Other(
                 "the debug line programs section has an unsupported version",
             )));
@@ -2605,7 +2623,7 @@ impl<'a> ProgramBlob<'a> {
 
         const ENTRY_SIZE: usize = 12;
 
-        let slice = &self.blob[self.debug_line_program_ranges.clone()];
+        let slice = &self.debug_line_program_ranges;
         if slice.len() % ENTRY_SIZE != 0 {
             return Err(ProgramParseError(ProgramParseErrorKind::Other(
                 "the debug function ranges section has an invalid size",
@@ -2639,7 +2657,11 @@ impl<'a> ProgramBlob<'a> {
             )));
         }
 
-        let mut reader = self.get_section_reader(self.debug_line_programs.clone());
+        let mut reader = Reader {
+            blob: &self.debug_line_programs,
+            position: 0,
+        };
+
         reader.skip(info_offset as usize)?;
 
         Ok(Some(LineProgram {
@@ -2653,32 +2675,6 @@ impl<'a> ProgramBlob<'a> {
             stack_depth: 0,
             mutation_depth: 0,
         }))
-    }
-
-    /// Returns an owned program blob, possibly cloning it if it was deserialized in a zero-copy fashion.
-    #[cfg(feature = "alloc")]
-    pub fn into_owned(self) -> ProgramBlob<'static> {
-        ProgramBlob {
-            blob: self.blob.into_owned(),
-
-            ro_data_size: self.ro_data_size,
-            rw_data_size: self.rw_data_size,
-            stack_size: self.stack_size,
-
-            ro_data: self.ro_data,
-            rw_data: self.rw_data,
-            exports: self.exports,
-            import_symbols: self.import_symbols,
-            import_offsets: self.import_offsets,
-            code: self.code,
-            jump_table: self.jump_table,
-            jump_table_entry_size: self.jump_table_entry_size,
-            bitmask: self.bitmask,
-
-            debug_strings: self.debug_strings,
-            debug_line_program_ranges: self.debug_line_program_ranges,
-            debug_line_programs: self.debug_line_programs,
-        }
     }
 }
 
@@ -2737,7 +2733,7 @@ pub enum FrameKind {
 }
 
 pub struct FrameInfo<'a> {
-    blob: &'a ProgramBlob<'a>,
+    blob: &'a ProgramBlob,
     inner: &'a LineProgramFrame,
 }
 
@@ -2832,7 +2828,7 @@ impl<'a> FrameInfo<'a> {
 /// Debug information about a given region of bytecode.
 pub struct RegionInfo<'a> {
     entry_index: usize,
-    blob: &'a ProgramBlob<'a>,
+    blob: &'a ProgramBlob,
     range: Range<u32>,
     frames: &'a [LineProgramFrame],
 }
@@ -2868,8 +2864,8 @@ struct LineProgramFrame {
 pub struct LineProgram<'a> {
     entry_index: usize,
     region_counter: usize,
-    blob: &'a ProgramBlob<'a>,
-    reader: Reader<'a>,
+    blob: &'a ProgramBlob,
+    reader: Reader<'a, ArcBytes>,
     is_finished: bool,
     program_counter: u32,
     // Support inline call stacks ~16 frames deep. Picked entirely arbitrarily.
@@ -3153,7 +3149,7 @@ pub const SECTION_RO_DATA: u8 = 2;
 pub const SECTION_RW_DATA: u8 = 3;
 pub const SECTION_IMPORTS: u8 = 4;
 pub const SECTION_EXPORTS: u8 = 5;
-pub const SECTION_CODE: u8 = 6;
+pub const SECTION_CODE_AND_JUMP_TABLE: u8 = 6;
 pub const SECTION_OPT_DEBUG_STRINGS: u8 = 128;
 pub const SECTION_OPT_DEBUG_LINE_PROGRAMS: u8 = 129;
 pub const SECTION_OPT_DEBUG_LINE_PROGRAM_RANGES: u8 = 130;

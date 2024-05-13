@@ -11,7 +11,7 @@ pub struct Instance {
 
 impl Backend for PolkaVM {
     type Engine = polkavm::Engine;
-    type Blob = Vec<u8>;
+    type Blob = polkavm::ArcBytes;
     type Module = polkavm::Module;
     type Instance = Instance;
 
@@ -34,14 +34,14 @@ impl Backend for PolkaVM {
     }
 
     fn load(&self, path: &Path) -> Self::Blob {
-        std::fs::read(path).unwrap()
+        std::fs::read(path).unwrap().into()
     }
 
     fn compile(&self, engine: &mut Self::Engine, blob: &Self::Blob) -> Self::Module {
-        let blob = polkavm::ProgramBlob::parse(&**blob).unwrap();
+        let blob = polkavm::ProgramBlob::parse(blob.clone()).unwrap();
         let mut config = polkavm::ModuleConfig::default();
         config.set_gas_metering(self.1);
-        polkavm::Module::from_blob(engine, &config, &blob).unwrap()
+        polkavm::Module::from_blob(engine, &config, blob).unwrap()
     }
 
     fn spawn(&self, engine: &mut Self::Engine, module: &Self::Module) -> Self::Instance {

@@ -1,4 +1,5 @@
 use crate::program::{self, Instruction, ProgramSymbol};
+use alloc::boxed::Box;
 use alloc::vec::Vec;
 use core::ops::Range;
 
@@ -74,8 +75,8 @@ pub struct ProgramBlobBuilder {
     stack_size: u32,
     ro_data: Vec<u8>,
     rw_data: Vec<u8>,
-    imports: Vec<ProgramSymbol<'static>>,
-    exports: Vec<(u32, ProgramSymbol<'static>)>,
+    imports: Vec<ProgramSymbol<Box<[u8]>>>,
+    exports: Vec<(u32, ProgramSymbol<Box<[u8]>>)>,
     jump_table: Vec<u8>,
     jump_table_entry_count: u32,
     jump_table_entry_size: u8,
@@ -113,12 +114,12 @@ impl ProgramBlobBuilder {
         self.rw_data = data;
     }
 
-    pub fn add_import(&mut self, import: ProgramSymbol) {
-        self.imports.push(import.into_owned());
+    pub fn add_import(&mut self, import: &[u8]) {
+        self.imports.push(ProgramSymbol::new(import.into()));
     }
 
-    pub fn add_export_by_basic_block(&mut self, target_basic_block: u32, symbol: ProgramSymbol) {
-        self.exports.push((target_basic_block, symbol.into_owned()));
+    pub fn add_export_by_basic_block(&mut self, target_basic_block: u32, symbol: &[u8]) {
+        self.exports.push((target_basic_block, ProgramSymbol::new(symbol.into())));
     }
 
     pub fn set_code(&mut self, code: &[Instruction], jump_table: &[u32]) {
@@ -307,7 +308,7 @@ impl ProgramBlobBuilder {
                 let mut symbols_blob = Vec::new();
                 for symbol in &self.imports {
                     offsets_blob.extend_from_slice(&(symbols_blob.len() as u32).to_le_bytes());
-                    symbols_blob.extend_from_slice(symbol)
+                    symbols_blob.extend_from_slice(symbol.as_bytes())
                 }
 
                 writer.push_varint(self.imports.len().try_into().expect("too many imports"));
@@ -323,12 +324,12 @@ impl ProgramBlobBuilder {
                     let nth_instruction = self.basic_block_to_instruction_index[target_basic_block as usize];
                     let offset = self.instruction_index_to_code_offset[nth_instruction];
                     writer.push_varint(offset);
-                    writer.push_bytes_with_length(&symbol);
+                    writer.push_bytes_with_length(symbol.as_bytes());
                 }
             });
         }
 
-        writer.push_section_inplace(program::SECTION_CODE, |writer| {
+        writer.push_section_inplace(program::SECTION_CODE_AND_JUMP_TABLE, |writer| {
             writer.push_varint(self.jump_table_entry_count);
             writer.push_byte(self.jump_table_entry_size);
             writer.push_varint(self.code.len() as u32);

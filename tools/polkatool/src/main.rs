@@ -115,14 +115,14 @@ fn main_link(input: PathBuf, output: PathBuf, strip: bool, run_only_if_newer: bo
         }
     };
 
-    if let Err(error) = std::fs::write(&output, blob.as_bytes()) {
+    if let Err(error) = std::fs::write(&output, blob) {
         bail!("failed to write the program blob to {output:?}: {error}");
     }
 
     Ok(())
 }
 
-fn load_blob(input: &Path) -> Result<ProgramBlob<'static>, String> {
+fn load_blob(input: &Path) -> Result<ProgramBlob, String> {
     let data = match std::fs::read(input) {
         Ok(data) => data,
         Err(error) => {
@@ -130,14 +130,14 @@ fn load_blob(input: &Path) -> Result<ProgramBlob<'static>, String> {
         }
     };
 
-    let blob = match polkavm_linker::ProgramBlob::parse(&data[..]) {
+    let blob = match polkavm_linker::ProgramBlob::parse(data[..].into()) {
         Ok(blob) => blob,
         Err(error) => {
             bail!("failed to parse {input:?}: {error}");
         }
     };
 
-    Ok(blob.into_owned())
+    Ok(blob)
 }
 
 fn main_stats(inputs: Vec<PathBuf>) -> Result<(), String> {

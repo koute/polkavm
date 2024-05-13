@@ -1351,7 +1351,7 @@ fn check_imports_and_assign_indexes(imports: &mut [Import], used_imports: &HashS
 
             return Err(ProgramFromElfError::other(format!(
                 "duplicate imports with the same symbol yet different prototype: {}",
-                ProgramSymbol::from(&*import.metadata.symbol)
+                ProgramSymbol::new(&*import.metadata.symbol)
             )));
         }
 
@@ -6406,7 +6406,7 @@ impl Config {
     }
 }
 
-pub fn program_from_elf(config: Config, data: &[u8]) -> Result<ProgramBlob, ProgramFromElfError> {
+pub fn program_from_elf(config: Config, data: &[u8]) -> Result<Vec<u8>, ProgramFromElfError> {
     let mut elf = Elf::parse(data)?;
 
     if elf.section_by_name(".got").next().is_none() {
@@ -7018,7 +7018,7 @@ pub fn program_from_elf(config: Config, data: &[u8]) -> Result<ProgramBlob, Prog
             assert_eq!(index, next_index);
             next_index += 1;
 
-            builder.add_import(polkavm_common::program::ProgramSymbol::new(import.metadata.symbol.into()));
+            builder.add_import(&import.metadata.symbol);
         }
     }
 
@@ -7030,7 +7030,7 @@ pub fn program_from_elf(config: Config, data: &[u8]) -> Result<ProgramBlob, Prog
         let jump_target = jump_target_for_block[block_target.index()]
             .expect("internal error: export metadata points to a block without a jump target assigned");
 
-        builder.add_export_by_basic_block(jump_target.static_target, export.metadata.symbol.into());
+        builder.add_export_by_basic_block(jump_target.static_target, &export.metadata.symbol);
     }
 
     let mut locations_for_instruction: Vec<Option<Arc<[Location]>>> = Vec::with_capacity(code.len());
@@ -7108,7 +7108,7 @@ pub fn program_from_elf(config: Config, data: &[u8]) -> Result<ProgramBlob, Prog
     let raw_blob = builder.into_vec();
 
     log::debug!("Built a program of {} bytes", raw_blob.len());
-    let blob = ProgramBlob::parse(raw_blob)?;
+    let blob = ProgramBlob::parse(raw_blob[..].into())?;
 
     // Sanity check that our debug info was properly emitted and can be parsed.
     if cfg!(debug_assertions) && !config.strip {
@@ -7163,7 +7163,7 @@ pub fn program_from_elf(config: Config, data: &[u8]) -> Result<ProgramBlob, Prog
         }
     }
 
-    Ok(blob)
+    Ok(raw_blob)
 }
 
 fn simplify_path(path: &str) -> Cow<str> {
