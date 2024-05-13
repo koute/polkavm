@@ -14,8 +14,8 @@ use polkavm_common::abi::MemoryMap;
 use polkavm_common::abi::{VM_ADDR_RETURN_TO_HOST, VM_ADDR_USER_STACK_HIGH};
 use polkavm_common::error::Trap;
 use polkavm_common::program::{FrameKind, Imports, Reg};
-use polkavm_common::program::{ProgramBlob, ProgramSymbol};
-use polkavm_common::utils::{Access, AsUninitSliceMut, Gas};
+use polkavm_common::program::{Instructions, JumpTable, ProgramBlob, ProgramSymbol};
+use polkavm_common::utils::{Access, ArcBytes, AsUninitSliceMut, Gas};
 
 use crate::caller::{Caller, CallerRaw};
 use crate::config::{BackendKind, Config, GasMeteringKind, ModuleConfig, SandboxKind};
@@ -160,7 +160,7 @@ struct ModulePrivate {
     debug_trace_execution: bool,
     code_offset_by_symbol: HashMap<Vec<u8>, u32>,
 
-    blob: ProgramBlob<'static>,
+    blob: ProgramBlob,
     compiled_module: CompiledModuleKind,
     interpreted_module: Option<InterpretedModule>,
     memory_map: MemoryMap,
@@ -205,8 +205,31 @@ impl Module {
         self.0.interpreted_module.as_ref()
     }
 
-    pub(crate) fn blob(&self) -> &ProgramBlob<'static> {
-        &self.0.blob
+    pub(crate) fn code_len(&self) -> u32 {
+        self.0.blob.code().len() as u32
+    }
+
+    pub(crate) fn instructions_at(&self, offset: u32) -> Option<Instructions> {
+        self.0.blob.instructions_at(offset)
+    }
+
+    pub(crate) fn jump_table(&self) -> JumpTable {
+        self.0.blob.jump_table()
+    }
+
+    pub(crate) fn imports(&self) -> Imports {
+        self.0.blob.imports()
+    }
+
+    pub fn get_debug_string(&self, offset: u32) -> Result<&str, polkavm_common::program::ProgramParseError> {
+        self.0.blob.get_debug_string(offset)
+    }
+
+    pub(crate) fn get_debug_line_program_at(
+        &self,
+        code_offset: u32,
+    ) -> Result<Option<polkavm_common::program::LineProgram>, polkavm_common::program::ProgramParseError> {
+        self.0.blob.get_debug_line_program_at(code_offset)
     }
 
     pub(crate) fn gas_metering(&self) -> Option<GasMeteringKind> {
@@ -214,21 +237,19 @@ impl Module {
     }
 
     /// Creates a new module by deserializing the program from the given `bytes`.
-    pub fn new(engine: &Engine, config: &ModuleConfig, bytes: impl AsRef<[u8]>) -> Result<Self, Error> {
-        let blob = match ProgramBlob::parse(bytes.as_ref()) {
+    pub fn new(engine: &Engine, config: &ModuleConfig, bytes: ArcBytes) -> Result<Self, Error> {
+        let blob = match ProgramBlob::parse(bytes) {
             Ok(blob) => blob,
             Err(error) => {
                 bail!("failed to parse blob: {}", error);
             }
         };
 
-        Self::from_blob(engine, config, &blob)
+        Self::from_blob(engine, config, blob)
     }
 
     /// Creates a new module from a deserialized program `blob`.
-    pub fn from_blob(engine: &Engine, config: &ModuleConfig, blob: &ProgramBlob) -> Result<Self, Error> {
-        log::debug!("Preparing a module from a blob of length {}...", blob.as_bytes().len());
-
+    pub fn from_blob(engine: &Engine, config: &ModuleConfig, blob: ProgramBlob) -> Result<Self, Error> {
         // Do an early check for memory config validity.
         MemoryMap::new(config.page_size, blob.ro_data_size(), blob.rw_data_size(), blob.stack_size()).map_err(Error::from_static_str)?;
 
@@ -304,7 +325,7 @@ impl Module {
                 )?;
 
                 let run = polkavm_common::program::prepare_visitor!($visitor_name, VisitorTy<'a>);
-                let visitor = run(blob, visitor);
+                let visitor = run(&blob, visitor);
                 let module = visitor.finish_compilation(&engine.state.compiler_cache, aux)?;
                 Some(CompiledModuleKind::$module_kind(module))
             }};
@@ -360,7 +381,7 @@ impl Module {
 
         let code_offset_by_symbol = exports
             .iter()
-            .map(|export| (export.symbol().to_vec(), export.target_code_offset()))
+            .map(|export| (export.symbol().as_bytes().to_vec(), export.target_code_offset()))
             .collect();
 
         let memory_map = init.memory_map().map_err(Error::from_static_str)?;
@@ -390,8 +411,7 @@ impl Module {
             debug_trace_execution: engine.debug_trace_execution,
             code_offset_by_symbol,
 
-            // TODO: Remove the clone.
-            blob: blob.clone().into_owned(),
+            blob,
             compiled_module,
             interpreted_module,
             memory_map,
@@ -483,15 +503,14 @@ impl Module {
     /// Will return `None` if the given `code_offset` is invalid.
     /// Mostly only useful for debugging.
     pub fn gas_cost_for_code_offset(&self, code_offset: u32) -> Option<i64> {
-        let instructions = self.0.blob.instructions_at(code_offset)?;
+        let instructions = self.instructions_at(code_offset)?;
         Some(i64::from(crate::gas::calculate_for_block(instructions)))
     }
 
     pub(crate) fn debug_print_location(&self, log_level: log::Level, pc: u32) {
         log::log!(log_level, "  At #{pc}:");
 
-        let blob = self.blob();
-        let Ok(Some(mut line_program)) = blob.get_debug_line_program_at(pc) else {
+        let Ok(Some(mut line_program)) = self.0.blob.get_debug_line_program_at(pc) else {
             log::log!(log_level, "    (no location available)");
             return;
         };
@@ -945,7 +964,7 @@ impl<T> Linker<T> {
         if self.host_functions.contains_key(symbol) {
             bail!(
                 "cannot register host function: host function was already registered: {}",
-                ProgramSymbol::from(symbol)
+                ProgramSymbol::new(symbol)
             );
         }
 
@@ -970,7 +989,7 @@ impl<T> Linker<T> {
         if self.host_functions.contains_key(symbol) {
             bail!(
                 "cannot register host function: host function was already registered: {}",
-                ProgramSymbol::from(symbol)
+                ProgramSymbol::new(symbol)
             );
         }
 
@@ -980,8 +999,8 @@ impl<T> Linker<T> {
 
     /// Pre-instantiates a new module, linking it with the external functions previously defined on this object.
     pub fn instantiate_pre(&self, module: &Module) -> Result<InstancePre<T>, Error> {
-        let mut host_functions: Vec<Option<CallFnArc<T>>> = Vec::with_capacity(module.0.blob.imports().len() as usize);
-        for symbol in module.0.blob.imports() {
+        let mut host_functions: Vec<Option<CallFnArc<T>>> = Vec::with_capacity(module.imports().len() as usize);
+        for symbol in module.imports() {
             let Some(symbol) = symbol else {
                 host_functions.push(None);
                 continue;
@@ -1001,7 +1020,7 @@ impl<T> Linker<T> {
             host_functions.push(host_fn);
         }
 
-        assert_eq!(host_functions.len(), module.0.blob.imports().len() as usize);
+        assert_eq!(host_functions.len(), module.imports().len() as usize);
         Ok(InstancePre(Arc::new(InstancePrePrivate {
             engine_state: Arc::clone(&self.engine_state),
             module: module.clone(),
@@ -1314,7 +1333,7 @@ impl<T> Instance<T> {
             return Err(ExecutionError::Error(
                 format!(
                     "failed to call function {}: the module contains no such export",
-                    ProgramSymbol::new(symbol.into())
+                    ProgramSymbol::new(symbol)
                 )
                 .into(),
             ));
@@ -1446,7 +1465,7 @@ impl<T> Instance<T> {
             let mut on_hostcall = on_hostcall(
                 call_args.user_data,
                 &instance_pre.0.host_functions,
-                instance_pre.0.module.0.blob.imports(),
+                instance_pre.0.module.imports(),
                 instance_pre.0.fallback_handler.as_ref(),
                 &mut mutable.raw,
             );
@@ -1751,7 +1770,9 @@ fn on_hostcall<'a, T>(
         let Some(host_fn) = host_functions.get(hostcall as usize).and_then(|func| func.as_ref()) else {
             if let Some(fallback_handler) = fallback_handler {
                 if let Some(ref symbol) = imports.get(hostcall) {
-                    return Caller::wrap(user_data, &mut access, raw, move |caller| fallback_handler(caller, symbol));
+                    return Caller::wrap(user_data, &mut access, raw, move |caller| {
+                        fallback_handler(caller, symbol.as_bytes())
+                    });
                 }
             }
 

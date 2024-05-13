@@ -77,7 +77,7 @@ pub use polkavm_common::{
     abi::MemoryMap,
     error::{ExecutionError, Trap},
     program::{ProgramBlob, ProgramParseError, Reg},
-    utils::{AsUninitSliceMut, Gas},
+    utils::{ArcBytes, AsUninitSliceMut, Gas},
 };
 
 pub use crate::api::{CallArgs, Engine, ExportIndex, Instance, InstancePre, Linker, Module, StateArgs};

@@ -88,12 +88,12 @@ macro_rules! run_tests {
     }
 }
 
-fn basic_test_blob() -> ProgramBlob<'static> {
+fn basic_test_blob() -> ProgramBlob {
     let memory_map = MemoryMap::new(0x4000, 0, 0x4000, 0).unwrap();
     let mut builder = ProgramBlobBuilder::new();
     builder.set_rw_data_size(0x4000);
-    builder.add_export_by_basic_block(0, "main".into());
-    builder.add_import("hostcall".into());
+    builder.add_export_by_basic_block(0, b"main");
+    builder.add_import(b"hostcall");
     builder.set_code(
         &[
             asm::store_imm_u32(memory_map.rw_data_address(), 0x12345678),
@@ -104,14 +104,14 @@ fn basic_test_blob() -> ProgramBlob<'static> {
         ],
         &[],
     );
-    ProgramBlob::parse(builder.into_vec()).unwrap()
+    ProgramBlob::parse(builder.into_vec().into()).unwrap()
 }
 
 fn caller_and_caller_ref_work(config: Config) {
     let _ = env_logger::try_init();
     let blob = basic_test_blob();
     let engine = Engine::new(&config).unwrap();
-    let module = Module::from_blob(&engine, &Default::default(), &blob).unwrap();
+    let module = Module::from_blob(&engine, &Default::default(), blob).unwrap();
     let mut linker = Linker::new(&engine);
 
     #[derive(Default)]
@@ -158,7 +158,7 @@ fn caller_split_works(config: Config) {
     let _ = env_logger::try_init();
     let blob = basic_test_blob();
     let engine = Engine::new(&config).unwrap();
-    let module = Module::from_blob(&engine, &Default::default(), &blob).unwrap();
+    let module = Module::from_blob(&engine, &Default::default(), blob).unwrap();
     let mut linker = Linker::new(&engine);
 
     #[derive(Default)]
@@ -195,7 +195,7 @@ fn trapping_from_hostcall_handler_works(config: Config) {
     let _ = env_logger::try_init();
     let blob = basic_test_blob();
     let engine = Engine::new(&config).unwrap();
-    let module = Module::from_blob(&engine, &Default::default(), &blob).unwrap();
+    let module = Module::from_blob(&engine, &Default::default(), blob).unwrap();
     let mut linker = Linker::new(&engine);
 
     enum Kind {
@@ -226,7 +226,7 @@ fn fallback_hostcall_handler_works(config: Config) {
     let _ = env_logger::try_init();
     let blob = basic_test_blob();
     let engine = Engine::new(&config).unwrap();
-    let module = Module::from_blob(&engine, &Default::default(), &blob).unwrap();
+    let module = Module::from_blob(&engine, &Default::default(), blob).unwrap();
     let mut linker = Linker::new(&engine);
 
     linker.func_fallback(move |mut caller: Caller<()>, symbol: &[u8]| -> Result<(), Trap> {
@@ -270,8 +270,8 @@ fn get_blob(elf: &'static [u8]) -> ProgramBlob {
         .or_insert_with(|| {
             // This is slow, so cache it.
             let elf = decompress_zstd(elf);
-            let blob = polkavm_linker::program_from_elf(Default::default(), &elf).unwrap();
-            blob.into_owned()
+            let bytes = polkavm_linker::program_from_elf(Default::default(), &elf).unwrap();
+            ProgramBlob::parse(bytes.into()).unwrap()
         })
         .clone()
 }
@@ -294,7 +294,7 @@ fn doom(config: Config, elf: &'static [u8]) {
     let engine = Engine::new(&config).unwrap();
     let mut module_config = ModuleConfig::default();
     module_config.set_page_size(16 * 1024); // TODO: Also test with other page sizes.
-    let module = Module::from_blob(&engine, &module_config, &blob).unwrap();
+    let module = Module::from_blob(&engine, &module_config, blob).unwrap();
     let mut linker = Linker::new(&engine);
 
     struct State {
@@ -429,7 +429,7 @@ fn pinky(config: Config) {
     let blob = get_blob(include_bytes!("../../../test-data/bench-pinky.elf.zst"));
 
     let engine = Engine::new(&config).unwrap();
-    let module = Module::from_blob(&engine, &Default::default(), &blob).unwrap();
+    let module = Module::from_blob(&engine, &Default::default(), blob).unwrap();
     let linker = Linker::new(&engine);
     let instance_pre = linker.instantiate_pre(&module).unwrap();
     let instance = instance_pre.instantiate().unwrap();
@@ -469,7 +469,7 @@ impl TestInstance {
         let blob = get_blob(include_bytes!("../../../test-data/test-blob.elf.zst"));
 
         let engine = Engine::new(config).unwrap();
-        let module = Module::from_blob(&engine, &Default::default(), &blob).unwrap();
+        let module = Module::from_blob(&engine, &Default::default(), blob).unwrap();
         let mut linker = Linker::new(&engine);
         linker
             .func_wrap("multiply_by_2", |_caller: Caller<()>, value: u32| -> Result<u32, Trap> {
@@ -714,15 +714,15 @@ fn basic_gas_metering(config: Config, gas_metering_kind: GasMeteringKind) {
     let _ = env_logger::try_init();
 
     let mut builder = ProgramBlobBuilder::new();
-    builder.add_export_by_basic_block(0, "main".into());
+    builder.add_export_by_basic_block(0, b"main");
     builder.set_code(&[asm::add_imm(A0, A0, 666), asm::ret()], &[]);
 
-    let blob = ProgramBlob::parse(builder.into_vec()).unwrap();
+    let blob = ProgramBlob::parse(builder.into_vec().into()).unwrap();
     let engine = Engine::new(&config).unwrap();
     let mut module_config = ModuleConfig::default();
     module_config.set_gas_metering(Some(gas_metering_kind));
 
-    let module = Module::from_blob(&engine, &module_config, &blob).unwrap();
+    let module = Module::from_blob(&engine, &module_config, blob).unwrap();
     let linker = Linker::new(&engine);
     let instance_pre = linker.instantiate_pre(&module).unwrap();
     let instance = instance_pre.instantiate().unwrap();
@@ -786,16 +786,16 @@ fn consume_gas_in_host_function(config: Config, gas_metering_kind: GasMeteringKi
     let _ = env_logger::try_init();
 
     let mut builder = ProgramBlobBuilder::new();
-    builder.add_export_by_basic_block(0, "main".into());
-    builder.add_import("hostfn".into());
+    builder.add_export_by_basic_block(0, b"main");
+    builder.add_import(b"hostfn");
     builder.set_code(&[asm::ecalli(0), asm::ret()], &[]);
 
-    let blob = ProgramBlob::parse(builder.into_vec()).unwrap();
+    let blob = ProgramBlob::parse(builder.into_vec().into()).unwrap();
     let engine = Engine::new(&config).unwrap();
     let mut module_config = ModuleConfig::default();
     module_config.set_gas_metering(Some(gas_metering_kind));
 
-    let module = Module::from_blob(&engine, &module_config, &blob).unwrap();
+    let module = Module::from_blob(&engine, &module_config, blob).unwrap();
     let mut linker = Linker::new(&engine);
     linker
         .func_wrap("hostfn", |mut caller: Caller<u64>| -> u32 {
@@ -849,8 +849,8 @@ fn gas_metering_with_more_than_one_basic_block(config: Config) {
     let _ = env_logger::try_init();
 
     let mut builder = ProgramBlobBuilder::new();
-    builder.add_export_by_basic_block(0, "export_1".into());
-    builder.add_export_by_basic_block(1, "export_2".into());
+    builder.add_export_by_basic_block(0, b"export_1");
+    builder.add_export_by_basic_block(1, b"export_2");
     builder.set_code(
         &[
             asm::add_imm(A0, A0, 666),
@@ -862,12 +862,12 @@ fn gas_metering_with_more_than_one_basic_block(config: Config) {
         &[],
     );
 
-    let blob = ProgramBlob::parse(builder.into_vec()).unwrap();
+    let blob = ProgramBlob::parse(builder.into_vec().into()).unwrap();
     let engine = Engine::new(&config).unwrap();
     let mut module_config = ModuleConfig::default();
     module_config.set_gas_metering(Some(GasMeteringKind::Sync));
 
-    let module = Module::from_blob(&engine, &module_config, &blob).unwrap();
+    let module = Module::from_blob(&engine, &module_config, blob).unwrap();
     let linker = Linker::new(&engine);
     let instance_pre = linker.instantiate_pre(&module).unwrap();
     let instance = instance_pre.instantiate().unwrap();
@@ -901,19 +901,19 @@ fn spawn_stress_test(mut config: Config) {
     let _ = env_logger::try_init();
 
     let mut builder = ProgramBlobBuilder::new();
-    builder.add_export_by_basic_block(0, "main".into());
+    builder.add_export_by_basic_block(0, b"main");
     builder.set_ro_data_size(1);
     builder.set_rw_data_size(1);
     builder.set_ro_data(vec![0x00]);
     builder.set_code(&[asm::ret()], &[]);
 
-    let blob = ProgramBlob::parse(builder.into_vec()).unwrap();
+    let blob = ProgramBlob::parse(builder.into_vec().into()).unwrap();
 
     for worker_count in [0, 1] {
         config.set_worker_count(worker_count);
         let engine = Engine::new(&config).unwrap();
 
-        let module = Module::from_blob(&engine, &ModuleConfig::default(), &blob).unwrap();
+        let module = Module::from_blob(&engine, &ModuleConfig::default(), blob.clone()).unwrap();
         let ext_main = module.lookup_export("main").unwrap();
         let linker = Linker::new(&engine);
         let instance_pre = linker.instantiate_pre(&module).unwrap();
@@ -1021,7 +1021,7 @@ assert_send_sync! {
     crate::Linker<()>,
     crate::Module,
     crate::ModuleConfig,
-    crate::ProgramBlob<'static>,
+    crate::ProgramBlob,
     crate::StateArgs,
     crate::Trap,
 }

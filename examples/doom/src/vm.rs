@@ -22,7 +22,7 @@ impl Vm {
         let engine = Engine::new(&config)?;
         let mut module_config = ModuleConfig::new();
         module_config.set_page_size(0x4000);
-        let module = Module::from_blob(&engine, &module_config, &blob)?;
+        let module = Module::from_blob(&engine, &module_config, blob)?;
         let mut linker = Linker::new(&engine);
 
         linker.func_wrap(

@@ -4,11 +4,11 @@ fn main() {
     env_logger::init();
 
     let raw_blob = include_bytes!("../../../guest-programs/output/example-hello-world.polkavm");
-    let blob = ProgramBlob::parse(&raw_blob[..]).unwrap();
+    let blob = ProgramBlob::parse(raw_blob[..].into()).unwrap();
 
     let config = Config::from_env().unwrap();
     let engine = Engine::new(&config).unwrap();
-    let module = Module::from_blob(&engine, &Default::default(), &blob).unwrap();
+    let module = Module::from_blob(&engine, &Default::default(), blob).unwrap();
     let mut linker = Linker::new(&engine);
 
     // Define a host function.

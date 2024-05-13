@@ -27,7 +27,7 @@ fn main() {
     const DOOM_PROGRAM: &[u8] = include_bytes!("../roms/doom.polkavm");
     const DOOM_ROM: &[u8] = include_bytes!("../roms/doom1.wad");
 
-    let blob = ProgramBlob::parse(program_override.as_deref().unwrap_or(DOOM_PROGRAM)).unwrap();
+    let blob = ProgramBlob::parse(program_override.as_deref().unwrap_or(DOOM_PROGRAM).into()).unwrap();
     let mut vm = Vm::from_blob(blob).unwrap();
 
     vm.initialize(rom_override.as_deref().unwrap_or(DOOM_ROM)).unwrap();

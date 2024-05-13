@@ -219,9 +219,9 @@ pub(crate) struct InterpretedInstance {
 impl InterpretedInstance {
     pub fn new_from_module(module: Module) -> Self {
         let mut instance = Self {
-            compiled_offset_for_block: FlatMap::new(module.blob().code().len() as u32),
+            compiled_offset_for_block: FlatMap::new(module.code_len()),
             compiled_instructions: Default::default(),
-            gas_cost_for_block: FlatMap::new(module.blob().code().len() as u32),
+            gas_cost_for_block: FlatMap::new(module.code_len()),
             module,
             memory: BasicMemory::new(),
             regs: [0; Reg::ALL.len()],
@@ -321,7 +321,7 @@ impl InterpretedInstance {
         }
 
         self.cycle_counter += 1;
-        let Some(mut instructions) = self.module.blob().instructions_at(self.instruction_offset) else {
+        let Some(mut instructions) = self.module.instructions_at(self.instruction_offset) else {
             return Err(ExecutionError::Trap(Default::default()));
         };
 
@@ -458,7 +458,7 @@ impl InterpretedInstance {
     #[cold]
     fn calculate_gas_cost(&mut self) -> i64 {
         let instruction_offset = self.instruction_offset;
-        let Some(instructions) = self.module.blob().instructions_at(instruction_offset) else {
+        let Some(instructions) = self.module.instructions_at(instruction_offset) else {
             return 0;
         };
 
@@ -470,7 +470,7 @@ impl InterpretedInstance {
     #[inline(never)]
     #[cold]
     fn compile_block<const DEBUG: bool>(&mut self) -> Result<(), ExecutionError> {
-        let Some(instructions) = self.module.blob().instructions_at(self.instruction_offset) else {
+        let Some(instructions) = self.module.instructions_at(self.instruction_offset) else {
             return Err(ExecutionError::Trap(Default::default()));
         };
 
@@ -749,7 +749,7 @@ impl<'a, 'b, const DEBUG: bool> Visitor<'a, 'b, DEBUG> {
             return Ok(());
         }
 
-        let Some(instruction_offset) = self.inner.module.blob().jump_table().get_by_address(target) else {
+        let Some(instruction_offset) = self.inner.module.jump_table().get_by_address(target) else {
             if DEBUG {
                 log::trace!("Indirect jump to address {target}: INVALID");
             }

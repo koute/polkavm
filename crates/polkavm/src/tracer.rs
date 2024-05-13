@@ -76,7 +76,7 @@ impl Tracer {
         self.trace_current_instruction_source(program_counter);
 
         if let Some(native_address) = access.native_program_counter() {
-            if let Some(instruction) = self.module.blob().instructions_at(program_counter).and_then(|mut iter| iter.next()) {
+            if let Some(instruction) = self.module.instructions_at(program_counter).and_then(|mut iter| iter.next()) {
                 log::trace!("0x{native_address:x}: #{program_counter}: {instruction}");
             } else {
                 log::trace!("0x{native_address:x}: #{program_counter}: <NONE>");
@@ -168,8 +168,7 @@ impl Tracer {
             return;
         }
 
-        let blob = self.module.blob();
-        let mut line_program = match blob.get_debug_line_program_at(program_counter) {
+        let mut line_program = match self.module.get_debug_line_program_at(program_counter) {
             Err(error) => {
                 log::warn!("Failed to get line program for instruction #{program_counter}: {error}");
                 self.current_source_location = None;
@@ -263,7 +262,7 @@ impl Tracer {
             return;
         };
 
-        let Ok(path) = blob.get_debug_string(path_offset) else {
+        let Ok(path) = self.module.get_debug_string(path_offset) else {
             return;
         };
 
@@ -290,7 +289,7 @@ impl Tracer {
         self.program_counter_history[self.program_counter_history_position] = program_counter;
         self.program_counter_history_position = (self.program_counter_history_position + 1) % self.program_counter_history.len();
 
-        let Some(instruction) = self.module.blob().instructions_at(program_counter).and_then(|mut iter| iter.next()) else {
+        let Some(instruction) = self.module.instructions_at(program_counter).and_then(|mut iter| iter.next()) else {
             return Ok(());
         };
 

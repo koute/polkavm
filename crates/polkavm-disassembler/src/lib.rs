@@ -16,10 +16,10 @@ struct NativeCode {
     instruction_map: Vec<(u32, u32)>,
 }
 
-impl TryFrom<&'_ ProgramBlob<'_>> for NativeCode {
+impl TryFrom<&'_ ProgramBlob> for NativeCode {
     type Error = polkavm::Error;
 
-    fn try_from(blob: &'_ ProgramBlob<'_>) -> Result<Self, Self::Error> {
+    fn try_from(blob: &'_ ProgramBlob) -> Result<Self, Self::Error> {
         if !cfg!(target_arch = "x86_64") {
             return Err("the selected disassembly format is not supported on this architecture".into());
         }
@@ -28,8 +28,7 @@ impl TryFrom<&'_ ProgramBlob<'_>> for NativeCode {
         config.set_worker_count(0);
 
         let engine = polkavm::Engine::new(&config)?;
-
-        let module = polkavm::Module::from_blob(&engine, &Default::default(), blob)?;
+        let module = polkavm::Module::from_blob(&engine, &Default::default(), blob.clone())?;
 
         let Some(machine_code) = module.machine_code() else {
             return Err("currently selected VM backend doesn't provide raw machine code".into());
@@ -111,16 +110,16 @@ impl AssemblyFormatter {
     }
 }
 
-pub struct Disassembler<'a, 'blob> {
-    blob: &'a ProgramBlob<'blob>,
+pub struct Disassembler<'a> {
+    blob: &'a ProgramBlob,
     format: DisassemblyFormat,
     gas_cost_map: Option<HashMap<u32, i64>>,
     native: Option<NativeCode>,
     show_raw_bytes: bool,
 }
 
-impl<'a, 'blob> Disassembler<'a, 'blob> {
-    pub fn new(blob: &'a ProgramBlob<'blob>, format: DisassemblyFormat) -> Result<Self, polkavm::Error> {
+impl<'a> Disassembler<'a> {
+    pub fn new(blob: &'a ProgramBlob, format: DisassemblyFormat) -> Result<Self, polkavm::Error> {
         let native = if matches!(format, DisassemblyFormat::Native | DisassemblyFormat::GuestAndNative) {
             Some(NativeCode::try_from(blob)?)
         } else {
@@ -150,7 +149,7 @@ impl<'a, 'blob> Disassembler<'a, 'blob> {
         let mut config = polkavm::ModuleConfig::default();
         config.set_gas_metering(Some(polkavm::GasMeteringKind::Sync));
 
-        let module = polkavm::Module::from_blob(&engine, &config, self.blob)?;
+        let module = polkavm::Module::from_blob(&engine, &config, self.blob.clone())?;
 
         let mut in_new_block = true;
         let mut gas_cost_map = HashMap::new();
@@ -425,8 +424,8 @@ mod tests {
         let memory_map = MemoryMap::new(0x4000, 0, 0x4000, 0).unwrap();
         let mut builder = ProgramBlobBuilder::new();
         builder.set_rw_data_size(0x4000);
-        builder.add_export_by_basic_block(0, "main".into());
-        builder.add_import("hostcall".into());
+        builder.add_export_by_basic_block(0, b"main");
+        builder.add_import(b"hostcall");
         builder.set_code(
             &[
                 asm::store_imm_u32(memory_map.rw_data_address(), 0x12345678),
@@ -437,7 +436,7 @@ mod tests {
             ],
             &[],
         );
-        let blob = ProgramBlob::parse(builder.into_vec()).unwrap();
+        let blob = ProgramBlob::parse(builder.into_vec().into()).unwrap();
 
         test_all_formats(&blob);
 

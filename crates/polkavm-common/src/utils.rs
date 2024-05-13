@@ -1,62 +1,120 @@
 use core::mem::MaybeUninit;
+use core::ops::{Deref, Range};
 
 #[cfg(feature = "alloc")]
-use alloc::{borrow::Cow, vec::Vec};
+use alloc::{borrow::Cow, sync::Arc, vec::Vec};
 
 use crate::program::Reg;
 
-/// A replacement for `alloc::borrow::Cow<[u8]>` which also works in pure no_std.
-#[derive(Clone, PartialEq, Eq, Debug, Default)]
-#[repr(transparent)]
-pub struct CowBytes<'a>(CowBytesImpl<'a>);
-
-#[cfg(feature = "alloc")]
-type CowBytesImpl<'a> = Cow<'a, [u8]>;
-
-#[cfg(not(feature = "alloc"))]
-type CowBytesImpl<'a> = &'a [u8];
-
-impl<'a> CowBytes<'a> {
+#[derive(Clone, Debug, Default)]
+pub struct ArcBytes {
     #[cfg(feature = "alloc")]
-    pub fn into_owned(self) -> CowBytes<'static> {
-        match self.0 {
-            Cow::Borrowed(data) => CowBytes(Cow::Owned(data.into())),
-            Cow::Owned(data) => CowBytes(Cow::Owned(data)),
+    data: Option<Arc<[u8]>>,
+    #[cfg(not(feature = "alloc"))]
+    data: &'static [u8],
+    range: Range<usize>,
+}
+
+impl ArcBytes {
+    pub(crate) fn subslice(&self, subrange: Range<usize>) -> Self {
+        if subrange.start == subrange.end {
+            return Default::default();
+        }
+
+        let start = self.range.start + subrange.start;
+        let end = self.range.start + subrange.end;
+        assert!(start <= self.range.end);
+        assert!(end <= self.range.end);
+
+        ArcBytes {
+            #[allow(noop_method_call)]
+            data: self.data.clone(),
+            range: start..end,
         }
     }
 }
 
-impl<'a> core::ops::Deref for CowBytes<'a> {
+impl Eq for ArcBytes {}
+
+impl PartialEq for ArcBytes {
+    fn eq(&self, rhs: &ArcBytes) -> bool {
+        self.deref() == rhs.deref()
+    }
+}
+
+#[cfg(feature = "alloc")]
+impl Deref for ArcBytes {
     type Target = [u8];
 
     fn deref(&self) -> &Self::Target {
-        &self.0
+        const EMPTY: &[u8] = &[];
+        let slice = self.data.as_ref().map_or(EMPTY, |slice| &slice[..]);
+        &slice[self.range.clone()]
     }
 }
 
-impl<'a> From<&'a [u8]> for CowBytes<'a> {
-    fn from(slice: &'a [u8]) -> Self {
-        CowBytes(slice.into())
+#[cfg(not(feature = "alloc"))]
+impl Deref for ArcBytes {
+    type Target = [u8];
+
+    fn deref(&self) -> &Self::Target {
+        &self.data[self.range.clone()]
     }
 }
 
-impl<'a> From<&'a str> for CowBytes<'a> {
-    fn from(slice: &'a str) -> Self {
-        CowBytes(slice.as_bytes().into())
+impl AsRef<[u8]> for ArcBytes {
+    fn as_ref(&self) -> &[u8] {
+        self.deref()
     }
 }
 
 #[cfg(feature = "alloc")]
-impl<'a> From<Vec<u8>> for CowBytes<'a> {
-    fn from(vec: Vec<u8>) -> Self {
-        CowBytes(vec.into())
+impl<'a> From<&'a [u8]> for ArcBytes {
+    fn from(data: &'a [u8]) -> Self {
+        ArcBytes {
+            data: Some(data.into()),
+            range: 0..data.len(),
+        }
+    }
+}
+
+#[cfg(not(feature = "alloc"))]
+impl<'a> From<&'static [u8]> for ArcBytes {
+    fn from(data: &'static [u8]) -> Self {
+        ArcBytes {
+            data,
+            range: 0..data.len(),
+        }
     }
 }
 
 #[cfg(feature = "alloc")]
-impl<'a> From<Cow<'a, [u8]>> for CowBytes<'a> {
+impl From<Vec<u8>> for ArcBytes {
+    fn from(data: Vec<u8>) -> Self {
+        ArcBytes {
+            range: 0..data.len(),
+            data: Some(data.into()),
+        }
+    }
+}
+
+#[cfg(feature = "alloc")]
+impl From<Arc<[u8]>> for ArcBytes {
+    fn from(data: Arc<[u8]>) -> Self {
+        ArcBytes {
+            range: 0..data.len(),
+            data: Some(data),
+        }
+    }
+}
+
+#[cfg(feature = "alloc")]
+impl<'a> From<Cow<'a, [u8]>> for ArcBytes {
     fn from(cow: Cow<'a, [u8]>) -> Self {
-        CowBytes(cow)
+        match cow {
+            Cow::Borrowed(data) => data.into(),
+            Cow::Owned(data) => data.into(),
+        }
     }
 }
 
