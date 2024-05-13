@@ -24,9 +24,17 @@ use crate::backend::{Backend, CreateArgs};
 const FAST_INNER_COUNT: u32 = 32;
 const SLOW_INNER_COUNT: u32 = 1;
 
-fn benchmark_execution<T: Backend>(outer_count: u64, inner_count: u32, backend: T, path: &Path) -> core::time::Duration {
+fn benchmark_execution<T: Backend>(
+    engine_cache: &mut Option<T::Engine>,
+    outer_count: u64,
+    inner_count: u32,
+    backend: T,
+    path: &Path,
+) -> core::time::Duration {
     let mut total_elapsed = core::time::Duration::new(0, 0);
-    let mut engine = backend.create(CreateArgs { is_compile_only: false });
+    let mut engine = engine_cache
+        .take()
+        .unwrap_or_else(|| backend.create(CreateArgs { is_compile_only: false }));
     let blob = backend.load(path);
     let module = backend.compile(&mut engine, &blob);
     for _ in 0..outer_count {
@@ -39,21 +47,29 @@ fn benchmark_execution<T: Backend>(outer_count: u64, inner_count: u32, backend: 
         total_elapsed += start.elapsed();
     }
 
-    total_elapsed / inner_count
+    let elapsed = total_elapsed / inner_count;
+    *engine_cache = Some(engine);
+    elapsed
 }
 
-fn benchmark_compilation<T: Backend>(count: u64, backend: T, path: &Path) -> core::time::Duration {
-    let mut engine = backend.create(CreateArgs { is_compile_only: true });
+fn benchmark_compilation<T: Backend>(engine_cache: &mut Option<T::Engine>, count: u64, backend: T, path: &Path) -> core::time::Duration {
+    let mut engine = engine_cache
+        .take()
+        .unwrap_or_else(|| backend.create(CreateArgs { is_compile_only: true }));
     let blob = backend.load(path);
     let start = std::time::Instant::now();
     for _ in 0..count {
         backend.compile(&mut engine, &blob);
     }
-    start.elapsed()
+    let elapsed = start.elapsed();
+    *engine_cache = Some(engine);
+    elapsed
 }
 
-fn benchmark_oneshot<T: Backend>(count: u64, backend: T, path: &Path) -> core::time::Duration {
-    let mut engine = backend.create(CreateArgs { is_compile_only: false });
+fn benchmark_oneshot<T: Backend>(engine_cache: &mut Option<T::Engine>, count: u64, backend: T, path: &Path) -> core::time::Duration {
+    let mut engine = engine_cache
+        .take()
+        .unwrap_or_else(|| backend.create(CreateArgs { is_compile_only: false }));
     let blob = backend.load(path);
     let start = std::time::Instant::now();
     for _ in 0..count {
@@ -62,7 +78,9 @@ fn benchmark_oneshot<T: Backend>(count: u64, backend: T, path: &Path) -> core::t
         backend.initialize(&mut instance);
         backend.run(&mut instance);
     }
-    start.elapsed()
+    let elapsed = start.elapsed();
+    *engine_cache = Some(engine);
+    elapsed
 }
 
 #[cfg(feature = "criterion")]
@@ -77,7 +95,7 @@ fn criterion_main(c: &mut Criterion, benches: &[Benchmark]) {
         for bench in variants {
             for backend in bench.kind.matching_backends() {
                 group.bench_function(backend.name(), |b| {
-                    b.iter_custom(|count| benchmark_execution(count, FAST_INNER_COUNT, backend, &bench.path));
+                    b.iter_custom(|count| benchmark_execution(&mut None, count, FAST_INNER_COUNT, backend, &bench.path));
                 });
             }
         }
@@ -93,7 +111,7 @@ fn criterion_main(c: &mut Criterion, benches: &[Benchmark]) {
                 }
 
                 group.bench_function(backend.name(), |b| {
-                    b.iter_custom(|count| benchmark_compilation(count, backend, &bench.path));
+                    b.iter_custom(|count| benchmark_compilation(&mut None, count, backend, &bench.path));
                 });
             }
         }
@@ -105,7 +123,7 @@ fn criterion_main(c: &mut Criterion, benches: &[Benchmark]) {
         for bench in variants {
             for backend in bench.kind.matching_backends() {
                 group.bench_function(backend.name(), |b| {
-                    b.iter_custom(|count| benchmark_oneshot(count, backend, &bench.path));
+                    b.iter_custom(|count| benchmark_oneshot(&mut None, count, backend, &bench.path));
                 });
             }
         }
@@ -496,6 +514,11 @@ fn main() {
             }
 
             let mut stats_for_bench = Vec::new();
+            let mut engine_cache = Vec::new();
+            for _ in 0..list.len() {
+                engine_cache.push(None);
+            }
+
             loop {
                 let is_initial_run = stats_for_bench.is_empty();
                 for (nth_bench, &(ref name, variant, bench, backend)) in list.iter().enumerate() {
@@ -510,17 +533,22 @@ fn main() {
                             } else {
                                 (iteration_limit.unwrap_or(12), FAST_INNER_COUNT)
                             };
-                            benchmark_execution(outer_count, inner_count, backend, &bench.path) / outer_count as u32
+                            benchmark_execution(&mut engine_cache[nth_bench], outer_count, inner_count, backend, &bench.path)
+                                / outer_count as u32
                         }
                         BenchVariant::Compilation => {
                             let count = if cfg!(miri) { 1 } else { iteration_limit.unwrap_or(128) };
-                            benchmark_compilation(count, backend, &bench.path) / count as u32
+                            benchmark_compilation(&mut engine_cache[nth_bench], count, backend, &bench.path) / count as u32
                         }
                         BenchVariant::Oneshot => {
                             let count = iteration_limit.unwrap_or(10);
-                            benchmark_oneshot(count, backend, &bench.path) / count as u32
+                            benchmark_oneshot(&mut engine_cache[nth_bench], count, backend, &bench.path) / count as u32
                         }
                     };
+
+                    if !forever {
+                        engine_cache[nth_bench].take();
+                    }
 
                     if is_initial_run {
                         let mut samples = vec![elapsed];
