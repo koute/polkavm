@@ -260,6 +260,7 @@ pub const VMCTX_FUTEX_HOSTCALL: u32 = 3;
 /// The VM has triggered a trap.
 pub const VMCTX_FUTEX_TRAP: u32 = 4;
 
+#[allow(clippy::new_without_default)]
 impl VmCtx {
     /// Creates a zeroed VM context.
     pub const fn zeroed() -> Self {
