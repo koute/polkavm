@@ -13,7 +13,6 @@ members = [
 
     "crates/simplealloc",
 
-    "tools/benchtool",
     "tools/polkatool",
     "tools/polkavm-linux-raw-generate",
 
