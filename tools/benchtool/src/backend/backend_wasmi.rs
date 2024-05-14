@@ -34,7 +34,7 @@ impl Backend for Wasmi {
     }
 
     fn compile(&self, engine: &mut Self::Engine, blob: &Self::Blob) -> Self::Module {
-        wasmi::Module::new(engine, &**blob).unwrap()
+        wasmi::Module::new(engine, blob).unwrap()
     }
 
     fn spawn(&self, engine: &mut Self::Engine, module: &Self::Module) -> Self::Instance {
