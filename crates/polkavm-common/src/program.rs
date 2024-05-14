@@ -2148,9 +2148,7 @@ fn parse_bitmask_slow(bitmask: &[u8], mut offset: usize) -> Option<(usize, usize
 #[cfg_attr(not(debug_assertions), inline(always))]
 pub(crate) fn parse_bitmask_fast(bitmask: &[u8], mut offset: usize) -> Option<(usize, usize)> {
     offset += 1;
-    let Some(bitmask) = bitmask.get(offset >> 3..(offset >> 3) + 4) else {
-        return None;
-    };
+    let bitmask = bitmask.get(offset >> 3..(offset >> 3) + 4)?;
 
     let shift = offset & 7;
     let mask = u32::from_le_bytes([bitmask[0], bitmask[1], bitmask[2], bitmask[3]]) >> shift;
