@@ -1,23 +1,18 @@
 [package]
 name = "benchtool"
-version.workspace = true
-authors.workspace = true
-license.workspace = true
-edition.workspace = true
-rust-version.workspace = true
-repository.workspace = true
 publish = false
+edition = "2021"
 
 [dependencies]
-clap = { workspace = true, features = ["derive"] }
+clap = { version = "4.4.6", features = ["derive"] }
 criterion = { version = "0.5.1", default-features = false, optional = true }
-env_logger = { workspace = true, optional = true }
-libc = { workspace = true }
+env_logger = { version = "0.10.0", default-features = false, optional = true }
+libc = { version = "0.2.149" }
 libloading = { version = "0.8.1", optional = true }
-log = { workspace = true }
+log = { version = "0.4.20" }
 object = { version = "0.32.1", default-features = false, features = ["std", "elf"], optional = true }
 wasmi = { version = "0.32.0-beta.16", optional = true }
-polkavm = { workspace = true }
+polkavm = { path = "../../crates/polkavm" }
 
 [target.'cfg(target_arch = "x86_64")'.dependencies]
 ckb-vm = { version = "0.24.9", features = ["asm"], optional = true }
@@ -58,3 +53,12 @@ wasmer = ["dep:wasmer"]
 wasmi = ["dep:wasmi"]
 wasmtime = ["dep:wasmtime"]
 wazero = ["dep:libloading"]
+
+[profile.release]
+lto = true
+codegen-units = 1
+debug = true
+
+[workspace]
+resolver = "2"
+members = ["."]
