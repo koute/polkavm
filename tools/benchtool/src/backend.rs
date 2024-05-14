@@ -1,6 +1,7 @@
 use crate::BenchmarkKind;
 use std::path::Path;
 
+#[allow(unused_imports)]
 mod backend_prelude {
     pub use super::{Backend, CreateArgs};
     pub use std::path::{Path, PathBuf};
