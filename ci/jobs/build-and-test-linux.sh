@@ -23,3 +23,7 @@ POLKAVM_TRACE_EXECUTION=1 POLKAVM_ALLOW_INSECURE=1 POLKAVM_BACKEND=compiler POLK
 
 echo ">> cargo check (polkatool, i686-unknown-linux-musl)"
 cargo check --target=i686-unknown-linux-musl -p polkatool
+
+echo ">> cargo check (benchtool, all features)"
+cd tools/benchtool
+cargo check --all-features
