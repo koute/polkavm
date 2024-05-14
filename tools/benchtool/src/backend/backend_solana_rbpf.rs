@@ -26,7 +26,7 @@ pub struct Ctx;
 
 fn static_ctx() -> &'static mut Ctx {
     static mut CTX: Ctx = Ctx;
-    unsafe { &mut CTX }
+    unsafe { &mut *core::ptr::addr_of_mut!(CTX) }
 }
 
 impl ContextObject for Ctx {
