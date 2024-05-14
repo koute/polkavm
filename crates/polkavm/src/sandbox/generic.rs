@@ -25,7 +25,6 @@ use super::ExecuteArgs;
 use core::ops::Range;
 use core::cell::UnsafeCell;
 use core::sync::atomic::{AtomicUsize, Ordering};
-use core::mem::MaybeUninit;
 use std::borrow::Cow;
 use std::sync::{Arc, Mutex};
 
@@ -276,18 +275,18 @@ impl Drop for Mmap {
     }
 }
 
-static mut OLD_SIGSEGV: MaybeUninit<sys::sigaction> = MaybeUninit::uninit();
-static mut OLD_SIGILL: MaybeUninit<sys::sigaction> = MaybeUninit::uninit();
+static mut OLD_SIGSEGV: sys::sigaction = unsafe { core::mem::zeroed() };
+static mut OLD_SIGILL: sys::sigaction = unsafe { core::mem::zeroed() };
 
 #[cfg(any(target_os = "macos", target_os = "freebsd"))]
-static mut OLD_SIGBUS: MaybeUninit<sys::sigaction> = MaybeUninit::uninit();
+static mut OLD_SIGBUS: sys::sigaction = unsafe { core::mem::zeroed() };
 
 unsafe extern "C" fn signal_handler(signal: c_int, info: &sys::siginfo_t, context: &sys::ucontext_t) {
     let old = match signal {
-        sys::SIGSEGV => &OLD_SIGSEGV,
-        sys::SIGILL => &OLD_SIGILL,
+        sys::SIGSEGV => core::ptr::addr_of!(OLD_SIGSEGV),
+        sys::SIGILL => core::ptr::addr_of!(OLD_SIGILL),
         #[cfg(any(target_os = "macos", target_os = "freebsd"))]
-        sys::SIGBUS => &OLD_SIGBUS,
+        sys::SIGBUS => core::ptr::addr_of!(OLD_SIGBUS),
         _ => unreachable!("received unknown signal")
     };
 
@@ -318,9 +317,9 @@ unsafe extern "C" fn signal_handler(signal: c_int, info: &sys::siginfo_t, contex
 
     // This signal is unrelated to anything the guest program did; proceed normally.
 
-    let old = &*old.as_ptr();
+    let old = core::ptr::read(old);
     if old.sa_sigaction == sys::SIG_IGN || old.sa_sigaction == sys::SIG_DFL {
-        sys::sigaction(signal, old, core::ptr::null_mut());
+        sys::sigaction(signal, &old, core::ptr::null_mut());
         return;
     }
 
@@ -334,12 +333,11 @@ unsafe extern "C" fn signal_handler(signal: c_int, info: &sys::siginfo_t, contex
 }
 
 #[allow(clippy::fn_to_numeric_cast_any)]
-unsafe fn register_signal_handler_for_signal(signal: c_int, old_sa: &mut MaybeUninit<sys::sigaction>) -> Result<(), Error> {
+unsafe fn register_signal_handler_for_signal(signal: c_int, old_sa: *mut sys::sigaction) -> Result<(), Error> {
     let mut sa: sys::sigaction = core::mem::zeroed();
-    let old_sa = old_sa.write(core::mem::zeroed());
-
     sa.sa_flags = sys::SA_SIGINFO | sys::SA_NODEFER;
     sa.sa_sigaction = signal_handler as usize;
+
     sys::sigemptyset(&mut sa.sa_mask);
     if sys::sigaction(signal, &sa, old_sa) < 0 {
         return Err(Error(std::io::Error::last_os_error()));
@@ -349,10 +347,10 @@ unsafe fn register_signal_handler_for_signal(signal: c_int, old_sa: &mut MaybeUn
 }
 
 unsafe fn register_signal_handlers() -> Result<(), Error> {
-    register_signal_handler_for_signal(sys::SIGSEGV, &mut OLD_SIGSEGV)?;
-    register_signal_handler_for_signal(sys::SIGILL, &mut OLD_SIGILL)?;
+    register_signal_handler_for_signal(sys::SIGSEGV, core::ptr::addr_of_mut!(OLD_SIGSEGV))?;
+    register_signal_handler_for_signal(sys::SIGILL, core::ptr::addr_of_mut!(OLD_SIGILL))?;
     #[cfg(any(target_os = "macos", target_os = "freebsd"))]
-    register_signal_handler_for_signal(sys::SIGBUS, &mut OLD_SIGBUS)?;
+    register_signal_handler_for_signal(sys::SIGBUS, core::ptr::addr_of_mut!(OLD_SIGBUS))?;
     Ok(())
 }
 
