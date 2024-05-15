@@ -11,7 +11,7 @@ libc = { version = "0.2.149" }
 libloading = { version = "0.8.1", optional = true }
 log = { version = "0.4.20" }
 object = { version = "0.32.1", default-features = false, features = ["std", "elf"], optional = true }
-wasmi = { version = "0.32.0-beta.16", optional = true }
+wasmi = { version = "0.32.0-beta.16", features = ["no-hash-maps"], optional = true }
 polkavm = { path = "../../crates/polkavm" }
 
 [target.'cfg(target_arch = "x86_64")'.dependencies]

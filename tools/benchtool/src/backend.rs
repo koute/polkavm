@@ -278,11 +278,13 @@ define_backends! {
     Wasm3 => backend_wasm3::Wasm3(),
 
     #[cfg(feature = "wasmi")]
-    Wasmi_Eager => backend_wasmi::Wasmi(wasmi::CompilationMode::Eager),
+    Wasmi_Eager => backend_wasmi::Wasmi(backend_wasmi::WasmiConfig::Eager),
     #[cfg(feature = "wasmi")]
-    Wasmi_Lazy => backend_wasmi::Wasmi(wasmi::CompilationMode::Lazy),
+    Wasmi_Lazy => backend_wasmi::Wasmi(backend_wasmi::WasmiConfig::Lazy),
     #[cfg(feature = "wasmi")]
-    Wasmi_LazyTranslation => backend_wasmi::Wasmi(wasmi::CompilationMode::LazyTranslation),
+    Wasmi_Lazy_Unchecked => backend_wasmi::Wasmi(backend_wasmi::WasmiConfig::LazyUnchecked),
+    #[cfg(feature = "wasmi")]
+    Wasmi_LazyTranslation => backend_wasmi::Wasmi(backend_wasmi::WasmiConfig::LazyTranslation),
 
     #[cfg(feature = "native")]
     Native => backend_native::Native()
