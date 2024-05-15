@@ -1,7 +1,38 @@
 use super::backend_prelude::*;
 
 #[derive(Copy, Clone)]
-pub struct Wasmi(pub wasmi::CompilationMode);
+pub struct Wasmi(pub WasmiConfig);
+
+#[derive(Debug, Copy, Clone)]
+pub enum WasmiConfig {
+    Eager,
+    Lazy,
+    LazyUnchecked,
+    LazyTranslation,
+}
+
+impl WasmiConfig {
+    fn compilation_mode(&self) -> wasmi::CompilationMode {
+        match self {
+            Self::Eager => wasmi::CompilationMode::Eager,
+            Self::Lazy | Self::LazyUnchecked => wasmi::CompilationMode::Lazy,
+            Self::LazyTranslation => wasmi::CompilationMode::LazyTranslation,
+        }
+    }
+
+    fn validation(&self) -> Validation {
+        match self {
+            Self::Eager | Self::Lazy | Self::LazyTranslation => Validation::Checked,
+            Self::LazyUnchecked => Validation::Unchecked,
+        }
+    }
+}
+
+#[derive(Debug, Copy, Clone)]
+pub enum Validation {
+    Checked,
+    Unchecked,
+}
 
 pub struct WasmiInstance {
     store: wasmi::Store<()>,
@@ -16,16 +47,20 @@ impl Backend for Wasmi {
     type Instance = WasmiInstance;
 
     fn name(&self) -> &'static str {
-        match self.0 {
-            wasmi::CompilationMode::Eager => "wasmi_eager",
-            wasmi::CompilationMode::LazyTranslation => "wasmi_lazy_translation",
-            wasmi::CompilationMode::Lazy => "wasmi_lazy",
+        use wasmi::CompilationMode;
+        match (self.0.compilation_mode(), self.0.validation()) {
+            (CompilationMode::Eager, Validation::Checked) => "wasmi.eager.checked",
+            (CompilationMode::Eager, Validation::Unchecked) => "wasmi.eager.unchecked",
+            (CompilationMode::Lazy, Validation::Checked) => "wasmi.lazy.checked",
+            (CompilationMode::Lazy, Validation::Unchecked) => "wasmi.lazy.unchecked",
+            (CompilationMode::LazyTranslation, Validation::Checked) => "wasmi.lazy-translation.checked",
+            (CompilationMode::LazyTranslation, Validation::Unchecked) => "wasmi.lazy-translation.unchecked",
         }
     }
 
     fn create(&self, _args: CreateArgs) -> Self::Engine {
         let mut config = wasmi::Config::default();
-        config.compilation_mode(self.0);
+        config.compilation_mode(self.0.compilation_mode());
         wasmi::Engine::new(&config)
     }
 
@@ -34,7 +69,13 @@ impl Backend for Wasmi {
     }
 
     fn compile(&self, engine: &mut Self::Engine, blob: &Self::Blob) -> Self::Module {
-        wasmi::Module::new(engine, blob).unwrap()
+        match self.0.validation() {
+            Validation::Checked => wasmi::Module::new(engine, blob).unwrap(),
+            Validation::Unchecked => {
+                // SAFETY: All benchmark inputs are known to be valid.
+                unsafe { wasmi::Module::new_unchecked(engine, blob).unwrap() }
+            }
+        }
     }
 
     fn spawn(&self, engine: &mut Self::Engine, module: &Self::Module) -> Self::Instance {
