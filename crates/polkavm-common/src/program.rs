@@ -176,7 +176,7 @@ impl<T> VisitorHelper<T> {
         T: ParsingVisitor,
     {
         if let Some((next_offset, args_length)) = parse_bitmask_fast(bitmask, instruction_offset) {
-            debug_assert!(args_length <= 31);
+            debug_assert!(args_length <= 24);
             if let Some(chunk) = code.get(instruction_offset..instruction_offset + 32) {
                 assert!(chunk.len() >= 32);
                 let opcode = chunk[0];
@@ -994,7 +994,7 @@ fn test_parse_instruction() {
         Some(ParsedInstruction {
             kind: Instruction::add_imm(Reg::RA.into(), Reg::RA.into(), 0x80000000),
             offset: 0,
-            length: 512
+            length: 25
         })
     );
 }
@@ -2114,8 +2114,9 @@ impl<'a> Iterator for JumpTableIter<'a> {
     }
 }
 
-#[inline(never)]
-#[cold]
+const BITMASK_MAX: u32 = 24;
+
+#[cfg_attr(not(debug_assertions), inline(always))]
 fn parse_bitmask_slow(bitmask: &[u8], mut offset: usize) -> Option<(usize, usize)> {
     if bitmask.is_empty() {
         return None;
@@ -2126,19 +2127,24 @@ fn parse_bitmask_slow(bitmask: &[u8], mut offset: usize) -> Option<(usize, usize
     while let Some(&byte) = bitmask.get(offset >> 3) {
         let shift = offset & 7;
         let mask = byte >> shift;
+        let length = if mask == 0 {
+            8 - shift
+        } else {
+            let length = mask.trailing_zeros() as usize;
+            if length == 0 {
+                break;
+            }
+            length
+        };
 
-        if mask == 0 {
-            args_length += 8 - shift;
-            offset += 8 - shift;
-            continue;
-        }
-
-        let length = mask.trailing_zeros() as usize;
-        if length == 0 {
+        let new_args_length = args_length + length;
+        if new_args_length >= BITMASK_MAX as usize {
+            offset += BITMASK_MAX as usize - args_length;
+            args_length = BITMASK_MAX as usize;
             break;
         }
 
-        args_length += length;
+        args_length = new_args_length;
         offset += length;
     }
 
@@ -2148,15 +2154,12 @@ fn parse_bitmask_slow(bitmask: &[u8], mut offset: usize) -> Option<(usize, usize
 #[cfg_attr(not(debug_assertions), inline(always))]
 pub(crate) fn parse_bitmask_fast(bitmask: &[u8], mut offset: usize) -> Option<(usize, usize)> {
     offset += 1;
+
     let bitmask = bitmask.get(offset >> 3..(offset >> 3) + 4)?;
-
     let shift = offset & 7;
-    let mask = u32::from_le_bytes([bitmask[0], bitmask[1], bitmask[2], bitmask[3]]) >> shift;
-    if mask == 0 {
-        return None;
-    }
-
+    let mask: u32 = (u32::from_le_bytes([bitmask[0], bitmask[1], bitmask[2], bitmask[3]]) >> shift) | (1 << BITMASK_MAX);
     let args_length = mask.trailing_zeros() as usize;
+    debug_assert!(args_length <= BITMASK_MAX as usize);
     offset += args_length;
 
     Some((offset, args_length))
@@ -2164,30 +2167,33 @@ pub(crate) fn parse_bitmask_fast(bitmask: &[u8], mut offset: usize) -> Option<(u
 
 #[test]
 fn test_parse_bitmask() {
-    fn p(bitmask: &[u8]) -> Option<(usize, usize)> {
-        let result_fast = parse_bitmask_fast(bitmask, 0);
-        let result_slow = parse_bitmask_slow(bitmask, 0);
-        if result_fast.is_some() {
-            assert_eq!(result_fast, result_slow);
-        }
+    #[track_caller]
+    fn parse_both(bitmask: &[u8], offset: usize) -> Option<(usize, usize)> {
+        let result_fast = parse_bitmask_fast(bitmask, offset);
+        let result_slow = parse_bitmask_slow(bitmask, offset);
+        assert_eq!(result_fast, result_slow);
 
-        result_slow
+        result_fast
     }
 
-    assert_eq!(p(&[0b00000001, 0, 0, 0]), Some((32, 31)));
-    assert_eq!(p(&[0b00000001, 0, 0]), Some((24, 23)));
-    assert_eq!(p(&[0b00000001, 0]), Some((16, 15)));
-    assert_eq!(p(&[0b00000001]), Some((8, 7)));
-    assert_eq!(p(&[0b00000011]), Some((1, 0)));
-    assert_eq!(p(&[0b00000011, 0]), Some((1, 0)));
-    assert_eq!(p(&[0b00000101]), Some((2, 1)));
-    assert_eq!(p(&[0b10000001]), Some((7, 6)));
-    assert_eq!(p(&[0b00000001, 1]), Some((8, 7)));
+    assert_eq!(parse_both(&[0b00000011, 0, 0, 0], 0), Some((1, 0)));
+    assert_eq!(parse_both(&[0b00000101, 0, 0, 0], 0), Some((2, 1)));
+    assert_eq!(parse_both(&[0b10000001, 0, 0, 0], 0), Some((7, 6)));
+    assert_eq!(parse_both(&[0b00000001, 1, 0, 0], 0), Some((8, 7)));
+    assert_eq!(parse_both(&[0b00000001, 1 << 7, 0, 0], 0), Some((15, 14)));
+    assert_eq!(parse_both(&[0b00000001, 0, 1, 0], 0), Some((16, 15)));
+    assert_eq!(parse_both(&[0b00000001, 0, 1 << 7, 0], 0), Some((23, 22)));
+    assert_eq!(parse_both(&[0b00000001, 0, 0, 1], 0), Some((24, 23)));
 
-    assert_eq!(parse_bitmask_fast(&[1, 0, 1, 0, 0, 0, 0, 0], 0), Some((16, 15)));
-    assert_eq!(parse_bitmask_fast(&[1, 0, 0, 1, 0, 0, 0, 0], 0), Some((24, 23)));
-    assert_eq!(parse_bitmask_fast(&[1, 0, 0, 0b10000000, 0, 0, 0, 0], 0), Some((31, 30)));
-    assert_eq!(parse_bitmask_fast(&[1, 0, 0, 0, 1, 0, 0, 0], 0), None);
+    assert_eq!(parse_both(&[0b11000000, 0, 0, 0, 0], 6), Some((7, 0)));
+    assert_eq!(parse_both(&[0b01000000, 1, 0, 0, 0], 6), Some((8, 1)));
+
+    assert_eq!(parse_both(&[0b10000000, 1, 0, 0, 0], 7), Some((8, 0)));
+    assert_eq!(parse_both(&[0b10000000, 1 << 1, 0, 0, 0], 7), Some((9, 1)));
+
+    assert_eq!(parse_both(&[0, 0, 0, 0, 0b00000001], 0), Some((25, 24)));
+    assert_eq!(parse_both(&[0, 0, 0, 0, 0b00000001], 6), Some((31, 24)));
+    assert_eq!(parse_both(&[0, 0, 0, 0, 0b00000001], 7), Some((32, 24)));
 }
 
 #[derive(Clone)]
