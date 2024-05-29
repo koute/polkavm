@@ -22,6 +22,7 @@ case "$OSTYPE" in
 esac
 
 ./ci/jobs/check-freebsd.sh
+./ci/jobs/kani.sh
 
 ./ci/jobs/clippy.sh
 ./ci/jobs/rustfmt.sh
