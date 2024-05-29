@@ -9,7 +9,7 @@ if [ "${RV32E_TOOLCHAIN:-}" == "" ]; then
     echo "WARN: rv32e toolchain is missing; PolkaVM binaries won't be built!"
 fi
 
-TOOLCHAIN_VERSION="1.72.1"
+TOOLCHAIN_VERSION="1.75.0"
 
 BUILD_WASM=0
 BUILD_CKBVM=0
