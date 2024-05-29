@@ -2458,12 +2458,6 @@ impl ProgramBlob {
                     "the bitmask length doesn't match the code length",
                 )));
             }
-
-            if blob.bitmask[0] & 1 != 1 {
-                return Err(ProgramParseError(ProgramParseErrorKind::Other(
-                    "the bitmask doesn't start with a 1",
-                )));
-            }
         }
 
         Ok(blob)
