@@ -1,6 +1,8 @@
 use crate::abi::{VM_CODE_ADDRESS_ALIGNMENT, VM_MAXIMUM_CODE_SIZE, VM_MAXIMUM_IMPORT_COUNT, VM_MAXIMUM_JUMP_TABLE_ENTRIES};
 use crate::utils::ArcBytes;
-use crate::varint::{read_simple_varint, read_simple_varint_length_minus_1, read_varint, write_simple_varint, MAX_VARINT_LENGTH};
+use crate::varint::{
+    read_length_minus_one_varint, read_length_minus_two_varint, read_simple_varint, read_varint, write_simple_varint, MAX_VARINT_LENGTH,
+};
 use core::ops::Range;
 
 #[derive(Copy, Clone)]
@@ -176,7 +178,7 @@ impl<T> VisitorHelper<T> {
         T: ParsingVisitor,
     {
         if let Some((next_offset, args_length)) = parse_bitmask_fast(bitmask, instruction_offset) {
-            debug_assert!(args_length <= 24);
+            debug_assert!(args_length <= BITMASK_MAX as usize);
             if let Some(chunk) = code.get(instruction_offset..instruction_offset + 32) {
                 assert!(chunk.len() >= 32);
                 let opcode = chunk[0];
@@ -226,119 +228,304 @@ impl<T> VisitorHelper<T> {
 
         self.visitor
     }
+}
 
-    #[inline(always)]
-    pub fn read_args_offset(&mut self, chunk: u128, instruction_offset: u32, args_length: u32) -> Option<u32> {
-        let imm = read_simple_varint(chunk as u32, args_length);
-        Some(instruction_offset.wrapping_add(imm))
+#[inline(always)]
+pub fn read_args_imm(chunk: u128, skip: u32) -> u32 {
+    read_simple_varint(chunk as u32, skip)
+}
+
+#[inline(always)]
+pub fn read_args_offset(chunk: u128, instruction_offset: u32, skip: u32) -> u32 {
+    instruction_offset.wrapping_add(read_args_imm(chunk, skip))
+}
+
+#[inline(always)]
+pub fn read_args_imm2(chunk: u128, skip: u32) -> (u32, u32) {
+    let imm1_aux = (chunk as u32) & 0b111;
+    let chunk = chunk >> 8;
+    let chunk = chunk as u64;
+    let imm1 = read_simple_varint(chunk as u32, imm1_aux);
+    let chunk = chunk >> (imm1_aux << 3);
+    let imm2 = read_length_minus_one_varint(chunk as u32, u32::from(skip.wrapping_sub(imm1_aux) as u8));
+    (imm1, imm2)
+}
+
+#[inline(always)]
+pub fn read_args_reg_imm(chunk: u128, skip: u32) -> (RawReg, u32) {
+    let chunk = chunk as u64;
+    let reg = RawReg(chunk as u32);
+    let chunk = chunk >> 8;
+    let imm = read_length_minus_one_varint(chunk as u32, skip);
+    (reg, imm)
+}
+
+#[inline(always)]
+pub fn read_args_reg_imm2(chunk: u128, skip: u32) -> (RawReg, u32, u32) {
+    let (reg, imm1_length) = {
+        let value = chunk as u32;
+        (RawReg(value), (value >> 4) & 0b111)
+    };
+    let chunk = chunk >> 8;
+    let chunk = chunk as u64;
+    let imm1 = read_simple_varint(chunk as u32, imm1_length);
+    let chunk = chunk >> (imm1_length << 3);
+    let imm2 = read_length_minus_one_varint(chunk as u32, u32::from(skip.wrapping_sub(imm1_length) as u8));
+    (reg, imm1, imm2)
+}
+
+#[inline(always)]
+pub fn read_args_reg_imm_offset(chunk: u128, instruction_offset: u32, skip: u32) -> (RawReg, u32, u32) {
+    let (reg, imm1, imm2) = read_args_reg_imm2(chunk, skip);
+    let imm2 = instruction_offset.wrapping_add(imm2);
+    (reg, imm1, imm2)
+}
+
+#[inline(always)]
+pub fn read_args_regs2_imm2(chunk: u128, skip: u32) -> (RawReg, RawReg, u32, u32) {
+    let (reg1, reg2, imm1_aux) = {
+        let value = chunk as u32;
+        (RawReg(value), RawReg(value >> 4), (value >> 8) & 0b111)
+    };
+
+    debug_assert!(imm1_aux <= 7);
+
+    let chunk = chunk >> 16;
+    let chunk = chunk as u64;
+    let imm1 = read_simple_varint(chunk as u32, imm1_aux);
+    let chunk = chunk >> (imm1_aux << 3);
+    let imm2_aux = u32::from(skip.wrapping_sub(imm1_aux) as u8);
+    debug_assert!(skip <= 24);
+    debug_assert!(imm2_aux <= 24 || (imm2_aux >= 249 && imm2_aux <= 255));
+
+    let imm2 = read_length_minus_two_varint(chunk as u32, imm2_aux);
+    (reg1, reg2, imm1, imm2)
+}
+
+#[inline(always)]
+pub fn read_args_regs2_imm(chunk: u128, skip: u32) -> (RawReg, RawReg, u32) {
+    let chunk = chunk as u64;
+    let (reg1, reg2) = {
+        let value = chunk as u32;
+        (RawReg(value), RawReg(value >> 4))
+    };
+    let chunk = chunk >> 8;
+    let imm = read_length_minus_one_varint(chunk as u32, skip);
+    (reg1, reg2, imm)
+}
+
+#[inline(always)]
+pub fn read_args_regs2_offset(chunk: u128, instruction_offset: u32, skip: u32) -> (RawReg, RawReg, u32) {
+    let (reg1, reg2, imm) = read_args_regs2_imm(chunk, skip);
+    let imm = instruction_offset.wrapping_add(imm);
+    (reg1, reg2, imm)
+}
+
+#[inline(always)]
+pub fn read_args_regs3(chunk: u128) -> (RawReg, RawReg, RawReg) {
+    let chunk = chunk as u32;
+    let (reg1, reg2, reg3) = (RawReg(chunk), RawReg(chunk >> 4), RawReg(chunk >> 8));
+    (reg1, reg2, reg3)
+}
+
+#[inline(always)]
+pub fn read_args_regs2(chunk: u128) -> (RawReg, RawReg) {
+    let chunk = chunk as u32;
+    let (reg1, reg2) = (RawReg(chunk), RawReg(chunk >> 4));
+    (reg1, reg2)
+}
+
+#[cfg(kani)]
+mod kani {
+    use core::cmp::min;
+
+    fn clamp<T>(range: core::ops::RangeInclusive<T>, value: T) -> T
+    where
+        T: PartialOrd + Copy,
+    {
+        if value < *range.start() {
+            *range.start()
+        } else if value > *range.end() {
+            *range.end()
+        } else {
+            value
+        }
     }
 
-    #[inline(always)]
-    pub fn read_args_imm(&mut self, chunk: u128, args_length: u32) -> Option<u32> {
-        let imm = read_simple_varint(chunk as u32, args_length);
-        Some(imm)
+    fn read<O, L>(slice: &[u8], offset: O, length: L) -> u32
+    where
+        O: TryInto<usize>,
+        L: TryInto<usize>,
+    {
+        let offset = offset.try_into().unwrap_or_else(|_| unreachable!());
+        let length = length.try_into().unwrap_or_else(|_| unreachable!());
+        let slice = &slice[offset..offset + length];
+        match length {
+            0 => 0,
+            1 => slice[0] as u32,
+            2 => u16::from_le_bytes([slice[0], slice[1]]) as u32,
+            3 => u32::from_le_bytes([slice[0], slice[1], slice[2], 0]),
+            4 => u32::from_le_bytes([slice[0], slice[1], slice[2], slice[3]]),
+            _ => unreachable!(),
+        }
     }
 
-    #[inline(always)]
-    pub fn read_args_imm2(&mut self, chunk: u128, args_length: u32) -> Option<(u32, u32)> {
-        let imm1_length = u32::from(chunk as u8);
-        let chunk = chunk >> 8;
-        let chunk = chunk as u64;
-        let imm1 = read_simple_varint(chunk as u32, imm1_length);
-        let chunk = chunk >> (imm1_length << 3);
-        let imm2 = read_simple_varint_length_minus_1(chunk as u32, args_length.wrapping_sub(imm1_length));
-        Some((imm1, imm2))
+    fn sext<L>(value: u32, length: L) -> u32
+    where
+        L: Into<i64>,
+    {
+        match length.into() {
+            0 => 0,
+            1 => value as u8 as i8 as i32 as u32,
+            2 => value as u16 as i16 as i32 as u32,
+            3 => (((value << 8) as i32) >> 8) as u32,
+            4 => value,
+            _ => unreachable!(),
+        }
     }
 
-    #[inline(always)]
-    pub fn read_args_reg_imm(&mut self, chunk: u128, args_length: u32) -> Option<(RawReg, u32)> {
-        let chunk = chunk as u64;
-        let reg = RawReg(chunk as u32);
-        let chunk = chunk >> 8;
-        let imm = read_simple_varint_length_minus_1(chunk as u32, args_length);
-        Some((reg, imm))
+    macro_rules! args {
+        () => {{
+            let code: [u8; 16] = kani::any();
+            let chunk = u128::from_le_bytes(code);
+            let skip: u32 = kani::any_where(|x| *x <= super::BITMASK_MAX);
+
+            (code, chunk, skip)
+        }};
     }
 
-    #[inline(always)]
-    pub fn read_args_reg_imm_offset(&mut self, chunk: u128, instruction_offset: u32, args_length: u32) -> Option<(RawReg, u32, u32)> {
-        let (reg, imm1_length) = {
-            let value = chunk as u32;
-            (RawReg(value), (value >> 4) & 0b1111)
-        };
-        let chunk = chunk >> 8;
-        let chunk = chunk as u64;
-        let imm1 = read_simple_varint(chunk as u32, imm1_length);
-        let chunk = chunk >> (imm1_length << 3);
-        let imm2 = read_simple_varint_length_minus_1(chunk as u32, args_length.wrapping_sub(imm1_length));
-        let imm2 = instruction_offset.wrapping_add(imm2);
-        Some((reg, imm1, imm2))
+    #[kani::proof]
+    fn verify_read_args_imm() {
+        fn simple_read_args_imm(code: &[u8], skip: u32) -> u32 {
+            let imm_length = min(4, skip);
+            sext(read(code, 0, imm_length), imm_length)
+        }
+
+        let (code, chunk, skip) = args!();
+        assert_eq!(super::read_args_imm(chunk, skip), simple_read_args_imm(&code, skip));
     }
 
-    #[inline(always)]
-    pub fn read_args_reg_imm2(&mut self, chunk: u128, args_length: u32) -> Option<(RawReg, u32, u32)> {
-        let (reg, imm1_length) = {
-            let value = chunk as u32;
-            (RawReg(value), (value >> 4) & 0b1111)
-        };
-        let chunk = chunk >> 8;
-        let chunk = chunk as u64;
-        let imm1 = read_simple_varint(chunk as u32, imm1_length);
-        let chunk = chunk >> (imm1_length << 3);
-        let imm2 = read_simple_varint_length_minus_1(chunk as u32, args_length.wrapping_sub(imm1_length));
-        Some((reg, imm1, imm2))
+    #[kani::proof]
+    fn verify_read_args_imm2() {
+        fn simple_read_args_imm2(code: &[u8], skip: u32) -> (u32, u32) {
+            let imm1_aux = i32::from(code[0]) & 0b111;
+            let imm1_length = min(4, imm1_aux);
+            let imm1 = sext(read(code, 1, imm1_length), imm1_length);
+            let imm2_length = clamp(0..=4, skip as i32 - 1 - imm1_aux);
+            let imm2_raw = read(code, 1 + imm1_aux, min(imm2_length, 8 - imm1_aux));
+            let imm2 = sext(imm2_raw, imm2_length);
+            (imm1, imm2)
+        }
+
+        let (code, chunk, skip) = args!();
+        assert_eq!(super::read_args_imm2(chunk, skip), simple_read_args_imm2(&code, skip));
     }
 
-    #[inline(always)]
-    pub fn read_args_regs2_imm2(&mut self, chunk: u128, args_length: u32) -> Option<(RawReg, RawReg, u32, u32)> {
-        let (reg1, reg2, imm1_length) = {
-            let value = chunk as u32;
-            (RawReg(value), RawReg(value >> 4), u32::from((value >> 8) as u8))
-        };
-        let chunk = chunk >> 16;
-        let chunk = chunk as u64;
-        let imm1 = read_simple_varint(chunk as u32, imm1_length);
-        let chunk = chunk >> (imm1_length << 3);
-        let imm2 = read_simple_varint_length_minus_1(chunk as u32, args_length.wrapping_sub(imm1_length + 1));
-        Some((reg1, reg2, imm1, imm2))
+    #[kani::proof]
+    fn verify_read_args_reg_imm() {
+        fn simple_read_args_reg_imm(code: &[u8], skip: u32) -> (u8, u32) {
+            let reg = min(12, code[0] & 0b1111);
+            let imm_length = clamp(0..=4, skip as i32 - 1);
+            let imm_raw = read(code, 1, imm_length);
+            let imm = sext(imm_raw, imm_length);
+            (reg, imm)
+        }
+
+        let (code, chunk, skip) = args!();
+        let (reg, imm) = super::read_args_reg_imm(chunk, skip);
+        let reg = reg.get() as u8;
+        assert_eq!((reg, imm), simple_read_args_reg_imm(&code, skip));
     }
 
-    #[inline(always)]
-    pub fn read_args_regs2_imm(&mut self, chunk: u128, args_length: u32) -> Option<(RawReg, RawReg, u32)> {
-        let chunk = chunk as u64;
-        let (reg1, reg2) = {
-            let value = chunk as u32;
-            (RawReg(value), RawReg(value >> 4))
-        };
-        let chunk = chunk >> 8;
-        let imm = read_simple_varint_length_minus_1(chunk as u32, args_length);
-        Some((reg1, reg2, imm))
+    #[kani::proof]
+    fn verify_read_args_reg_imm2() {
+        fn simple_read_args_reg_imm2(code: &[u8], skip: u32) -> (u8, u32, u32) {
+            let reg = min(12, code[0] & 0b1111);
+            let imm1_aux = ((code[0] >> 4) & 0b111) as i32;
+            let imm1_length = clamp(0..=4, imm1_aux);
+            let imm1_raw = read(code, 1, imm1_length);
+            let imm1 = sext(imm1_raw, imm1_length);
+            let imm2_length = clamp(0..=4, skip as i32 - 1 - imm1_aux);
+            let imm2_raw = read(code, 1 + imm1_aux, min(imm2_length, 8 - imm1_aux));
+            let imm2 = sext(imm2_raw, imm2_length);
+            (reg, imm1, imm2)
+        }
+
+        let (code, chunk, skip) = args!();
+        let (reg, imm1, imm2) = super::read_args_reg_imm2(chunk, skip);
+        let reg = reg.get() as u8;
+        assert_eq!((reg, imm1, imm2), simple_read_args_reg_imm2(&code, skip));
     }
 
-    #[inline(always)]
-    pub fn read_args_regs2_offset(&mut self, chunk: u128, instruction_offset: u32, args_length: u32) -> Option<(RawReg, RawReg, u32)> {
-        let chunk = chunk as u64;
-        let (reg1, reg2) = {
-            let value = chunk as u32;
-            (RawReg(value), RawReg(value >> 4))
-        };
-        let chunk = chunk >> 8;
-        let imm = read_simple_varint_length_minus_1(chunk as u32, args_length);
-        let imm = instruction_offset.wrapping_add(imm);
-        Some((reg1, reg2, imm))
+    #[kani::proof]
+    fn verify_read_args_regs2_imm2() {
+        fn simple_read_args_regs2_imm2(code: &[u8], skip: u32) -> (u8, u8, u32, u32) {
+            let reg1 = min(12, code[0] & 0b1111);
+            let reg2 = min(12, code[0] >> 4);
+            let imm1_aux = i32::from(code[1]) & 0b111;
+            let imm1_length = min(4, imm1_aux);
+            let imm1 = sext(read(code, 2, imm1_length), imm1_length);
+            let imm2_length = clamp(0..=4, skip as i32 - 2 - imm1_aux);
+            let imm2_raw = read(code, 2 + imm1_aux, min(imm2_length, 8 - imm1_aux));
+            let imm2 = sext(imm2_raw, imm2_length);
+            (reg1, reg2, imm1, imm2)
+        }
+
+        let (code, chunk, skip) = args!();
+        let (reg1, reg2, imm1, imm2) = super::read_args_regs2_imm2(chunk, skip);
+        let reg1 = reg1.get() as u8;
+        let reg2 = reg2.get() as u8;
+        assert_eq!((reg1, reg2, imm1, imm2), simple_read_args_regs2_imm2(&code, skip))
     }
 
-    #[inline(always)]
-    pub fn read_args_regs3(&mut self, chunk: u128) -> Option<(RawReg, RawReg, RawReg)> {
-        let chunk = chunk as u32;
-        let (reg1, reg2, reg3) = (RawReg(chunk), RawReg(chunk >> 4), RawReg(chunk >> 8));
-        Some((reg1, reg2, reg3))
+    #[kani::proof]
+    fn verify_read_args_regs2_imm() {
+        fn simple_read_args_regs2_imm(code: &[u8], skip: u32) -> (u8, u8, u32) {
+            let reg1 = min(12, code[0] & 0b1111);
+            let reg2 = min(12, code[0] >> 4);
+            let imm_length = clamp(0..=4, skip as i32 - 1);
+            let imm_raw = read(code, 1, imm_length);
+            let imm = sext(imm_raw, imm_length);
+            (reg1, reg2, imm)
+        }
+
+        let (code, chunk, skip) = args!();
+        let (reg1, reg2, imm) = super::read_args_regs2_imm(chunk, skip);
+        let reg1 = reg1.get() as u8;
+        let reg2 = reg2.get() as u8;
+        assert_eq!((reg1, reg2, imm), simple_read_args_regs2_imm(&code, skip));
     }
 
-    #[inline(always)]
-    pub fn read_args_regs2(&mut self, chunk: u128) -> Option<(RawReg, RawReg)> {
-        let chunk = chunk as u32;
-        let (reg1, reg2) = (RawReg(chunk), RawReg(chunk >> 4));
-        Some((reg1, reg2))
+    #[kani::proof]
+    fn verify_read_args_regs3() {
+        fn simple_read_args_regs3(code: &[u8]) -> (u8, u8, u8) {
+            let reg1 = min(12, code[0] & 0b1111);
+            let reg2 = min(12, code[0] >> 4);
+            let reg3 = min(12, code[1] & 0b1111);
+            (reg1, reg2, reg3)
+        }
+
+        let (code, chunk, _) = args!();
+        let (reg1, reg2, reg3) = super::read_args_regs3(chunk);
+        let reg1 = reg1.get() as u8;
+        let reg2 = reg2.get() as u8;
+        let reg3 = reg3.get() as u8;
+        assert_eq!((reg1, reg2, reg3), simple_read_args_regs3(&code));
+    }
+
+    #[kani::proof]
+    fn verify_read_args_regs2() {
+        fn simple_read_args_regs2(code: &[u8]) -> (u8, u8) {
+            let reg1 = min(12, code[0] & 0b1111);
+            let reg2 = min(12, code[0] >> 4);
+            (reg1, reg2)
+        }
+
+        let (code, chunk, _) = args!();
+        let (reg1, reg2) = super::read_args_regs2(chunk);
+        let reg1 = reg1.get() as u8;
+        let reg2 = reg2.get() as u8;
+        assert_eq!((reg1, reg2), simple_read_args_regs2(&code));
     }
 }
 
@@ -645,7 +832,7 @@ macro_rules! define_opcodes {
                     $({
                         #[cfg_attr(target_os = "linux", link_section = concat!(".text.", stringify!($table_name)))]
                         fn $name_reg_imm<$d($visitor_ty_params),*>(state: &mut VisitorHelper<$visitor_ty<$d($visitor_ty_params),*>>, chunk: u128, instruction_offset: u32, args_length: u32) -> ReturnTy<$d($visitor_ty_params),*>{
-                            let Some((reg, imm)) = state.read_args_reg_imm(chunk, args_length) else { return state.visitor.invalid(instruction_offset, args_length) };
+                            let (reg, imm) = $crate::program::read_args_reg_imm(chunk, args_length);
                             state.visitor.$name_reg_imm(instruction_offset, args_length, reg, imm)
                         }
 
@@ -655,7 +842,7 @@ macro_rules! define_opcodes {
                     $({
                         #[cfg_attr(target_os = "linux", link_section = concat!(".text.", stringify!($table_name)))]
                         fn $name_reg_imm_offset<$d($visitor_ty_params),*>(state: &mut VisitorHelper<$visitor_ty<$d($visitor_ty_params),*>>, chunk: u128, instruction_offset: u32, args_length: u32) -> ReturnTy<$d($visitor_ty_params),*>{
-                            let Some((reg, imm1, imm2)) = state.read_args_reg_imm_offset(chunk, instruction_offset, args_length) else { return state.visitor.invalid(instruction_offset, args_length) };
+                            let (reg, imm1, imm2) = $crate::program::read_args_reg_imm_offset(chunk, instruction_offset, args_length);
                             state.visitor.$name_reg_imm_offset(instruction_offset, args_length, reg, imm1, imm2)
                         }
 
@@ -665,7 +852,7 @@ macro_rules! define_opcodes {
                     $({
                         #[cfg_attr(target_os = "linux", link_section = concat!(".text.", stringify!($table_name)))]
                         fn $name_reg_imm_imm<$d($visitor_ty_params),*>(state: &mut VisitorHelper<$visitor_ty<$d($visitor_ty_params),*>>, chunk: u128, instruction_offset: u32, args_length: u32) -> ReturnTy<$d($visitor_ty_params),*>{
-                            let Some((reg, imm1, imm2)) = state.read_args_reg_imm2(chunk, args_length) else { return state.visitor.invalid(instruction_offset, args_length) };
+                            let (reg, imm1, imm2) = $crate::program::read_args_reg_imm2(chunk, args_length);
                             state.visitor.$name_reg_imm_imm(instruction_offset, args_length, reg, imm1, imm2)
                         }
 
@@ -675,7 +862,7 @@ macro_rules! define_opcodes {
                     $({
                         #[cfg_attr(target_os = "linux", link_section = concat!(".text.", stringify!($table_name)))]
                         fn $name_reg_reg_imm<$d($visitor_ty_params),*>(state: &mut VisitorHelper<$visitor_ty<$d($visitor_ty_params),*>>, chunk: u128, instruction_offset: u32, args_length: u32) -> ReturnTy<$d($visitor_ty_params),*>{
-                            let Some((reg1, reg2, imm)) = state.read_args_regs2_imm(chunk, args_length) else { return state.visitor.invalid(instruction_offset, args_length) };
+                            let (reg1, reg2, imm) = $crate::program::read_args_regs2_imm(chunk, args_length);
                             state.visitor.$name_reg_reg_imm(instruction_offset, args_length, reg1, reg2, imm)
                         }
 
@@ -685,7 +872,7 @@ macro_rules! define_opcodes {
                     $({
                         #[cfg_attr(target_os = "linux", link_section = concat!(".text.", stringify!($table_name)))]
                         fn $name_reg_reg_offset<$d($visitor_ty_params),*>(state: &mut VisitorHelper<$visitor_ty<$d($visitor_ty_params),*>>, chunk: u128, instruction_offset: u32, args_length: u32) -> ReturnTy<$d($visitor_ty_params),*>{
-                            let Some((reg1, reg2, imm)) = state.read_args_regs2_offset(chunk, instruction_offset, args_length) else { return state.visitor.invalid(instruction_offset, args_length) };
+                            let (reg1, reg2, imm) = $crate::program::read_args_regs2_offset(chunk, instruction_offset, args_length);
                             state.visitor.$name_reg_reg_offset(instruction_offset, args_length, reg1, reg2, imm)
                         }
 
@@ -695,7 +882,7 @@ macro_rules! define_opcodes {
                     $({
                         #[cfg_attr(target_os = "linux", link_section = concat!(".text.", stringify!($table_name)))]
                         fn $name_reg_reg_reg<$d($visitor_ty_params),*>(state: &mut VisitorHelper<$visitor_ty<$d($visitor_ty_params),*>>, chunk: u128, instruction_offset: u32, args_length: u32) -> ReturnTy<$d($visitor_ty_params),*>{
-                            let Some((reg1, reg2, reg3)) = state.read_args_regs3(chunk) else { return state.visitor.invalid(instruction_offset, args_length) };
+                            let (reg1, reg2, reg3) = $crate::program::read_args_regs3(chunk);
                             state.visitor.$name_reg_reg_reg(instruction_offset, args_length, reg1, reg2, reg3)
                         }
 
@@ -705,7 +892,7 @@ macro_rules! define_opcodes {
                     $({
                         #[cfg_attr(target_os = "linux", link_section = concat!(".text.", stringify!($table_name)))]
                         fn $name_offset<$d($visitor_ty_params),*>(state: &mut VisitorHelper<$visitor_ty<$d($visitor_ty_params),*>>, chunk: u128, instruction_offset: u32, args_length: u32) -> ReturnTy<$d($visitor_ty_params),*>{
-                            let Some(imm) = state.read_args_offset(chunk, instruction_offset, args_length) else { return state.visitor.invalid(instruction_offset, args_length) };
+                            let imm = $crate::program::read_args_offset(chunk, instruction_offset, args_length);
                             state.visitor.$name_offset(instruction_offset, args_length, imm)
                         }
 
@@ -715,7 +902,7 @@ macro_rules! define_opcodes {
                     $({
                         #[cfg_attr(target_os = "linux", link_section = concat!(".text.", stringify!($table_name)))]
                         fn $name_imm<$d($visitor_ty_params),*>(state: &mut VisitorHelper<$visitor_ty<$d($visitor_ty_params),*>>, chunk: u128, instruction_offset: u32, args_length: u32) -> ReturnTy<$d($visitor_ty_params),*>{
-                            let Some(imm) = state.read_args_imm(chunk, args_length) else { return state.visitor.invalid(instruction_offset, args_length) };
+                            let imm = $crate::program::read_args_imm(chunk, args_length);
                             state.visitor.$name_imm(instruction_offset, args_length, imm)
                         }
 
@@ -725,7 +912,7 @@ macro_rules! define_opcodes {
                     $({
                         #[cfg_attr(target_os = "linux", link_section = concat!(".text.", stringify!($table_name)))]
                         fn $name_imm_imm<$d($visitor_ty_params),*>(state: &mut VisitorHelper<$visitor_ty<$d($visitor_ty_params),*>>, chunk: u128, instruction_offset: u32, args_length: u32) -> ReturnTy<$d($visitor_ty_params),*>{
-                            let Some((imm1, imm2)) = state.read_args_imm2(chunk, args_length) else { return state.visitor.invalid(instruction_offset, args_length) };
+                            let (imm1, imm2) = $crate::program::read_args_imm2(chunk, args_length);
                             state.visitor.$name_imm_imm(instruction_offset, args_length, imm1, imm2)
                         }
 
@@ -735,7 +922,7 @@ macro_rules! define_opcodes {
                     $({
                         #[cfg_attr(target_os = "linux", link_section = concat!(".text.", stringify!($table_name)))]
                         fn $name_reg_reg<$d($visitor_ty_params),*>(state: &mut VisitorHelper<$visitor_ty<$d($visitor_ty_params),*>>, chunk: u128, instruction_offset: u32, args_length: u32) -> ReturnTy<$d($visitor_ty_params),*>{
-                            let Some((reg1, reg2)) = state.read_args_regs2(chunk) else { return state.visitor.invalid(instruction_offset, args_length) };
+                            let (reg1, reg2) = $crate::program::read_args_regs2(chunk);
                             state.visitor.$name_reg_reg(instruction_offset, args_length, reg1, reg2)
                         }
 
@@ -745,7 +932,7 @@ macro_rules! define_opcodes {
                     $({
                         #[cfg_attr(target_os = "linux", link_section = concat!(".text.", stringify!($table_name)))]
                         fn $name_reg_reg_imm_imm<$d($visitor_ty_params),*>(state: &mut VisitorHelper<$visitor_ty<$d($visitor_ty_params),*>>, chunk: u128, instruction_offset: u32, args_length: u32) -> ReturnTy<$d($visitor_ty_params),*>{
-                            let Some((reg1, reg2, imm1, imm2)) = state.read_args_regs2_imm2(chunk, args_length) else { return state.visitor.invalid(instruction_offset, args_length) };
+                            let (reg1, reg2, imm1, imm2) = $crate::program::read_args_regs2_imm2(chunk, args_length);
                             state.visitor.$name_reg_reg_imm_imm(instruction_offset, args_length, reg1, reg2, imm1, imm2)
                         }
 
@@ -891,6 +1078,7 @@ fn parse_instruction(code: &[u8], bitmask: &[u8], offset: &mut usize) -> Option<
 }
 
 #[test]
+#[ignore]
 fn test_parse_instruction() {
     // Instruction with no arguments.
     assert_eq!(

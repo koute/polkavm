@@ -75,50 +75,77 @@ proptest::proptest! {
     }
 }
 
-#[inline(always)]
-fn apply_zigzag(value: u32) -> u32 {
-    let value = value as i32;
-    let value = (value << 1) ^ (value >> 31);
-    value as u32
-}
-
-#[inline(always)]
-fn undo_zigzag(value: u32) -> u32 {
-    (value >> 1) ^ (-((value & 1) as i32)) as u32
-}
-
-const fn bit_length_to_mask_u32_slow(length: u32) -> u32 {
-    if length >= 32 {
-        0xffffffff
-    } else {
-        (1_u32 << length) - 1
-    }
-}
-
-static LENGTH_MINUS_1_TO_MASK: [u32; 256] = {
+static LENGTH_MINUS_TWO_TO_SHIFT: [u32; 256] = {
     let mut output = [0; 256];
-    let mut length = 0_u32;
-    while length < 256 {
-        let length_effective = length.wrapping_sub(1);
-        let length_effective = if length_effective < 4 { length_effective } else { 4 };
-        output[length as usize] = bit_length_to_mask_u32_slow(length_effective * 8);
-        length += 1;
+    let mut index = 0_u32;
+    while index < 256 {
+        let effective_length = if index <= 2 {
+            0
+        } else if index <= 6 {
+            index - 2
+        } else if index <= 24 {
+            4
+        } else {
+            0
+        };
+
+        let shift = match effective_length {
+            0 => 32,
+            1 => 24,
+            2 => 16,
+            3 => 8,
+            4 => 0,
+            _ => unreachable!(),
+        };
+
+        output[index as usize] = shift;
+        index += 1;
     }
     output
 };
 
-#[inline(always)]
-pub(crate) fn read_simple_varint_length_minus_1(chunk: u32, length: u32) -> u32 {
-    let mask = LENGTH_MINUS_1_TO_MASK[length as u8 as usize];
-    undo_zigzag(chunk & mask)
-}
+static LENGTH_MINUS_ONE_TO_SHIFT: [u32; 256] = {
+    let mut output = [0; 256];
+    let mut index = 0_u32;
+    while index < 256 {
+        let effective_length = if index <= 1 {
+            0
+        } else if index <= 5 {
+            index - 1
+        } else if index <= 24 {
+            4
+        } else {
+            0
+        };
 
-static LENGTH_TO_MASK: [u32; 256] = {
+        let shift = match effective_length {
+            0 => 32,
+            1 => 24,
+            2 => 16,
+            3 => 8,
+            4 => 0,
+            _ => unreachable!(),
+        };
+
+        output[index as usize] = shift;
+        index += 1;
+    }
+    output
+};
+
+static LENGTH_TO_SHIFT: [u32; 256] = {
     let mut output = [0; 256];
     let mut length = 0_u32;
     while length < 256 {
-        let length_effective = if length < 4 { length } else { 4 };
-        output[length as usize] = bit_length_to_mask_u32_slow(length_effective * 8);
+        let shift = match length {
+            0 => 32,
+            1 => 24,
+            2 => 16,
+            3 => 8,
+            _ => 0,
+        };
+
+        output[length as usize] = shift;
         length += 1;
     }
     output
@@ -126,20 +153,51 @@ static LENGTH_TO_MASK: [u32; 256] = {
 
 #[inline(always)]
 pub(crate) fn read_simple_varint(chunk: u32, length: u32) -> u32 {
-    let mask = LENGTH_TO_MASK[length as u8 as usize];
-    undo_zigzag(chunk & mask)
+    let shift = LENGTH_TO_SHIFT[length as usize];
+    (((u64::from(chunk) << shift) as u32 as i32).wrapping_shr(shift)) as u32
+}
+
+#[inline(always)]
+pub(crate) fn read_length_minus_one_varint(chunk: u32, length: u32) -> u32 {
+    let shift = LENGTH_MINUS_ONE_TO_SHIFT[length as usize];
+    (((u64::from(chunk) << shift) as u32 as i32).wrapping_shr(shift)) as u32
+}
+
+#[inline(always)]
+pub(crate) fn read_length_minus_two_varint(chunk: u32, length: u32) -> u32 {
+    let shift = LENGTH_MINUS_TWO_TO_SHIFT[length as usize];
+    (((u64::from(chunk) << shift) as u32 as i32).wrapping_shr(shift)) as u32
 }
 
 #[inline]
 fn get_bytes_required(value: u32) -> u32 {
-    let leading_zeros = value.leading_zeros();
-    let bits_required = 32 - leading_zeros;
-    bits_required / 8 + (if leading_zeros % 8 > 0 { 1 } else { 0 })
+    let zeros = value.leading_zeros();
+    if zeros == 32 {
+        0
+    } else if zeros > 24 {
+        1
+    } else if zeros > 16 {
+        2
+    } else if zeros > 8 {
+        3
+    } else if zeros != 0 {
+        4
+    } else {
+        let ones = value.leading_ones();
+        if ones > 24 {
+            1
+        } else if ones > 16 {
+            2
+        } else if ones > 8 {
+            3
+        } else {
+            4
+        }
+    }
 }
 
 #[inline]
 pub(crate) fn write_simple_varint(value: u32, buffer: &mut [u8]) -> usize {
-    let value = apply_zigzag(value);
     let varint_length = get_bytes_required(value);
     match varint_length {
         0 => {}
@@ -170,35 +228,58 @@ pub(crate) fn write_simple_varint(value: u32, buffer: &mut [u8]) -> usize {
     varint_length as usize
 }
 
+#[test]
+fn test_simple_varint() {
+    assert_eq!(get_bytes_required(0b00000000_00000000_00000000_00000000), 0);
+    assert_eq!(get_bytes_required(0b00000000_00000000_00000000_00000001), 1);
+    assert_eq!(get_bytes_required(0b00000000_00000000_00000000_01000001), 1);
+    assert_eq!(get_bytes_required(0b00000000_00000000_00000000_10000000), 2);
+    assert_eq!(get_bytes_required(0b00000000_00000000_00000000_11111111), 2);
+    assert_eq!(get_bytes_required(0b00000000_00000000_00000001_00000000), 2);
+    assert_eq!(get_bytes_required(0b00000000_00000000_01000000_00000000), 2);
+    assert_eq!(get_bytes_required(0b00000000_00000000_10000000_00000000), 3);
+    assert_eq!(get_bytes_required(0b00000000_00000001_00000000_00000000), 3);
+    assert_eq!(get_bytes_required(0b00000000_01000000_00000000_00000000), 3);
+    assert_eq!(get_bytes_required(0b00000000_10000000_00000000_00000000), 4);
+    assert_eq!(get_bytes_required(0b00000001_00000000_00000000_00000000), 4);
+    assert_eq!(get_bytes_required(0b10000000_00000000_00000000_00000000), 4);
+    assert_eq!(get_bytes_required(0b11111111_11111111_11111111_11111111), 1);
+    assert_eq!(get_bytes_required(0b10111111_11111111_11111111_11111111), 4);
+    assert_eq!(get_bytes_required(0b11111110_11111111_11111111_11111111), 4);
+    assert_eq!(get_bytes_required(0b11111111_01111111_11111111_11111111), 4);
+    assert_eq!(get_bytes_required(0b11111111_10111111_11111111_11111111), 3);
+    assert_eq!(get_bytes_required(0b11111111_11111110_11111111_11111111), 3);
+    assert_eq!(get_bytes_required(0b11111111_11111111_01111111_11111111), 3);
+    assert_eq!(get_bytes_required(0b11111111_11111111_10111111_11111111), 2);
+    assert_eq!(get_bytes_required(0b11111111_11111111_11111110_11111111), 2);
+    assert_eq!(get_bytes_required(0b11111111_11111111_11111111_01111111), 2);
+    assert_eq!(get_bytes_required(0b11111111_11111111_11111111_10111111), 1);
+
+    assert_eq!(read_simple_varint(0x000000ff, 1), 0xffffffff);
+    assert_eq!(read_simple_varint(0x555555ff, 1), 0xffffffff);
+    assert_eq!(read_simple_varint(0xaaaaaaff, 1), 0xffffffff);
+    assert_eq!(read_simple_varint(0xffffffff, 1), 0xffffffff);
+
+    assert_eq!(read_simple_varint(0x000000ff, 0), 0);
+    assert_eq!(read_simple_varint(0x555555ff, 0), 0);
+    assert_eq!(read_simple_varint(0xaaaaaaff, 0), 0);
+    assert_eq!(read_simple_varint(0xffffffff, 0), 0);
+}
+
 #[cfg(test)]
 proptest::proptest! {
     #[allow(clippy::ignored_unit_patterns)]
     #[test]
-    fn simple_varint_serialization(value in 0u32..=0xffffffff) {
-        fn read_simple_varint_slow(input: &[u8]) -> Option<u32> {
-            let value = match input.len() {
-                0 => 0,
-                1 => u32::from(input[0]),
-                2 => u32::from(u16::from_le_bytes([input[0], input[1]])),
-                3 => u32::from_le_bytes([input[0], input[1], input[2], 0]),
-                4 => u32::from_le_bytes([input[0], input[1], input[2], input[3]]),
-                _ => return None,
-            };
-
-            let value = (value >> 1) ^ (-((value & 1) as i32)) as u32;
-            Some(value)
+    fn proptest_simple_varint(value in 0u32..=0xffffffff) {
+        fn read_simple_varint_from_slice(input: [u8; 4], length: usize) -> u32 {
+            let chunk = u32::from_le_bytes(input);
+            read_simple_varint(chunk, length as u32)
         }
 
-        let mut t = [0; 4];
-        let length = write_simple_varint(value, &mut t);
-        assert_eq!(read_simple_varint_slow(&t[..length]).unwrap(), value, "value mismatch");
-
-        let chunk = u32::from_le_bytes([t[0], t[1], t[2], t[3]]);
-        assert_eq!(read_simple_varint(chunk, length as u32), value);
-        assert_eq!(read_simple_varint(chunk, length as u32 + 1), value);
-        assert_eq!(read_simple_varint(chunk, length as u32 + 2), value);
-        assert_eq!(read_simple_varint(chunk, length as u32 + 3), value);
-        assert_eq!(read_simple_varint(chunk, length as u32 + 4), value);
-        assert_eq!(read_simple_varint(chunk, 0xffffffff), value);
+        for fill_byte in [0x00, 0x55, 0xaa, 0xff] {
+            let mut t = [fill_byte; 4];
+            let length = write_simple_varint(value, &mut t);
+            assert_eq!(read_simple_varint_from_slice(t, length), value, "value mismatch");
+        }
     }
 }
