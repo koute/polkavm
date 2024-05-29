@@ -43,6 +43,16 @@ jobs:
     - name: Build and test
       shell: bash
       run: ./ci/jobs/build-and-test.sh
+  kani:
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v4
+    - name: Install kani
+      run: cargo install --locked kani-verifier
+    - name: Setup kani
+      run: cargo kani setup
+    - name: Run kani
+      run: ./ci/jobs/kani.sh
   clippy:
     runs-on: ubuntu-latest
     steps:
