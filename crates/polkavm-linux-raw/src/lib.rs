@@ -780,13 +780,20 @@ macro_rules! cstr {
     }}
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct Error {
     #[cfg(not(feature = "std"))]
     message: &'static str,
     #[cfg(feature = "std")]
     message: Cow<'static, str>,
     errno: c_int,
+}
+
+impl core::fmt::Debug for Error {
+    #[cold]
+    fn fmt(&self, fmt: &mut core::fmt::Formatter) -> core::fmt::Result {
+        core::fmt::Display::fmt(self, fmt)
+    }
 }
 
 impl core::fmt::Display for Error {
