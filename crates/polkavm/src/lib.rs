@@ -69,8 +69,15 @@ mod mutex_no_std;
 pub(crate) use mutex_no_std as mutex;
 
 if_compiler_is_supported! {
+    mod bit_mask;
     mod compiler;
     mod sandbox;
+
+    #[cfg(target_os = "linux")]
+    mod generic_allocator;
+
+    #[cfg(target_os = "linux")]
+    mod shm_allocator;
 }
 
 pub use polkavm_common::{
@@ -87,3 +94,11 @@ pub use crate::error::Error;
 
 #[cfg(test)]
 mod tests;
+
+#[doc(hidden)]
+pub mod _for_testing {
+    #[cfg(target_os = "linux")]
+    if_compiler_is_supported! {
+        pub use crate::shm_allocator::{ShmAllocation, ShmAllocator};
+    }
+}

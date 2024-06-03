@@ -80,3 +80,9 @@ where
         self.inner.clear();
     }
 }
+
+#[inline(always)]
+pub(crate) fn as_bytes(slice: &[usize]) -> &[u8] {
+    // SAFETY: Casting a &[usize] into a &[u8] is always safe as `u8` doesn't have any alignment requirements.
+    unsafe { core::slice::from_raw_parts(slice.as_ptr().cast(), core::mem::size_of_val(slice)) }
+}

@@ -26,40 +26,27 @@ use crate::tracer::Tracer;
 use crate::utils::GuestInit;
 
 if_compiler_is_supported! {
-    use crate::sandbox::{Sandbox, SandboxInstance};
-    use crate::sandbox::generic::Sandbox as SandboxGeneric;
-    use crate::compiler::CompiledModule;
-
-    #[cfg(target_os = "linux")]
-    use crate::sandbox::linux::Sandbox as SandboxLinux;
-}
-
-pub type RegValue = u32;
-
-if_compiler_is_supported! {
     {
-        impl EngineState {
-            pub(crate) fn sandbox_cache(&self) -> Option<&SandboxCache> {
-                self.sandbox_cache.as_ref()
-            }
-        }
+        use crate::sandbox::{Sandbox, SandboxInstance};
+        use crate::compiler::{CompiledModule, CompilerCache};
 
-        use crate::sandbox::SandboxCache;
-        use crate::compiler::CompilerCache;
-    } else {
-        struct SandboxCache;
+        #[cfg(target_os = "linux")]
+        use crate::sandbox::linux::Sandbox as SandboxLinux;
+        use crate::sandbox::generic::Sandbox as SandboxGeneric;
 
         #[derive(Default)]
-        struct CompilerCache;
+        pub(crate) struct EngineState {
+            pub(crate) sandbox_global: Option<crate::sandbox::GlobalStateKind>,
+            pub(crate) sandbox_cache: Option<crate::sandbox::WorkerCacheKind>,
+            compiler_cache: CompilerCache,
+        }
+    } else {
+        #[derive(Default)]
+        pub(crate) struct EngineState {}
     }
 }
 
-pub(crate) struct EngineState {
-    #[allow(dead_code)]
-    sandbox_cache: Option<SandboxCache>,
-    #[allow(dead_code)]
-    compiler_cache: CompilerCache,
-}
+pub type RegValue = u32;
 
 pub struct Engine {
     selected_backend: BackendKind,
@@ -92,7 +79,7 @@ impl Engine {
         let selected_backend = config.backend.unwrap_or(default_backend);
         log::debug!("Selected backend: '{selected_backend}'");
 
-        let (selected_sandbox, sandbox_cache) = if_compiler_is_supported! {
+        let (selected_sandbox, state) = if_compiler_is_supported! {
             {
                 if selected_backend == BackendKind::Compiler {
                     let default_sandbox = if SandboxKind::Linux.is_supported() {
@@ -112,8 +99,19 @@ impl Engine {
                         bail!("cannot use the '{selected_sandbox}' sandbox: this sandbox is not secure yet, and `set_allow_insecure`/`POLKAVM_ALLOW_INSECURE` is not enabled");
                     }
 
-                    let sandbox_cache = SandboxCache::new(selected_sandbox, config.worker_count, debug_trace_execution)?;
-                    (Some(selected_sandbox), Some(sandbox_cache))
+                    let sandbox_global = crate::sandbox::GlobalStateKind::new(selected_sandbox, config)?;
+                    let sandbox_cache = crate::sandbox::WorkerCacheKind::new(selected_sandbox, config);
+                    for _ in 0..config.worker_count {
+                        sandbox_cache.spawn(&sandbox_global)?;
+                    }
+
+                    let state = Arc::new(EngineState {
+                        sandbox_global: Some(sandbox_global),
+                        sandbox_cache: Some(sandbox_cache),
+                        compiler_cache: Default::default()
+                    });
+
+                    (Some(selected_sandbox), state)
                 } else {
                     Default::default()
                 }
@@ -127,10 +125,7 @@ impl Engine {
             selected_sandbox,
             interpreter_enabled: debug_trace_execution || selected_backend == BackendKind::Interpreter,
             debug_trace_execution,
-            state: Arc::new(EngineState {
-                sandbox_cache,
-                compiler_cache: Default::default(),
-            }),
+            state,
         })
     }
 }
@@ -326,7 +321,8 @@ impl Module {
 
                 let run = polkavm_common::program::prepare_visitor!($visitor_name, VisitorTy<'a>);
                 let visitor = run(&blob, visitor);
-                let module = visitor.finish_compilation(&engine.state.compiler_cache, aux)?;
+                let global = $sandbox_kind::downcast_global_state(engine.state.sandbox_global.as_ref().unwrap());
+                let module = visitor.finish_compilation(global, &engine.state.compiler_cache, aux)?;
                 Some(CompiledModuleKind::$module_kind(module))
             }};
         }

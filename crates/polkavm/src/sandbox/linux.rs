@@ -4,13 +4,12 @@
 extern crate polkavm_linux_raw as linux_raw;
 
 use polkavm_common::{
-    abi::VM_MAX_PAGE_SIZE,
     error::{ExecutionError, Trap},
     program::Reg,
     utils::{align_to_next_page_usize, slice_assume_init_mut, Access, AsUninitSliceMut, Gas},
     zygote::{
         AddressTable, AddressTablePacked,
-        SandboxMemoryConfig, VmCtx, SANDBOX_EMPTY_NATIVE_PROGRAM_COUNTER, SANDBOX_EMPTY_NTH_INSTRUCTION, VMCTX_FUTEX_BUSY,
+        VmCtx, VmMap, SANDBOX_EMPTY_NATIVE_PROGRAM_COUNTER, SANDBOX_EMPTY_NTH_INSTRUCTION, VMCTX_FUTEX_BUSY,
         VMCTX_FUTEX_HOSTCALL, VMCTX_FUTEX_IDLE, VMCTX_FUTEX_INIT, VMCTX_FUTEX_TRAP, VM_ADDR_NATIVE_CODE,
     },
 };
@@ -20,7 +19,6 @@ use super::ExecuteArgs;
 pub use linux_raw::Error;
 
 use core::ffi::{c_int, c_uint};
-use core::ops::Range;
 use core::sync::atomic::Ordering;
 use core::time::Duration;
 use linux_raw::{abort, cstr, syscall_readonly, Fd, Mmap, STDERR_FILENO, STDIN_FILENO};
@@ -28,11 +26,24 @@ use std::borrow::Cow;
 use std::time::Instant;
 use std::sync::Arc;
 
-use super::{SandboxKind, SandboxInit, SandboxVec, get_native_page_size};
+use super::{SandboxKind, SandboxInit, get_native_page_size, WorkerCache, WorkerCacheKind};
 use crate::api::{BackendAccess, CompiledModuleKind, MemoryAccessError, Module, HostcallHandler};
+use crate::config::Config;
 use crate::compiler::CompiledModule;
 use crate::config::GasMeteringKind;
-use crate::mutex::Mutex;
+use crate::shm_allocator::{ShmAllocator, ShmAllocation};
+
+pub struct GlobalState {
+    shared_memory: ShmAllocator
+}
+
+impl GlobalState {
+    pub fn new(_config: &Config) -> Result<Self, Error> {
+        Ok(GlobalState {
+            shared_memory: ShmAllocator::new()?
+        })
+    }
+}
 
 pub struct SandboxConfig {
     enable_logger: bool,
@@ -464,37 +475,6 @@ fn create_empty_memfd(name: &core::ffi::CStr) -> Result<Fd, Error> {
     linux_raw::sys_memfd_create(name, linux_raw::MFD_CLOEXEC | linux_raw::MFD_ALLOW_SEALING)
 }
 
-// Creating these is relatively slow, so we can keep one ready to go in memory at all times to speed up instantiation.
-static CACHED_PROGRAM_MEMFD: core::sync::atomic::AtomicI32 = core::sync::atomic::AtomicI32::new(-1);
-
-fn create_program_memfd() -> Result<Fd, Error> {
-    let memfd_raw = CACHED_PROGRAM_MEMFD.load(Ordering::Relaxed);
-    if memfd_raw != -1 && CACHED_PROGRAM_MEMFD.compare_exchange(memfd_raw, -1, Ordering::Relaxed, Ordering::Relaxed).is_ok() {
-        Ok(Fd::from_raw_unchecked(memfd_raw))
-    } else {
-        create_empty_memfd(cstr!("polkavm_program"))
-    }
-}
-
-fn cache_program_memfd_if_necessary() {
-    if CACHED_PROGRAM_MEMFD.load(Ordering::Relaxed) != -1 {
-        return;
-    }
-
-    let memfd = match create_empty_memfd(cstr!("polkavm_program")) {
-        Ok(memfd) => memfd,
-        Err(error) => {
-            // This should never happen.
-            log::warn!("Failed to create a memfd: {error}");
-            return;
-        }
-    };
-
-    if CACHED_PROGRAM_MEMFD.compare_exchange(-1, memfd.raw(), Ordering::Relaxed, Ordering::Relaxed).is_ok() {
-        memfd.leak();
-    }
-}
-
 fn prepare_sealed_memfd<const N: usize>(memfd: Fd, length: usize, data: [&[u8]; N]) -> Result<Fd, Error> {
     let native_page_size = get_native_page_size();
     if length % native_page_size != 0 {
@@ -578,6 +558,29 @@ fn prepare_vmctx() -> Result<(Fd, Mmap), Error> {
     Ok((memfd, vmctx))
 }
 
+fn prepare_memory() -> Result<(Fd, Mmap), Error> {
+    let memfd = create_empty_memfd(cstr!("polkavm_memory"))?;
+    linux_raw::sys_ftruncate(memfd.borrow(), linux_raw::c_ulong::from(u32::MAX))?;
+    linux_raw::sys_fcntl(
+        memfd.borrow(),
+        linux_raw::F_ADD_SEALS,
+        linux_raw::F_SEAL_SEAL | linux_raw::F_SEAL_SHRINK | linux_raw::F_SEAL_GROW,
+    )?;
+
+    let vmctx = unsafe {
+        linux_raw::Mmap::map(
+            core::ptr::null_mut(),
+            u32::MAX as usize,
+            linux_raw::PROT_READ | linux_raw::PROT_WRITE,
+            linux_raw::MAP_SHARED,
+            Some(memfd.borrow()),
+            0,
+        )?
+    };
+
+    Ok((memfd, vmctx))
+}
+
 unsafe fn child_main(zygote_memfd: Fd, child_socket: Fd, uid_map: &str, gid_map: &str, logging_pipe: Option<Fd>) -> Result<(), Error> {
     // Change the name of the process.
     linux_raw::sys_prctl_set_name(b"polkavm-sandbox\0")?;
@@ -606,9 +609,9 @@ unsafe fn child_main(zygote_memfd: Fd, child_socket: Fd, uid_map: &str, gid_map:
     }
 
     let fd_limit = if logging_pipe.is_some() {
-        4
+        6
     } else {
-        3
+        5
     };
 
     // This should never happen in practice, but can in theory if the user closes stdin or stderr manually.
@@ -706,32 +709,24 @@ unsafe fn child_main(zygote_memfd: Fd, child_socket: Fd, uid_map: &str, gid_map:
 #[derive(Clone)]
 pub struct SandboxProgram(Arc<SandboxProgramInner>);
 
+struct ProgramMap {
+    address: u64,
+    length: u64,
+    is_writable: bool,
+    initialize_with: Option<ShmAllocation>,
+}
+
 struct SandboxProgramInner {
-    memfd: Fd,
-    memory_config: SandboxMemoryConfig,
-    code_range: Range<usize>,
+    memory_map: Vec<ProgramMap>,
+    shm_code: ShmAllocation,
+    shm_jump_table: ShmAllocation,
+    code_length: usize,
+    sysreturn_address: u64,
 }
 
 impl super::SandboxProgram for SandboxProgram {
     fn machine_code(&self) -> Cow<[u8]> {
-        // The code is kept inside of the memfd and we don't have it readily accessible.
-        // So if necessary just read it back from the memfd.
-        let mut buffer = vec![0; self.0.code_range.len()];
-        linux_raw::sys_lseek(self.0.memfd.borrow(), self.0.code_range.start as i64, linux_raw::SEEK_SET).expect("failed to get machine code of the program: seek failed");
-
-        let mut position = 0;
-        while position < self.0.code_range.len() {
-            let count = match linux_raw::sys_read(self.0.memfd.borrow(), &mut buffer[position..]) {
-                Ok(count) => count,
-                Err(error) if error.errno() == linux_raw::EINTR => continue,
-                Err(error) => panic!("failed to get machine code of the program: read failed: {error}")
-            };
-
-            assert_ne!(count, 0);
-            position += count as usize;
-        }
-
-        Cow::Owned(buffer)
+        Cow::Borrowed(&unsafe { self.0.shm_code.as_slice() }[..self.0.code_length])
     }
 }
 
@@ -866,14 +861,17 @@ unsafe fn set_message(vmctx: &VmCtx, message: core::fmt::Arguments) {
 pub struct Sandbox {
     _lifetime_pipe: Fd,
     vmctx_mmap: Mmap,
+    #[allow(dead_code)] // TODO: Actually use this.
+    memory_mmap: Mmap,
     child: ChildProcess,
-    socket: Fd,
 
     count_wait_loop_start: u64,
     count_futex_wait: u64,
 
     module: Option<Module>,
     gas_metering: Option<GasMeteringKind>,
+
+    shm_memory_map: Option<ShmAllocation>,
 }
 
 impl Drop for Sandbox {
@@ -902,6 +900,31 @@ impl super::SandboxAddressSpace for () {
     }
 }
 
+#[repr(transparent)]
+pub struct JumpTableAllocation(ShmAllocation);
+
+impl AsRef<[usize]> for JumpTableAllocation {
+    fn as_ref(&self) -> &[usize] {
+        #[allow(clippy::cast_ptr_alignment)] // Allocation is guaranteed to be page aligned.
+        unsafe {
+            core::slice::from_raw_parts(
+                self.0.as_ptr().cast::<usize>(), self.0.len() / core::mem::size_of::<usize>()
+            )
+        }
+    }
+}
+
+impl AsMut<[usize]> for JumpTableAllocation {
+    fn as_mut(&mut self) -> &mut [usize] {
+        #[allow(clippy::cast_ptr_alignment)] // Allocation is guaranteed to be page aligned.
+        unsafe {
+            core::slice::from_raw_parts_mut(
+                self.0.as_mut_ptr().cast::<usize>(), self.0.len() / core::mem::size_of::<usize>()
+            )
+        }
+    }
+}
+
 impl super::Sandbox for Sandbox {
     const KIND: SandboxKind = SandboxKind::Linux;
 
@@ -910,63 +933,147 @@ impl super::Sandbox for Sandbox {
     type Error = Error;
     type Program = SandboxProgram;
     type AddressSpace = ();
+    type GlobalState = GlobalState;
+    type JumpTable = JumpTableAllocation;
 
-    fn as_sandbox_vec(vec: &SandboxVec) -> &Mutex<Vec<Self>> {
-        #[allow(clippy::match_wildcard_for_single_variants)]
-        match vec {
-            SandboxVec::Linux(ref vec) => vec,
-            _ => unreachable!(),
-        }
-    }
-
-    fn as_compiled_module(module: &Module) -> &CompiledModule<Self> {
+    fn downcast_module(module: &Module) -> &CompiledModule<Self> {
         match module.compiled_module() {
             CompiledModuleKind::Linux(ref module) => module,
             _ => unreachable!(),
         }
     }
 
+    fn downcast_global_state(global: &crate::sandbox::GlobalStateKind) -> &Self::GlobalState {
+        #[allow(clippy::match_wildcard_for_single_variants)]
+        match global {
+            crate::sandbox::GlobalStateKind::Linux(ref global) => global,
+            _ => unreachable!(),
+        }
+    }
+
+    fn downcast_worker_cache(cache: &WorkerCacheKind) -> &WorkerCache<Self> {
+        #[allow(clippy::match_wildcard_for_single_variants)]
+        match cache {
+            crate::sandbox::WorkerCacheKind::Linux(ref cache) => cache,
+            _ => unreachable!(),
+        }
+    }
+
+    fn allocate_jump_table(global: &Self::GlobalState, count: usize) -> Result<Self::JumpTable, Self::Error> {
+        let Some(alloc) = global.shared_memory.alloc(count * core::mem::size_of::<usize>()) else {
+            return Err(Error::from_str("failed to allocate the jump table: out of shared memory"));
+        };
+
+        Ok(JumpTableAllocation(alloc))
+    }
+
     fn reserve_address_space() -> Result<Self::AddressSpace, Self::Error> {
         Ok(())
     }
 
-    fn prepare_program(init: SandboxInit, (): Self::AddressSpace) -> Result<Self::Program, Self::Error> {
-        static PADDING: [u8; VM_MAX_PAGE_SIZE as usize] = [0; VM_MAX_PAGE_SIZE as usize];
+    fn prepare_program(global: &Self::GlobalState, init: SandboxInit<Self>, (): Self::AddressSpace) -> Result<Self::Program, Self::Error> {
+        let cfg = init.guest_init.memory_map()?;
 
-        let native_page_size = get_native_page_size();
-        let cfg = init.memory_config(native_page_size)?;
-        let ro_data_padding = &PADDING[..cfg.ro_data_fd_size as usize - init.guest_init.ro_data.len()];
-        let rw_data_padding = &PADDING[..cfg.rw_data_fd_size as usize - init.guest_init.rw_data.len()];
-        let code_padding = &PADDING[..cfg.code_size as usize - init.code.len()];
+        let Some(shm_ro_data) = global.shared_memory.alloc(init.guest_init.ro_data.len()) else {
+            return Err(Error::from_str("failed to prepare the program for the sandbox: out of shared memory"));
+        };
 
-        let memfd = prepare_sealed_memfd(
-            create_program_memfd()?,
-            cfg.ro_data_fd_size as usize + cfg.rw_data_fd_size as usize + cfg.code_size as usize + cfg.jump_table_size as usize,
-            [
-                init.guest_init.ro_data,
-                ro_data_padding,
-                init.guest_init.rw_data,
-                rw_data_padding,
-                init.code,
-                code_padding,
-                init.jump_table
-            ]
-        )?;
+        let Some(shm_rw_data) = global.shared_memory.alloc(init.guest_init.rw_data.len()) else {
+            return Err(Error::from_str("failed to prepare the program for the sandbox: out of shared memory"));
+        };
 
-        let code_offset = cfg.ro_data_fd_size as usize + cfg.rw_data_fd_size as usize;
-        let code_range = code_offset..code_offset + init.code.len();
+        let Some(shm_code) = global.shared_memory.alloc(init.code.len()) else {
+            return Err(Error::from_str("failed to prepare the program for the sandbox: out of shared memory"));
+        };
+
+        unsafe {
+            let shm_ro_data = shm_ro_data.as_slice_mut();
+            shm_ro_data[..init.guest_init.ro_data.len()].copy_from_slice(init.guest_init.ro_data);
+            shm_ro_data[init.guest_init.ro_data.len()..].fill(0);
+        }
+
+        unsafe {
+            let shm_rw_data = shm_rw_data.as_slice_mut();
+            shm_rw_data[..init.guest_init.rw_data.len()].copy_from_slice(init.guest_init.rw_data);
+            shm_rw_data[init.guest_init.rw_data.len()..].fill(0);
+        }
+
+        let code_length = init.code.len();
+        unsafe {
+            let shm_code = shm_code.as_slice_mut();
+            shm_code[..code_length].copy_from_slice(init.code);
+        }
+
+        let mut memory_map = Vec::new();
+        if cfg.ro_data_size() > 0 {
+            let physical_size = shm_ro_data.len() as u64;
+            let virtual_size = u64::from(cfg.ro_data_size());
+            if physical_size > 0 {
+                memory_map.push(ProgramMap {
+                    address: u64::from(cfg.ro_data_address()),
+                    length: physical_size,
+                    is_writable: false,
+                    initialize_with: Some(shm_ro_data),
+                });
+            }
+
+            let padding = virtual_size - physical_size;
+            if padding > 0 {
+                memory_map.push(ProgramMap {
+                    address: u64::from(cfg.ro_data_address()) + physical_size,
+                    length: padding,
+                    is_writable: false,
+                    initialize_with: None,
+                });
+            }
+        }
+
+        if cfg.rw_data_size() > 0 {
+            let physical_size = shm_rw_data.len() as u64;
+            let virtual_size = u64::from(cfg.rw_data_size());
+            if physical_size > 0 {
+                memory_map.push(ProgramMap {
+                    address: u64::from(cfg.rw_data_address()),
+                    length: physical_size,
+                    is_writable: true,
+                    initialize_with: Some(shm_rw_data),
+                });
+            }
+
+            let padding = virtual_size - physical_size;
+            if padding > 0 {
+                memory_map.push(ProgramMap {
+                    address: u64::from(cfg.rw_data_address()) + physical_size,
+                    length: padding,
+                    is_writable: true,
+                    initialize_with: None,
+                });
+            }
+        }
+
+        if cfg.stack_size() > 0 {
+            memory_map.push(ProgramMap {
+                address: u64::from(cfg.stack_address_low()),
+                length: u64::from(cfg.stack_size()),
+                is_writable: true,
+                initialize_with: None,
+            });
+        }
 
         Ok(SandboxProgram(Arc::new(SandboxProgramInner {
-            memfd,
-            memory_config: cfg,
-            code_range,
+            memory_map,
+            shm_code,
+            shm_jump_table: init.jump_table.0,
+            code_length,
+            sysreturn_address: init.sysreturn_address,
         })))
     }
 
-    fn spawn(config: &SandboxConfig) -> Result<Self, Error> {
+    fn spawn(global: &Self::GlobalState, config: &SandboxConfig) -> Result<Self, Error> {
         let sigset = Sigmask::block_all_signals()?;
         let zygote_memfd = prepare_zygote()?;
         let (vmctx_memfd, vmctx_mmap) = prepare_vmctx()?;
+        let (memory_memfd, memory_mmap) = prepare_memory()?;
         let (socket, child_socket) = linux_raw::sys_socketpair(linux_raw::AF_UNIX, linux_raw::SOCK_SEQPACKET | linux_raw::SOCK_CLOEXEC, 0)?;
         let (lifetime_pipe_host, lifetime_pipe_child) = linux_raw::sys_pipe2(linux_raw::O_CLOEXEC)?;
 
@@ -1212,7 +1319,10 @@ impl super::Sandbox for Sandbox {
         }
 
         linux_raw::sendfd(socket.borrow(), lifetime_pipe_child.borrow())?;
+        linux_raw::sendfd(socket.borrow(), global.shared_memory.fd())?;
+        linux_raw::sendfd(socket.borrow(), memory_memfd.borrow())?;
         lifetime_pipe_child.close()?;
+        socket.close()?;
 
         // Wait until the child process receives the vmctx memfd.
         wait_for_futex(vmctx, &mut child, VMCTX_FUTEX_BUSY, VMCTX_FUTEX_INIT)?;
@@ -1261,18 +1371,20 @@ impl super::Sandbox for Sandbox {
         Ok(Sandbox {
             _lifetime_pipe: lifetime_pipe_host,
             vmctx_mmap,
+            memory_mmap,
             child,
-            socket,
 
             count_wait_loop_start: 0,
             count_futex_wait: 0,
 
             module: None,
             gas_metering: None,
+
+            shm_memory_map: None,
         })
     }
 
-    fn execute(&mut self, mut args: ExecuteArgs) -> Result<(), ExecutionError<Self::Error>> {
+    fn execute(&mut self, global: &Self::GlobalState, mut args: ExecuteArgs) -> Result<(), ExecutionError<Self::Error>> {
         self.wait_if_necessary(match args.hostcall_handler {
             Some(ref mut hostcall_handler) => Some(&mut *hostcall_handler),
             None => None,
@@ -1284,15 +1396,40 @@ impl super::Sandbox for Sandbox {
 
         unsafe {
             if let Some(module) = args.module {
+                let compiled_module = Self::downcast_module(module);
+                let program = &compiled_module.sandbox_program.0;
+
+                let Some(memory_map) = global.shared_memory.alloc(core::mem::size_of::<VmMap>() * program.memory_map.len()) else {
+                    return Err(Error::from_str("out of shared memory").into());
+                };
+
                 args.flags |= polkavm_common::zygote::VM_RPC_FLAG_RECONFIGURE;
 
-                let compiled_module = Self::as_compiled_module(module);
-                let program = &compiled_module.sandbox_program;
-                *self.vmctx().memory_config.get() = program.0.memory_config.clone();
+                for (chunk, vm_map) in program.memory_map.iter().zip(memory_map.as_typed_slice_mut::<VmMap>().iter_mut()) {
+                    *vm_map = VmMap {
+                        address: chunk.address,
+                        length: chunk.length,
+                        shm_offset: chunk.initialize_with.as_ref().map_or(u64::MAX, |alloc| alloc.offset() as u64),
+                        is_writable: chunk.is_writable,
+                    };
+                }
+
                 *self.vmctx().heap_info.heap_top.get() = u64::from(module.memory_map().heap_base());
                 *self.vmctx().heap_info.heap_threshold.get() = u64::from(module.memory_map().rw_data_range().end);
+                *self.vmctx().heap_base.get() = module.memory_map().heap_base();
+                *self.vmctx().heap_initial_threshold.get() = module.memory_map().rw_data_range().end;
+                *self.vmctx().heap_max_size.get() = module.memory_map().max_heap_size();
+                *self.vmctx().page_size.get() = module.memory_map().page_size();
+                *self.vmctx().shm_memory_map_offset.get() = memory_map.offset() as u64;
+                *self.vmctx().shm_memory_map_count.get() = program.memory_map.len() as u64;
+                *self.vmctx().shm_code_offset.get() = program.shm_code.offset() as u64;
+                *self.vmctx().shm_code_length.get() = program.shm_code.len() as u64;
+                *self.vmctx().shm_jump_table_offset.get() = program.shm_jump_table.offset() as u64;
+                *self.vmctx().shm_jump_table_length.get() = program.shm_jump_table.len() as u64;
+                *self.vmctx().sysreturn_address.get() = program.sysreturn_address;
                 self.gas_metering = module.gas_metering();
                 self.module = Some(module.clone());
+                self.shm_memory_map = Some(memory_map);
             }
 
             if let Some(gas) = crate::sandbox::get_gas(&args, self.gas_metering) {
@@ -1300,7 +1437,7 @@ impl super::Sandbox for Sandbox {
             }
 
             *self.vmctx().rpc_address.get() = args.entry_point.map_or(0, |entry_point|
-                Self::as_compiled_module(self.module.as_ref().unwrap()).export_trampolines.get(&entry_point).copied().unwrap_or(0) as usize
+                Self::downcast_module(self.module.as_ref().unwrap()).export_trampolines.get(&entry_point).copied().unwrap_or(0) as usize
             ) as u64;
 
             *self.vmctx().rpc_flags.get() = args.flags;
@@ -1312,12 +1449,6 @@ impl super::Sandbox for Sandbox {
 
             self.vmctx().futex.store(VMCTX_FUTEX_BUSY, Ordering::Release);
             linux_raw::sys_futex_wake_one(&self.vmctx().futex)?;
-
-            if let Some(module) = args.module {
-                let compiled_module = Self::as_compiled_module(module);
-                // TODO: This can block forever.
-                linux_raw::sendfd(self.socket.borrow(), compiled_module.sandbox_program.0.memfd.borrow())?;
-            }
         }
 
         if !args.is_async {
@@ -1449,9 +1580,6 @@ impl Sandbox {
                 return Err(Error::from_str("internal error: unexpected worker process state").into());
             }
 
-            // We're going to be waiting anyway, so do some useful work if we can.
-            cache_program_memfd_if_necessary();
-
             for _ in 0..yield_target {
                 let _ = linux_raw::sys_sched_yield();
                 if self.vmctx().futex.load(Ordering::Relaxed) != VMCTX_FUTEX_BUSY {
@@ -1499,6 +1627,8 @@ impl Sandbox {
         if self.vmctx().futex.load(Ordering::Relaxed) != VMCTX_FUTEX_IDLE {
             self.wait(hostcall_handler, low_latency)?;
         }
+
+        self.shm_memory_map.take();
 
         Ok(())
     }
@@ -1657,7 +1787,7 @@ impl<'a> Access<'a> for SandboxAccess<'a> {
     }
 
     fn heap_size(&self) -> u32 {
-        let heap_base = unsafe { (*self.sandbox.vmctx().memory_config.get()).memory_map.heap_base() };
+        let heap_base = unsafe { *self.sandbox.vmctx().heap_base.get() };
         let heap_top = unsafe { *self.sandbox.vmctx().heap_info().heap_top.get() };
         (heap_top - u64::from(heap_base)) as u32
     }

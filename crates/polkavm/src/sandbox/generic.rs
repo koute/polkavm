@@ -1,7 +1,6 @@
 #![allow(clippy::manual_range_contains)]
 
 use polkavm_common::{
-    abi::MemoryMap,
     error::{ExecutionError, Trap},
     program::Reg,
     utils::{align_to_next_page_usize, byte_slice_init, Access, AsUninitSliceMut, Gas},
@@ -9,7 +8,6 @@ use polkavm_common::{
         AddressTable,
         AddressTableRaw,
         CacheAligned,
-        SandboxMemoryConfig,
         VM_ADDR_JUMP_TABLE,
         VM_ADDR_JUMP_TABLE_RETURN_TO_HOST,
         VM_SANDBOX_MAXIMUM_NATIVE_CODE_SIZE,
@@ -28,10 +26,38 @@ use core::sync::atomic::{AtomicUsize, Ordering};
 use std::borrow::Cow;
 use std::sync::Arc;
 
-use super::{SandboxKind, SandboxInit, SandboxVec, get_native_page_size};
+use super::{SandboxKind, SandboxInit, get_native_page_size, WorkerCache, WorkerCacheKind};
 use crate::api::{BackendAccess, CompiledModuleKind, MemoryAccessError, Module, HostcallHandler};
+use crate::config::Config;
 use crate::compiler::CompiledModule;
-use crate::mutex::Mutex;
+
+#[repr(transparent)]
+struct Cast<T, U>(T, core::marker::PhantomData<U>);
+
+impl Cast<u32, usize> {
+    #[inline]
+    fn get(self) -> usize {
+        const _: () = {
+            assert!(core::mem::size_of::<usize>() >= core::mem::size_of::<u32>());
+        };
+
+        self.0 as usize
+    }
+}
+
+impl core::ops::Add<Cast<u32, usize>> for usize {
+    type Output = usize;
+
+    #[inline]
+    fn add(self, rhs: Cast<u32, usize>) -> usize {
+        self + rhs.get()
+    }
+}
+
+#[inline]
+fn to_usize<T>(value: T) -> Cast<T, usize> {
+    Cast(value, core::marker::PhantomData)
+}
 
 // On Linux don't depend on the `libc` crate to lower the number of dependencies.
 #[cfg(target_os = "linux")]
@@ -448,7 +474,12 @@ struct VmCtx {
     gas: i64,
 
     heap_info: HeapInfo,
-    memory_map: MemoryMap,
+    heap_base: u32,
+    heap_initial_threshold: u32,
+    heap_max_size: u32,
+    heap_map_index: usize,
+    page_size: u32,
+    maps: Vec<ProgramMap>,
 
     program_range: Range<u64>,
     trap_kind: TrapKind,
@@ -472,7 +503,12 @@ impl VmCtx {
                 heap_top: 0,
                 heap_threshold: 0,
             },
-            memory_map: MemoryMap::empty(),
+            heap_base: 0,
+            heap_initial_threshold: 0,
+            heap_max_size: 0,
+            heap_map_index: 0,
+            page_size: 0,
+            maps: Vec::new(),
             gas: 0,
             regs: CacheAligned([0; REG_COUNT]),
             hostcall_handler: None,
@@ -490,6 +526,15 @@ impl VmCtx {
 
 // Make sure it fits within a single page on amd64.
 polkavm_common::static_assert!(core::mem::size_of::<VmCtx>() <= 4096);
+
+pub struct GlobalState {
+}
+
+impl GlobalState {
+    pub fn new(_config: &Config) -> Result<Self, Error> {
+        Ok(GlobalState {})
+    }
+}
 
 #[derive(Default)]
 pub struct SandboxConfig {
@@ -573,30 +618,38 @@ unsafe extern "C" fn syscall_return() -> ! {
 }
 
 unsafe fn sbrk(vmctx: &mut VmCtx, pending_heap_top: u64) -> Result<Option<u32>, ()> {
-    if pending_heap_top > u64::from(vmctx.memory_map.heap_base() + vmctx.memory_map.max_heap_size()) {
+    if pending_heap_top > u64::from(vmctx.heap_base) + u64::from(vmctx.heap_max_size) {
         return Ok(None);
     }
 
-    let Some(start) = align_to_next_page_usize(vmctx.memory_map.page_size() as usize, vmctx.heap_info.heap_top as usize) else { return Err(()); };
-    let Some(end) = align_to_next_page_usize(vmctx.memory_map.page_size() as usize, pending_heap_top as usize) else { return Err(()); };
+    let Some(start) = align_to_next_page_usize(vmctx.page_size as usize, vmctx.heap_info.heap_top as usize) else { return Err(()); };
+    let Some(end) = align_to_next_page_usize(vmctx.page_size as usize, pending_heap_top as usize) else { return Err(()); };
 
     let size = end - start;
     if size > 0 {
         let guest_memory_base = (vmctx as *mut VmCtx).cast::<u8>().offset(-GUEST_MEMORY_TO_VMCTX_OFFSET);
-        let pointer = sys::mmap(
-            guest_memory_base.add(start).cast::<core::ffi::c_void>(),
-            end - start,
+        let pointer = guest_memory_base.add(start);
+        log::trace!("sbrk: mapping 0x{:x}-0x{:x} (0x{:x}-0x{:x}) (0x{:x})", pointer as usize, pointer as usize + size, start, end, size);
+
+        let result = sys::mmap(
+            pointer.cast::<core::ffi::c_void>(),
+            size,
             sys::PROT_READ | sys::PROT_WRITE,
             sys::MAP_FIXED | sys::MAP_PRIVATE | sys::MAP_ANONYMOUS,
             -1,
             0,
         );
 
-        if pointer == sys::MAP_FAILED {
+        if result == sys::MAP_FAILED {
             log::error!("sbrk mmap failed!");
             return Err(());
         }
     }
+
+    debug_assert!(matches!(vmctx.maps[vmctx.heap_map_index].kind, MapKind::Transient));
+    vmctx.maps[vmctx.heap_map_index].length = ((end as u64) - u64::from(vmctx.heap_initial_threshold)) as u32;
+
+    log::trace!("sbrk: heap memory range: 0x{:x}-0x{:x}", vmctx.maps[vmctx.heap_map_index].address, vmctx.maps[vmctx.heap_map_index].address + vmctx.maps[vmctx.heap_map_index].length);
 
     vmctx.heap_info.heap_top = pending_heap_top;
     vmctx.heap_info.heap_threshold = end as u64;
@@ -621,11 +674,24 @@ unsafe extern "C" fn syscall_sbrk(pending_heap_top: u64) -> u32 {
 #[derive(Clone)]
 pub struct SandboxProgram(Arc<SandboxProgramInner>);
 
-struct SandboxProgramInner {
-    memory_config: SandboxMemoryConfig,
-    ro_data: Vec<u8>,
-    rw_data: Vec<u8>,
+#[derive(Clone)]
+enum MapKind {
+    Zeroed,
+    Transient,
+    Initialized(Arc<[u8]>),
+}
 
+#[derive(Clone)]
+struct ProgramMap {
+    address: u32,
+    length: u32,
+    is_writable: bool,
+    kind: MapKind,
+}
+
+struct SandboxProgramInner {
+    memory_map: Vec<ProgramMap>,
+    heap_map_index: usize,
     code_memory: Mmap,
     code_length: usize,
 }
@@ -682,101 +748,109 @@ impl Sandbox {
             0
         )?;
 
+        self.vmctx_mut().maps.clear();
+        self.vmctx_mut().heap_info.heap_top = 0;
+        self.vmctx_mut().heap_info.heap_threshold = 0;
+        self.vmctx_mut().heap_base = 0;
+        self.vmctx_mut().heap_initial_threshold = 0;
+        self.vmctx_mut().heap_max_size = 0;
+        self.vmctx_mut().heap_map_index = 0;
+        self.vmctx_mut().page_size = 0;
+
         if let Some(program) = program {
             if let Some(program) = Arc::into_inner(program.0) {
                 program.code_memory.unmap()?;
             }
         }
 
-        self.vmctx_mut().heap_info.heap_top = 0;
-        self.vmctx_mut().heap_info.heap_threshold = 0;
-        self.vmctx_mut().memory_map = MemoryMap::empty();
-
         Ok(())
     }
 
     fn force_reset_memory(&mut self) -> Result<(), Error> {
-        let Some(ref program) = self.program else { return Ok(()) };
-        let program = &program.0;
-        let memory_map = program.memory_config.memory_map.clone();
-
         log::trace!("Resetting memory");
-        log::trace!("  Read-write data: 0x{:x}..0x{:x}", memory_map.rw_data_address(), memory_map.rw_data_range().end);
 
-        let rw_data_size = memory_map.rw_data_size() as usize;
-        if rw_data_size > 0 {
-            let offset = self.guest_memory_offset + memory_map.rw_data_address() as usize;
-            assert!(program.rw_data.len() <= rw_data_size);
+        {
+            // SAFETY: `memory` is always valid and contains a valid `VmCtx`.
+            let maps = unsafe {
+                &mut (*vmctx_mut_ptr(&mut self.memory)).maps
+            };
 
-            let copy_range = offset..offset + program.rw_data.len();
-            self.memory.as_slice_mut()[copy_range.clone()].copy_from_slice(&program.rw_data);
-            log::trace!("    ...copy: 0x{:x}..0x{:x}", copy_range.start - self.guest_memory_offset, copy_range.end - self.guest_memory_offset);
+            for map in maps {
+                if map.length == 0 {
+                    continue;
+                }
 
-            let native_page_size = get_native_page_size();
-            let offset_to_next_native_page = align_to_next_page_usize(native_page_size, offset + program.rw_data.len()).unwrap();
+                let offset = self.guest_memory_offset + to_usize(map.address);
+                let length = to_usize(map.length).get();
+                match map.kind {
+                    MapKind::Initialized(ref initialize_with) => {
+                        if !map.is_writable {
+                            continue;
+                        }
 
-            let fill_range = offset + program.rw_data.len()..offset_to_next_native_page;
-            self.memory.as_slice_mut()[fill_range.clone()].fill(0);
-            log::trace!("    ...fill: 0x{:x}..0x{:x}", fill_range.start - self.guest_memory_offset, fill_range.end - self.guest_memory_offset);
+                        log::trace!("  Initializing: 0x{:x}..0x{:x}", offset, offset + length);
 
-            let bss_size = memory_map.rw_data_size() as usize - (offset_to_next_native_page - offset);
-            if bss_size > 0 {
-                log::trace!("    ...mmap: 0x{:x}..0x{:x}", offset_to_next_native_page - self.guest_memory_offset, offset_to_next_native_page + bss_size - self.guest_memory_offset);
-                self.memory.mmap_within(
-                    offset_to_next_native_page,
-                    bss_size,
-                    PROT_READ | PROT_WRITE
-                )?;
+                        // SAFETY: Both pointers are valid.
+                        // NOTE: We can't use `as_slice_mut` as that would return a slice to the whole chunk of memory,
+                        //       which would include the vmctx to which we're currently holding a reference.
+                        unsafe {
+                            core::ptr::copy(initialize_with.as_ptr(), self.memory.as_mut_ptr().cast::<u8>().add(offset), initialize_with.len());
+                        }
+                    },
+                    MapKind::Zeroed => {
+                        if !map.is_writable {
+                            continue;
+                        }
+
+                        log::trace!("  Clearing: 0x{:x}..0x{:x}", offset, offset + length);
+                        self.memory.mmap_within(
+                            offset,
+                            length,
+                            PROT_READ | PROT_WRITE
+                        )?;
+                    },
+                    MapKind::Transient => {
+                        log::trace!("  Clearing transient: 0x{:x}..0x{:x}", offset, offset + length);
+                        self.memory.mmap_within(
+                            offset,
+                            length,
+                            0
+                        )?;
+
+                        map.length = 0;
+                    }
+                }
             }
         }
 
-        let stack_size = memory_map.stack_size() as usize;
-        if stack_size > 0 {
-            self.memory.mmap_within(
-                self.guest_memory_offset + memory_map.stack_address_low() as usize,
-                stack_size,
-                PROT_READ | PROT_WRITE
-            )?;
-        }
-
-        let initial_heap_threshold = u64::from(memory_map.rw_data_range().end);
-        let heap_top = self.vmctx().heap_info.heap_top;
-        log::trace!("  Heap: 0x{:x}..0x{:x}", memory_map.heap_base(), heap_top);
-        if heap_top > initial_heap_threshold {
-            log::trace!("    ..mmap:: 0x{:x}..0x{:x}", initial_heap_threshold, heap_top);
-            self.memory.mmap_within(
-                self.guest_memory_offset + initial_heap_threshold as usize,
-                heap_top as usize - initial_heap_threshold as usize,
-                0
-            )?;
-        }
-
-        self.vmctx_mut().heap_info.heap_top = u64::from(program.memory_config.memory_map.heap_base());
-        self.vmctx_mut().heap_info.heap_threshold = initial_heap_threshold;
+        let heap_base = self.vmctx().heap_base;
+        let heap_initial_threshold = self.vmctx().heap_initial_threshold;
+        self.vmctx_mut().heap_info.heap_top = heap_base.into();
+        self.vmctx_mut().heap_info.heap_threshold = heap_initial_threshold.into();
 
         Ok(())
     }
 
-    fn bound_check_access(&self, address: u32, length: u32) -> Result<(), ()> {
-        let memory_map = self.vmctx().memory_map.clone();
-
-        let (start, region_length) = if address >= memory_map.stack_address_low() {
-            (memory_map.stack_address_low(), memory_map.stack_size())
-        } else if address >= memory_map.rw_data_address() {
-            let heap_threshold = self.vmctx().heap_info.heap_threshold as u32;
-            if heap_threshold == 0 {
-                (memory_map.rw_data_address(), memory_map.rw_data_size())
-            } else {
-                (memory_map.rw_data_address(), heap_threshold - memory_map.rw_data_address())
-            }
-        } else if address >= memory_map.ro_data_address() {
-            (memory_map.ro_data_address(), memory_map.ro_data_size())
-        } else {
-            return Err(());
-        };
-
+    fn bound_check_access(&self, mut address: u32, mut length: u32) -> Result<(), ()> {
         let Some(address_end) = address.checked_add(length) else { return Err(()) };
-        if address_end <= (start + region_length) {
+
+        for map in &self.vmctx().maps {
+            if address < map.address {
+                return Err(());
+            }
+
+            let map_end = map.address + map.length;
+            if address >= map_end {
+                continue;
+            } else if address_end <= map_end {
+                return Ok(());
+            }
+
+            length -= map_end - address;
+            address = map_end;
+        }
+
+        if length == 0 {
             Ok(())
         } else {
             Err(())
@@ -797,73 +871,55 @@ impl Sandbox {
 
     fn execute_impl(&mut self, mut args: ExecuteArgs) -> Result<(), ExecutionError<Error>> {
         if let Some(module) = args.module {
-            let compiled_module = <Self as crate::sandbox::Sandbox>::as_compiled_module(module);
+            let compiled_module = <Self as crate::sandbox::Sandbox>::downcast_module(module);
             let program = &compiled_module.sandbox_program.0;
 
             log::trace!("Reconfiguring sandbox...");
             self.clear_program()?;
 
-            let new = &program.memory_config;
-            if new.memory_map.ro_data_size() > 0 {
-                let offset = self.guest_memory_offset + new.memory_map.ro_data_address() as usize;
-                let length = new.memory_map.ro_data_size() as usize;
-                assert!(program.ro_data.len() <= length);
+            for map in &program.memory_map {
+                if map.length > 0 {
+                    let mut protection = PROT_READ;
+                    if map.is_writable {
+                        protection |= PROT_WRITE;
+                    }
 
-                self.memory.modify_and_protect(offset, length, PROT_READ, |slice| {
-                    slice[..program.ro_data.len()].copy_from_slice(&program.ro_data);
-                })?;
+                    let offset = self.guest_memory_offset + to_usize(map.address);
+                    let length = to_usize(map.length).get();
+                    self.memory.modify_and_protect(offset, length, protection, |slice| {
+                        match map.kind {
+                            MapKind::Initialized(ref initialize_with) => {
+                                slice.copy_from_slice(initialize_with);
+                            },
+                            MapKind::Zeroed | MapKind::Transient => {
+                                slice.fill(0);
+                            }
+                        }
+                    })?;
 
-                let memory_address = self.memory.as_ptr() as usize + offset;
-                log::trace!(
-                    "  New rodata range: 0x{:x}-0x{:x} (0x{:x}-0x{:x}) (0x{:x})",
-                    memory_address,
-                    memory_address + length,
-                    new.memory_map.ro_data_address(),
-                    new.memory_map.ro_data_address() + new.memory_map.ro_data_size(),
-                    new.memory_map.ro_data_size()
-                );
+                    let memory_address = self.memory.as_ptr() as usize + offset;
+                    log::trace!(
+                        "  New accessible range: 0x{:x}-0x{:x} (0x{:x}-0x{:x}) (0x{:x}){}{}",
+                        memory_address,
+                        memory_address + length,
+                        to_usize(map.address).get(),
+                        to_usize(map.address).get() + length,
+                        length,
+                        if !map.is_writable { " [RO]" } else { "" },
+                        if matches!(map.kind, MapKind::Initialized(..)) { " [INIT]" } else { "" },
+                    );
+                }
+
+                self.vmctx_mut().maps.push(map.clone());
             }
 
-            if new.memory_map.rw_data_size() > 0 {
-                let offset = self.guest_memory_offset + new.memory_map.rw_data_address() as usize;
-                let length = new.memory_map.rw_data_size() as usize;
-                assert!(program.rw_data.len() <= length);
-
-                self.memory.modify_and_protect(offset, length, PROT_READ | PROT_WRITE, |slice| {
-                    slice[..program.rw_data.len()].copy_from_slice(&program.rw_data);
-                })?;
-
-                let memory_address = self.memory.as_ptr() as usize + offset;
-                log::trace!(
-                    "  New rwdata range: 0x{:x}-0x{:x} (0x{:x}-0x{:x}) (0x{:x})",
-                    memory_address,
-                    memory_address + length,
-                    new.memory_map.rw_data_address(),
-                    new.memory_map.rw_data_address() + new.memory_map.rw_data_size(),
-                    new.memory_map.rw_data_size()
-                );
-            }
-
-            if new.memory_map.stack_size() > 0 {
-                let offset = self.guest_memory_offset + new.memory_map.stack_address_low() as usize;
-                let length = new.memory_map.stack_size() as usize;
-
-                self.memory.mprotect(offset, length, PROT_READ | PROT_WRITE)?;
-
-                let memory_address = self.memory.as_ptr() as usize + offset;
-                log::trace!(
-                    "  New stack range: 0x{:x}-0x{:x} (0x{:x}-0x{:x}) (0x{:x})",
-                    memory_address,
-                    memory_address + length,
-                    new.memory_map.stack_address_low(),
-                    new.memory_map.stack_address_low() + new.memory_map.stack_size(),
-                    new.memory_map.stack_size()
-                );
-            }
-
-            self.vmctx_mut().heap_info.heap_top = u64::from(program.memory_config.memory_map.heap_base());
-            self.vmctx_mut().heap_info.heap_threshold = u64::from(new.memory_map.rw_data_range().end);
-            self.vmctx_mut().memory_map = new.memory_map.clone();
+            self.vmctx_mut().heap_info.heap_top = u64::from(module.memory_map().heap_base());
+            self.vmctx_mut().heap_info.heap_threshold = u64::from(module.memory_map().rw_data_range().end);
+            self.vmctx_mut().heap_base = module.memory_map().heap_base();
+            self.vmctx_mut().heap_initial_threshold = module.memory_map().rw_data_range().end;
+            self.vmctx_mut().heap_max_size = module.memory_map().max_heap_size();
+            self.vmctx_mut().heap_map_index = program.heap_map_index;
+            self.vmctx_mut().page_size = module.memory_map().page_size();
 
             self.program = Some(SandboxProgram(Arc::clone(program)));
             self.module = Some(module.clone());
@@ -895,7 +951,7 @@ impl Sandbox {
 
         let mut trap_kind = TrapKind::None;
         if let Some(entry_point) = args.entry_point {
-            let entry_point = <Self as crate::sandbox::Sandbox>::as_compiled_module(self.module.as_ref().unwrap()).export_trampolines.get(&entry_point).copied().unwrap_or(0) as usize;
+            let entry_point = <Self as crate::sandbox::Sandbox>::downcast_module(self.module.as_ref().unwrap()).export_trampolines.get(&entry_point).copied().unwrap_or(0) as usize;
 
             {
                 let Some(program) = self.program.as_ref() else {
@@ -1010,39 +1066,58 @@ impl super::Sandbox for Sandbox {
     type Error = Error;
     type Program = SandboxProgram;
     type AddressSpace = Mmap;
+    type GlobalState = GlobalState;
+    type JumpTable = Vec<usize>;
 
-    fn as_sandbox_vec(vec: &SandboxVec) -> &Mutex<Vec<Self>> {
-        #[allow(clippy::match_wildcard_for_single_variants)]
-        match vec {
-            SandboxVec::Generic(ref vec) => vec,
-            _ => unreachable!(),
-        }
-    }
-
-    fn as_compiled_module(module: &Module) -> &CompiledModule<Self> {
+    fn downcast_module(module: &Module) -> &CompiledModule<Self> {
         match module.compiled_module() {
             CompiledModuleKind::Generic(ref module) => module,
             _ => unreachable!(),
         }
     }
 
+    fn downcast_global_state(global: &crate::sandbox::GlobalStateKind) -> &Self::GlobalState {
+        #[allow(clippy::match_wildcard_for_single_variants)]
+        match global {
+            crate::sandbox::GlobalStateKind::Generic(global) => global,
+            _ => unreachable!(),
+        }
+    }
+
+    fn downcast_worker_cache(cache: &WorkerCacheKind) -> &WorkerCache<Self> {
+        #[allow(clippy::match_wildcard_for_single_variants)]
+        match cache {
+            crate::sandbox::WorkerCacheKind::Generic(ref cache) => cache,
+            _ => unreachable!(),
+        }
+    }
+
+    fn allocate_jump_table(_global: &Self::GlobalState, count: usize) -> Result<Self::JumpTable, Self::Error> {
+        // TODO: Cache this and don't unnecessarily double-initialize it.
+        Ok(vec![0; count])
+    }
+
     fn reserve_address_space() -> Result<Self::AddressSpace, Self::Error> {
         Mmap::reserve_address_space(VM_SANDBOX_MAXIMUM_NATIVE_CODE_SIZE as usize + VM_SANDBOX_MAXIMUM_JUMP_TABLE_VIRTUAL_SIZE as usize)
     }
 
-    fn prepare_program(init: SandboxInit, mut map: Self::AddressSpace) -> Result<Self::Program, Self::Error> {
+    fn prepare_program(_global: &Self::GlobalState, init: SandboxInit<Self>, mut map: Self::AddressSpace) -> Result<Self::Program, Self::Error> {
         let native_page_size = get_native_page_size();
-        let cfg = init.memory_config(native_page_size)?;
+        let cfg = init.guest_init.memory_map()?;
+        let jump_table = crate::utils::as_bytes(&init.jump_table);
 
-        let jump_table_offset = cfg.code_size as usize;
+        let code_size = align_to_next_page_usize(native_page_size, init.code.len()).unwrap();
+        let jump_table_size = align_to_next_page_usize(native_page_size, jump_table.len()).unwrap();
+
+        let jump_table_offset = code_size as usize;
         let sysreturn_offset = jump_table_offset + (VM_ADDR_JUMP_TABLE_RETURN_TO_HOST - VM_ADDR_JUMP_TABLE) as usize;
 
-        map.modify_and_protect(0, cfg.code_size as usize, PROT_EXEC, |slice| {
+        map.modify_and_protect(0, code_size as usize, PROT_EXEC, |slice| {
             slice[..init.code.len()].copy_from_slice(init.code);
         })?;
 
-        map.modify_and_protect(jump_table_offset, cfg.jump_table_size as usize, PROT_READ, |slice| {
-            slice[..init.jump_table.len()].copy_from_slice(init.jump_table);
+        map.modify_and_protect(jump_table_offset, jump_table_size as usize, PROT_READ, |slice| {
+            slice[..jump_table.len()].copy_from_slice(jump_table);
         })?;
 
         map.modify_and_protect(sysreturn_offset, native_page_size, PROT_READ, |slice| {
@@ -1051,34 +1126,115 @@ impl super::Sandbox for Sandbox {
 
         log::trace!(
             "New code range: 0x{:x}-0x{:x} (0x{:x})",
-            map.as_ptr() as u64,
-            map.as_ptr() as u64 + u64::from(cfg.code_size),
-            cfg.code_size
+            map.as_ptr() as usize,
+            map.as_ptr() as usize + code_size,
+            code_size
         );
 
         log::trace!(
             "New jump table range: 0x{:x}-0x{:x} (0x{:x})",
-            map.as_ptr() as u64 + jump_table_offset as u64,
-            map.as_ptr() as u64 + jump_table_offset as u64 + u64::from(cfg.jump_table_size),
-            cfg.jump_table_size
+            map.as_ptr() as usize + jump_table_offset,
+            map.as_ptr() as usize + jump_table_offset + jump_table_size,
+            jump_table_size
         );
 
         log::trace!(
             "New sysreturn address: 0x{:x} (set at 0x{:x})",
             init.sysreturn_address,
-            map.as_ptr() as u64 + sysreturn_offset as u64
+            map.as_ptr() as usize + sysreturn_offset
         );
 
+        let mut memory_map = Vec::new();
+        if cfg.ro_data_size() > 0 {
+            let mut ro_data = init.guest_init.ro_data.to_vec();
+            let physical_size = align_to_next_page_usize(native_page_size, ro_data.len()).unwrap();
+            ro_data.resize(physical_size, 0);
+            let physical_size = physical_size.try_into().expect("overflow");
+
+            let virtual_size = cfg.ro_data_size();
+            if physical_size > 0 {
+                memory_map.push(ProgramMap {
+                    address: cfg.ro_data_address(),
+                    length: physical_size,
+                    is_writable: false,
+                    kind: MapKind::Initialized(ro_data.into()),
+                });
+            }
+
+            let padding = virtual_size - physical_size;
+            if padding > 0 {
+                memory_map.push(ProgramMap {
+                    address: cfg.ro_data_address() + physical_size,
+                    length: padding,
+                    is_writable: false,
+                    kind: MapKind::Zeroed,
+                });
+            }
+        }
+
+        if cfg.rw_data_size() > 0 {
+            let mut rw_data = init.guest_init.rw_data.to_vec();
+            let physical_size = align_to_next_page_usize(native_page_size, rw_data.len()).unwrap();
+            rw_data.resize(physical_size, 0);
+            let physical_size = physical_size.try_into().expect("overflow");
+
+            let virtual_size = cfg.rw_data_size();
+            if physical_size > 0 {
+                memory_map.push(ProgramMap {
+                    address: cfg.rw_data_address(),
+                    length: physical_size,
+                    is_writable: true,
+                    kind: MapKind::Initialized(rw_data.into()),
+                });
+            }
+
+            let padding = virtual_size - physical_size;
+            if padding > 0 {
+                memory_map.push(ProgramMap {
+                    address: cfg.rw_data_address() + physical_size,
+                    length: padding,
+                    is_writable: true,
+                    kind: MapKind::Zeroed,
+                });
+            }
+        }
+
+        let heap_map_index = memory_map.len();
+
+        // Reserve entry for the heap.
+        memory_map.push(ProgramMap {
+            address: cfg.rw_data_range().end,
+            length: 0,
+            is_writable: true,
+            kind: MapKind::Transient,
+        });
+
+        if cfg.stack_size() > 0 {
+            memory_map.push(ProgramMap {
+                address: cfg.stack_address_low(),
+                length: cfg.stack_size(),
+                is_writable: true,
+                kind: MapKind::Zeroed,
+            });
+        }
+
+        // Make sure the map is sorted.
+        assert!(memory_map.windows(2).all(|pair| {
+            matches!(
+                (pair[0].address + pair[0].length).cmp(&pair[1].address),
+                core::cmp::Ordering::Less | core::cmp::Ordering::Equal
+            )
+        }));
+
         Ok(SandboxProgram(Arc::new(SandboxProgramInner {
-            memory_config: cfg,
-            ro_data: init.guest_init.ro_data.to_vec(),
-            rw_data: init.guest_init.rw_data.to_vec(),
+            memory_map,
+            heap_map_index,
             code_memory: map,
             code_length: init.code.len(),
         })))
     }
 
-    fn spawn(_config: &SandboxConfig) -> Result<Self, Error> {
+    fn spawn(_global: &Self::GlobalState, _config: &SandboxConfig) -> Result<Self, Error> {
         register_signal_handlers_if_necessary()?;
 
         let guest_memory_offset = get_guest_memory_offset();
@@ -1102,7 +1258,7 @@ impl super::Sandbox for Sandbox {
         })
     }
 
-    fn execute(&mut self, args: ExecuteArgs) -> Result<(), ExecutionError<Self::Error>> {
+    fn execute(&mut self, _global: &Self::GlobalState, args: ExecuteArgs) -> Result<(), ExecutionError<Self::Error>> {
         if !matches!(self.poison, Poison::None) {
             return Err(ExecutionError::Error("sandbox has been poisoned".into()));
         }
@@ -1256,8 +1412,7 @@ impl<'a> Access<'a> for SandboxAccess<'a> {
     }
 
     fn heap_size(&self) -> u32 {
-        let Some(program) = self.sandbox.program.as_ref() else { return 0 };
-        let heap_base = program.0.memory_config.memory_map.heap_base();
+        let heap_base = self.sandbox.vmctx().heap_base;
         let heap_top = self.sandbox.vmctx().heap_info.heap_top;
         (heap_top - u64::from(heap_base)) as u32
     }

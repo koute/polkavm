@@ -3,7 +3,6 @@
 //! In general everything here can be modified at will, provided the zygote
 //! is recompiled.
 
-use crate::abi::MemoryMap;
 use core::cell::UnsafeCell;
 use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64};
 
@@ -100,6 +99,12 @@ pub const VM_ADDR_NATIVE_STACK_SIZE: u64 = 0x4000;
 /// The address of the top of the native stack.
 pub const VM_ADDR_NATIVE_STACK_HIGH: u64 = VM_ADDR_NATIVE_STACK_LOW + VM_ADDR_NATIVE_STACK_SIZE;
 
+/// Address where the shared memory is mapped.
+pub const VM_ADDR_SHARED_MEMORY: u64 = 0x700000000;
+
+/// The size of the shared memory region.
+pub const VM_SHARED_MEMORY_SIZE: u64 = u32::MAX as u64;
+
 /// The maximum number of native code bytes that can be emitted by a single VM instruction.
 ///
 /// This does *not* affect the VM ABI and can be changed at will,
@@ -123,18 +128,6 @@ pub const VM_SANDBOX_MAXIMUM_JUMP_TABLE_VIRTUAL_SIZE: u64 = 0x100000000 * core::
 // TODO: Make this smaller.
 /// The maximum number of bytes the native code can be.
 pub const VM_SANDBOX_MAXIMUM_NATIVE_CODE_SIZE: u32 = 2048 * 1024 * 1024 - 1;
-
-/// The memory configuration used by a given program and/or sandbox instance.
-#[derive(Clone)]
-#[repr(C)]
-pub struct SandboxMemoryConfig {
-    pub memory_map: MemoryMap,
-    pub ro_data_fd_size: u32,
-    pub rw_data_fd_size: u32,
-    pub code_size: u32,
-    pub jump_table_size: u32,
-    pub sysreturn_address: u64,
-}
 
 /// A flag which will trigger the sandbox to reload its program before execution.
 pub const VM_RPC_FLAG_RECONFIGURE: u32 = 1 << 0;
@@ -203,6 +196,14 @@ pub struct VmCtxCounters {
     pub syscall_futex_wait: UnsafeCell<u64>,
 }
 
+#[repr(C)]
+pub struct VmMap {
+    pub address: u64,
+    pub length: u64,
+    pub shm_offset: u64,
+    pub is_writable: bool,
+}
+
 /// The virtual machine context.
 ///
 /// This is mapped in shared memory and used by the sandbox to keep its state in,
@@ -225,10 +226,34 @@ pub struct VmCtx {
     pub rpc_flags: UnsafeCell<u32>,
     /// The amount of memory to allocate.
     pub rpc_sbrk: UnsafeCell<u32>,
-    /// The memory configuration of the sandbox.
-    pub memory_config: UnsafeCell<SandboxMemoryConfig>,
     /// Whether the memory of the sandbox is dirty.
     pub is_memory_dirty: AtomicBool,
+    /// Offset in shared memory to this sandbox's memory map.
+    pub shm_memory_map_offset: UnsafeCell<u64>,
+    /// Number of maps to map.
+    pub shm_memory_map_count: UnsafeCell<u64>,
+    /// Offset in shared memory to this sandbox's code.
+    pub shm_code_offset: UnsafeCell<u64>,
+    /// Length this sandbox's code.
+    pub shm_code_length: UnsafeCell<u64>,
+    /// Offset in shared memory to this sandbox's jump table.
+    pub shm_jump_table_offset: UnsafeCell<u64>,
+    /// Length of sandbox's jump table, in bytes.
+    pub shm_jump_table_length: UnsafeCell<u64>,
+    /// Address of the sysreturn routine.
+    pub sysreturn_address: UnsafeCell<u64>,
+
+    /// Address to the base of the heap.
+    pub heap_base: UnsafeCell<u32>,
+
+    /// The initial heap growth threshold.
+    pub heap_initial_threshold: UnsafeCell<u32>,
+
+    /// The maximum heap size.
+    pub heap_max_size: UnsafeCell<u32>,
+
+    /// The page size.
+    pub page_size: UnsafeCell<u32>,
 
     /// Performance counters. Only for debugging.
     pub counters: CacheAligned<VmCtxCounters>,
@@ -270,15 +295,18 @@ impl VmCtx {
             rpc_address: UnsafeCell::new(0),
             rpc_flags: UnsafeCell::new(0),
             rpc_sbrk: UnsafeCell::new(0),
-            memory_config: UnsafeCell::new(SandboxMemoryConfig {
-                memory_map: MemoryMap::empty(),
-                ro_data_fd_size: 0,
-                rw_data_fd_size: 0,
-                code_size: 0,
-                jump_table_size: 0,
-                sysreturn_address: 0,
-            }),
             is_memory_dirty: AtomicBool::new(false),
+            shm_memory_map_offset: UnsafeCell::new(0),
+            shm_memory_map_count: UnsafeCell::new(0),
+            shm_code_offset: UnsafeCell::new(0),
+            shm_code_length: UnsafeCell::new(0),
+            shm_jump_table_offset: UnsafeCell::new(0),
+            shm_jump_table_length: UnsafeCell::new(0),
+            sysreturn_address: UnsafeCell::new(0),
+            heap_base: UnsafeCell::new(0),
+            heap_initial_threshold: UnsafeCell::new(0),
+            heap_max_size: UnsafeCell::new(0),
+            page_size: UnsafeCell::new(0),
 
             syscall_ffi: CacheAligned(VmCtxSyscall {
                 gas: UnsafeCell::new(0),
