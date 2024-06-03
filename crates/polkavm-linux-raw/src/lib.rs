@@ -198,6 +198,8 @@ pub use crate::arch_amd64_bindings::{
     ETXTBSY,
     EXDEV,
     F_ADD_SEALS,
+    F_SEAL_EXEC,
+    F_SEAL_FUTURE_WRITE,
     F_SEAL_GROW,
     F_SEAL_SEAL,
     F_SEAL_SHRINK,
