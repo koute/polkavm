@@ -69,6 +69,7 @@ fn main() {
         "ETIMEDOUT",
         "ETXTBSY",
         "EXDEV",
+        "_?UFFD.+",
     ]
     .join("|");
 
@@ -89,6 +90,7 @@ fn main() {
         "siginfo_t",
         "sigset_t",
         "timespec",
+        "uffd_msg",
     ]
     .join("|");
 
