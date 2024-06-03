@@ -25,7 +25,7 @@ impl Backend for PolkaVM {
     }
 
     fn create(&self, args: CreateArgs) -> Self::Engine {
-        let mut config = polkavm::Config::default();
+        let mut config = polkavm::Config::from_env().unwrap();
         config.set_backend(Some(self.0));
         if args.is_compile_only {
             config.set_worker_count(0);
