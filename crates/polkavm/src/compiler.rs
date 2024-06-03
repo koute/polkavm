@@ -23,7 +23,6 @@ mod amd64;
 struct CachePerCompilation {
     assembler: Assembler,
     code_offset_to_label: FlatMap<Label>,
-    native_jump_table: Vec<usize>,
     gas_metering_stub_offsets: Vec<usize>,
     gas_cost_for_basic_block: Vec<u32>,
     export_to_label: HashMap<u32, Label>,
@@ -66,7 +65,6 @@ pub(crate) struct CompilerVisitor<'a, S> where S: Sandbox {
     trap_label: Label,
 
     // Not used during compilation, but smuggled until the compilation is finished.
-    native_jump_table: Vec<usize>,
     export_trampolines: HashMap<u32, u64>,
 
     _phantom: PhantomData<S>,
@@ -122,20 +120,17 @@ impl<'a, S> CompilerVisitor<'a, S> where S: Sandbox {
         let mut gas_metering_stub_offsets: Vec<usize>;
         let mut gas_cost_for_basic_block: Vec<u32>;
         let code_offset_to_label;
-        let native_jump_table;
         let export_to_label;
 
         if let Some(per_compilation_cache) = per_compilation_cache {
             asm = per_compilation_cache.assembler;
             code_offset_to_label = FlatMap::new_reusing_memory(per_compilation_cache.code_offset_to_label, code_length);
-            native_jump_table = per_compilation_cache.native_jump_table;
             gas_metering_stub_offsets = per_compilation_cache.gas_metering_stub_offsets;
             gas_cost_for_basic_block = per_compilation_cache.gas_cost_for_basic_block;
             export_to_label = per_compilation_cache.export_to_label;
         } else {
             asm = Assembler::new();
             code_offset_to_label = FlatMap::new(code_length);
-            native_jump_table = Vec::new();
             gas_metering_stub_offsets = Vec::new();
             gas_cost_for_basic_block = Vec::new();
             export_to_label = HashMap::new();
@@ -187,7 +182,6 @@ impl<'a, S> CompilerVisitor<'a, S> where S: Sandbox {
             gas_metering_stub_offsets,
             gas_cost_for_basic_block,
             code_length,
-            native_jump_table,
             export_trampolines,
             _phantom: PhantomData,
         };
@@ -204,7 +198,10 @@ impl<'a, S> CompilerVisitor<'a, S> where S: Sandbox {
         Ok((visitor, address_space))
     }
 
-    pub(crate) fn finish_compilation(mut self, cache: &CompilerCache, address_space: S::AddressSpace) -> Result<CompiledModule<S>, Error> where S: Sandbox {
+    pub(crate) fn finish_compilation(mut self, global: &S::GlobalState, cache: &CompilerCache, address_space: S::AddressSpace) -> Result<CompiledModule<S>, Error> where S: Sandbox {
+        // Finish with a trap in case the code doesn't end with a basic block terminator.
+        ArchVisitor(&mut self).trap();
+
         let epilogue_start = self.asm.len();
         self.code_offset_to_native_code_offset.push((self.code_length, epilogue_start as u32));
         self.code_offset_to_native_code_offset.shrink_to_fit();
@@ -225,20 +222,23 @@ impl<'a, S> CompilerVisitor<'a, S> where S: Sandbox {
         let label_sysreturn = ArchVisitor(&mut self).emit_sysreturn();
         let native_code_address = self.asm.origin();
 
-        let mut native_jump_table = self.native_jump_table;
-        assert!(native_jump_table.is_empty());
-        native_jump_table.resize((self.jump_table.len() as usize + 1) * VM_CODE_ADDRESS_ALIGNMENT as usize, 0);
-        native_jump_table[..VM_CODE_ADDRESS_ALIGNMENT as usize].fill(0); // First entry is always invalid.
+        let jump_table_length = (self.jump_table.len() as usize + 1) * VM_CODE_ADDRESS_ALIGNMENT as usize;
+        let mut native_jump_table = S::allocate_jump_table(global, jump_table_length).map_err(Error::from_display)?;
+        {
+            let native_jump_table = native_jump_table.as_mut();
+            native_jump_table[..VM_CODE_ADDRESS_ALIGNMENT as usize].fill(0); // First entry is always invalid.
+            native_jump_table[jump_table_length..].fill(0); // Fill in the padding, since the size is page-aligned.
 
-        for (jump_table_index, code_offset) in self.jump_table.iter().enumerate() {
-            let mut address = 0;
-            if let Some(label) = self.code_offset_to_label.get(code_offset) {
-                if let Some(native_code_offset) = self.asm.get_label_origin_offset(label) {
-                    address = native_code_address.checked_add_signed(native_code_offset as i64).expect("overflow") as usize;
+            for (jump_table_index, code_offset) in self.jump_table.iter().enumerate() {
+                let mut address = 0;
+                if let Some(label) = self.code_offset_to_label.get(code_offset) {
+                    if let Some(native_code_offset) = self.asm.get_label_origin_offset(label) {
+                        address = native_code_address.checked_add_signed(native_code_offset as i64).expect("overflow") as usize;
+                    }
                 }
-            }
 
-            native_jump_table[(jump_table_index + 1) * VM_CODE_ADDRESS_ALIGNMENT as usize] = address;
+                native_jump_table[(jump_table_index + 1) * VM_CODE_ADDRESS_ALIGNMENT as usize] = address;
+            }
         }
 
         let mut export_trampolines = self.export_trampolines;
@@ -274,23 +274,15 @@ impl<'a, S> CompilerVisitor<'a, S> where S: Sandbox {
             }
         }
 
-        #[inline(always)]
-        fn as_bytes(slice: &[usize]) -> &[u8] {
-            // SAFETY: Casting a &[usize] into a &[u8] is always safe as `u8` doesn't have any alignment requirements.
-            unsafe {
-                core::slice::from_raw_parts(slice.as_ptr().cast(), core::mem::size_of_val(slice))
-            }
-        }
-
         let module = {
             let init = SandboxInit {
                 guest_init: self.init,
                 code: &self.asm.finalize(),
-                jump_table: as_bytes(&native_jump_table),
+                jump_table: native_jump_table,
                 sysreturn_address,
             };
 
-            let sandbox_program = S::prepare_program(init, address_space).map_err(Error::from_display)?;
+            let sandbox_program = S::prepare_program(global, init, address_space).map_err(Error::from_display)?;
             CompiledModule {
                 sandbox_program,
                 export_trampolines,
@@ -309,7 +301,6 @@ impl<'a, S> CompilerVisitor<'a, S> where S: Sandbox {
                 self.asm.clear();
                 self.code_offset_to_label.clear();
                 self.export_to_label.clear();
-                native_jump_table.clear();
                 gas_metering_stub_offsets.clear();
                 gas_cost_for_basic_block.clear();
 
@@ -317,7 +308,6 @@ impl<'a, S> CompilerVisitor<'a, S> where S: Sandbox {
                     assembler: self.asm,
                     code_offset_to_label: self.code_offset_to_label,
                     export_to_label: self.export_to_label,
-                    native_jump_table,
                     gas_metering_stub_offsets,
                     gas_cost_for_basic_block,
                 });
