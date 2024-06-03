@@ -1,6 +1,5 @@
 use alloc::borrow::Cow;
 use alloc::sync::Arc;
-use std::sync::Mutex;
 use core::sync::atomic::{AtomicUsize, Ordering};
 
 use polkavm_common::{
@@ -15,6 +14,7 @@ use polkavm_common::{
 use crate::api::{BackendAccess, EngineState, ExecuteArgs, Module};
 use crate::compiler::CompiledModule;
 use crate::config::{GasMeteringKind, SandboxKind};
+use crate::mutex::Mutex;
 use crate::utils::GuestInit;
 use crate::error::Error;
 
@@ -249,11 +249,7 @@ impl SandboxCache {
         }
 
         let sandboxes = S::as_sandbox_vec(&self.sandboxes);
-        let mut sandboxes = match sandboxes.lock() {
-            Ok(sandboxes) => sandboxes,
-            Err(poison) => poison.into_inner(),
-        };
-
+        let mut sandboxes = sandboxes.lock();
         let mut sandbox = sandboxes.pop()?;
         self.available_workers.fetch_sub(1, Ordering::Relaxed);
 
@@ -326,11 +322,7 @@ fn recycle_sandbox<S>(engine_state: &EngineState, get_sandbox: impl FnOnce() -> 
     }
 
     if let Some(sandbox) = get_sandbox() {
-        let mut sandboxes = match sandboxes.lock() {
-            Ok(sandboxes) => sandboxes,
-            Err(poison) => poison.into_inner(),
-        };
-
+        let mut sandboxes = sandboxes.lock();
         sandboxes.push(sandbox);
     } else {
         sandbox_cache.available_workers.fetch_sub(1, Ordering::Relaxed);

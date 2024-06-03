@@ -26,11 +26,12 @@ use core::ops::Range;
 use core::cell::UnsafeCell;
 use core::sync::atomic::{AtomicUsize, Ordering};
 use std::borrow::Cow;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 use super::{SandboxKind, SandboxInit, SandboxVec, get_native_page_size};
 use crate::api::{BackendAccess, CompiledModuleKind, MemoryAccessError, Module, HostcallHandler};
 use crate::compiler::CompiledModule;
+use crate::mutex::Mutex;
 
 // On Linux don't depend on the `libc` crate to lower the number of dependencies.
 #[cfg(target_os = "linux")]
