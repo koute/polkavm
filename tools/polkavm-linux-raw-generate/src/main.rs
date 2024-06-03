@@ -12,6 +12,7 @@ fn main() {
         "CLOCK_.+",
         "CLONE_.+",
         "F_.+",
+        "FALLOC_.+",
         "FUTEX_.+",
         "MADV_.+",
         "MAP_.+",

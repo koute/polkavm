@@ -26,6 +26,7 @@
 #include <linux/types.h>
 #include <linux/capability.h>
 #include <linux/wait.h>
+#include <linux/falloc.h>
 
 #define u64 __u64
 #define s64 __s64
