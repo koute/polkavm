@@ -1088,6 +1088,13 @@ pub const P_ALL: u32 = 0;
 pub const P_PID: u32 = 1;
 pub const P_PGID: u32 = 2;
 pub const P_PIDFD: u32 = 3;
+pub const FALLOC_FL_KEEP_SIZE: u32 = 1;
+pub const FALLOC_FL_PUNCH_HOLE: u32 = 2;
+pub const FALLOC_FL_NO_HIDE_STALE: u32 = 4;
+pub const FALLOC_FL_COLLAPSE_RANGE: u32 = 8;
+pub const FALLOC_FL_ZERO_RANGE: u32 = 16;
+pub const FALLOC_FL_INSERT_RANGE: u32 = 32;
+pub const FALLOC_FL_UNSHARE_RANGE: u32 = 64;
 #[test]
 fn bindgen_test_layout___kernel_old_timeval() {
     const UNINIT: ::core::mem::MaybeUninit<__kernel_old_timeval> = ::core::mem::MaybeUninit::uninit();

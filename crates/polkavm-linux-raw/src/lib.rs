@@ -85,6 +85,7 @@ pub use crate::arch_amd64_bindings::{
     __NR_dup3 as SYS_dup3,
     __NR_execveat as SYS_execveat,
     __NR_exit as SYS_exit,
+    __NR_fallocate as SYS_fallocate,
     __NR_fchdir as SYS_fchdir,
     __NR_fcntl as SYS_fcntl,
     __NR_ftruncate as SYS_ftruncate,
@@ -204,6 +205,13 @@ pub use crate::arch_amd64_bindings::{
     F_SETFL,
     F_SETOWN,
     F_SETSIG,
+    FALLOC_FL_COLLAPSE_RANGE,
+    FALLOC_FL_INSERT_RANGE,
+    FALLOC_FL_KEEP_SIZE,
+    FALLOC_FL_NO_HIDE_STALE,
+    FALLOC_FL_PUNCH_HOLE,
+    FALLOC_FL_UNSHARE_RANGE,
+    FALLOC_FL_ZERO_RANGE,
     FUTEX_WAIT,
     FUTEX_WAKE,
     iovec,
@@ -1180,6 +1188,11 @@ pub fn sys_fcntl(fd: FdRef, cmd: u32, arg: u32) -> Result<(), Error> {
 pub fn sys_close_range(first_fd: c_int, last_fd: c_int, flags: c_uint) -> Result<(), Error> {
     let result = unsafe { syscall_readonly!(SYS_close_range, first_fd, last_fd, flags) };
     Error::from_syscall("close_range", result)
+}
+
+pub fn sys_fallocate(fd: FdRef, mode: c_uint, offset: u64, length: u64) -> Result<(), Error> {
+    let result = unsafe { syscall!(SYS_fallocate, fd, mode, offset, length) };
+    Error::from_syscall("fallocate", result)
 }
 
 pub fn sys_ftruncate(fd: FdRef, length: c_ulong) -> Result<(), Error> {
