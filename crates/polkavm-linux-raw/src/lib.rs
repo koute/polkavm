@@ -186,6 +186,7 @@ pub use crate::arch_amd64_bindings::{
     ENOTDIR,
     ENOTTY,
     ENXIO,
+    EOPNOTSUPP,
     EPERM,
     EPIPE,
     ERANGE,
@@ -898,6 +899,7 @@ impl Error {
             EPIPE => Some("EPIPE"),
             EDOM => Some("EDOM"),
             ERANGE => Some("ERANGE"),
+            EOPNOTSUPP => Some("EOPNOTSUPP"),
             _ => None,
         };
 

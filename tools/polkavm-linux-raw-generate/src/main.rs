@@ -58,6 +58,7 @@ fn main() {
         "ENOTDIR",
         "ENOTTY",
         "ENXIO",
+        "EOPNOTSUPP",
         "EPERM",
         "EPIPE",
         "ERANGE",
