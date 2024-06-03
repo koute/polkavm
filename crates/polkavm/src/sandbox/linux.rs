@@ -26,12 +26,13 @@ use core::time::Duration;
 use linux_raw::{abort, cstr, syscall_readonly, Fd, Mmap, STDERR_FILENO, STDIN_FILENO};
 use std::borrow::Cow;
 use std::time::Instant;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 use super::{SandboxKind, SandboxInit, SandboxVec, get_native_page_size};
 use crate::api::{BackendAccess, CompiledModuleKind, MemoryAccessError, Module, HostcallHandler};
 use crate::compiler::CompiledModule;
 use crate::config::GasMeteringKind;
+use crate::mutex::Mutex;
 
 pub struct SandboxConfig {
     enable_logger: bool,
