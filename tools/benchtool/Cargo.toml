@@ -11,20 +11,20 @@ libc = { version = "0.2.149" }
 libloading = { version = "0.8.1", optional = true }
 log = { version = "0.4.20" }
 object = { version = "0.32.1", default-features = false, features = ["std", "elf"], optional = true }
-wasmi = { version = "0.32.0-beta.16", features = ["no-hash-maps"], optional = true }
+wasmi = { version = "0.32.2", features = ["no-hash-maps"], optional = true }
 polkavm = { path = "../../crates/polkavm" }
 
 [target.'cfg(target_arch = "x86_64")'.dependencies]
-ckb-vm = { version = "0.24.9", features = ["asm"], optional = true }
+ckb-vm = { version = "0.24.11", features = ["asm"], optional = true }
 pvf-executor = { git = "https://github.com/paritytech/pvf-executor.git", rev = "d3b2bb77b783bcfaff540c2f9ade99f58a311ac3", optional = true }
 wasm3 = { git = "https://github.com/wasm3/wasm3-rs.git", rev = "df74c2a17ed8831595de43db98c406da4633e32a", features = ["build-bindgen"], optional = true }
 
 [target.'cfg(all(target_arch = "x86_64", not(target_os = "windows")))'.dependencies]
-solana_rbpf = { version = "0.8.0", optional = true }
+solana_rbpf = { version = "0.8.1", optional = true }
 
 [target.'cfg(any(target_arch = "x86_64", target_arch = "aarch64"))'.dependencies]
-wasmer = { version = "4.3.0", default-features = false, features = ["std", "singlepass"], optional = true }
-wasmtime = { version = "20.0.2", default-features = false, features = ["cranelift", "winch", "runtime"], optional = true }
+wasmer = { version = "4.3.2", default-features = false, features = ["std", "singlepass"], optional = true }
+wasmtime = { version = "21.0.1", default-features = false, features = ["cranelift", "winch", "runtime"], optional = true }
 
 [features]
 default = [
