@@ -572,6 +572,7 @@ dependencies = [
  "log",
  "object",
  "polkavm-common",
+ "proptest",
  "regalloc2",
  "rustc-demangle",
 ]
