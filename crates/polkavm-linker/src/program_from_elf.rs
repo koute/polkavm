@@ -229,7 +229,7 @@ impl Source {
 
     fn iter(&'_ self) -> impl Iterator<Item = SectionTarget> + '_ {
         (self.offset_range.start..self.offset_range.end)
-            .step_by(4)
+            .step_by(2)
             .map(|offset| SectionTarget {
                 section_index: self.section_index,
                 offset,
@@ -1859,7 +1859,7 @@ fn convert_instruction(
 /// The instruction length and the raw instruction.
 fn read_instruction_bytes(text: &[u8], relative_offset: usize) -> (u64, u32) {
     assert!(
-        relative_offset % 2 == 0,
+        relative_offset % VM_CODE_ADDRESS_ALIGNMENT as usize == 0,
         "internal error: misaligned instruction read: 0x{relative_offset:08x}"
     );
 
@@ -1884,7 +1884,7 @@ fn parse_code_section(
     let section_name = section.name();
     let text = &section.data();
 
-    if text.len() % 2 != 0 {
+    if text.len() % VM_CODE_ADDRESS_ALIGNMENT as usize != 0 {
         return Err(ProgramFromElfError::other(format!(
             "size of section '{section_name}' is not divisible by 2"
         )));
@@ -2090,7 +2090,7 @@ fn split_code_into_basic_blocks(
         let (block_section, block_start) = if !is_jump_target {
             // Make sure nothing wants to jump into the middle of this instruction.
             assert!((source.offset_range.start..source.offset_range.end)
-                .step_by(4)
+                .step_by(2)
                 .skip(1)
                 .all(|offset| !jump_targets.contains(&SectionTarget {
                     section_index: source.section_index,
@@ -7060,7 +7060,7 @@ pub fn program_from_elf(config: Config, data: &[u8]) -> Result<Vec<u8>, ProgramF
             // TODO: Use a smallvec.
             let mut list = Vec::new();
             for source in source_stack.as_slice() {
-                for offset in (source.offset_range.start..source.offset_range.end).step_by(4) {
+                for offset in (source.offset_range.start..source.offset_range.end).step_by(2) {
                     let target = SectionTarget {
                         section_index: source.section_index,
                         offset,
