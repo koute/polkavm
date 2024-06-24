@@ -457,11 +457,22 @@ impl R {
 }
 
 impl Inst {
+    pub fn size(op: u32) -> u64 {
+        match op & 0b00000011 {
+            0b00..=0b10 => 2,
+            _ => 4,
+        }
+    }
+
     pub fn decode_compressed(op: u32) -> Option<Self> {
         let quadrant = op & 0b11;
         let funct3 = (op >> 13) & 0b111;
 
         match (quadrant, funct3) {
+            // Considered the unimplemented instruction by the asm manual:
+            // https://github.com/riscv-non-isa/riscv-asm-manual/blob/master/riscv-asm.md#instruction-aliases
+            (0b00, 0b000) if op & 0b11111111_11111111 == 0 => Some(Inst::Unimplemented),
+
             // RVC, Quadrant 0
             // C.ADDI4SPN expands to addi rd′, x2, nzuimm[9:2]
             (0b00, 0b000) if op & 0b00011111_11100000 != 0 => Some(Inst::RegImm {
@@ -661,14 +672,14 @@ impl Inst {
     }
 
     pub fn decode(op: u32) -> Option<Self> {
+        if let Some(compressed_instruction) = Self::decode_compressed(op) {
+            return Some(compressed_instruction);
+        }
+
         // This is mostly unofficial, but it's a defacto standard used by both LLVM and GCC.
         // https://github.com/riscv-non-isa/riscv-asm-manual/blob/master/riscv-asm.md#instruction-aliases
         if op == 0xc0001073 {
             return Some(Inst::Unimplemented);
-        }
-
-        if let Some(compressed_instruction) = Self::decode_compressed(op) {
-            return Some(compressed_instruction);
         }
 
         match op & 0b1111111 {
@@ -1152,7 +1163,7 @@ fn test_decode_cmov() {
 #[cfg_attr(debug_assertions, ignore)]
 #[test]
 fn test_encode() {
-    for op in 0..=0xFFFFFFFF_u32 {
+    for op in (0..=0xFFFFFFFF_u32).filter(|op| Inst::decode_compressed(*op).is_none()) {
         if let Some(inst) = Inst::decode(op) {
             let encoded = inst.encode();
             if encoded != Some(op) {
@@ -1187,7 +1198,7 @@ mod test_decode_compressed {
 
     #[test]
     fn illegal_instruction() {
-        assert_eq!(Inst::decode_compressed(0b00000000_11111111_00000000_00000000), None);
+        assert_eq!(Inst::decode_compressed(1 << 16), Some(Inst::Unimplemented));
     }
 
     #[test]
