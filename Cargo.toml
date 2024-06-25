@@ -15,6 +15,7 @@ members = [
 
     "tools/polkatool",
     "tools/polkavm-linux-raw-generate",
+    "tools/spectool",
 
     "examples/doom",
     "examples/hello-world",
@@ -53,6 +54,8 @@ proptest = "1.3.1"
 quote = "1.0.33"
 rustc-demangle = "0.1.23"
 ruzstd = { version = "0.4.0", default-features = false }
+serde = { version = "1.0.203", features = ["derive"] }
+serde_json = { version = "1.0.117" }
 syn = "2.0.25"
 
 [workspace.lints.clippy]

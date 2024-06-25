@@ -1,0 +1,5 @@
+pre: ra = 0xffff0000
+
+pub @main:
+pub @expected_exit:
+    ret
