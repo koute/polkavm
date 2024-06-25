@@ -1,0 +1,4 @@
+pre: a0 = 0b101
+
+pub @main:
+    a2 = a0 ^ 0b011

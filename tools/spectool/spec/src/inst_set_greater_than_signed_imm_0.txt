@@ -1,0 +1,4 @@
+pre: a0 = -10
+
+pub @main:
+    a2 = a0 >s 10

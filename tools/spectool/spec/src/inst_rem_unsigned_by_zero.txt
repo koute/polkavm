@@ -1,0 +1,5 @@
+pre: a0 = 0x80000010
+pre: a1 = 0
+
+pub @main:
+    a2 = a0 %u a1

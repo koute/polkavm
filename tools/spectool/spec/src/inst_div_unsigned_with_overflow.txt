@@ -1,0 +1,6 @@
+pre: a0 = 0x80000000
+pre: a1 = 0xffffffff
+pre: a2 = 0x1234
+
+pub @main:
+    a2 = a0 /u a1
