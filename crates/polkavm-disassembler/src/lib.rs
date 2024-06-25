@@ -116,6 +116,10 @@ pub struct Disassembler<'a> {
     gas_cost_map: Option<HashMap<u32, i64>>,
     native: Option<NativeCode>,
     show_raw_bytes: bool,
+    prefer_non_abi_reg_names: bool,
+    prefer_unaliased: bool,
+    emit_header: bool,
+    emit_exports: bool,
 }
 
 impl<'a> Disassembler<'a> {
@@ -132,11 +136,31 @@ impl<'a> Disassembler<'a> {
             gas_cost_map: None,
             native,
             show_raw_bytes: false,
+            prefer_non_abi_reg_names: false,
+            prefer_unaliased: false,
+            emit_header: true,
+            emit_exports: true,
         })
     }
 
     pub fn show_raw_bytes(&mut self, value: bool) {
         self.show_raw_bytes = value;
+    }
+
+    pub fn prefer_non_abi_reg_names(&mut self, value: bool) {
+        self.prefer_non_abi_reg_names = value;
+    }
+
+    pub fn prefer_unaliased(&mut self, value: bool) {
+        self.prefer_unaliased = value;
+    }
+
+    pub fn emit_header(&mut self, value: bool) {
+        self.emit_header = value;
+    }
+
+    pub fn emit_exports(&mut self, value: bool) {
+        self.emit_exports = value;
     }
 
     pub fn display_gas(&mut self) -> Result<(), polkavm::Error> {
@@ -200,13 +224,15 @@ impl<'a> Disassembler<'a> {
             }}
         }
 
-        w!("// RO data = {}/{} bytes", self.blob.ro_data().len(), self.blob.ro_data_size());
-        w!("// RW data = {}/{} bytes", self.blob.rw_data().len(), self.blob.rw_data_size());
-        w!("// Stack size = {} bytes", self.blob.stack_size());
-        w!();
-        w!("// Instructions = {}", instructions.len());
-        w!("// Code size = {} bytes", self.blob.code().len());
-        w!();
+        if self.emit_header {
+            w!("// RO data = {}/{} bytes", self.blob.ro_data().len(), self.blob.ro_data_size());
+            w!("// RW data = {}/{} bytes", self.blob.rw_data().len(), self.blob.rw_data_size());
+            w!("// Stack size = {} bytes", self.blob.stack_size());
+            w!();
+            w!("// Instructions = {}", instructions.len());
+            w!("// Code size = {} bytes", self.blob.code().len());
+            w!();
+        }
 
         let format_jump_target = |target_offset: u32, basic_block_counter: u32| {
             use core::fmt::Write;
@@ -226,9 +252,11 @@ impl<'a> Disassembler<'a> {
                 }
             }
 
-            if let Some(exports) = exports_for_code_offset.get(&target_offset) {
-                for (nth_export, export) in exports {
-                    write!(&mut buf, " [export #{}: {}]", nth_export, export.symbol()).unwrap()
+            if self.emit_exports {
+                if let Some(exports) = exports_for_code_offset.get(&target_offset) {
+                    for (nth_export, export) in exports {
+                        write!(&mut buf, " [export #{}: {}]", nth_export, export.symbol()).unwrap()
+                    }
                 }
             }
 
@@ -238,6 +266,10 @@ impl<'a> Disassembler<'a> {
 
             buf
         };
+
+        let mut disassembly_format = polkavm_common::program::InstructionFormat::default();
+        disassembly_format.prefer_non_abi_reg_names = self.prefer_non_abi_reg_names;
+        disassembly_format.prefer_unaliased = self.prefer_unaliased;
 
         let mut fmt = AssemblyFormatter::default();
         let mut last_line_program_entry = None;
@@ -250,14 +282,15 @@ impl<'a> Disassembler<'a> {
             let instruction = instruction.kind;
             let raw_bytes = &self.blob.code()[offset as usize..offset as usize + length as usize];
 
+            let instruction_s = instruction.display(&disassembly_format);
             let instruction_s = if let polkavm_common::program::Instruction::ecalli(nth_import) = instruction {
                 if let Some(import) = self.blob.imports().get(nth_import) {
-                    format!("{instruction} // {}", import)
+                    format!("{instruction_s} // {}", import)
                 } else {
-                    format!("{instruction} // INVALID")
+                    format!("{instruction_s} // INVALID")
                 }
             } else {
-                instruction.to_string()
+                instruction_s.to_string()
             };
 
             let line_program = self.blob.get_debug_line_program_at(nth_instruction as u32)?;
