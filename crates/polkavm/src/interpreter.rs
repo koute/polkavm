@@ -298,7 +298,6 @@ impl InterpretedInstance {
                 return Err(trap());
             };
 
-            visitor.inner.compiled_offset += 1;
             visitor.inner.instruction_offset = instruction.offset;
             visitor.inner.instruction_length = instruction.length;
             visitor.trace_current_instruction(&instruction);
@@ -335,10 +334,6 @@ impl InterpretedInstance {
 
         visitor.trace_current_instruction(&instruction);
         instruction.visit(&mut visitor)?;
-
-        if !instruction.starts_new_basic_block() {
-            self.instruction_offset += instruction.length;
-        }
 
         Ok(())
     }
@@ -642,6 +637,8 @@ impl<'a, 'b, const DEBUG: bool> Visitor<'a, 'b, DEBUG> {
         let s1 = self.get(s1);
         let s2 = self.get(s2);
         self.set(dst, callback(s1, s2))?;
+        self.on_next_instruction();
+
         Ok(())
     }
 
@@ -657,10 +654,16 @@ impl<'a, 'b, const DEBUG: bool> Visitor<'a, 'b, DEBUG> {
         if callback(s1, s2) {
             self.inner.instruction_offset = target;
         } else {
-            self.inner.instruction_offset += self.inner.instruction_length;
+            self.on_next_instruction();
         }
 
         self.inner.on_start_new_basic_block::<DEBUG>()
+    }
+
+    #[inline(always)]
+    fn on_next_instruction(&mut self) {
+        self.inner.instruction_offset += self.inner.instruction_length;
+        self.inner.compiled_offset += 1;
     }
 
     #[cfg_attr(not(debug_assertions), inline(always))]
@@ -691,6 +694,8 @@ impl<'a, 'b, const DEBUG: bool> Visitor<'a, 'b, DEBUG> {
 
         let value = T::from_slice(slice);
         self.set(dst, value)?;
+        self.on_next_instruction();
+
         Ok(())
     }
 
@@ -741,6 +746,7 @@ impl<'a, 'b, const DEBUG: bool> Visitor<'a, 'b, DEBUG> {
             (on_store)(address, value.as_ref()).map_err(ExecutionError::Trap)?;
         }
 
+        self.on_next_instruction();
         Ok(())
     }
 
@@ -855,7 +861,7 @@ impl<'a, 'b, const DEBUG: bool> InstructionVisitor for Visitor<'a, 'b, DEBUG> {
     }
 
     fn fallthrough(&mut self) -> Self::ReturnTy {
-        self.inner.instruction_offset += 1;
+        self.on_next_instruction();
         self.inner.on_start_new_basic_block::<DEBUG>()
     }
 
@@ -863,11 +869,16 @@ impl<'a, 'b, const DEBUG: bool> InstructionVisitor for Visitor<'a, 'b, DEBUG> {
         let size = self.get(size);
         let result = self.inner.sbrk(size).unwrap_or(0);
         self.set(dst, result)?;
+        self.on_next_instruction();
+
         Ok(())
     }
 
     fn ecalli(&mut self, imm: u32) -> Self::ReturnTy {
         if let Some(on_hostcall) = self.ctx.on_hostcall.as_mut() {
+            self.inner.instruction_offset += self.inner.instruction_length; // TODO: Call self.on_next_instruction().
+            self.inner.compiled_offset += 1;
+
             let access = BackendAccess::Interpreted(self.inner.access());
             (on_hostcall)(imm, access).map_err(ExecutionError::Trap)?;
             self.inner.check_gas()?;
@@ -1020,12 +1031,16 @@ impl<'a, 'b, const DEBUG: bool> InstructionVisitor for Visitor<'a, 'b, DEBUG> {
 
     fn load_imm(&mut self, dst: RawReg, imm: u32) -> Self::ReturnTy {
         self.set(dst, imm)?;
+        self.on_next_instruction();
+
         Ok(())
     }
 
     fn move_reg(&mut self, d: RawReg, s: RawReg) -> Self::ReturnTy {
         let imm = self.get(s);
         self.set(d, imm)?;
+        self.on_next_instruction();
+
         Ok(())
     }
 
@@ -1035,6 +1050,7 @@ impl<'a, 'b, const DEBUG: bool> InstructionVisitor for Visitor<'a, 'b, DEBUG> {
             self.set(d, value)?;
         }
 
+        self.on_next_instruction();
         Ok(())
     }
 
@@ -1043,6 +1059,7 @@ impl<'a, 'b, const DEBUG: bool> InstructionVisitor for Visitor<'a, 'b, DEBUG> {
             self.set(d, s)?;
         }
 
+        self.on_next_instruction();
         Ok(())
     }
 
@@ -1052,6 +1069,7 @@ impl<'a, 'b, const DEBUG: bool> InstructionVisitor for Visitor<'a, 'b, DEBUG> {
             self.set(d, value)?;
         }
 
+        self.on_next_instruction();
         Ok(())
     }
 
@@ -1060,6 +1078,7 @@ impl<'a, 'b, const DEBUG: bool> InstructionVisitor for Visitor<'a, 'b, DEBUG> {
             self.set(d, s)?;
         }
 
+        self.on_next_instruction();
         Ok(())
     }
 
