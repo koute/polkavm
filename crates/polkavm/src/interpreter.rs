@@ -432,7 +432,7 @@ impl InterpretedInstance {
             let gas_remaining = self.gas_remaining.as_mut().unwrap();
             if DEBUG {
                 log::trace!(
-                    "Consume gas at at {}: {} ({} -> {})",
+                    "Consume gas at {}: {} ({} -> {})",
                     instruction_offset,
                     gas_cost,
                     *gas_remaining,
