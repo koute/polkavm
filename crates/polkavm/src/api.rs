@@ -1591,6 +1591,11 @@ impl<T> Instance<T> {
         let mutable = self.0.mutable.lock();
         mutable.backend.pid()
     }
+
+    pub fn program_counter(&self) -> Option<u32> {
+        let mut mutable = self.0.mutable.lock();
+        mutable.backend.access().program_counter()
+    }
 }
 
 /// The code offset an exported function to be called.
