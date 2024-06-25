@@ -339,3 +339,35 @@ pub fn byte_slice_init<'dst>(dst: &'dst mut [MaybeUninit<u8>], src: &[u8]) -> &'
     // SAFETY: We've just initialized this slice.
     unsafe { slice_assume_init_mut(dst) }
 }
+
+pub fn parse_imm(text: &str) -> Option<i32> {
+    let text = text.trim();
+    if let Some(text) = text.strip_prefix("0x") {
+        return u32::from_str_radix(text, 16).ok().map(|value| value as i32);
+    }
+
+    if let Some(text) = text.strip_prefix("0b") {
+        return u32::from_str_radix(text, 2).ok().map(|value| value as i32);
+    }
+
+    if let Ok(value) = text.parse::<i32>() {
+        Some(value)
+    } else if let Ok(value) = text.parse::<u32>() {
+        Some(value as i32)
+    } else {
+        None
+    }
+}
+
+pub fn parse_reg(text: &str) -> Option<Reg> {
+    const REG_NAME_ALT: [&str; 13] = ["r0", "r1", "r2", "r3", "r4", "r5", "r6", "r7", "r8", "r9", "r10", "r11", "r12"];
+
+    let text = text.trim();
+    for (reg, name_alt) in Reg::ALL.into_iter().zip(REG_NAME_ALT) {
+        if text == reg.name() || text == name_alt {
+            return Some(reg);
+        }
+    }
+
+    None
+}

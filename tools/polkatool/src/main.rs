@@ -47,6 +47,16 @@ enum Args {
         input: PathBuf,
     },
 
+    /// Assembles a .polkavm blob from human-readable assembly.
+    Assemble {
+        /// The output file.
+        #[clap(short = 'o', long)]
+        output: PathBuf,
+
+        /// The input file.
+        input: PathBuf,
+    },
+
     /// Calculates various statistics for given program blobs.
     Stats {
         /// The input files.
@@ -78,6 +88,7 @@ fn main() {
             show_raw_bytes,
             input,
         } => main_disassemble(input, format, display_gas, show_raw_bytes, output),
+        Args::Assemble { input, output } => main_assemble(input, output),
         Args::Stats { inputs } => main_stats(inputs),
     };
 
@@ -199,4 +210,26 @@ fn main_disassemble(
         }
     }
     .map_err(|error| error.to_string())
+}
+
+fn main_assemble(input_path: PathBuf, output_path: PathBuf) -> Result<(), String> {
+    let input = match std::fs::read_to_string(&input_path) {
+        Ok(input) => input,
+        Err(error) => {
+            bail!("failed to read {input_path:?}: {error}");
+        }
+    };
+
+    let blob = match polkavm_common::assembler::assemble(&input) {
+        Ok(blob) => blob,
+        Err(error) => {
+            bail!("failed to assemble {input_path:?}: {error}");
+        }
+    };
+
+    if let Err(error) = std::fs::write(&output_path, blob) {
+        bail!("failed to write to {output_path:?}: {error}");
+    }
+
+    Ok(())
 }
