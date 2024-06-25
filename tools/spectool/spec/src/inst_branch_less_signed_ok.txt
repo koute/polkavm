@@ -1,0 +1,7 @@
+pub @main:
+    a0 = 0xFFFFFB2D
+    a1 = 0xFFFFFB2E
+    jump @target if a0 <s a1
+    trap
+@target:
+    a0 = 0xdeadbeef
