@@ -528,7 +528,7 @@ impl Inst {
                 kind: RegImmKind::Add,
                 dst: Reg::decode(op >> 7),
                 src: Reg::Zero,
-                imm: sign_ext(bits(5, 5, op, 12) | bits(0, 4, op, 2), 26),
+                imm: sign_ext(bits(5, 5, op, 12) | bits(0, 4, op, 2), 6),
             }),
             // C.ADDI16SP expands into addi x2, x2, nzimm[9:4]
             (0b01, 0b011) if Reg::decode(op >> 7) == Reg::SP && op & 0b00010000_01111100 != 0 => Some(Inst::RegImm {
@@ -1318,7 +1318,7 @@ mod test_decode_compressed {
 
     #[test]
     fn c_li() {
-        let op = 0b010_0_01000_10101_01;
+        let op = 0b010_1_01000_10101_01;
 
         assert_eq!(
             Inst::decode_compressed(op),
@@ -1326,7 +1326,7 @@ mod test_decode_compressed {
                 kind: RegImmKind::Add,
                 dst: Reg::decode(0b01000),
                 src: Reg::Zero,
-                imm: 0b10101
+                imm: -11
             })
         );
 
