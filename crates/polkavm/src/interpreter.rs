@@ -463,6 +463,10 @@ impl InterpretedInstance {
         };
 
         let cost = crate::gas::calculate_for_block(instructions);
+        if cost == 0 {
+            return 0;
+        }
+
         self.gas_cost_for_block.insert(instruction_offset, GasCost::new(cost));
         u64::from(cost) as i64
     }
@@ -493,6 +497,10 @@ impl InterpretedInstance {
             if instruction.opcode().starts_new_basic_block() {
                 break;
             }
+        }
+
+        if self.compiled_instructions.len() == starting_offset {
+            return Ok(());
         }
 
         self.compiled_offset_for_block
