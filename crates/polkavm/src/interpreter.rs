@@ -781,7 +781,12 @@ impl<'a, 'b, const DEBUG: bool> Visitor<'a, 'b, DEBUG> {
     #[inline(always)]
     fn trace_current_instruction(&self, instruction: &Instruction) {
         if DEBUG {
-            log::trace!("{}: {instruction}", self.inner.instruction_offset);
+            log::trace!(
+                "[{}]: {}..{}: {instruction}",
+                self.inner.compiled_offset,
+                self.inner.instruction_offset,
+                self.inner.instruction_offset + self.inner.instruction_length
+            );
         }
     }
 }
