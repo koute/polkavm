@@ -17,6 +17,9 @@ macro_rules! static_assert {
     };
 }
 
+#[cfg(feature = "alloc")]
+pub mod assembler;
+
 pub mod abi;
 #[cfg(feature = "alloc")]
 pub mod elf;
