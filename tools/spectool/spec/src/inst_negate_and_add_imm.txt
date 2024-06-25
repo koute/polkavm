@@ -1,0 +1,4 @@
+pre: a1 = 2
+
+pub @main:
+    a2 = 1 - a1

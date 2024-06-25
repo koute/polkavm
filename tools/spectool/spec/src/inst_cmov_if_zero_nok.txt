@@ -1,0 +1,5 @@
+pre: a1 = 100
+pre: a3 = 1
+
+pub @main:
+    a0 = a1 if a3 == 0

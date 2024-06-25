@@ -83,8 +83,6 @@ pub struct ProgramBlobBuilder {
     code: Vec<u8>,
     bitmask: Vec<u8>,
     custom: Vec<(u8, Vec<u8>)>,
-    instruction_count: u32,
-    basic_block_count: u32,
     basic_block_to_instruction_index: Vec<usize>,
     instruction_index_to_code_offset: Vec<u32>,
 }
@@ -146,8 +144,6 @@ impl ProgramBlobBuilder {
 
         self.jump_table.clear();
         self.code.clear();
-        self.instruction_count = u32::try_from(code.len()).expect("too many instructions");
-        self.basic_block_count = u32::try_from(basic_block_to_instruction_index.len()).expect("too many basic blocks");
 
         let mut instructions = Vec::new();
         let mut position: u32 = 0;
