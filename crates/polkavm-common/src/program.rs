@@ -3,6 +3,7 @@ use crate::utils::ArcBytes;
 use crate::varint::{
     read_length_minus_one_varint, read_length_minus_two_varint, read_simple_varint, read_varint, write_simple_varint, MAX_VARINT_LENGTH,
 };
+use core::fmt::Write;
 use core::ops::Range;
 
 #[derive(Copy, Clone)]
@@ -106,6 +107,25 @@ impl Reg {
             A3 => "a3",
             A4 => "a4",
             A5 => "a5",
+        }
+    }
+
+    pub const fn name_non_abi(self) -> &'static str {
+        use Reg::*;
+        match self {
+            RA => "r0",
+            SP => "r1",
+            T0 => "r2",
+            T1 => "r3",
+            T2 => "r4",
+            S0 => "r5",
+            S1 => "r6",
+            A0 => "r7",
+            A1 => "r8",
+            A2 => "r9",
+            A3 => "r10",
+            A4 => "r11",
+            A5 => "r12",
         }
     }
 
@@ -1363,11 +1383,29 @@ impl Opcode {
 
 impl core::fmt::Display for Instruction {
     fn fmt(&self, fmt: &mut core::fmt::Formatter) -> core::fmt::Result {
-        self.visit(fmt)
+        self.visit(&mut InstructionFormatter {
+            format: &Default::default(),
+            fmt,
+        })
     }
 }
 
 impl Instruction {
+    pub fn display(self, format: &'_ InstructionFormat) -> impl core::fmt::Display + '_ {
+        struct Inner<'a> {
+            instruction: Instruction,
+            format: &'a InstructionFormat,
+        }
+
+        impl<'a> core::fmt::Display for Inner<'a> {
+            fn fmt(&self, fmt: &mut core::fmt::Formatter) -> core::fmt::Result {
+                self.instruction.visit(&mut InstructionFormatter { format: self.format, fmt })
+            }
+        }
+
+        Inner { instruction: self, format }
+    }
+
     pub fn starts_new_basic_block(self) -> bool {
         self.opcode().starts_new_basic_block()
     }
@@ -1464,7 +1502,35 @@ impl Instruction {
 
 pub const MAX_INSTRUCTION_LENGTH: usize = 2 + MAX_VARINT_LENGTH * 2;
 
-impl<'a> InstructionVisitor for core::fmt::Formatter<'a> {
+#[derive(Default)]
+#[non_exhaustive]
+pub struct InstructionFormat {
+    pub prefer_non_abi_reg_names: bool,
+    pub prefer_unaliased: bool,
+}
+
+struct InstructionFormatter<'a, 'b> {
+    format: &'a InstructionFormat,
+    fmt: &'a mut core::fmt::Formatter<'b>,
+}
+
+impl<'a, 'b> InstructionFormatter<'a, 'b> {
+    fn format_reg(&self, reg: RawReg) -> &'static str {
+        if self.format.prefer_non_abi_reg_names {
+            reg.get().name_non_abi()
+        } else {
+            reg.get().name()
+        }
+    }
+}
+
+impl<'a, 'b> core::fmt::Write for InstructionFormatter<'a, 'b> {
+    fn write_str(&mut self, s: &str) -> Result<(), core::fmt::Error> {
+        self.fmt.write_str(s)
+    }
+}
+
+impl<'a, 'b> InstructionVisitor for InstructionFormatter<'a, 'b> {
     type ReturnTy = core::fmt::Result;
 
     fn trap(&mut self) -> Self::ReturnTy {
@@ -1476,6 +1542,8 @@ impl<'a> InstructionVisitor for core::fmt::Formatter<'a> {
     }
 
     fn sbrk(&mut self, d: RawReg, s: RawReg) -> Self::ReturnTy {
+        let d = self.format_reg(d);
+        let s = self.format_reg(s);
         write!(self, "{d} = sbrk {s}")
     }
 
@@ -1484,167 +1552,268 @@ impl<'a> InstructionVisitor for core::fmt::Formatter<'a> {
     }
 
     fn set_less_than_unsigned(&mut self, d: RawReg, s1: RawReg, s2: RawReg) -> Self::ReturnTy {
+        let d = self.format_reg(d);
+        let s1 = self.format_reg(s1);
+        let s2 = self.format_reg(s2);
         write!(self, "{d} = {s1} <u {s2}")
     }
 
     fn set_less_than_signed(&mut self, d: RawReg, s1: RawReg, s2: RawReg) -> Self::ReturnTy {
+        let d = self.format_reg(d);
+        let s1 = self.format_reg(s1);
+        let s2 = self.format_reg(s2);
         write!(self, "{d} = {s1} <s {s2}")
     }
 
     fn shift_logical_right(&mut self, d: RawReg, s1: RawReg, s2: RawReg) -> Self::ReturnTy {
+        let d = self.format_reg(d);
+        let s1 = self.format_reg(s1);
+        let s2 = self.format_reg(s2);
         write!(self, "{d} = {s1} >> {s2}")
     }
 
     fn shift_arithmetic_right(&mut self, d: RawReg, s1: RawReg, s2: RawReg) -> Self::ReturnTy {
+        let d = self.format_reg(d);
+        let s1 = self.format_reg(s1);
+        let s2 = self.format_reg(s2);
         write!(self, "{d} = {s1} >>a {s2}")
     }
 
     fn shift_logical_left(&mut self, d: RawReg, s1: RawReg, s2: RawReg) -> Self::ReturnTy {
+        let d = self.format_reg(d);
+        let s1 = self.format_reg(s1);
+        let s2 = self.format_reg(s2);
         write!(self, "{d} = {s1} << {s2}")
     }
 
     fn xor(&mut self, d: RawReg, s1: RawReg, s2: RawReg) -> Self::ReturnTy {
+        let d = self.format_reg(d);
+        let s1 = self.format_reg(s1);
+        let s2 = self.format_reg(s2);
         write!(self, "{d} = {s1} ^ {s2}")
     }
 
     fn and(&mut self, d: RawReg, s1: RawReg, s2: RawReg) -> Self::ReturnTy {
+        let d = self.format_reg(d);
+        let s1 = self.format_reg(s1);
+        let s2 = self.format_reg(s2);
         write!(self, "{d} = {s1} & {s2}")
     }
 
     fn or(&mut self, d: RawReg, s1: RawReg, s2: RawReg) -> Self::ReturnTy {
+        let d = self.format_reg(d);
+        let s1 = self.format_reg(s1);
+        let s2 = self.format_reg(s2);
         write!(self, "{d} = {s1} | {s2}")
     }
 
     fn add(&mut self, d: RawReg, s1: RawReg, s2: RawReg) -> Self::ReturnTy {
+        let d = self.format_reg(d);
+        let s1 = self.format_reg(s1);
+        let s2 = self.format_reg(s2);
         write!(self, "{d} = {s1} + {s2}")
     }
 
     fn sub(&mut self, d: RawReg, s1: RawReg, s2: RawReg) -> Self::ReturnTy {
+        let d = self.format_reg(d);
+        let s1 = self.format_reg(s1);
+        let s2 = self.format_reg(s2);
         write!(self, "{d} = {s1} - {s2}")
     }
 
     fn mul(&mut self, d: RawReg, s1: RawReg, s2: RawReg) -> Self::ReturnTy {
+        let d = self.format_reg(d);
+        let s1 = self.format_reg(s1);
+        let s2 = self.format_reg(s2);
         write!(self, "{d} = {s1} * {s2}")
     }
 
     fn mul_imm(&mut self, d: RawReg, s1: RawReg, s2: u32) -> Self::ReturnTy {
+        let d = self.format_reg(d);
+        let s1 = self.format_reg(s1);
         write!(self, "{d} = {s1} * {s2}")
     }
 
     fn mul_upper_signed_signed(&mut self, d: RawReg, s1: RawReg, s2: RawReg) -> Self::ReturnTy {
+        let d = self.format_reg(d);
+        let s1 = self.format_reg(s1);
+        let s2 = self.format_reg(s2);
         write!(self, "{d} = ({s1} as i64 * {s2} as i64) >> 32")
     }
 
     fn mul_upper_signed_signed_imm(&mut self, d: RawReg, s1: RawReg, s2: u32) -> Self::ReturnTy {
+        let d = self.format_reg(d);
+        let s1 = self.format_reg(s1);
         write!(self, "{d} = ({s1} as i64 * {s2} as i64) >> 32", s2 = s2 as i32)
     }
 
     fn mul_upper_unsigned_unsigned(&mut self, d: RawReg, s1: RawReg, s2: RawReg) -> Self::ReturnTy {
+        let d = self.format_reg(d);
+        let s1 = self.format_reg(s1);
+        let s2 = self.format_reg(s2);
         write!(self, "{d} = ({s1} as u64 * {s2} as u64) >> 32")
     }
 
     fn mul_upper_unsigned_unsigned_imm(&mut self, d: RawReg, s1: RawReg, s2: u32) -> Self::ReturnTy {
+        let d = self.format_reg(d);
+        let s1 = self.format_reg(s1);
         write!(self, "{d} = ({s1} as u64 * {s2} as u64) >> 32")
     }
 
     fn mul_upper_signed_unsigned(&mut self, d: RawReg, s1: RawReg, s2: RawReg) -> Self::ReturnTy {
+        let d = self.format_reg(d);
+        let s1 = self.format_reg(s1);
+        let s2 = self.format_reg(s2);
         write!(self, "{d} = ({s1} as i64 * {s2} as u64) >> 32")
     }
 
     fn div_unsigned(&mut self, d: RawReg, s1: RawReg, s2: RawReg) -> Self::ReturnTy {
+        let d = self.format_reg(d);
+        let s1 = self.format_reg(s1);
+        let s2 = self.format_reg(s2);
         write!(self, "{d} = {s1} /u {s2}")
     }
 
     fn div_signed(&mut self, d: RawReg, s1: RawReg, s2: RawReg) -> Self::ReturnTy {
+        let d = self.format_reg(d);
+        let s1 = self.format_reg(s1);
+        let s2 = self.format_reg(s2);
         write!(self, "{d} = {s1} /s {s2}")
     }
 
     fn rem_unsigned(&mut self, d: RawReg, s1: RawReg, s2: RawReg) -> Self::ReturnTy {
+        let d = self.format_reg(d);
+        let s1 = self.format_reg(s1);
+        let s2 = self.format_reg(s2);
         write!(self, "{d} = {s1} %u {s2}")
     }
 
     fn rem_signed(&mut self, d: RawReg, s1: RawReg, s2: RawReg) -> Self::ReturnTy {
+        let d = self.format_reg(d);
+        let s1 = self.format_reg(s1);
+        let s2 = self.format_reg(s2);
         write!(self, "{d} = {s1} %s {s2}")
     }
 
     fn set_less_than_unsigned_imm(&mut self, d: RawReg, s1: RawReg, s2: u32) -> Self::ReturnTy {
+        let d = self.format_reg(d);
+        let s1 = self.format_reg(s1);
         write!(self, "{d} = {s1} <u 0x{s2:x}")
     }
 
     fn set_greater_than_unsigned_imm(&mut self, d: RawReg, s1: RawReg, s2: u32) -> Self::ReturnTy {
+        let d = self.format_reg(d);
+        let s1 = self.format_reg(s1);
         write!(self, "{d} = {s1} >u 0x{s2:x}")
     }
 
     fn set_less_than_signed_imm(&mut self, d: RawReg, s1: RawReg, s2: u32) -> Self::ReturnTy {
+        let d = self.format_reg(d);
+        let s1 = self.format_reg(s1);
         write!(self, "{d} = {s1} <s {s2}", s2 = s2 as i32)
     }
 
     fn set_greater_than_signed_imm(&mut self, d: RawReg, s1: RawReg, s2: u32) -> Self::ReturnTy {
+        let d = self.format_reg(d);
+        let s1 = self.format_reg(s1);
         write!(self, "{d} = {s1} >s {s2}", s2 = s2 as i32)
     }
 
     fn shift_logical_right_imm(&mut self, d: RawReg, s1: RawReg, s2: u32) -> Self::ReturnTy {
+        let d = self.format_reg(d);
+        let s1 = self.format_reg(s1);
         write!(self, "{d} = {s1} >> {s2}")
     }
 
     fn shift_logical_right_imm_alt(&mut self, d: RawReg, s2: RawReg, s1: u32) -> Self::ReturnTy {
+        let d = self.format_reg(d);
+        let s2 = self.format_reg(s2);
         write!(self, "{d} = {s1} >> {s2}")
     }
 
     fn shift_arithmetic_right_imm(&mut self, d: RawReg, s1: RawReg, s2: u32) -> Self::ReturnTy {
+        let d = self.format_reg(d);
+        let s1 = self.format_reg(s1);
         write!(self, "{d} = {s1} >>a {s2}")
     }
 
     fn shift_arithmetic_right_imm_alt(&mut self, d: RawReg, s2: RawReg, s1: u32) -> Self::ReturnTy {
+        let d = self.format_reg(d);
+        let s2 = self.format_reg(s2);
         write!(self, "{d} = {s1} >>a {s2}")
     }
 
     fn shift_logical_left_imm(&mut self, d: RawReg, s1: RawReg, s2: u32) -> Self::ReturnTy {
+        let d = self.format_reg(d);
+        let s1 = self.format_reg(s1);
         write!(self, "{d} = {s1} << {s2}")
     }
 
     fn shift_logical_left_imm_alt(&mut self, d: RawReg, s2: RawReg, s1: u32) -> Self::ReturnTy {
+        let d = self.format_reg(d);
+        let s2 = self.format_reg(s2);
         write!(self, "{d} = {s1} << {s2}")
     }
 
     fn or_imm(&mut self, d: RawReg, s1: RawReg, s2: u32) -> Self::ReturnTy {
+        let d = self.format_reg(d);
+        let s1 = self.format_reg(s1);
         write!(self, "{d} = {s1} | 0x{s2:x}")
     }
 
     fn and_imm(&mut self, d: RawReg, s1: RawReg, s2: u32) -> Self::ReturnTy {
+        let d = self.format_reg(d);
+        let s1 = self.format_reg(s1);
         write!(self, "{d} = {s1} & 0x{s2:x}")
     }
 
     fn xor_imm(&mut self, d: RawReg, s1: RawReg, s2: u32) -> Self::ReturnTy {
+        let d = self.format_reg(d);
+        let s1 = self.format_reg(s1);
         write!(self, "{d} = {s1} ^ 0x{s2:x}")
     }
 
     fn load_imm(&mut self, d: RawReg, a: u32) -> Self::ReturnTy {
+        let d = self.format_reg(d);
         write!(self, "{d} = 0x{a:x}")
     }
 
     fn move_reg(&mut self, d: RawReg, s: RawReg) -> Self::ReturnTy {
+        let d = self.format_reg(d);
+        let s = self.format_reg(s);
         write!(self, "{d} = {s}")
     }
 
     fn cmov_if_zero(&mut self, d: RawReg, s: RawReg, c: RawReg) -> Self::ReturnTy {
+        let d = self.format_reg(d);
+        let s = self.format_reg(s);
+        let c = self.format_reg(c);
         write!(self, "{d} = {s} if {c} == 0")
     }
 
     fn cmov_if_not_zero(&mut self, d: RawReg, s: RawReg, c: RawReg) -> Self::ReturnTy {
+        let d = self.format_reg(d);
+        let s = self.format_reg(s);
+        let c = self.format_reg(c);
         write!(self, "{d} = {s} if {c} != 0")
     }
 
     fn cmov_if_zero_imm(&mut self, d: RawReg, c: RawReg, s: u32) -> Self::ReturnTy {
+        let d = self.format_reg(d);
+        let c = self.format_reg(c);
         write!(self, "{d} = {s} if {c} == 0")
     }
 
     fn cmov_if_not_zero_imm(&mut self, d: RawReg, c: RawReg, s: u32) -> Self::ReturnTy {
+        let d = self.format_reg(d);
+        let c = self.format_reg(c);
         write!(self, "{d} = {s} if {c} != 0")
     }
 
     fn add_imm(&mut self, d: RawReg, s1: RawReg, s2: u32) -> Self::ReturnTy {
-        if (s2 as i32) < 0 && (s2 as i32) > -4096 {
+        let d = self.format_reg(d);
+        let s1 = self.format_reg(s1);
+        if !self.format.prefer_unaliased && (s2 as i32) < 0 && (s2 as i32) > -4096 {
             write!(self, "{d} = {s1} - {s2}", s2 = -(s2 as i32))
         } else {
             write!(self, "{d} = {s1} + 0x{s2:x}")
@@ -1652,7 +1821,9 @@ impl<'a> InstructionVisitor for core::fmt::Formatter<'a> {
     }
 
     fn negate_and_add_imm(&mut self, d: RawReg, s1: RawReg, s2: u32) -> Self::ReturnTy {
-        if s2 == 0 {
+        let d = self.format_reg(d);
+        let s1 = self.format_reg(s1);
+        if !self.format.prefer_unaliased && s2 == 0 {
             write!(self, "{d} = -{s1}")
         } else {
             write!(self, "{d} = -{s1} + {s2}")
@@ -1660,19 +1831,23 @@ impl<'a> InstructionVisitor for core::fmt::Formatter<'a> {
     }
 
     fn store_imm_indirect_u8(&mut self, base: RawReg, offset: u32, value: u32) -> Self::ReturnTy {
+        let base = self.format_reg(base);
         write!(self, "u8 [{base} + {offset}] = {value}")
     }
 
     fn store_imm_indirect_u16(&mut self, base: RawReg, offset: u32, value: u32) -> Self::ReturnTy {
+        let base = self.format_reg(base);
         write!(self, "u16 [{base} + {offset}] = {value}")
     }
 
     fn store_imm_indirect_u32(&mut self, base: RawReg, offset: u32, value: u32) -> Self::ReturnTy {
+        let base = self.format_reg(base);
         write!(self, "u32 [{base} + {offset}] = {value}")
     }
 
     fn store_indirect_u8(&mut self, src: RawReg, base: RawReg, offset: u32) -> Self::ReturnTy {
-        if offset != 0 {
+        let base = self.format_reg(base);
+        if self.format.prefer_unaliased || offset != 0 {
             write!(self, "u8 [{base} + {offset}] = {src}")
         } else {
             write!(self, "u8 [{base}] = {src}")
@@ -1680,7 +1855,9 @@ impl<'a> InstructionVisitor for core::fmt::Formatter<'a> {
     }
 
     fn store_indirect_u16(&mut self, src: RawReg, base: RawReg, offset: u32) -> Self::ReturnTy {
-        if offset != 0 {
+        let src = self.format_reg(src);
+        let base = self.format_reg(base);
+        if self.format.prefer_unaliased || offset != 0 {
             write!(self, "u16 [{base} + {offset}] = {src}")
         } else {
             write!(self, "u16 [{base}] = {src}")
@@ -1688,7 +1865,9 @@ impl<'a> InstructionVisitor for core::fmt::Formatter<'a> {
     }
 
     fn store_indirect_u32(&mut self, src: RawReg, base: RawReg, offset: u32) -> Self::ReturnTy {
-        if offset != 0 {
+        let src = self.format_reg(src);
+        let base = self.format_reg(base);
+        if self.format.prefer_unaliased || offset != 0 {
             write!(self, "u32 [{base} + {offset}] = {src}")
         } else {
             write!(self, "u32 [{base}] = {src}")
@@ -1708,19 +1887,24 @@ impl<'a> InstructionVisitor for core::fmt::Formatter<'a> {
     }
 
     fn store_u8(&mut self, src: RawReg, offset: u32) -> Self::ReturnTy {
+        let src = self.format_reg(src);
         write!(self, "u8 [0x{offset:x}] = {src}")
     }
 
     fn store_u16(&mut self, src: RawReg, offset: u32) -> Self::ReturnTy {
+        let src = self.format_reg(src);
         write!(self, "u16 [0x{offset:x}] = {src}")
     }
 
     fn store_u32(&mut self, src: RawReg, offset: u32) -> Self::ReturnTy {
+        let src = self.format_reg(src);
         write!(self, "u32 [0x{offset:x}] = {src}")
     }
 
     fn load_indirect_u8(&mut self, dst: RawReg, base: RawReg, offset: u32) -> Self::ReturnTy {
-        if offset != 0 {
+        let dst = self.format_reg(dst);
+        let base = self.format_reg(base);
+        if self.format.prefer_unaliased || offset != 0 {
             write!(self, "{} = u8 [{} + {}]", dst, base, offset)
         } else {
             write!(self, "{} = u8 [{}]", dst, base)
@@ -1728,7 +1912,9 @@ impl<'a> InstructionVisitor for core::fmt::Formatter<'a> {
     }
 
     fn load_indirect_i8(&mut self, dst: RawReg, base: RawReg, offset: u32) -> Self::ReturnTy {
-        if offset != 0 {
+        let dst = self.format_reg(dst);
+        let base = self.format_reg(base);
+        if self.format.prefer_unaliased || offset != 0 {
             write!(self, "{} = i8 [{} + {}]", dst, base, offset)
         } else {
             write!(self, "{} = i8 [{}]", dst, base)
@@ -1736,7 +1922,9 @@ impl<'a> InstructionVisitor for core::fmt::Formatter<'a> {
     }
 
     fn load_indirect_u16(&mut self, dst: RawReg, base: RawReg, offset: u32) -> Self::ReturnTy {
-        if offset != 0 {
+        let dst = self.format_reg(dst);
+        let base = self.format_reg(base);
+        if self.format.prefer_unaliased || offset != 0 {
             write!(self, "{} = u16 [{} + {}]", dst, base, offset)
         } else {
             write!(self, "{} = u16 [{} ]", dst, base)
@@ -1744,7 +1932,9 @@ impl<'a> InstructionVisitor for core::fmt::Formatter<'a> {
     }
 
     fn load_indirect_i16(&mut self, dst: RawReg, base: RawReg, offset: u32) -> Self::ReturnTy {
-        if offset != 0 {
+        let dst = self.format_reg(dst);
+        let base = self.format_reg(base);
+        if self.format.prefer_unaliased || offset != 0 {
             write!(self, "{} = i16 [{} + {}]", dst, base, offset)
         } else {
             write!(self, "{} = i16 [{}]", dst, base)
@@ -1752,7 +1942,9 @@ impl<'a> InstructionVisitor for core::fmt::Formatter<'a> {
     }
 
     fn load_indirect_u32(&mut self, dst: RawReg, base: RawReg, offset: u32) -> Self::ReturnTy {
-        if offset != 0 {
+        let dst = self.format_reg(dst);
+        let base = self.format_reg(base);
+        if self.format.prefer_unaliased || offset != 0 {
             write!(self, "{} = u32 [{} + {}]", dst, base, offset)
         } else {
             write!(self, "{} = u32 [{}]", dst, base)
@@ -1760,86 +1952,113 @@ impl<'a> InstructionVisitor for core::fmt::Formatter<'a> {
     }
 
     fn load_u8(&mut self, dst: RawReg, offset: u32) -> Self::ReturnTy {
+        let dst = self.format_reg(dst);
         write!(self, "{} = u8 [0x{:x}]", dst, offset)
     }
 
     fn load_i8(&mut self, dst: RawReg, offset: u32) -> Self::ReturnTy {
+        let dst = self.format_reg(dst);
         write!(self, "{} = i8 [0x{:x}]", dst, offset)
     }
 
     fn load_u16(&mut self, dst: RawReg, offset: u32) -> Self::ReturnTy {
+        let dst = self.format_reg(dst);
         write!(self, "{} = u16 [0x{:x}]", dst, offset)
     }
 
     fn load_i16(&mut self, dst: RawReg, offset: u32) -> Self::ReturnTy {
+        let dst = self.format_reg(dst);
         write!(self, "{} = i16 [0x{:x}]", dst, offset)
     }
 
     fn load_u32(&mut self, dst: RawReg, offset: u32) -> Self::ReturnTy {
+        let dst = self.format_reg(dst);
         write!(self, "{} = u32 [0x{:x}]", dst, offset)
     }
 
     fn branch_less_unsigned(&mut self, s1: RawReg, s2: RawReg, imm: u32) -> Self::ReturnTy {
+        let s1 = self.format_reg(s1);
+        let s2 = self.format_reg(s2);
         write!(self, "jump {} if {} <u {}", imm, s1, s2)
     }
 
     fn branch_less_signed(&mut self, s1: RawReg, s2: RawReg, imm: u32) -> Self::ReturnTy {
+        let s1 = self.format_reg(s1);
+        let s2 = self.format_reg(s2);
         write!(self, "jump {} if {} <s {}", imm, s1, s2)
     }
 
     fn branch_less_unsigned_imm(&mut self, s1: RawReg, s2: u32, imm: u32) -> Self::ReturnTy {
+        let s1 = self.format_reg(s1);
         write!(self, "jump {} if {} <u {}", imm, s1, s2)
     }
 
     fn branch_less_signed_imm(&mut self, s1: RawReg, s2: u32, imm: u32) -> Self::ReturnTy {
+        let s1 = self.format_reg(s1);
         write!(self, "jump {} if {} <s {}", imm, s1, s2)
     }
 
     fn branch_greater_or_equal_unsigned(&mut self, s1: RawReg, s2: RawReg, imm: u32) -> Self::ReturnTy {
+        let s1 = self.format_reg(s1);
+        let s2 = self.format_reg(s2);
         write!(self, "jump {} if {} >=u {}", imm, s1, s2)
     }
 
     fn branch_greater_or_equal_signed(&mut self, s1: RawReg, s2: RawReg, imm: u32) -> Self::ReturnTy {
+        let s1 = self.format_reg(s1);
+        let s2 = self.format_reg(s2);
         write!(self, "jump {} if {} >=s {}", imm, s1, s2)
     }
 
     fn branch_greater_or_equal_unsigned_imm(&mut self, s1: RawReg, s2: u32, imm: u32) -> Self::ReturnTy {
+        let s1 = self.format_reg(s1);
         write!(self, "jump {} if {} >=u {}", imm, s1, s2)
     }
 
     fn branch_greater_or_equal_signed_imm(&mut self, s1: RawReg, s2: u32, imm: u32) -> Self::ReturnTy {
+        let s1 = self.format_reg(s1);
         write!(self, "jump {} if {} >=s {}", imm, s1, s2)
     }
 
     fn branch_eq(&mut self, s1: RawReg, s2: RawReg, imm: u32) -> Self::ReturnTy {
+        let s1 = self.format_reg(s1);
+        let s2 = self.format_reg(s2);
         write!(self, "jump {} if {} == {}", imm, s1, s2)
     }
 
     fn branch_not_eq(&mut self, s1: RawReg, s2: RawReg, imm: u32) -> Self::ReturnTy {
+        let s1 = self.format_reg(s1);
+        let s2 = self.format_reg(s2);
         write!(self, "jump {} if {} != {}", imm, s1, s2)
     }
 
     fn branch_eq_imm(&mut self, s1: RawReg, s2: u32, imm: u32) -> Self::ReturnTy {
+        let s1 = self.format_reg(s1);
         write!(self, "jump {} if {} == {}", imm, s1, s2)
     }
 
     fn branch_not_eq_imm(&mut self, s1: RawReg, s2: u32, imm: u32) -> Self::ReturnTy {
+        let s1 = self.format_reg(s1);
         write!(self, "jump {} if {} != {}", imm, s1, s2)
     }
 
     fn branch_less_or_equal_unsigned_imm(&mut self, s1: RawReg, s2: u32, imm: u32) -> Self::ReturnTy {
+        let s1 = self.format_reg(s1);
         write!(self, "jump {} if {} <=u {}", imm, s1, s2)
     }
 
     fn branch_less_or_equal_signed_imm(&mut self, s1: RawReg, s2: u32, imm: u32) -> Self::ReturnTy {
+        let s1 = self.format_reg(s1);
         write!(self, "jump {} if {} <=s {}", imm, s1, s2)
     }
 
     fn branch_greater_unsigned_imm(&mut self, s1: RawReg, s2: u32, imm: u32) -> Self::ReturnTy {
+        let s1 = self.format_reg(s1);
         write!(self, "jump {} if {} >u {}", imm, s1, s2)
     }
 
     fn branch_greater_signed_imm(&mut self, s1: RawReg, s2: u32, imm: u32) -> Self::ReturnTy {
+        let s1 = self.format_reg(s1);
         write!(self, "jump {} if {} >s {}", imm, s1, s2)
     }
 
@@ -1848,19 +2067,26 @@ impl<'a> InstructionVisitor for core::fmt::Formatter<'a> {
     }
 
     fn load_imm_and_jump(&mut self, ra: RawReg, value: u32, target: u32) -> Self::ReturnTy {
+        let ra = self.format_reg(ra);
         write!(self, "{ra} = {value}, jump {target}")
     }
 
     fn jump_indirect(&mut self, base: RawReg, offset: u32) -> Self::ReturnTy {
-        match (base, offset) {
-            (_, 0) if base == Reg::RA.into() => write!(self, "ret"),
-            (_, 0) => write!(self, "jump [{}]", base),
-            (_, _) => write!(self, "jump [{} + {}]", base, offset),
+        if !self.format.prefer_unaliased {
+            match (base, offset) {
+                (_, 0) if base == Reg::RA.into() => return write!(self, "ret"),
+                (_, 0) => return write!(self, "jump [{}]", self.format_reg(base)),
+                (_, _) => {}
+            }
         }
+
+        write!(self, "jump [{} + {}]", self.format_reg(base), offset)
     }
 
     fn load_imm_and_jump_indirect(&mut self, ra: RawReg, base: RawReg, value: u32, offset: u32) -> Self::ReturnTy {
-        if offset == 0 {
+        let ra = self.format_reg(ra);
+        let base = self.format_reg(base);
+        if !self.format.prefer_unaliased && offset == 0 {
             write!(self, "jump [{base}], {ra} = {value}")
         } else {
             write!(self, "jump [{base} + {offset}], {ra} = {value}")
@@ -2450,7 +2676,7 @@ impl<'a> Iterator for Instructions<'a> {
     }
 }
 
-#[derive(Default)]
+#[derive(Clone, Default)]
 #[non_exhaustive]
 pub struct ProgramParts {
     pub ro_data_size: u32,
