@@ -229,7 +229,7 @@ impl Source {
 
     fn iter(&'_ self) -> impl Iterator<Item = SectionTarget> + '_ {
         (self.offset_range.start..self.offset_range.end)
-            .step_by(4)
+            .step_by(2)
             .map(|offset| SectionTarget {
                 section_index: self.section_index,
                 offset,
@@ -1482,6 +1482,7 @@ fn convert_instruction(
     section: &Section,
     current_location: SectionTarget,
     instruction: Inst,
+    instruction_size: u64,
     mut emit: impl FnMut(InstExt<SectionTarget, SectionTarget>),
 ) -> Result<(), ProgramFromElfError> {
     match instruction {
@@ -1501,7 +1502,7 @@ fn convert_instruction(
             }
 
             let next = if let Some(dst) = cast_reg_non_zero(dst)? {
-                let target_return = current_location.add(4);
+                let target_return = current_location.add(instruction_size);
                 ControlInst::Call {
                     ra: dst,
                     target,
@@ -1527,7 +1528,7 @@ fn convert_instruction(
                 return Err(ProgramFromElfError::other("out of range unrelocated branch"));
             }
 
-            let target_false = current_location.add(4);
+            let target_false = current_location.add(instruction_size);
             emit(InstExt::Control(ControlInst::Branch {
                 kind,
                 src1,
@@ -1543,7 +1544,7 @@ fn convert_instruction(
             };
 
             let next = if let Some(dst) = cast_reg_non_zero(dst)? {
-                let target_return = current_location.add(4);
+                let target_return = current_location.add(instruction_size);
                 ControlInst::CallIndirect {
                     ra: dst,
                     base,
@@ -1847,6 +1848,37 @@ fn convert_instruction(
     }
 }
 
+/// Read `n` bytes in `text` at `relative_offset` where `n` is
+/// the length of the instruction at `relative_offset`.
+///
+/// # Panics
+/// - Valid RISC-V instructions can be 2 or 4 bytes. Misaligned
+///   `relative_offset` are considered an internal error.
+/// - `relative_offset` is expected to be inbounds.
+///
+/// # Returns
+/// The instruction length and the raw instruction.
+fn read_instruction_bytes(text: &[u8], relative_offset: usize) -> (u64, u32) {
+    assert!(
+        relative_offset % VM_CODE_ADDRESS_ALIGNMENT as usize == 0,
+        "internal error: misaligned instruction read: 0x{relative_offset:08x}"
+    );
+
+    if Inst::is_compressed(text[relative_offset]) {
+        (2, u32::from(u16::from_le_bytes([text[relative_offset], text[relative_offset + 1]])))
+    } else {
+        (
+            4,
+            u32::from_le_bytes([
+                text[relative_offset],
+                text[relative_offset + 1],
+                text[relative_offset + 2],
+                text[relative_offset + 3],
+            ]),
+        )
+    }
+}
+
 fn parse_code_section(
     elf: &Elf,
     section: &Section,
@@ -1859,9 +1891,9 @@ fn parse_code_section(
     let section_name = section.name();
     let text = &section.data();
 
-    if text.len() % 4 != 0 {
+    if text.len() % VM_CODE_ADDRESS_ALIGNMENT as usize != 0 {
         return Err(ProgramFromElfError::other(format!(
-            "size of section '{section_name}' is not divisible by 4"
+            "size of section '{section_name}' is not divisible by 2"
         )));
     }
 
@@ -1873,12 +1905,7 @@ fn parse_code_section(
             offset: relative_offset.try_into().expect("overflow"),
         };
 
-        let raw_inst = u32::from_le_bytes([
-            text[relative_offset],
-            text[relative_offset + 1],
-            text[relative_offset + 2],
-            text[relative_offset + 3],
-        ]);
+        let (inst_size, raw_inst) = read_instruction_bytes(text, relative_offset);
 
         const FUNC3_ECALLI: u32 = 0b000;
         const FUNC3_SBRK: u32 = 0b001;
@@ -1926,12 +1953,7 @@ fn parse_code_section(
                 value: 0,
             };
 
-            let next_raw_inst = u32::from_le_bytes([
-                text[relative_offset],
-                text[relative_offset + 1],
-                text[relative_offset + 2],
-                text[relative_offset + 3],
-            ]);
+            let (next_inst_size, next_raw_inst) = read_instruction_bytes(text, relative_offset);
 
             if Inst::decode(next_raw_inst) != Some(INST_RET) {
                 return Err(ProgramFromElfError::other("external call shim doesn't end with a 'ret'"));
@@ -1940,12 +1962,12 @@ fn parse_code_section(
             output.push((
                 Source {
                     section_index,
-                    offset_range: AddressRange::from(relative_offset as u64..relative_offset as u64 + 4),
+                    offset_range: AddressRange::from(relative_offset as u64..relative_offset as u64 + next_inst_size),
                 },
                 InstExt::Control(ControlInst::JumpIndirect { base: Reg::RA, offset: 0 }),
             ));
 
-            relative_offset += 4;
+            relative_offset += next_inst_size as usize;
             continue;
         }
 
@@ -1965,21 +1987,21 @@ fn parse_code_section(
             output.push((
                 Source {
                     section_index,
-                    offset_range: (relative_offset as u64..relative_offset as u64 + 4).into(),
+                    offset_range: (relative_offset as u64..relative_offset as u64 + inst_size).into(),
                 },
                 InstExt::Basic(BasicInst::Sbrk { dst, size }),
             ));
 
-            relative_offset += 4;
+            relative_offset += inst_size as usize;
             continue;
         }
 
         let source = Source {
             section_index,
-            offset_range: AddressRange::from(relative_offset as u64..relative_offset as u64 + 4),
+            offset_range: AddressRange::from(relative_offset as u64..relative_offset as u64 + inst_size),
         };
 
-        relative_offset += 4;
+        relative_offset += inst_size as usize;
 
         let Some(original_inst) = Inst::decode(raw_inst) else {
             return Err(ProgramFromElfErrorKind::UnsupportedInstruction {
@@ -2001,17 +2023,15 @@ fn parse_code_section(
             } = original_inst
             {
                 if relative_offset < text.len() {
-                    let next_inst = Inst::decode(u32::from_le_bytes([
-                        text[relative_offset],
-                        text[relative_offset + 1],
-                        text[relative_offset + 2],
-                        text[relative_offset + 3],
-                    ]));
+                    let (next_inst_size, next_inst) = read_instruction_bytes(text, relative_offset);
+                    let next_inst = Inst::decode(next_inst);
 
                     if let Some(Inst::JumpAndLinkRegister { dst: ra_dst, base, value }) = next_inst {
                         if base == ra_dst && base == base_upper {
                             if let Some(ra) = cast_reg_non_zero(ra_dst)? {
-                                let offset = (relative_offset as i32 - 4).wrapping_add(value).wrapping_add(value_upper as i32);
+                                let offset = (relative_offset as i32 - next_inst_size as i32)
+                                    .wrapping_add(value)
+                                    .wrapping_add(value_upper as i32);
                                 if offset >= 0 && offset < section.data().len() as i32 {
                                     output.push((
                                         source,
@@ -2021,11 +2041,11 @@ fn parse_code_section(
                                                 section_index,
                                                 offset: u64::from(offset as u32),
                                             },
-                                            target_return: current_location.add(8),
+                                            target_return: current_location.add(inst_size + next_inst_size),
                                         }),
                                     ));
 
-                                    relative_offset += 4;
+                                    relative_offset += inst_size as usize;
                                     continue;
                                 }
                             }
@@ -2035,7 +2055,7 @@ fn parse_code_section(
             }
 
             let original_length = output.len();
-            convert_instruction(section, current_location, original_inst, |inst| {
+            convert_instruction(section, current_location, original_inst, inst_size, |inst| {
                 output.push((source, inst));
             })?;
 
@@ -2077,7 +2097,7 @@ fn split_code_into_basic_blocks(
         let (block_section, block_start) = if !is_jump_target {
             // Make sure nothing wants to jump into the middle of this instruction.
             assert!((source.offset_range.start..source.offset_range.end)
-                .step_by(4)
+                .step_by(2)
                 .skip(1)
                 .all(|offset| !jump_targets.contains(&SectionTarget {
                     section_index: source.section_index,
@@ -7047,7 +7067,7 @@ pub fn program_from_elf(config: Config, data: &[u8]) -> Result<Vec<u8>, ProgramF
             // TODO: Use a smallvec.
             let mut list = Vec::new();
             for source in source_stack.as_slice() {
-                for offset in (source.offset_range.start..source.offset_range.end).step_by(4) {
+                for offset in (source.offset_range.start..source.offset_range.end).step_by(2) {
                     let target = SectionTarget {
                         section_index: source.section_index,
                         offset,

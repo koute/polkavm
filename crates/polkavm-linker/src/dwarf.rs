@@ -1074,7 +1074,7 @@ where
             R: gimli::Reader,
         {
             let inline_source = inlined.source;
-            for offset in (inline_source.offset_range.start..inline_source.offset_range.end).step_by(4) {
+            for offset in (inline_source.offset_range.start..inline_source.offset_range.end).step_by(2) {
                 let list = output.get_mut(&offset).unwrap();
                 if inlined.call_location.is_some() {
                     list.push(LocationKindRef::InlineCall(inlined));
@@ -1117,7 +1117,7 @@ where
                 log::trace!("  Frame: {}", source);
 
                 let mut map: LocationsForOffset<R> = BTreeMap::new();
-                for offset in (source.offset_range.start..source.offset_range.end).step_by(4) {
+                for offset in (source.offset_range.start..source.offset_range.end).step_by(2) {
                     map.insert(offset, Vec::new());
                 }
 
@@ -1127,7 +1127,7 @@ where
 
                 #[allow(clippy::type_complexity)]
                 let mut last_emitted: Option<(Vec<LocationKindRef<R>>, Arc<[Location]>)> = None;
-                for offset in (source.offset_range.start..source.offset_range.end).step_by(4) {
+                for offset in (source.offset_range.start..source.offset_range.end).step_by(2) {
                     let mut list = map.remove(&offset).unwrap();
                     let mut fallback = false;
                     if let Some(line_entry) = line_range_map.get_value(offset) {
