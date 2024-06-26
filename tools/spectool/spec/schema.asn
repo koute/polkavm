@@ -1,6 +1,6 @@
 PVMTestSuite DEFINITIONS ::= BEGIN
 
--- a 32-bit signed integer
+-- a 64-bit signed integer
 I64 ::= INTEGER(-9223372036854775808..9223372036854775807)
 
 -- a 32-bit unsigned integer
@@ -67,7 +67,7 @@ Testcase ::= SEQUENCE {
     expected-pc U32,
 
     -- (part of the "µ′" from the paper)
-    -- lists all non-zero values after the execution finishes; all accessible address not on this list must be filled with zeroes
+    -- lists all non-zero values after the execution finishes; all accessible addresses not on this list must be filled with zeroes
     expected-memory MemoryChunk,
 
     -- (the "ξ′" from the paper)
