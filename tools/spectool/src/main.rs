@@ -55,11 +55,13 @@ struct TestcaseJson {
     initial_pc: u32,
     initial_page_map: Vec<Page>,
     initial_memory: Vec<MemoryChunk>,
+    initial_gas: i64,
     code: Vec<u8>,
     expected_status: String,
     expected_regs: Vec<u32>,
     expected_pc: u32,
     expected_memory: Vec<MemoryChunk>,
+    expected_gas: i64,
 }
 
 fn extract_chunks(base_address: u32, slice: &[u8]) -> Vec<MemoryChunk> {
@@ -88,6 +90,7 @@ fn main_generate() {
     let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("spec");
     for entry in std::fs::read_dir(root.join("src")).unwrap() {
         let mut initial_regs = [0; 13];
+        let mut initial_gas = 10000;
 
         let path = entry.unwrap().path();
         let name = path.file_stem().unwrap().to_string_lossy();
@@ -99,10 +102,14 @@ fn main_generate() {
                 let line = line.trim();
                 let index = line.find('=').expect("invalid 'pre' directive: no '=' found");
                 let lhs = line[..index].trim();
-                let lhs = polkavm_common::utils::parse_reg(lhs).expect("invalid 'pre' directive: failed to parse lhs");
                 let rhs = line[index + 1..].trim();
-                let rhs = polkavm_common::utils::parse_imm(rhs).expect("invalid 'pre' directive: failed to parse rhs");
-                initial_regs[lhs as usize] = rhs as u32;
+                if lhs == "gas" {
+                    initial_gas = rhs.parse::<i64>().expect("invalid 'pre' directive: failed to parse rhs");
+                } else {
+                    let lhs = polkavm_common::utils::parse_reg(lhs).expect("invalid 'pre' directive: failed to parse lhs");
+                    let rhs = polkavm_common::utils::parse_imm(rhs).expect("invalid 'pre' directive: failed to parse rhs");
+                    initial_regs[lhs as usize] = rhs as u32;
+                }
                 input_lines.push(""); // Insert dummy line to not mess up the line count.
                 continue;
             }
@@ -177,7 +184,7 @@ fn main_generate() {
         let export_index = module.lookup_export("main").unwrap();
         let mut user_data = ();
         let mut state_args = polkavm::StateArgs::default();
-        state_args.set_gas(polkavm::Gas::new(10000).unwrap());
+        state_args.set_gas(polkavm::Gas::new(initial_gas as u64).unwrap());
 
         let mut call_args = polkavm::CallArgs::new(&mut user_data, export_index);
         for (reg, value) in Reg::ALL.into_iter().zip(initial_regs) {
@@ -209,6 +216,8 @@ fn main_generate() {
             expected_memory.extend(extract_chunks(page.address, &memory));
         }
 
+        let expected_gas = instance.gas_remaining().unwrap().get() as i64;
+
         let mut disassembler = polkavm_disassembler::Disassembler::new(&blob, polkavm_disassembler::DisassemblyFormat::Guest).unwrap();
         disassembler.show_raw_bytes(true);
         disassembler.prefer_non_abi_reg_names(true);
@@ -228,11 +237,13 @@ fn main_generate() {
                 initial_pc,
                 initial_page_map,
                 initial_memory,
+                initial_gas,
                 code: parts.code_and_jump_table.to_vec(),
                 expected_status: expected_status.to_owned(),
                 expected_regs,
                 expected_pc: expected_final_pc,
                 expected_memory,
+                expected_gas,
             },
         });
     }
@@ -362,6 +373,12 @@ fn main_generate() {
 
         writeln!(&mut index_md, "Program should end with: {}\n", test.json.expected_status).unwrap();
         writeln!(&mut index_md, "Final value of the program counter: {}\n", test.json.expected_pc).unwrap();
+        writeln!(
+            &mut index_md,
+            "Gas consumed: {} -> {}\n",
+            test.json.initial_gas, test.json.expected_gas
+        )
+        .unwrap();
         writeln!(&mut index_md).unwrap();
     }
 
