@@ -457,11 +457,8 @@ impl R {
 }
 
 impl Inst {
-    pub fn size(op: u32) -> u64 {
-        match op & 0b00000011 {
-            0b00..=0b10 => 2,
-            _ => 4,
-        }
+    pub const fn is_compressed(op: u8) -> bool {
+        op & 0b00000011 < 0b00000011
     }
 
     pub fn decode_compressed(op: u32) -> Option<Self> {

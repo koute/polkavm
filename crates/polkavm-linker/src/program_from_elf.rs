@@ -1852,8 +1852,9 @@ fn convert_instruction(
 /// the length of the instruction at `relative_offset`.
 ///
 /// # Panics
-/// Valid RISC-V instructions can be 2 or 4 bytes. Misaligned
-/// `relative_offset` are considered an internal error.
+/// - Valid RISC-V instructions can be 2 or 4 bytes. Misaligned
+///   `relative_offset` are considered an internal error.
+/// - `relative_offset` is expected to be inbounds.
 ///
 /// # Returns
 /// The instruction length and the raw instruction.
@@ -1863,13 +1864,19 @@ fn read_instruction_bytes(text: &[u8], relative_offset: usize) -> (u64, u32) {
         "internal error: misaligned instruction read: 0x{relative_offset:08x}"
     );
 
-    let mut op = u32::from_le_bytes([text[relative_offset], text[relative_offset + 1], 0, 0]);
-    let size = Inst::size(op);
-    if size == 4 {
-        op |= u32::from_le_bytes([0, 0, text[relative_offset + 2], text[relative_offset + 3]])
+    if Inst::is_compressed(text[relative_offset]) {
+        (2, u32::from(u16::from_le_bytes([text[relative_offset], text[relative_offset + 1]])))
+    } else {
+        (
+            4,
+            u32::from_le_bytes([
+                text[relative_offset],
+                text[relative_offset + 1],
+                text[relative_offset + 2],
+                text[relative_offset + 3],
+            ]),
+        )
     }
-
-    (size, op)
 }
 
 fn parse_code_section(
