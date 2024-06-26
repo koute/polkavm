@@ -426,7 +426,7 @@ impl InterpretedInstance {
             let gas_cost: i64 = if let Some(cost) = self.gas_cost_for_block.get(instruction_offset) {
                 u64::from(cost.get()) as i64
             } else {
-                self.calculate_gas_cost()
+                self.calculate_gas_cost::<DEBUG>()
             };
 
             let gas_remaining = self.gas_remaining.as_mut().unwrap();
@@ -451,18 +451,21 @@ impl InterpretedInstance {
 
     #[inline(never)]
     #[cold]
-    fn calculate_gas_cost(&mut self) -> i64 {
+    fn calculate_gas_cost<const DEBUG: bool>(&mut self) -> i64 {
         let instruction_offset = self.instruction_offset;
         let Some(instructions) = self.module.instructions_at(instruction_offset) else {
             return 0;
         };
 
-        let cost = crate::gas::calculate_for_block(instructions);
-        if cost == 0 {
-            return 0;
+        let (cost, started_out_of_bounds) = crate::gas::calculate_for_block(instructions);
+        if DEBUG {
+            log::trace!("Calculated gas cost for block at {instruction_offset}: {cost}");
         }
 
-        self.gas_cost_for_block.insert(instruction_offset, GasCost::new(cost));
+        if !started_out_of_bounds {
+            self.gas_cost_for_block.insert(instruction_offset, GasCost::new(cost));
+        }
+
         u64::from(cost) as i64
     }
 

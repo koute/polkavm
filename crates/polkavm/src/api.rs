@@ -500,7 +500,7 @@ impl Module {
     /// Mostly only useful for debugging.
     pub fn gas_cost_for_code_offset(&self, code_offset: u32) -> Option<i64> {
         let instructions = self.instructions_at(code_offset)?;
-        Some(i64::from(crate::gas::calculate_for_block(instructions)))
+        Some(i64::from(crate::gas::calculate_for_block(instructions).0))
     }
 
     pub(crate) fn debug_print_location(&self, log_level: log::Level, pc: u32) {
