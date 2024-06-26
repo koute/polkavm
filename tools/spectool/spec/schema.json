@@ -31,7 +31,7 @@
     "initial-gas": {
       "$ref": "#/$defs/i64"
     },
-    "code": {
+    "program": {
       "type": "array",
       "items": { "$ref": "#/$defs/u8" }
     },
@@ -53,7 +53,7 @@
       "$ref": "#/$defs/i64"
     }
   },
-  "required": ["name", "initial-regs", "initial-pc", "initial-page-map", "initial-memory", "initial-gas", "code", "expected-status", "expected-regs", "expected-pc", "expected-memory", "expected-gas"],
+  "required": ["name", "initial-regs", "initial-pc", "initial-page-map", "initial-memory", "initial-gas", "program", "expected-status", "expected-regs", "expected-pc", "expected-memory", "expected-gas"],
   "additionalProperties": false,
   "$defs": {
     "u8": {
