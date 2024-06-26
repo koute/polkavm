@@ -1,9 +1,12 @@
 PVMTestSuite DEFINITIONS ::= BEGIN
 
--- a 32-bit integer
+-- a 32-bit signed integer
+I64 ::= INTEGER(-9223372036854775808..9223372036854775807)
+
+-- a 32-bit unsigned integer
 U32 ::= INTEGER(0..4294967295)
 
--- an 8-bit integer (a byte)
+-- an 8-bit unsigned integer (a byte)
 U8 ::= INTEGER(0..255)
 
 -- a blob of bytes at a given memory address
@@ -36,6 +39,10 @@ Testcase ::= SEQUENCE {
     -- lists all non-zero values to put in memory before execution
     initial-memory MemoryChunk,
 
+    -- (the "ξ" from the paper)
+    -- the initial amount of gas
+    initial-gas I64,
+
     -- (the bold "p" from the paper)
     -- the program blob to be executed as part of the test
     code SEQUENCE OF U8,
@@ -61,7 +68,11 @@ Testcase ::= SEQUENCE {
 
     -- (part of the "µ′" from the paper)
     -- lists all non-zero values after the execution finishes; all accessible address not on this list must be filled with zeroes
-    expected-memory MemoryChunk
+    expected-memory MemoryChunk,
+
+    -- (the "ξ′" from the paper)
+    -- the final amount of gas remaining after the execution finishes
+    expected-gas I64
 }
 
 END
