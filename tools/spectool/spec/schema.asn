@@ -45,7 +45,7 @@ Testcase ::= SEQUENCE {
 
     -- (the bold "p" from the paper)
     -- the program blob to be executed as part of the test
-    code SEQUENCE OF U8,
+    program SEQUENCE OF U8,
 
     -- (the "ζ" from the paper)
     -- the status code of the execution, i.e. the way the program is supposed to end
