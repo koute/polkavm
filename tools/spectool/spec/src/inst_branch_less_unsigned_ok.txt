@@ -1,6 +1,6 @@
 pub @main:
     a0 = 10
-    a1 = -20
+    a1 = -10
     jump @target if a0 <u a1
     trap
 @target:
