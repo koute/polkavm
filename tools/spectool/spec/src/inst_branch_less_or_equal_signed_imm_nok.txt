@@ -1,7 +1,6 @@
 pub @main:
     a0 = 10
-    a1 = -10
-    jump @target if a0 <s a1
+    jump @target if a0 <=s -10
 pub @expected_exit:
     trap
 @target:
