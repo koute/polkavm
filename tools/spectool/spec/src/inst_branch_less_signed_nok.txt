@@ -1,6 +1,6 @@
 pub @main:
-    a0 = 0xFFFFFB2E
-    a1 = 0xFFFFFB2E
+    a0 = 10
+    a1 = -11
     jump @target if a0 <s a1
 pub @expected_exit:
     trap
