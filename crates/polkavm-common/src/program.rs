@@ -344,7 +344,7 @@ pub fn read_args_regs2_offset(chunk: u128, instruction_offset: u32, skip: u32) -
 #[inline(always)]
 pub fn read_args_regs3(chunk: u128) -> (RawReg, RawReg, RawReg) {
     let chunk = chunk as u32;
-    let (reg1, reg2, reg3) = (RawReg(chunk), RawReg(chunk >> 4), RawReg(chunk >> 8));
+    let (reg2, reg3, reg1) = (RawReg(chunk), RawReg(chunk >> 4), RawReg(chunk >> 8));
     (reg1, reg2, reg3)
 }
 
@@ -519,9 +519,9 @@ mod kani {
     #[kani::proof]
     fn verify_read_args_regs3() {
         fn simple_read_args_regs3(code: &[u8]) -> (u8, u8, u8) {
-            let reg1 = min(12, code[0] & 0b1111);
-            let reg2 = min(12, code[0] >> 4);
-            let reg3 = min(12, code[1] & 0b1111);
+            let reg2 = min(12, code[0] & 0b1111);
+            let reg3 = min(12, code[0] >> 4);
+            let reg1 = min(12, code[1] & 0b1111);
             (reg1, reg2, reg3)
         }
 
@@ -1448,8 +1448,8 @@ impl Instruction {
 
     fn serialize_reg_reg_reg(buffer: &mut [u8], opcode: Opcode, reg1: RawReg, reg2: RawReg, reg3: RawReg) -> usize {
         buffer[0] = opcode as u8;
-        buffer[1] = reg1.0 as u8 | (reg2.0 as u8) << 4;
-        buffer[2] = reg3.0 as u8;
+        buffer[1] = reg2.0 as u8 | (reg3.0 as u8) << 4;
+        buffer[2] = reg1.0 as u8;
         3
     }
 
