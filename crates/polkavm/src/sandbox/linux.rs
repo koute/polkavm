@@ -34,16 +34,55 @@ use crate::config::GasMeteringKind;
 use crate::shm_allocator::{ShmAllocator, ShmAllocation};
 
 pub struct GlobalState {
-    shared_memory: ShmAllocator
+    shared_memory: ShmAllocator,
+    is_sandboxing_enabled: bool,
 }
 
 impl GlobalState {
-    pub fn new(_config: &Config) -> Result<Self, Error> {
+    pub fn new(config: &Config) -> Result<Self, Error> {
+        let is_sandboxing_enabled = GlobalState::is_sandboxing_supported();
+        if !config.allow_insecure && !is_sandboxing_enabled  {
+            return Err(Error::from_str("failed to spawn new process"));
+        }
+
         Ok(GlobalState {
-            shared_memory: ShmAllocator::new()?
+            shared_memory: ShmAllocator::new()?,
+            is_sandboxing_enabled,
         })
     }
+
+    fn is_sandboxing_supported() -> bool {
+        let child_pid = unsafe { linux_raw::syscall!(linux_raw::SYS_clone, SANDBOX_FLAGS, 0, 0, 0, 0) };
+        if child_pid < 0 {
+            return false;
+        }
+
+        if !cfg!(polkavm_dev_debug_zygote) {
+            // Overwrite the hostname and domainname.
+            match linux_raw::sys_sethostname("localhost") {
+                Ok(()) => {},
+                Err(error) => {
+                    log::trace!("Failed to call sys_sethostname: {}", error);
+                    return false
+                },
+            }
+        }
+        true
+    }
 }
+
+const SANDBOX_FLAGS: u32 =
+    if !cfg!(polkavm_dev_debug_zygote) {
+        linux_raw::CLONE_NEWCGROUP
+            | linux_raw::CLONE_NEWIPC
+            | linux_raw::CLONE_NEWNET
+            | linux_raw::CLONE_NEWNS
+            | linux_raw::CLONE_NEWPID
+            | linux_raw::CLONE_NEWUSER
+            | linux_raw::CLONE_NEWUTS
+    } else {
+        0
+    };
 
 pub struct SandboxConfig {
     enable_logger: bool,
@@ -1077,22 +1116,9 @@ impl super::Sandbox for Sandbox {
         let (socket, child_socket) = linux_raw::sys_socketpair(linux_raw::AF_UNIX, linux_raw::SOCK_SEQPACKET | linux_raw::SOCK_CLOEXEC, 0)?;
         let (lifetime_pipe_host, lifetime_pipe_child) = linux_raw::sys_pipe2(linux_raw::O_CLOEXEC)?;
 
-        let sandbox_flags =
-            if !cfg!(polkavm_dev_debug_zygote) {
-                u64::from(linux_raw::CLONE_NEWCGROUP
-                    | linux_raw::CLONE_NEWIPC
-                    | linux_raw::CLONE_NEWNET
-                    | linux_raw::CLONE_NEWNS
-                    | linux_raw::CLONE_NEWPID
-                    | linux_raw::CLONE_NEWUSER
-                    | linux_raw::CLONE_NEWUTS)
-            } else {
-                0
-            };
-
         let mut pidfd: c_int = -1;
         let args = CloneArgs {
-            flags: linux_raw::CLONE_CLEAR_SIGHAND | u64::from(linux_raw::CLONE_PIDFD) | sandbox_flags,
+            flags: linux_raw::CLONE_CLEAR_SIGHAND | u64::from(linux_raw::CLONE_PIDFD) | u64::from(SANDBOX_FLAGS),
             pidfd: &mut pidfd,
             child_tid: 0,
             parent_tid: 0,
@@ -1122,7 +1148,7 @@ impl super::Sandbox for Sandbox {
         if child_pid < 0 {
             // Fallback for Linux versions older than 5.5.
             let error = Error::from_last_os_error("clone");
-            child_pid = unsafe { linux_raw::syscall!(linux_raw::SYS_clone, sandbox_flags, 0, 0, 0, 0) };
+            child_pid = unsafe { linux_raw::syscall!(linux_raw::SYS_clone, SANDBOX_FLAGS, 0, 0, 0, 0) };
 
             if child_pid < 0 {
                 return Err(error);
@@ -1248,7 +1274,7 @@ impl super::Sandbox for Sandbox {
         }
 
         #[cfg(debug_assertions)]
-        if cfg!(polkavm_dev_debug_zygote) {
+        if cfg!(polkavm_dev_debug_zygote) || !global.is_sandboxing_enabled {
             use core::fmt::Write;
             std::thread::sleep(core::time::Duration::from_millis(200));
 
