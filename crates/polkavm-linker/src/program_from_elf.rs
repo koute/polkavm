@@ -1570,15 +1570,16 @@ fn convert_instruction(
             Ok(())
         }
         Inst::Load { kind, dst, base, offset } => {
-            let Some(dst) = cast_reg_non_zero(dst)? else {
-                return Err(ProgramFromElfError::other("found a load with a zero register as the destination"));
-            };
-
             let Some(base) = cast_reg_non_zero(base)? else {
                 return Err(ProgramFromElfError::other("found an unrelocated absolute load"));
             };
 
-            emit(InstExt::Basic(BasicInst::LoadIndirect { kind, dst, base, offset }));
+            // LLVM riscv-enable-dead-defs pass may rewrite dst to the zero register.
+            match cast_reg_non_zero(dst)? {
+                Some(dst) => emit(InstExt::Basic(BasicInst::LoadIndirect { kind, dst, base, offset })),
+                None => emit(InstExt::Basic(BasicInst::Nop)),
+            }
+
             Ok(())
         }
         Inst::Store { kind, src, base, offset } => {
@@ -5833,6 +5834,14 @@ fn read_u32(data: &[u8], relative_address: u64) -> Result<u32, ProgramFromElfErr
     Ok(u32::from_le_bytes([value[0], value[1], value[2], value[3]]))
 }
 
+fn read_u16(data: &[u8], relative_address: u64) -> Result<u16, ProgramFromElfError> {
+    let target_range = relative_address as usize..relative_address as usize + 2;
+    let value = data
+        .get(target_range)
+        .ok_or(ProgramFromElfError::other("out of range relocation"))?;
+    Ok(u16::from_le_bytes([value[0], value[1]]))
+}
+
 fn read_u8(data: &[u8], relative_address: u64) -> Result<u8, ProgramFromElfError> {
     data.get(relative_address as usize)
         .ok_or(ProgramFromElfError::other("out of range relocation"))
@@ -6212,6 +6221,61 @@ fn harvest_code_relocations(
                             target
                         );
                     }
+                    object::elf::R_RISCV_RVC_JUMP => {
+                        let inst_raw = read_u16(section_data, relative_address)?;
+                        let Some(inst) = Inst::decode(inst_raw.into()) else {
+                            return Err(ProgramFromElfError::other(format!(
+                                "R_RISCV_RVC_JUMP for an unsupported instruction: 0x{inst_raw:04}"
+                            )));
+                        };
+
+                        let (Inst::JumpAndLink { dst, .. } | Inst::JumpAndLinkRegister { dst, .. }) = inst else {
+                            return Err(ProgramFromElfError::other(format!(
+                                "R_RISCV_RVC_JUMP for an unsupported instruction: 0x{inst_raw:04} ({inst:?})"
+                            )));
+                        };
+
+                        let target_return = current_location.add(2);
+                        instruction_overrides.insert(current_location, InstExt::Control(jump_or_call(dst, target, target_return)?));
+
+                        log::trace!(
+                            "  R_RISCV_RVC_JUMP: {}[0x{relative_address:x}] (0x{absolute_address:x} -> {}",
+                            section.name(),
+                            target
+                        );
+                    }
+                    object::elf::R_RISCV_RVC_BRANCH => {
+                        let inst_raw = read_u16(section_data, relative_address)?;
+                        let Some(inst) = Inst::decode_compressed(inst_raw.into()) else {
+                            return Err(ProgramFromElfError::other(format!(
+                                "R_RISCV_RVC_BRANCH for an unsupported instruction: 0x{inst_raw:04}"
+                            )));
+                        };
+
+                        let Inst::Branch { kind, src1, src2, .. } = inst else {
+                            return Err(ProgramFromElfError::other(format!(
+                                "R_RISCV_BRANCH for an unsupported instruction: 0x{inst_raw:04} ({inst:?})"
+                            )));
+                        };
+
+                        let target_false = current_location.add(2);
+                        instruction_overrides.insert(
+                            current_location,
+                            InstExt::Control(ControlInst::Branch {
+                                kind,
+                                src1: cast_reg_any(src1)?,
+                                src2: cast_reg_any(src2)?,
+                                target_true: target,
+                                target_false,
+                            }),
+                        );
+
+                        log::trace!(
+                            "  R_RISCV_RVC_BRANCH: {}[0x{relative_address:x}] (0x{absolute_address:x} -> {}",
+                            section.name(),
+                            target
+                        );
+                    }
                     object::elf::R_RISCV_RELAX => {}
                     _ => {
                         return Err(ProgramFromElfError::other(format!(
@@ -6275,7 +6339,9 @@ fn harvest_code_relocations(
                     ..
                 } => {
                     let Some(dst) = cast_reg_non_zero(dst)? else {
-                        return Err(ProgramFromElfError::other("{lo_rel_name} with a zero destination register"));
+                        return Err(ProgramFromElfError::other(format!(
+                            "{lo_rel_name} with a zero destination register: 0x{lo_inst_raw:08x} in {section_name}[0x{relative_lo:08x}]"
+                        )));
                     };
 
                     (base, InstExt::Basic(BasicInst::LoadAddressIndirect { dst, target }))
@@ -6295,14 +6361,17 @@ fn harvest_code_relocations(
                     ..
                 } => {
                     let Some(dst) = cast_reg_non_zero(dst)? else {
-                        return Err(ProgramFromElfError::other("{lo_rel_name} with a zero destination register"));
+                        return Err(ProgramFromElfError::other(format!(
+                            "{lo_rel_name} with a zero destination register: 0x{lo_inst_raw:08x} in {section_name}[0x{relative_lo:08x}]"
+                        )));
                     };
 
                     (src, InstExt::Basic(BasicInst::LoadAddress { dst, target }))
                 }
                 Inst::Load { kind, base, dst, .. } => {
                     let Some(dst) = cast_reg_non_zero(dst)? else {
-                        return Err(ProgramFromElfError::other("{lo_rel_name} with a zero destination register"));
+                        // The instruction will be translated to a NOP.
+                        continue;
                     };
 
                     (base, InstExt::Basic(BasicInst::LoadAbsolute { kind, dst, target }))
@@ -6453,6 +6522,7 @@ pub fn program_from_elf(config: Config, data: &[u8]) -> Result<Vec<u8>, ProgramF
             || name == ".data.rel.ro"
             || name.starts_with(".data.rel.ro.")
             || name == ".got"
+            || name == ".relro_padding"
         {
             if name == ".rodata" && is_writable {
                 return Err(ProgramFromElfError::other(format!(
