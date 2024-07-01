@@ -1,0 +1,7 @@
+pub @main:
+    a0 = 10
+    jump @target if a0 <s -11
+pub @expected_exit:
+    trap
+@target:
+    a0 = 0xdeadbeef
