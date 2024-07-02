@@ -1,0 +1,6 @@
+pub @main:
+    a0 = @target
+    jump [a0]
+    trap
+@target:
+    a1 = 0xdeadbeef
