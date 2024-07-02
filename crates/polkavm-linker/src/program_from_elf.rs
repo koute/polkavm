@@ -5605,6 +5605,7 @@ pub(crate) enum RelocationSize {
 #[derive(Copy, Clone, Debug)]
 pub(crate) enum SizeRelocationSize {
     SixBits,
+    Uleb128,
     Generic(RelocationSize),
 }
 
@@ -5664,6 +5665,9 @@ fn harvest_data_relocations(
 
         Set6 { target: SectionTarget },
         Sub6 { target: SectionTarget },
+
+        SetUleb128 { target: SectionTarget },
+        SubUleb128 { target: SectionTarget },
     }
 
     if elf.relocations(section).next().is_none() {
@@ -5723,6 +5727,8 @@ fn harvest_data_relocations(
                 object::elf::R_RISCV_SUB16 => ("R_RISCV_SUB16", Kind::Mut(MutOp::Sub, RelocationSize::U16, target)),
                 object::elf::R_RISCV_ADD32 => ("R_RISCV_ADD32", Kind::Mut(MutOp::Add, RelocationSize::U32, target)),
                 object::elf::R_RISCV_SUB32 => ("R_RISCV_SUB32", Kind::Mut(MutOp::Sub, RelocationSize::U32, target)),
+                object::elf::R_RISCV_SET_ULEB128 => ("R_RISCV_SET_ULEB128", Kind::SetUleb128 { target }),
+                object::elf::R_RISCV_SUB_ULEB128 => ("R_RISCV_SUB_ULEB128", Kind::SubUleb128 { target }),
                 _ => {
                     return Err(ProgramFromElfError::other(format!(
                         "unsupported relocation in data section '{section_name}': {relocation:?}"
@@ -5800,6 +5806,19 @@ fn harvest_data_relocations(
                 );
                 continue;
             }
+            [(_, Kind::SetUleb128 { target: target_1 }), (_, Kind::SubUleb128 { target: target_2 })]
+                if target_1.section_index == target_2.section_index && target_1.offset >= target_2.offset =>
+            {
+                relocations.insert(
+                    current_location,
+                    RelocationKind::Size {
+                        section_index: target_1.section_index,
+                        range: (target_2.offset..target_1.offset).into(),
+                        size: SizeRelocationSize::Uleb128,
+                    },
+                );
+                continue;
+            }
             [(_, Kind::Mut(MutOp::Add, size_1, target_1)), (_, Kind::Mut(MutOp::Sub, size_2, target_2))]
                 if size_1 == size_2
                     && *size_1 == RelocationSize::U32
@@ -5848,6 +5867,44 @@ fn read_u8(data: &[u8], relative_address: u64) -> Result<u8, ProgramFromElfError
     data.get(relative_address as usize)
         .ok_or(ProgramFromElfError::other("out of range relocation"))
         .copied()
+}
+
+/// ULEB128 encode `value` and overwrite the existing value at `data_offset`, keeping the length.
+///
+/// See the [ELF ABI spec] and [LLD implementation] for reference.
+///
+/// [ELF ABI spec]: https://github.com/riscv-non-isa/riscv-elf-psabi-doc/blob/fbf3cbbac00ef1860ae60302a9afedb98fd31109/riscv-elf.adoc#uleb128-note
+/// [LLD implementation]: https://github.com/llvm/llvm-project/blob/release/18.x/lld/ELF/Target.h#L310
+fn overwrite_uleb128(data: &mut [u8], mut data_offset: usize, mut value: u64) -> Result<(), ProgramFromElfError> {
+    loop {
+        let Some(byte) = data.get_mut(data_offset) else {
+            return Err(ProgramFromElfError::other("ULEB128 relocation target offset out of bounds"));
+        };
+        data_offset += 1;
+
+        if *byte & 0x80 != 0 {
+            *byte = 0x80 | (value as u8 & 0x7f);
+            value >>= 7;
+        } else {
+            *byte = value as u8;
+            return if value > 0x80 {
+                Err(ProgramFromElfError::other("ULEB128 relocation overflow"))
+            } else {
+                Ok(())
+            };
+        }
+    }
+}
+
+#[test]
+fn test_overwrite_uleb128() {
+    let value = 624485;
+    let encoded_value = vec![0xE5u8, 0x8E, 0x26];
+    let mut data = vec![0x80, 0x80, 0x00];
+
+    overwrite_uleb128(&mut data, 0, value).unwrap();
+
+    assert_eq!(data, encoded_value);
 }
 
 fn write_u32(data: &mut [u8], relative_address: u64, value: u32) -> Result<(), ProgramFromElfError> {
@@ -6527,6 +6584,7 @@ pub fn program_from_elf(config: Config, data: &[u8]) -> Result<Vec<u8>, ProgramF
             || name.starts_with(".data.rel.ro.")
             || name == ".got"
             || name == ".relro_padding"
+            || name.starts_with(".rela.debug_loclists")
         {
             if name == ".rodata" && is_writable {
                 return Err(ProgramFromElfError::other(format!(
@@ -6923,6 +6981,9 @@ pub fn program_from_elf(config: Config, data: &[u8]) -> Result<Vec<u8>, ProgramF
                 let data = elf.section_data_mut(relocation_target.section_index);
                 let value = range.end - range.start;
                 match size {
+                    SizeRelocationSize::Uleb128 => {
+                        overwrite_uleb128(data, relocation_target.offset as usize, value)?;
+                    }
                     SizeRelocationSize::SixBits => {
                         let mask = 0b00111111;
                         if value > mask {
