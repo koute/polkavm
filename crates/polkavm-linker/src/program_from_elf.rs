@@ -5687,8 +5687,10 @@ fn harvest_data_relocations(
             continue;
         };
 
-        let (relocation_name, kind) = match relocation.kind() {
-            object::RelocationKind::Absolute if relocation.encoding() == object::RelocationEncoding::Generic && relocation.size() == 32 => {
+        let (relocation_name, kind) = match (relocation.kind(), relocation.flags()) {
+            (object::RelocationKind::Absolute, _)
+                if relocation.encoding() == object::RelocationEncoding::Generic && relocation.size() == 32 =>
+            {
                 (
                     "R_RISCV_32",
                     Kind::Set(RelocationKind::Abs {
@@ -5697,7 +5699,7 @@ fn harvest_data_relocations(
                     }),
                 )
             }
-            object::RelocationKind::Elf(reloc_kind) => match reloc_kind {
+            (_, object::RelocationFlags::Elf { r_type: reloc_kind }) => match reloc_kind {
                 object::elf::R_RISCV_SET6 => ("R_RISCV_SET6", Kind::Set6 { target }),
                 object::elf::R_RISCV_SUB6 => ("R_RISCV_SUB6", Kind::Sub6 { target }),
                 object::elf::R_RISCV_SET8 => (
@@ -5922,8 +5924,10 @@ fn harvest_code_relocations(
             continue;
         };
 
-        match relocation.kind() {
-            object::RelocationKind::Absolute if relocation.encoding() == object::RelocationEncoding::Generic && relocation.size() == 32 => {
+        match (relocation.kind(), relocation.flags()) {
+            (object::RelocationKind::Absolute, _)
+                if relocation.encoding() == object::RelocationEncoding::Generic && relocation.size() == 32 =>
+            {
                 data_relocations.insert(
                     current_location,
                     RelocationKind::Abs {
@@ -5932,7 +5936,7 @@ fn harvest_code_relocations(
                     },
                 );
             }
-            object::RelocationKind::Elf(reloc_kind) => {
+            (_, object::RelocationFlags::Elf { r_type: reloc_kind }) => {
                 // https://github.com/riscv-non-isa/riscv-elf-psabi-doc/releases
                 match reloc_kind {
                     object::elf::R_RISCV_CALL_PLT => {
