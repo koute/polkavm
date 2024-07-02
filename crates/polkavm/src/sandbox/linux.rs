@@ -42,7 +42,7 @@ impl GlobalState {
     pub fn new(config: &Config) -> Result<Self, Error> {
         let is_sandboxing_enabled = GlobalState::is_sandboxing_supported();
         if !config.allow_insecure && !is_sandboxing_enabled  {
-            return Err(Error::from_str("failed to spawn new process"));
+            return Err(Error::from_str("Sandboxing is not supported on your system. You can enable set_allow_insecure/POLKAVM_ALLOW_INSECURE to run with reduced sandboxing, if you know what you're doing"));
         }
 
         Ok(GlobalState {
@@ -1110,10 +1110,16 @@ impl super::Sandbox for Sandbox {
         let (memory_memfd, memory_mmap) = prepare_memory()?;
         let (socket, child_socket) = linux_raw::sys_socketpair(linux_raw::AF_UNIX, linux_raw::SOCK_SEQPACKET | linux_raw::SOCK_CLOEXEC, 0)?;
         let (lifetime_pipe_host, lifetime_pipe_child) = linux_raw::sys_pipe2(linux_raw::O_CLOEXEC)?;
+        
+        let sandbox_flags = if !cfg!(polkavm_dev_debug_zygote) {
+            SANDBOX_FLAGS
+        } else {
+            0
+        };
 
         let mut pidfd: c_int = -1;
         let args = CloneArgs {
-            flags: linux_raw::CLONE_CLEAR_SIGHAND | u64::from(linux_raw::CLONE_PIDFD) | u64::from(SANDBOX_FLAGS),
+            flags: linux_raw::CLONE_CLEAR_SIGHAND | u64::from(linux_raw::CLONE_PIDFD) | u64::from(sandbox_flags),
             pidfd: &mut pidfd,
             child_tid: 0,
             parent_tid: 0,
@@ -1143,11 +1149,6 @@ impl super::Sandbox for Sandbox {
         if child_pid < 0 {
             // Fallback for Linux versions older than 5.5.
             let error = Error::from_last_os_error("clone");
-            let sandbox_flags = if !cfg!(polkavm_dev_debug_zygote) {
-                SANDBOX_FLAGS
-            } else {
-                0
-            };
             child_pid = unsafe { linux_raw::syscall!(linux_raw::SYS_clone, sandbox_flags, 0, 0, 0, 0) };
 
             if child_pid < 0 {
