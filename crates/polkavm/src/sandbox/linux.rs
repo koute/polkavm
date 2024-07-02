@@ -71,18 +71,13 @@ impl GlobalState {
     }
 }
 
-const SANDBOX_FLAGS: u32 =
-    if !cfg!(polkavm_dev_debug_zygote) {
-        linux_raw::CLONE_NEWCGROUP
-            | linux_raw::CLONE_NEWIPC
-            | linux_raw::CLONE_NEWNET
-            | linux_raw::CLONE_NEWNS
-            | linux_raw::CLONE_NEWPID
-            | linux_raw::CLONE_NEWUSER
-            | linux_raw::CLONE_NEWUTS
-    } else {
-        0
-    };
+const SANDBOX_FLAGS: u32 = linux_raw::CLONE_NEWCGROUP
+    | linux_raw::CLONE_NEWIPC
+    | linux_raw::CLONE_NEWNET
+    | linux_raw::CLONE_NEWNS
+    | linux_raw::CLONE_NEWPID
+    | linux_raw::CLONE_NEWUSER
+    | linux_raw::CLONE_NEWUTS;
 
 pub struct SandboxConfig {
     enable_logger: bool,
@@ -1148,7 +1143,12 @@ impl super::Sandbox for Sandbox {
         if child_pid < 0 {
             // Fallback for Linux versions older than 5.5.
             let error = Error::from_last_os_error("clone");
-            child_pid = unsafe { linux_raw::syscall!(linux_raw::SYS_clone, SANDBOX_FLAGS, 0, 0, 0, 0) };
+            let sandbox_flags = if !cfg!(polkavm_dev_debug_zygote) {
+                SANDBOX_FLAGS
+            } else {
+                0
+            };
+            child_pid = unsafe { linux_raw::syscall!(linux_raw::SYS_clone, sandbox_flags, 0, 0, 0, 0) };
 
             if child_pid < 0 {
                 return Err(error);
