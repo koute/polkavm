@@ -6584,7 +6584,6 @@ pub fn program_from_elf(config: Config, data: &[u8]) -> Result<Vec<u8>, ProgramF
             || name.starts_with(".data.rel.ro.")
             || name == ".got"
             || name == ".relro_padding"
-            || name.starts_with(".rela.debug_loclists")
         {
             if name == ".rodata" && is_writable {
                 return Err(ProgramFromElfError::other(format!(
