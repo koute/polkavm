@@ -634,7 +634,7 @@ pub fn assemble(code: &str) -> Result<Vec<u8>, String> {
                 jump_table.push(target_index);
                 code.push(Instruction::load_imm(
                     dst.into(),
-                    target_index * crate::abi::VM_CODE_ADDRESS_ALIGNMENT,
+                    (jump_table.len() as u32) * crate::abi::VM_CODE_ADDRESS_ALIGNMENT,
                 ));
             }
             MaybeInstruction::LoadImmAndJump(dst, value, label) => {
