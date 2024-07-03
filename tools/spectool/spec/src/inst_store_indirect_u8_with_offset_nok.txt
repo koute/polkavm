@@ -1,0 +1,7 @@
+pre: a0 = 0x20000
+pre: a1 = 0x12345678
+
+%rw_data_size = 1
+
+pub @main:
+    u8 [a0 + 4097] = a1
