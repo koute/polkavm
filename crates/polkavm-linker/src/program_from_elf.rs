@@ -1570,15 +1570,16 @@ fn convert_instruction(
             Ok(())
         }
         Inst::Load { kind, dst, base, offset } => {
-            let Some(dst) = cast_reg_non_zero(dst)? else {
-                return Err(ProgramFromElfError::other("found a load with a zero register as the destination"));
-            };
-
             let Some(base) = cast_reg_non_zero(base)? else {
                 return Err(ProgramFromElfError::other("found an unrelocated absolute load"));
             };
 
-            emit(InstExt::Basic(BasicInst::LoadIndirect { kind, dst, base, offset }));
+            // LLVM riscv-enable-dead-defs pass may rewrite dst to the zero register.
+            match cast_reg_non_zero(dst)? {
+                Some(dst) => emit(InstExt::Basic(BasicInst::LoadIndirect { kind, dst, base, offset })),
+                None => emit(InstExt::Basic(BasicInst::Nop)),
+            }
+
             Ok(())
         }
         Inst::Store { kind, src, base, offset } => {
@@ -5604,6 +5605,7 @@ pub(crate) enum RelocationSize {
 #[derive(Copy, Clone, Debug)]
 pub(crate) enum SizeRelocationSize {
     SixBits,
+    Uleb128,
     Generic(RelocationSize),
 }
 
@@ -5663,6 +5665,9 @@ fn harvest_data_relocations(
 
         Set6 { target: SectionTarget },
         Sub6 { target: SectionTarget },
+
+        SetUleb128 { target: SectionTarget },
+        SubUleb128 { target: SectionTarget },
     }
 
     if elf.relocations(section).next().is_none() {
@@ -5687,8 +5692,10 @@ fn harvest_data_relocations(
             continue;
         };
 
-        let (relocation_name, kind) = match relocation.kind() {
-            object::RelocationKind::Absolute if relocation.encoding() == object::RelocationEncoding::Generic && relocation.size() == 32 => {
+        let (relocation_name, kind) = match (relocation.kind(), relocation.flags()) {
+            (object::RelocationKind::Absolute, _)
+                if relocation.encoding() == object::RelocationEncoding::Generic && relocation.size() == 32 =>
+            {
                 (
                     "R_RISCV_32",
                     Kind::Set(RelocationKind::Abs {
@@ -5697,7 +5704,7 @@ fn harvest_data_relocations(
                     }),
                 )
             }
-            object::RelocationKind::Elf(reloc_kind) => match reloc_kind {
+            (_, object::RelocationFlags::Elf { r_type: reloc_kind }) => match reloc_kind {
                 object::elf::R_RISCV_SET6 => ("R_RISCV_SET6", Kind::Set6 { target }),
                 object::elf::R_RISCV_SUB6 => ("R_RISCV_SUB6", Kind::Sub6 { target }),
                 object::elf::R_RISCV_SET8 => (
@@ -5720,6 +5727,8 @@ fn harvest_data_relocations(
                 object::elf::R_RISCV_SUB16 => ("R_RISCV_SUB16", Kind::Mut(MutOp::Sub, RelocationSize::U16, target)),
                 object::elf::R_RISCV_ADD32 => ("R_RISCV_ADD32", Kind::Mut(MutOp::Add, RelocationSize::U32, target)),
                 object::elf::R_RISCV_SUB32 => ("R_RISCV_SUB32", Kind::Mut(MutOp::Sub, RelocationSize::U32, target)),
+                object::elf::R_RISCV_SET_ULEB128 => ("R_RISCV_SET_ULEB128", Kind::SetUleb128 { target }),
+                object::elf::R_RISCV_SUB_ULEB128 => ("R_RISCV_SUB_ULEB128", Kind::SubUleb128 { target }),
                 _ => {
                     return Err(ProgramFromElfError::other(format!(
                         "unsupported relocation in data section '{section_name}': {relocation:?}"
@@ -5797,6 +5806,19 @@ fn harvest_data_relocations(
                 );
                 continue;
             }
+            [(_, Kind::SetUleb128 { target: target_1 }), (_, Kind::SubUleb128 { target: target_2 })]
+                if target_1.section_index == target_2.section_index && target_1.offset >= target_2.offset =>
+            {
+                relocations.insert(
+                    current_location,
+                    RelocationKind::Size {
+                        section_index: target_1.section_index,
+                        range: (target_2.offset..target_1.offset).into(),
+                        size: SizeRelocationSize::Uleb128,
+                    },
+                );
+                continue;
+            }
             [(_, Kind::Mut(MutOp::Add, size_1, target_1)), (_, Kind::Mut(MutOp::Sub, size_2, target_2))]
                 if size_1 == size_2
                     && *size_1 == RelocationSize::U32
@@ -5833,10 +5855,56 @@ fn read_u32(data: &[u8], relative_address: u64) -> Result<u32, ProgramFromElfErr
     Ok(u32::from_le_bytes([value[0], value[1], value[2], value[3]]))
 }
 
+fn read_u16(data: &[u8], relative_address: u64) -> Result<u16, ProgramFromElfError> {
+    let target_range = relative_address as usize..relative_address as usize + 2;
+    let value = data
+        .get(target_range)
+        .ok_or(ProgramFromElfError::other("out of range relocation"))?;
+    Ok(u16::from_le_bytes([value[0], value[1]]))
+}
+
 fn read_u8(data: &[u8], relative_address: u64) -> Result<u8, ProgramFromElfError> {
     data.get(relative_address as usize)
         .ok_or(ProgramFromElfError::other("out of range relocation"))
         .copied()
+}
+
+/// ULEB128 encode `value` and overwrite the existing value at `data_offset`, keeping the length.
+///
+/// See the [ELF ABI spec] and [LLD implementation] for reference.
+///
+/// [ELF ABI spec]: https://github.com/riscv-non-isa/riscv-elf-psabi-doc/blob/fbf3cbbac00ef1860ae60302a9afedb98fd31109/riscv-elf.adoc#uleb128-note
+/// [LLD implementation]: https://github.com/llvm/llvm-project/blob/release/18.x/lld/ELF/Target.h#L310
+fn overwrite_uleb128(data: &mut [u8], mut data_offset: usize, mut value: u64) -> Result<(), ProgramFromElfError> {
+    loop {
+        let Some(byte) = data.get_mut(data_offset) else {
+            return Err(ProgramFromElfError::other("ULEB128 relocation target offset out of bounds"));
+        };
+        data_offset += 1;
+
+        if *byte & 0x80 != 0 {
+            *byte = 0x80 | (value as u8 & 0x7f);
+            value >>= 7;
+        } else {
+            *byte = value as u8;
+            return if value > 0x80 {
+                Err(ProgramFromElfError::other("ULEB128 relocation overflow"))
+            } else {
+                Ok(())
+            };
+        }
+    }
+}
+
+#[test]
+fn test_overwrite_uleb128() {
+    let value = 624485;
+    let encoded_value = vec![0xE5u8, 0x8E, 0x26];
+    let mut data = vec![0x80, 0x80, 0x00];
+
+    overwrite_uleb128(&mut data, 0, value).unwrap();
+
+    assert_eq!(data, encoded_value);
 }
 
 fn write_u32(data: &mut [u8], relative_address: u64, value: u32) -> Result<(), ProgramFromElfError> {
@@ -5922,8 +5990,10 @@ fn harvest_code_relocations(
             continue;
         };
 
-        match relocation.kind() {
-            object::RelocationKind::Absolute if relocation.encoding() == object::RelocationEncoding::Generic && relocation.size() == 32 => {
+        match (relocation.kind(), relocation.flags()) {
+            (object::RelocationKind::Absolute, _)
+                if relocation.encoding() == object::RelocationEncoding::Generic && relocation.size() == 32 =>
+            {
                 data_relocations.insert(
                     current_location,
                     RelocationKind::Abs {
@@ -5932,7 +6002,7 @@ fn harvest_code_relocations(
                     },
                 );
             }
-            object::RelocationKind::Elf(reloc_kind) => {
+            (_, object::RelocationFlags::Elf { r_type: reloc_kind }) => {
                 // https://github.com/riscv-non-isa/riscv-elf-psabi-doc/releases
                 match reloc_kind {
                     object::elf::R_RISCV_CALL_PLT => {
@@ -6212,6 +6282,61 @@ fn harvest_code_relocations(
                             target
                         );
                     }
+                    object::elf::R_RISCV_RVC_JUMP => {
+                        let inst_raw = read_u16(section_data, relative_address)?;
+                        let Some(inst) = Inst::decode(inst_raw.into()) else {
+                            return Err(ProgramFromElfError::other(format!(
+                                "R_RISCV_RVC_JUMP for an unsupported instruction: 0x{inst_raw:04}"
+                            )));
+                        };
+
+                        let (Inst::JumpAndLink { dst, .. } | Inst::JumpAndLinkRegister { dst, .. }) = inst else {
+                            return Err(ProgramFromElfError::other(format!(
+                                "R_RISCV_RVC_JUMP for an unsupported instruction: 0x{inst_raw:04} ({inst:?})"
+                            )));
+                        };
+
+                        let target_return = current_location.add(2);
+                        instruction_overrides.insert(current_location, InstExt::Control(jump_or_call(dst, target, target_return)?));
+
+                        log::trace!(
+                            "  R_RISCV_RVC_JUMP: {}[0x{relative_address:x}] (0x{absolute_address:x} -> {}",
+                            section.name(),
+                            target
+                        );
+                    }
+                    object::elf::R_RISCV_RVC_BRANCH => {
+                        let inst_raw = read_u16(section_data, relative_address)?;
+                        let Some(inst) = Inst::decode_compressed(inst_raw.into()) else {
+                            return Err(ProgramFromElfError::other(format!(
+                                "R_RISCV_RVC_BRANCH for an unsupported instruction: 0x{inst_raw:04}"
+                            )));
+                        };
+
+                        let Inst::Branch { kind, src1, src2, .. } = inst else {
+                            return Err(ProgramFromElfError::other(format!(
+                                "R_RISCV_BRANCH for an unsupported instruction: 0x{inst_raw:04} ({inst:?})"
+                            )));
+                        };
+
+                        let target_false = current_location.add(2);
+                        instruction_overrides.insert(
+                            current_location,
+                            InstExt::Control(ControlInst::Branch {
+                                kind,
+                                src1: cast_reg_any(src1)?,
+                                src2: cast_reg_any(src2)?,
+                                target_true: target,
+                                target_false,
+                            }),
+                        );
+
+                        log::trace!(
+                            "  R_RISCV_RVC_BRANCH: {}[0x{relative_address:x}] (0x{absolute_address:x} -> {}",
+                            section.name(),
+                            target
+                        );
+                    }
                     object::elf::R_RISCV_RELAX => {}
                     _ => {
                         return Err(ProgramFromElfError::other(format!(
@@ -6275,7 +6400,9 @@ fn harvest_code_relocations(
                     ..
                 } => {
                     let Some(dst) = cast_reg_non_zero(dst)? else {
-                        return Err(ProgramFromElfError::other("{lo_rel_name} with a zero destination register"));
+                        return Err(ProgramFromElfError::other(format!(
+                            "{lo_rel_name} with a zero destination register: 0x{lo_inst_raw:08x} in {section_name}[0x{relative_lo:08x}]"
+                        )));
                     };
 
                     (base, InstExt::Basic(BasicInst::LoadAddressIndirect { dst, target }))
@@ -6295,14 +6422,17 @@ fn harvest_code_relocations(
                     ..
                 } => {
                     let Some(dst) = cast_reg_non_zero(dst)? else {
-                        return Err(ProgramFromElfError::other("{lo_rel_name} with a zero destination register"));
+                        return Err(ProgramFromElfError::other(format!(
+                            "{lo_rel_name} with a zero destination register: 0x{lo_inst_raw:08x} in {section_name}[0x{relative_lo:08x}]"
+                        )));
                     };
 
                     (src, InstExt::Basic(BasicInst::LoadAddress { dst, target }))
                 }
                 Inst::Load { kind, base, dst, .. } => {
                     let Some(dst) = cast_reg_non_zero(dst)? else {
-                        return Err(ProgramFromElfError::other("{lo_rel_name} with a zero destination register"));
+                        // The instruction will be translated to a NOP.
+                        continue;
                     };
 
                     (base, InstExt::Basic(BasicInst::LoadAbsolute { kind, dst, target }))
@@ -6453,6 +6583,7 @@ pub fn program_from_elf(config: Config, data: &[u8]) -> Result<Vec<u8>, ProgramF
             || name == ".data.rel.ro"
             || name.starts_with(".data.rel.ro.")
             || name == ".got"
+            || name == ".relro_padding"
         {
             if name == ".rodata" && is_writable {
                 return Err(ProgramFromElfError::other(format!(
@@ -6849,6 +6980,9 @@ pub fn program_from_elf(config: Config, data: &[u8]) -> Result<Vec<u8>, ProgramF
                 let data = elf.section_data_mut(relocation_target.section_index);
                 let value = range.end - range.start;
                 match size {
+                    SizeRelocationSize::Uleb128 => {
+                        overwrite_uleb128(data, relocation_target.offset as usize, value)?;
+                    }
                     SizeRelocationSize::SixBits => {
                         let mask = 0b00111111;
                         if value > mask {

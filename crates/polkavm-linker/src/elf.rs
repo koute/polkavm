@@ -118,7 +118,7 @@ impl<'data, 'file> Symbol<'data, 'file> {
     }
 
     pub fn kind(&self) -> u8 {
-        self.elf_symbol.raw_symbol().st_type()
+        self.elf_symbol.elf_symbol().st_type()
     }
 }
 
@@ -132,23 +132,23 @@ pub struct Elf<'data> {
 impl<'data> Elf<'data> {
     pub fn parse(data: &'data [u8]) -> Result<Self, ProgramFromElfError> {
         let elf = ElfFile::parse(data)?;
-        if elf.raw_header().e_ident.data != object::elf::ELFDATA2LSB {
+        if elf.elf_header().e_ident.data != object::elf::ELFDATA2LSB {
             return Err(ProgramFromElfError::other("file is not a little endian ELF file"));
         }
 
-        let os_abi = elf.raw_header().e_ident.os_abi;
+        let os_abi = elf.elf_header().e_ident.os_abi;
         if os_abi != object::elf::ELFOSABI_SYSV && os_abi != object::elf::ELFOSABI_GNU {
             return Err(ProgramFromElfError::other("file doesn't use the System V nor GNU ABI"));
         }
 
         if !matches!(
-            elf.raw_header().e_type.get(LittleEndian),
+            elf.elf_header().e_type.get(LittleEndian),
             object::elf::ET_EXEC | object::elf::ET_REL
         ) {
             return Err(ProgramFromElfError::other("file is not a supported ELF file (ET_EXEC or ET_REL)"));
         }
 
-        if elf.raw_header().e_machine.get(LittleEndian) != object::elf::EM_RISCV {
+        if elf.elf_header().e_machine.get(LittleEndian) != object::elf::EM_RISCV {
             return Err(ProgramFromElfError::other("file is not a RISC-V file (EM_RISCV)"));
         }
 
