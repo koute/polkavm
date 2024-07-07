@@ -1,4 +1,4 @@
-%rw_data_size = 1
+%rw_data_size = 2
 %rw_data = 81 82
 
 pub @main:

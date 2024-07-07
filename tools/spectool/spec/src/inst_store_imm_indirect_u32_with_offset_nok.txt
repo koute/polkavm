@@ -3,4 +3,5 @@ pre: a0 = 0x20000
 %rw_data_size = 1
 
 pub @main:
+pub @expected_exit:
     u32 [a0 + 4097] = 0x12345678
