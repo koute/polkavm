@@ -533,8 +533,16 @@ impl<'r, 'a, S> ArchVisitor<'r, 'a, S> where S: Sandbox {
                 reg_indirect(RegSize::R64, LINUX_SANDBOX_VMCTX_REG + offset as i32)
             },
             SandboxKind::Generic => {
-                let offset = crate::sandbox::generic::GUEST_MEMORY_TO_VMCTX_OFFSET as i32 + offset as i32;
-                reg_indirect(RegSize::R64, GENERIC_SANDBOX_MEMORY_REG + offset)
+                #[cfg(feature = "generic-sandbox")]
+                {
+                    let offset = crate::sandbox::generic::GUEST_MEMORY_TO_VMCTX_OFFSET as i32 + offset as i32;
+                    reg_indirect(RegSize::R64, GENERIC_SANDBOX_MEMORY_REG + offset)
+                }
+
+                #[cfg(not(feature = "generic-sandbox"))]
+                {
+                    unreachable!();
+                }
             }
         }
     }
@@ -567,7 +575,7 @@ impl<'r, 'a, S> ArchVisitor<'r, 'a, S> where S: Sandbox {
             log::trace!("Emitting trampoline: export: {}", export.symbol());
 
             let trampoline_label = self.asm.create_label();
-            self.export_to_label.insert(export.target_code_offset(), trampoline_label);
+            self.export_to_label.insert(export.program_counter().0, trampoline_label);
 
             if matches!(S::KIND, SandboxKind::Linux) {
                 self.push(mov_imm64(LINUX_SANDBOX_VMCTX_REG, VM_ADDR_VMCTX));
@@ -580,7 +588,7 @@ impl<'r, 'a, S> ArchVisitor<'r, 'a, S> where S: Sandbox {
                 self.branch_to_label(Condition::Sign, self.trap_label);
             }
 
-            let target_label = self.get_or_forward_declare_label(export.target_code_offset()).unwrap_or(self.trap_label);
+            let target_label = self.get_or_forward_declare_label(export.program_counter().0).unwrap_or(self.trap_label);
             self.jump_to_label(target_label);
         }
     }

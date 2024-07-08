@@ -244,12 +244,12 @@ impl<'a, S> CompilerVisitor<'a, S> where S: Sandbox {
         let mut export_trampolines = self.export_trampolines;
         assert!(export_trampolines.is_empty());
         for export in self.exports {
-            let label = self.export_to_label.get(&export.target_code_offset()).unwrap();
+            let label = self.export_to_label.get(&export.program_counter().0).unwrap();
             let native_address = native_code_address
                 .checked_add_signed(self.asm.get_label_origin_offset_or_panic(*label) as i64)
                 .expect("overflow");
 
-            export_trampolines.entry(export.target_code_offset()).or_insert(native_address);
+            export_trampolines.entry(export.program_counter().0).or_insert(native_address);
         }
 
         let epilogue_length = self.asm.len() - epilogue_start;

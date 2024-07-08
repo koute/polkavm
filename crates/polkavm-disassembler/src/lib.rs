@@ -203,7 +203,7 @@ impl<'a> Disassembler<'a> {
         let mut exports_for_code_offset = HashMap::new();
         for (nth_export, export) in self.blob.exports().enumerate() {
             exports_for_code_offset
-                .entry(export.target_code_offset())
+                .entry(export.program_counter().0)
                 .or_insert_with(Vec::new)
                 .push((nth_export, export));
         }

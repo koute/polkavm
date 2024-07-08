@@ -23,7 +23,6 @@ pub mod assembler;
 pub mod abi;
 #[cfg(feature = "alloc")]
 pub mod elf;
-pub mod error;
 pub mod operation;
 pub mod program;
 pub mod utils;

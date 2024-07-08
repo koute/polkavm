@@ -255,6 +255,9 @@ pub struct VmCtx {
     /// The page size.
     pub page_size: UnsafeCell<u32>,
 
+    /// Whether userfaultfd-based memory management is enabled.
+    pub uffd_enabled: UnsafeCell<bool>,
+
     /// Performance counters. Only for debugging.
     pub counters: CacheAligned<VmCtxCounters>,
 
@@ -307,6 +310,7 @@ impl VmCtx {
             heap_initial_threshold: UnsafeCell::new(0),
             heap_max_size: UnsafeCell::new(0),
             page_size: UnsafeCell::new(0),
+            uffd_enabled: UnsafeCell::new(false),
 
             syscall_ffi: CacheAligned(VmCtxSyscall {
                 gas: UnsafeCell::new(0),

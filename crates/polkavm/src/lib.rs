@@ -7,7 +7,7 @@
 #[cfg(all(
     not(miri),
     target_arch = "x86_64",
-    any(target_os = "linux", target_os = "macos", target_os = "freebsd"),
+    any(target_os = "linux", all(feature = "generic-sandbox", any(target_os = "macos", target_os = "freebsd"))),
     feature = "std",
 ))]
 macro_rules! if_compiler_is_supported {
@@ -16,18 +16,19 @@ macro_rules! if_compiler_is_supported {
     } else {
         $($if_false:tt)*
     }) => {
-        $($if_true)*
+        // $($if_true)*
+        $($if_false)*
     };
 
     ($($if_true:tt)*) => {
-        $($if_true)*
+        // $($if_true)*
     }
 }
 
 #[cfg(not(all(
     not(miri),
     target_arch = "x86_64",
-    any(target_os = "linux", target_os = "macos", target_os = "freebsd"),
+    any(target_os = "linux", all(feature = "generic-sandbox", any(target_os = "macos", target_os = "freebsd"))),
     feature = "std",
 )))]
 macro_rules! if_compiler_is_supported {
@@ -47,7 +48,6 @@ extern crate alloc;
 mod error;
 
 mod api;
-mod caller;
 mod config;
 mod gas;
 mod interpreter;
@@ -55,6 +55,7 @@ mod interpreter;
 mod source_cache;
 mod tracer;
 mod utils;
+mod linker;
 
 #[cfg(feature = "std")]
 mod mutex_std;
@@ -82,15 +83,19 @@ if_compiler_is_supported! {
 
 pub use polkavm_common::{
     abi::MemoryMap,
-    error::{ExecutionError, Trap},
-    program::{ProgramBlob, ProgramParseError, Reg},
-    utils::{ArcBytes, AsUninitSliceMut, Gas},
+    program::{ProgramBlob, ProgramCounter, ProgramExport, ProgramParseError, ProgramSymbol, Reg},
+    utils::{ArcBytes, AsUninitSliceMut},
 };
 
-pub use crate::api::{CallArgs, Engine, ExportIndex, Instance, InstancePre, Linker, Module, StateArgs};
-pub use crate::caller::{Caller, CallerRef};
+pub type Gas = i64;
+
+pub use crate::api::{Engine, RawInstance, Module, MemoryAccessError, RegValue};
 pub use crate::config::{BackendKind, Config, GasMeteringKind, ModuleConfig, SandboxKind};
 pub use crate::error::Error;
+pub use crate::utils::{InterruptKind, Segfault, Trap};
+pub use crate::linker::{Caller, Linker, CallError, InstancePre, Instance};
+
+pub const RETURN_TO_HOST: u32 = polkavm_common::abi::VM_ADDR_RETURN_TO_HOST;
 
 #[cfg(test)]
 mod tests;

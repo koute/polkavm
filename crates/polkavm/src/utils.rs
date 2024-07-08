@@ -86,3 +86,52 @@ pub(crate) fn as_bytes(slice: &[usize]) -> &[u8] {
     // SAFETY: Casting a &[usize] into a &[u8] is always safe as `u8` doesn't have any alignment requirements.
     unsafe { core::slice::from_raw_parts(slice.as_ptr().cast(), core::mem::size_of_val(slice)) }
 }
+
+#[derive(Clone, Debug)]
+#[non_exhaustive]
+pub struct Segfault {
+    /// The address of the page which was accessed.
+    pub page_address: u32,
+}
+
+#[derive(Clone, Debug, Default)]
+#[non_exhaustive]
+pub struct Trap;
+
+#[derive(Clone, Debug)]
+pub enum InterruptKind {
+    /// The execution finished normally.
+    ///
+    /// This happens when the program jumps to the address `0xffff0000`.
+    Finished,
+
+    /// The execution finished abnormally with a trap.
+    ///
+    /// This can happen for a few reasons:
+    ///   - if the `trap` instruction is executed,
+    ///   - if an invalid instruction is executed,
+    ///   - if a jump to an invalid address is made,
+    ///   - if a segmentation fault is triggered (when dynamic paging is not enabled for this VM)
+    Trap(Trap),
+
+    /// The execution triggered an external call with an `ecalli` instruction.
+    Ecalli(u32),
+
+    /// The execution triggered a segmentation fault.
+    ///
+    /// This happens when a program accesses a memory page that is not mapped,
+    /// or tries to write to a read-only page.
+    ///
+    /// Requires dynamic paging to be enabled, otherwise is never emitted.
+    Segfault(Segfault),
+
+    /// The execution ran out of gas.
+    ///
+    /// Requires gas metering to be enabled, otherwise is never emitted.
+    NotEnoughGas,
+
+    /// Executed a single instruction.
+    ///
+    /// Requires execution step-tracing to be enabled, otherwise is never emitted.
+    Step,
+}

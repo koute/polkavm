@@ -1269,7 +1269,7 @@ impl super::Sandbox for Sandbox {
                 self.poison = Poison::Poisoned;
                 result
             }
-            result @ (Ok(()) | Err(ExecutionError::Trap(_) | ExecutionError::OutOfGas)) => {
+            result @ (Ok(()) | Err(ExecutionError::Trap(_) | ExecutionError::NotEnoughGas)) => {
                 self.poison = Poison::None;
                 result
             }
@@ -1307,11 +1307,11 @@ impl super::Sandbox for Sandbox {
         get_field_offset!(VmCtx::new(), |base| &base.heap_info)
     }
 
-    fn gas_remaining_impl(&self) -> Result<Option<Gas>, super::OutOfGas> {
+    fn gas_remaining_impl(&self) -> Result<Option<Gas>, super::NotEnoughGas> {
         let Some(module) = self.module.as_ref() else { return Ok(None) };
         if module.gas_metering().is_none() { return Ok(None) };
         let raw_gas = self.vmctx().gas;
-        Gas::from_i64(raw_gas).ok_or(super::OutOfGas).map(Some)
+        Gas::from_i64(raw_gas).ok_or(super::NotEnoughGas).map(Some)
     }
 
     fn sync(&mut self) -> Result<(), Self::Error> {

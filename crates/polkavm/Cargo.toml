@@ -33,3 +33,9 @@ workspace = true
 [features]
 default = ["std"]
 std = ["ruzstd/std"]
+
+# Whether to enable a cross-platform, generic sandbox for the recompiler backend.
+#
+# This is required on non-Linux systems to use the recompiler. On Linux it is unnecessary.
+# This sandbox is EXPERIMENTAL and is not meant for production use.
+generic-sandbox = []

@@ -1,20 +1,14 @@
-use crate::api::{BackendAccess, ExecuteArgs, HostcallHandler, MemoryAccessError, Module};
+use crate::api::{MemoryAccessError, Module, RegValue};
 use crate::error::Error;
-use crate::utils::GuestInit;
-use crate::utils::{FlatMap, RegImm};
+use crate::utils::{FlatMap, GuestInit, RegImm, InterruptKind};
+use crate::{Gas, Trap};
 use alloc::vec::Vec;
 use core::mem::MaybeUninit;
 use core::num::NonZeroU32;
 use polkavm_common::abi::VM_ADDR_RETURN_TO_HOST;
-use polkavm_common::error::Trap;
 use polkavm_common::operation::*;
 use polkavm_common::program::{Instruction, InstructionVisitor, ParsedInstruction, RawReg, Reg};
-use polkavm_common::utils::{align_to_next_page_usize, byte_slice_init, Access, AsUninitSliceMut, Gas};
-use polkavm_common::{
-    VM_RPC_FLAG_CLEAR_PROGRAM_AFTER_EXECUTION, VM_RPC_FLAG_RESET_MEMORY_AFTER_EXECUTION, VM_RPC_FLAG_RESET_MEMORY_BEFORE_EXECUTION,
-};
-
-type ExecutionError<E = core::convert::Infallible> = polkavm_common::error::ExecutionError<E>;
+use polkavm_common::utils::{align_to_next_page_usize, byte_slice_init, AsUninitSliceMut};
 
 // Define a custom trait instead of just using `Into<RegImm>` to make sure this is always inlined.
 trait IntoRegImm {
@@ -58,16 +52,11 @@ pub(crate) type OnStore<'a> = &'a mut dyn for<'r> FnMut(u32, &'r [u8]) -> Result
 
 #[derive(Default)]
 pub(crate) struct InterpreterContext<'a> {
-    on_hostcall: Option<HostcallHandler<'a>>,
     on_set_reg: Option<OnSetReg<'a>>,
     on_store: Option<OnStore<'a>>,
 }
 
 impl<'a> InterpreterContext<'a> {
-    pub fn set_on_hostcall(&mut self, on_hostcall: HostcallHandler<'a>) {
-        self.on_hostcall = Some(on_hostcall);
-    }
-
     pub fn set_on_set_reg(&mut self, on_set_reg: OnSetReg<'a>) {
         self.on_set_reg = Some(on_set_reg);
     }
@@ -165,9 +154,13 @@ impl BasicMemory {
     }
 
     fn sbrk(&mut self, module: &Module, size: u32) -> Option<u32> {
-        let new_heap_size = self.heap_size.checked_add(size)?;
+        let Some(new_heap_size) = self.heap_size.checked_add(size) else {
+            log::trace!("sbrk: heap size overflow; ignoring request: heap_size={} + size={} > 0xffffffff", self.heap_size, size);
+            return None;
+        };
         let memory_map = module.memory_map();
         if new_heap_size > memory_map.max_heap_size() {
+            log::trace!("sbrk: new heap size is too large; ignoring request: {} > {}", new_heap_size, memory_map.max_heap_size());
             return None;
         }
 
@@ -206,11 +199,10 @@ pub(crate) struct InterpretedInstance {
     regs: [u32; Reg::ALL.len()],
     instruction_offset: u32,
     instruction_length: u32,
-    return_to_host: bool,
     cycle_counter: u64,
     gas_cost_for_block: FlatMap<GasCost>,
     gas_remaining: Option<i64>,
-    in_new_execution: bool,
+    program_counter_changed: bool,
     compiled_offset_for_block: FlatMap<NonZeroU32>,
     compiled_instructions: Vec<ParsedInstruction>,
     compiled_offset: usize,
@@ -227,10 +219,9 @@ impl InterpretedInstance {
             regs: [0; Reg::ALL.len()],
             instruction_offset: 0,
             instruction_length: 0,
-            return_to_host: true,
             cycle_counter: 0,
             gas_remaining: None,
-            in_new_execution: false,
+            program_counter_changed: true,
             compiled_offset: 0,
         };
 
@@ -238,21 +229,92 @@ impl InterpretedInstance {
         instance
     }
 
-    pub fn execute(&mut self, mut args: ExecuteArgs) -> Result<(), ExecutionError<Error>> {
-        self.prepare_for_execution(&args);
-
-        let mut ctx = InterpreterContext::default();
-        if let Some(hostcall_handler) = args.hostcall_handler.take() {
-            ctx.set_on_hostcall(hostcall_handler);
-        }
-
-        let result = if args.entry_point.is_some() { self.run(ctx) } else { Ok(()) };
-
-        self.finish_execution(args.flags);
-        result
+    pub fn run(&mut self) -> Result<InterruptKind, Error> {
+        let ctx = InterpreterContext::default();
+        Ok(self.run_with_ctx(ctx))
     }
 
-    pub fn run(&mut self, ctx: InterpreterContext) -> Result<(), ExecutionError<Error>> {
+    pub fn reg(&self, reg: Reg) -> RegValue {
+        self.regs[reg as usize]
+    }
+
+    pub fn set_reg(&mut self, reg: Reg, value: u32) {
+        self.regs[reg as usize] = value;
+    }
+
+    pub fn gas(&self) -> Gas {
+        self.gas_remaining.unwrap_or(0)
+    }
+
+    pub fn set_gas(&mut self, gas: Gas) {
+        if let Some(ref mut gas_remaining) = self.gas_remaining {
+            *gas_remaining = gas;
+        }
+    }
+
+    pub fn program_counter(&self) -> Option<u32> {
+        Some(self.instruction_offset)
+    }
+
+    pub fn set_program_counter(&mut self, pc: u32) {
+        self.instruction_offset = pc;
+        self.program_counter_changed = true;
+    }
+
+    #[allow(clippy::unused_self)]
+    pub fn native_program_counter(&self) -> Option<usize> {
+        None
+    }
+
+    pub fn read_memory_into<'slice, B>(&self, address: u32, buffer: &'slice mut B) -> Result<&'slice mut [u8], MemoryAccessError>
+    where
+        B: ?Sized + AsUninitSliceMut,
+    {
+        let buffer: &mut [MaybeUninit<u8>] = buffer.as_uninit_slice_mut();
+        let Some(slice) = self
+            .memory
+            .get_memory_slice(&self.module, address, buffer.len() as u32)
+        else {
+            return Err(MemoryAccessError {
+                address,
+                length: buffer.len() as u64,
+                error: "out of range read".into(),
+            });
+        };
+
+        Ok(byte_slice_init(buffer, slice))
+    }
+
+    pub fn write_memory(&mut self, address: u32, data: &[u8]) -> Result<(), MemoryAccessError> {
+        let Some(slice) = self
+            .memory
+            .get_memory_slice_mut(&self.module, address, data.len() as u32)
+        else {
+            return Err(MemoryAccessError {
+                address,
+                length: data.len() as u64,
+                error: "out of range write".into(),
+            });
+        };
+
+        slice.copy_from_slice(data);
+        Ok(())
+    }
+
+    pub fn heap_size(&self) -> u32 {
+        self.memory.heap_size()
+    }
+
+    pub fn sbrk(&mut self, size: u32) -> Option<u32> {
+        self.memory.sbrk(&self.module, size)
+    }
+
+    #[allow(clippy::unused_self)]
+    pub fn pid(&self) -> Option<u32> {
+        None
+    }
+
+    fn run_with_ctx(&mut self, ctx: InterpreterContext) -> InterruptKind {
         if log::log_enabled!(target: "polkavm", log::Level::Debug)
             || log::log_enabled!(target: "polkavm::interpreter", log::Level::Debug)
             || cfg!(test)
@@ -264,28 +326,11 @@ impl InterpretedInstance {
     }
 
     #[inline(never)]
-    fn run_impl<const DEBUG: bool>(&mut self, ctx: InterpreterContext) -> Result<(), ExecutionError<Error>> {
-        #[cold]
-        fn translate_error(error: ExecutionError) -> ExecutionError<Error> {
-            match error {
-                ExecutionError::Trap(trap) => ExecutionError::Trap(trap),
-                ExecutionError::OutOfGas => ExecutionError::OutOfGas,
-                ExecutionError::Error(_) => unreachable!(),
-            }
-        }
-
-        #[cold]
-        fn trap() -> ExecutionError<Error> {
-            ExecutionError::Trap(Default::default())
-        }
-
+    fn run_impl<const DEBUG: bool>(&mut self, ctx: InterpreterContext) -> InterruptKind {
         self.memory.mark_dirty();
 
-        if self.in_new_execution {
-            self.in_new_execution = false;
-            if let Err(error) = self.on_start_new_basic_block::<DEBUG>() {
-                return Err(translate_error(error));
-            }
+        if let Err(error) = self.resume_execution_if_pending::<DEBUG>() {
+            return error;
         }
 
         let mut visitor = Visitor::<DEBUG> { inner: self, ctx };
@@ -295,37 +340,28 @@ impl InterpretedInstance {
                 if DEBUG {
                     log::trace!("Trap at {}: no instruction found", visitor.inner.instruction_offset);
                 }
-                return Err(trap());
+                return InterruptKind::Trap(Default::default());
             };
 
             visitor.inner.instruction_offset = instruction.offset;
             visitor.inner.instruction_length = instruction.length;
             visitor.trace_current_instruction(&instruction);
             if let Err(error) = instruction.visit(&mut visitor) {
-                return Err(translate_error(error));
-            }
-
-            if visitor.inner.return_to_host {
-                break;
+                return error;
             }
         }
-
-        Ok(())
     }
 
-    pub fn step_once(&mut self, ctx: InterpreterContext) -> Result<(), ExecutionError> {
-        if self.in_new_execution {
-            self.in_new_execution = false;
-            self.on_start_new_basic_block::<true>()?;
-        }
+    pub fn step_once(&mut self, ctx: InterpreterContext) -> Result<(), InterruptKind> {
+        self.resume_execution_if_pending::<true>()?;
 
         self.cycle_counter += 1;
         let Some(mut instructions) = self.module.instructions_at(self.instruction_offset) else {
-            return Err(ExecutionError::Trap(Default::default()));
+            return Err(InterruptKind::Trap(Default::default()));
         };
 
         let Some(instruction) = instructions.next() else {
-            return Err(ExecutionError::Trap(Default::default()));
+            return Err(InterruptKind::Trap(Default::default()));
         };
 
         self.instruction_offset = instruction.offset;
@@ -349,10 +385,6 @@ impl InterpretedInstance {
         self.memory.reset(&self.module);
     }
 
-    pub fn sbrk(&mut self, size: u32) -> Option<u32> {
-        self.memory.sbrk(&self.module, size)
-    }
-
     fn initialize_module(&mut self) {
         if self.module.gas_metering().is_some() {
             self.gas_remaining = Some(0);
@@ -361,59 +393,38 @@ impl InterpretedInstance {
         self.memory.force_reset(&self.module);
     }
 
-    pub fn prepare_for_execution(&mut self, args: &ExecuteArgs) {
-        if let Some(module) = args.module {
-            if module.interpreted_module().is_none() {
-                panic!("internal_error: an interpreter cannot be created from the given module");
+    fn resume_execution_if_pending<const DEBUG: bool>(&mut self) -> Result<(), InterruptKind> {
+        if let Some(gas_remaining) = self.gas_remaining {
+            if gas_remaining < 0 {
+                return Err(InterruptKind::NotEnoughGas);
             }
-
-            self.clear_instance();
-            self.module = module.clone();
-            self.initialize_module();
         }
 
-        if let Some(regs) = args.regs {
-            self.regs.copy_from_slice(regs);
+        if !self.program_counter_changed {
+            return Ok(());
         }
 
-        if self.module.gas_metering().is_some() {
-            if let Some(gas) = args.gas {
-                self.gas_remaining = Some(gas.get() as i64);
+        if DEBUG {
+            log::debug!("Resuming execution at: {}", self.instruction_offset);
+        }
+
+        let Some(mut instructions) = self.module.instructions_at(self.instruction_offset) else {
+            return Err(InterruptKind::Trap(Default::default()));
+        };
+
+        if let Some(previous_instruction) = instructions.next_back() {
+            if !previous_instruction.starts_new_basic_block() {
+                return Err(InterruptKind::Trap(Default::default()));
             }
-        } else {
-            self.gas_remaining = None;
         }
 
-        if let Some(entry_point) = args.entry_point {
-            self.instruction_offset = entry_point;
-        }
-
-        if args.flags & VM_RPC_FLAG_RESET_MEMORY_BEFORE_EXECUTION != 0 {
-            self.reset_memory();
-        }
-
-        if args.sbrk > 0 {
-            self.sbrk(args.sbrk).expect("internal error: sbrk failed");
-        }
-
-        self.return_to_host = false;
-        self.in_new_execution = true;
-    }
-
-    pub fn finish_execution(&mut self, flags: u32) {
-        if flags & VM_RPC_FLAG_CLEAR_PROGRAM_AFTER_EXECUTION != 0 {
-            self.clear_instance();
-        } else if flags & VM_RPC_FLAG_RESET_MEMORY_AFTER_EXECUTION != 0 {
-            self.reset_memory();
-        }
-    }
-
-    pub fn access(&mut self) -> InterpretedAccess {
-        InterpretedAccess { instance: self }
+        self.on_start_new_basic_block::<DEBUG>()?;
+        self.program_counter_changed = false;
+        Ok(())
     }
 
     #[cfg_attr(not(debug_assertions), inline(always))]
-    fn on_start_new_basic_block<const DEBUG: bool>(&mut self) -> Result<(), ExecutionError> {
+    fn on_start_new_basic_block<const DEBUG: bool>(&mut self) -> Result<(), InterruptKind> {
         let instruction_offset = self.instruction_offset;
         if let Some(compiled_offset) = self.compiled_offset_for_block.get(instruction_offset) {
             self.compiled_offset = (compiled_offset.get() - 1) as usize;
@@ -442,7 +453,7 @@ impl InterpretedInstance {
 
             *gas_remaining -= gas_cost;
             if *gas_remaining < 0 {
-                return Err(ExecutionError::OutOfGas);
+                return Err(InterruptKind::NotEnoughGas);
             }
         }
 
@@ -471,9 +482,9 @@ impl InterpretedInstance {
 
     #[inline(never)]
     #[cold]
-    fn compile_block<const DEBUG: bool>(&mut self) -> Result<(), ExecutionError> {
+    fn compile_block<const DEBUG: bool>(&mut self) -> Result<(), InterruptKind> {
         let Some(instructions) = self.module.instructions_at(self.instruction_offset) else {
-            return Err(ExecutionError::Trap(Default::default()));
+            return Err(InterruptKind::Trap(Default::default()));
         };
 
         if DEBUG {
@@ -506,96 +517,6 @@ impl InterpretedInstance {
 
         Ok(())
     }
-
-    fn check_gas(&mut self) -> Result<(), ExecutionError> {
-        if let Some(ref mut gas_remaining) = self.gas_remaining {
-            if *gas_remaining < 0 {
-                return Err(ExecutionError::OutOfGas);
-            }
-        }
-
-        Ok(())
-    }
-}
-
-pub struct InterpretedAccess<'a> {
-    instance: &'a mut InterpretedInstance,
-}
-
-impl<'a> Access<'a> for InterpretedAccess<'a> {
-    type Error = MemoryAccessError<&'static str>;
-
-    fn get_reg(&self, reg: Reg) -> u32 {
-        self.instance.regs[reg as usize]
-    }
-
-    fn set_reg(&mut self, reg: Reg, value: u32) {
-        self.instance.regs[reg as usize] = value;
-    }
-
-    fn read_memory_into_slice<'slice, T>(&self, address: u32, buffer: &'slice mut T) -> Result<&'slice mut [u8], Self::Error>
-    where
-        T: ?Sized + AsUninitSliceMut,
-    {
-        let buffer: &mut [MaybeUninit<u8>] = buffer.as_uninit_slice_mut();
-        let Some(slice) = self
-            .instance
-            .memory
-            .get_memory_slice(&self.instance.module, address, buffer.len() as u32)
-        else {
-            return Err(MemoryAccessError {
-                address,
-                length: buffer.len() as u64,
-                error: "out of range read",
-            });
-        };
-
-        Ok(byte_slice_init(buffer, slice))
-    }
-
-    fn write_memory(&mut self, address: u32, data: &[u8]) -> Result<(), Self::Error> {
-        let Some(slice) = self
-            .instance
-            .memory
-            .get_memory_slice_mut(&self.instance.module, address, data.len() as u32)
-        else {
-            return Err(MemoryAccessError {
-                address,
-                length: data.len() as u64,
-                error: "out of range write",
-            });
-        };
-
-        slice.copy_from_slice(data);
-        Ok(())
-    }
-
-    fn sbrk(&mut self, size: u32) -> Option<u32> {
-        self.instance.sbrk(size)
-    }
-
-    fn heap_size(&self) -> u32 {
-        self.instance.memory.heap_size()
-    }
-
-    fn program_counter(&self) -> Option<u32> {
-        Some(self.instance.instruction_offset)
-    }
-
-    fn native_program_counter(&self) -> Option<u64> {
-        None
-    }
-
-    fn gas_remaining(&self) -> Option<Gas> {
-        let gas = self.instance.gas_remaining?;
-        Some(Gas::new(gas as u64).unwrap_or(Gas::MIN))
-    }
-
-    fn consume_gas(&mut self, gas: u64) {
-        if let Some(ref mut gas_remaining) = self.instance.gas_remaining {
-            *gas_remaining = gas_remaining.checked_sub_unsigned(gas).unwrap_or(-1);
-        }
-    }
 }
 
 struct Visitor<'a, 'b, const DEBUG: bool> {
@@ -613,7 +534,7 @@ impl<'a, 'b, const DEBUG: bool> Visitor<'a, 'b, DEBUG> {
     }
 
     #[inline(always)]
-    fn set(&mut self, dst: RawReg, value: u32) -> Result<(), ExecutionError> {
+    fn set(&mut self, dst: RawReg, value: u32) -> Result<(), InterruptKind> {
         let dst = dst.get();
         self.inner.regs[dst as usize] = value;
 
@@ -623,7 +544,7 @@ impl<'a, 'b, const DEBUG: bool> Visitor<'a, 'b, DEBUG> {
 
         if let Some(on_set_reg) = self.ctx.on_set_reg.as_mut() {
             let result = (on_set_reg)(dst, value);
-            Ok(result.map_err(ExecutionError::Trap)?)
+            Ok(result.map_err(InterruptKind::Trap)?)
         } else {
             Ok(())
         }
@@ -636,7 +557,7 @@ impl<'a, 'b, const DEBUG: bool> Visitor<'a, 'b, DEBUG> {
         s1: impl IntoRegImm,
         s2: impl IntoRegImm,
         callback: impl Fn(u32, u32) -> u32,
-    ) -> Result<(), ExecutionError> {
+    ) -> Result<(), InterruptKind> {
         let s1 = self.get(s1);
         let s2 = self.get(s2);
         self.set(dst, callback(s1, s2))?;
@@ -651,7 +572,7 @@ impl<'a, 'b, const DEBUG: bool> Visitor<'a, 'b, DEBUG> {
         s2: impl IntoRegImm,
         target: u32,
         callback: impl Fn(u32, u32) -> bool,
-    ) -> Result<(), ExecutionError> {
+    ) -> Result<(), InterruptKind> {
         let s1 = self.get(s1);
         let s2 = self.get(s2);
         if callback(s1, s2) {
@@ -670,7 +591,7 @@ impl<'a, 'b, const DEBUG: bool> Visitor<'a, 'b, DEBUG> {
     }
 
     #[cfg_attr(not(debug_assertions), inline(always))]
-    fn load<T: LoadTy>(&mut self, dst: RawReg, base: Option<RawReg>, offset: u32) -> Result<(), ExecutionError> {
+    fn load<T: LoadTy>(&mut self, dst: RawReg, base: Option<RawReg>, offset: u32) -> Result<(), InterruptKind> {
         assert!(core::mem::size_of::<T>() >= 1);
 
         let address = base.map_or(0, |base| self.inner.regs[base.get() as usize]).wrapping_add(offset);
@@ -688,7 +609,7 @@ impl<'a, 'b, const DEBUG: bool> Visitor<'a, 'b, DEBUG> {
                     .debug_print_location(log::Level::Debug, self.inner.instruction_offset);
             }
 
-            return Err(ExecutionError::Trap(Default::default()));
+            return Err(InterruptKind::Trap(Default::default()));
         };
 
         if DEBUG {
@@ -702,7 +623,7 @@ impl<'a, 'b, const DEBUG: bool> Visitor<'a, 'b, DEBUG> {
         Ok(())
     }
 
-    fn store<T: StoreTy>(&mut self, src: impl IntoRegImm, base: Option<RawReg>, offset: u32) -> Result<(), ExecutionError> {
+    fn store<T: StoreTy>(&mut self, src: impl IntoRegImm, base: Option<RawReg>, offset: u32) -> Result<(), InterruptKind> {
         assert!(core::mem::size_of::<T>() >= 1);
 
         let address = base.map_or(0, |base| self.inner.regs[base.get() as usize]).wrapping_add(offset);
@@ -739,14 +660,14 @@ impl<'a, 'b, const DEBUG: bool> Visitor<'a, 'b, DEBUG> {
                     .debug_print_location(log::Level::Debug, self.inner.instruction_offset);
             }
 
-            return Err(ExecutionError::Trap(Default::default()));
+            return Err(InterruptKind::Trap(Default::default()));
         };
 
         let value = T::into_bytes(value);
         slice.copy_from_slice(value.as_ref());
 
         if let Some(on_store) = self.ctx.on_store.as_mut() {
-            (on_store)(address, value.as_ref()).map_err(ExecutionError::Trap)?;
+            (on_store)(address, value.as_ref()).map_err(InterruptKind::Trap)?;
         }
 
         self.on_next_instruction();
@@ -754,7 +675,7 @@ impl<'a, 'b, const DEBUG: bool> Visitor<'a, 'b, DEBUG> {
     }
 
     #[cfg_attr(not(debug_assertions), inline(always))]
-    fn jump_indirect_impl(&mut self, call: Option<(RawReg, u32)>, base: RawReg, offset: u32) -> Result<(), ExecutionError> {
+    fn jump_indirect_impl(&mut self, call: Option<(RawReg, u32)>, base: RawReg, offset: u32) -> Result<(), InterruptKind> {
         let base = base.get();
         let target = self.inner.regs[base as usize].wrapping_add(offset);
         if let Some((ra, return_address)) = call {
@@ -762,15 +683,14 @@ impl<'a, 'b, const DEBUG: bool> Visitor<'a, 'b, DEBUG> {
         }
 
         if target == VM_ADDR_RETURN_TO_HOST {
-            self.inner.return_to_host = true;
-            return Ok(());
+            return Err(InterruptKind::Finished);
         }
 
         let Some(instruction_offset) = self.inner.module.jump_table().get_by_address(target) else {
             if DEBUG {
                 log::trace!("Indirect jump to address {target}: INVALID");
             }
-            return Err(ExecutionError::Trap(Default::default()));
+            return Err(InterruptKind::Trap(Default::default()));
         };
 
         if DEBUG {
@@ -861,11 +781,11 @@ impl StoreTy for u32 {
 }
 
 impl<'a, 'b, const DEBUG: bool> InstructionVisitor for Visitor<'a, 'b, DEBUG> {
-    type ReturnTy = Result<(), ExecutionError>;
+    type ReturnTy = Result<(), InterruptKind>;
 
     fn trap(&mut self) -> Self::ReturnTy {
         log::debug!("Trap at {}: explicit trap", self.inner.instruction_offset);
-        Err(ExecutionError::Trap(Default::default()))
+        Err(InterruptKind::Trap(Default::default()))
     }
 
     fn fallthrough(&mut self) -> Self::ReturnTy {
@@ -883,18 +803,8 @@ impl<'a, 'b, const DEBUG: bool> InstructionVisitor for Visitor<'a, 'b, DEBUG> {
     }
 
     fn ecalli(&mut self, imm: u32) -> Self::ReturnTy {
-        if let Some(on_hostcall) = self.ctx.on_hostcall.as_mut() {
-            self.inner.instruction_offset += self.inner.instruction_length; // TODO: Call self.on_next_instruction().
-            self.inner.compiled_offset += 1;
-
-            let access = BackendAccess::Interpreted(self.inner.access());
-            (on_hostcall)(imm, access).map_err(ExecutionError::Trap)?;
-            self.inner.check_gas()?;
-            Ok(())
-        } else {
-            log::debug!("Hostcall called without any hostcall handler set!");
-            Err(ExecutionError::Trap(Default::default()))
-        }
+        self.on_next_instruction();
+        Err(InterruptKind::Ecalli(imm))
     }
 
     fn set_less_than_unsigned(&mut self, d: RawReg, s1: RawReg, s2: RawReg) -> Self::ReturnTy {

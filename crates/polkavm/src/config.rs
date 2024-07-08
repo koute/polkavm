@@ -85,7 +85,7 @@ impl SandboxKind {
             {
                 match self {
                     SandboxKind::Linux => cfg!(target_os = "linux"),
-                    SandboxKind::Generic => true
+                    SandboxKind::Generic => cfg!(feature = "generic-sandbox"),
                 }
             } else {
                 false

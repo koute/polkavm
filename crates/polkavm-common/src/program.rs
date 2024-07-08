@@ -2186,9 +2186,19 @@ impl core::fmt::Display for ProgramParseError {
 #[cfg(feature = "std")]
 impl std::error::Error for ProgramParseError {}
 
+#[derive(Copy, Clone, PartialEq, Eq, PartialOrd, Ord, Debug)]
+#[repr(transparent)]
+pub struct ProgramCounter(pub u32);
+
+impl core::fmt::Display for ProgramCounter {
+    fn fmt(&self, fmt: &mut core::fmt::Formatter) -> core::fmt::Result {
+        self.0.fmt(fmt)
+    }
+}
+
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub struct ProgramExport<T> {
-    target_code_offset: u32,
+    program_counter: ProgramCounter,
     symbol: ProgramSymbol<T>,
 }
 
@@ -2196,19 +2206,25 @@ impl<T> ProgramExport<T>
 where
     T: AsRef<[u8]>,
 {
-    pub fn new(target_code_offset: u32, symbol: ProgramSymbol<T>) -> Self {
+    pub fn new(program_counter: ProgramCounter, symbol: ProgramSymbol<T>) -> Self {
         Self {
-            target_code_offset,
+            program_counter,
             symbol,
         }
     }
 
-    pub fn target_code_offset(&self) -> u32 {
-        self.target_code_offset
+    pub fn program_counter(&self) -> ProgramCounter {
+        self.program_counter
     }
 
     pub fn symbol(&self) -> &ProgramSymbol<T> {
         &self.symbol
+    }
+}
+
+impl<T> PartialEq<str> for ProgramExport<T> where T: AsRef<[u8]> {
+    fn eq(&self, rhs: &str) -> bool {
+        self.symbol.as_bytes() == rhs.as_bytes()
     }
 }
 
@@ -2229,6 +2245,18 @@ where
 
     pub fn as_bytes(&self) -> &[u8] {
         self.0.as_ref()
+    }
+}
+
+impl<T> PartialEq<str> for ProgramSymbol<T> where T: AsRef<[u8]> {
+    fn eq(&self, rhs: &str) -> bool {
+        self.as_bytes() == rhs.as_bytes()
+    }
+}
+
+impl<'a, T> PartialEq<&'a str> for ProgramSymbol<T> where T: AsRef<[u8]> {
+    fn eq(&self, rhs: &&'a str) -> bool {
+        self.as_bytes() == rhs.as_bytes()
     }
 }
 
@@ -2676,6 +2704,28 @@ impl<'a> Iterator for Instructions<'a> {
     }
 }
 
+impl<'a> DoubleEndedIterator for Instructions<'a> {
+    #[inline(always)]
+    fn next_back(&mut self) -> Option<Self::Item> {
+        if self.offset == 0 {
+            return None;
+        }
+
+        self.offset -= 1;
+        loop {
+            let offset = self.offset;
+            if (self.bitmask[self.offset >> 3] >> (offset & 7)) & 1 == 1 {
+                return parse_instruction(self.code, self.bitmask, &mut self.offset);
+            }
+
+            self.offset -= 1;
+            if self.offset == 0 {
+                return None;
+            }
+        }
+    }
+}
+
 #[derive(Clone, Default)]
 #[non_exhaustive]
 pub struct ProgramParts {
@@ -2958,7 +3008,7 @@ impl ProgramBlob {
                 let target_code_offset = self.reader.read_varint().ok()?;
                 let symbol = self.reader.read_bytes_with_length().ok()?;
                 let export = ProgramExport {
-                    target_code_offset,
+                    program_counter: ProgramCounter(target_code_offset),
                     symbol: ProgramSymbol::new(symbol),
                 };
 

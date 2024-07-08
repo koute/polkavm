@@ -247,7 +247,6 @@ fn shm_fd() -> linux_raw::FdRef<'static> {
     linux_raw::FdRef::from_raw_unchecked(SHM_FD.load(Ordering::Relaxed))
 }
 
-#[allow(dead_code)] // TODO: Use this.
 #[inline]
 fn memory_fd() -> linux_raw::FdRef<'static> {
     linux_raw::FdRef::from_raw_unchecked(MEMORY_FD.load(Ordering::Relaxed))
@@ -477,15 +476,6 @@ unsafe fn initialize(mut stack: *mut usize) {
     // Stash the shared memory FD.
     SHM_FD.store(shm_fd.leak(), Ordering::Relaxed);
 
-    // Stash the guest memory FD.
-    let memory_fd = linux_raw::recvfd(socket.borrow()).unwrap_or_else(|error| abort_with_error("failed to read memory fd", error));
-    MEMORY_FD.store(memory_fd.leak(), Ordering::Relaxed);
-
-    // Close the socket; we don't need it anymore.
-    socket
-        .close()
-        .unwrap_or_else(|error| abort_with_error("failed to close the socket", error));
-
     // Wait for the host to fill out vmctx.
     signal_host(VMCTX_FUTEX_INIT, SignalHostKind::Normal)
         .unwrap_or_else(|error| abort_with_error("failed to wait for the host process (init)", error));
@@ -525,6 +515,39 @@ unsafe fn initialize(mut stack: *mut usize) {
             .unwrap_or_else(|| abort_with_message("overflow")),
     )
     .unwrap_or_else(|error| abort_with_error("failed to make sure the jump table address space is unmapped", error));
+
+    if *VMCTX.uffd_enabled.get() {
+        let memory_fd = linux_raw::recvfd(socket.borrow()).unwrap_or_else(|error| abort_with_error("failed to read memory fd", error));
+
+        linux_raw::sys_mmap(
+            0x10000 as *mut core::ffi::c_void,
+            (u32::MAX as usize) + 1 - 0x20000,
+            linux_raw::PROT_READ | linux_raw::PROT_WRITE,
+            linux_raw::MAP_FIXED | linux_raw::MAP_SHARED,
+            Some(memory_fd.borrow()),
+            0x10000,
+        )
+        .unwrap_or_else(|error| abort_with_error("failed to mmap the guest memory", error));
+
+        // Stash the guest memory FD.
+        MEMORY_FD.store(memory_fd.leak(), Ordering::Relaxed);
+
+        // Set up and send the userfaultfd to the host.
+        let userfaultfd = linux_raw::sys_userfaultfd(linux_raw::O_CLOEXEC)
+            .unwrap_or_else(|error| abort_with_error("failed to create an userfaultfd", error));
+
+        linux_raw::sendfd(socket.borrow(), userfaultfd.borrow())
+            .unwrap_or_else(|error| abort_with_error("failed to send the userfaultfd to the host", error));
+
+        userfaultfd
+            .close()
+            .unwrap_or_else(|error| abort_with_error("failed to close the userfaultfd", error));
+    }
+
+    // Close the socket; we don't need it anymore.
+    socket
+        .close()
+        .unwrap_or_else(|error| abort_with_error("failed to close the socket", error));
 
     // Set up our signal handler.
     let minsigstksz = align_to_next_page_usize(page_size, minsigstksz).unwrap_or_else(|| abort_with_message("overflow"));
@@ -636,16 +659,10 @@ unsafe fn initialize(mut stack: *mut usize) {
         (if a == linux_raw::SYS_madvise => jump @4),
         (if a == linux_raw::SYS_close => jump @1),
         (if a == linux_raw::SYS_write => jump @3),
-        (if a == linux_raw::SYS_recvmsg => jump @2),
         (if a == linux_raw::SYS_rt_sigreturn => jump @1),
         (if a == linux_raw::SYS_sched_yield => jump @1),
         (if a == linux_raw::SYS_exit => jump @1),
         (seccomp_kill_thread),
-
-        // SYS_recvmsg
-        ([2]: a = syscall_arg[0]),
-        (if a != HOST_SOCKET_FILENO => jump @0),
-        (seccomp_allow),
 
         // SYS_write
         ([3]: a = syscall_arg[0]),
@@ -985,11 +1002,36 @@ unsafe fn load_program() {
 
     let shm_fd = shm_fd();
     let memory_map = memory_map();
+
     for map in memory_map {
         let mut protection = linux_raw::PROT_READ;
         if map.is_writable {
             protection |= linux_raw::PROT_WRITE;
         }
+
+        // linux_raw::sys_mmap(
+        //     map.address as *mut core::ffi::c_void,
+        //     map.length as usize,
+        //     protection,
+        //     linux_raw::MAP_FIXED | linux_raw::MAP_SHARED,
+        //     Some(memory_fd()),
+        //     map.address,
+        // )
+        // .unwrap_or_else(|error| abort_with_error("failed to mmap anonymous memory", error));
+
+        // if map.shm_offset != u64::MAX {
+        //     let chunk_memory = core::slice::from_raw_parts_mut(
+        //         map.address as *mut u8,
+        //         map.length as usize
+        //     );
+
+        //     let chunk_shm = core::slice::from_raw_parts(
+        //         (VM_ADDR_SHARED_MEMORY as *mut u8).add(map.shm_offset as usize),
+        //         map.length as usize
+        //     );
+
+        //     chunk_memory.copy_from_slice(chunk_shm);
+        // }
 
         if map.shm_offset == u64::MAX {
             linux_raw::sys_mmap(
@@ -1101,6 +1143,9 @@ unsafe fn clear_program() {
     }
 
     polkavm_common::static_assert!(VM_ADDR_NATIVE_CODE + (VM_SANDBOX_MAXIMUM_NATIVE_CODE_SIZE as u64) < 0x200000000);
+
+    // linux_raw::sys_madvise(core::ptr::null_mut(), 0x100000000, linux_raw::MADV_REMOVE)
+    //     .unwrap_or_else(|error| abort_with_error("failed to clear user accessible memory", error));
 
     linux_raw::sys_munmap(core::ptr::null_mut(), 0x200000000)
         .unwrap_or_else(|error| abort_with_error("failed to unmap user accessible memory", error));

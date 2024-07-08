@@ -4,9 +4,8 @@
 extern crate polkavm_linux_raw as linux_raw;
 
 use polkavm_common::{
-    error::{ExecutionError, Trap},
     program::Reg,
-    utils::{align_to_next_page_usize, slice_assume_init_mut, Access, AsUninitSliceMut, Gas},
+    utils::{align_to_next_page_usize, slice_assume_init_mut, AsUninitSliceMut},
     zygote::{
         AddressTable, AddressTablePacked,
         VmCtx, VmMap, SANDBOX_EMPTY_NATIVE_PROGRAM_COUNTER, SANDBOX_EMPTY_NTH_INSTRUCTION, VMCTX_FUTEX_BUSY,
@@ -14,33 +13,57 @@ use polkavm_common::{
     },
 };
 
-use super::ExecuteArgs;
-
 pub use linux_raw::Error;
 
 use core::ffi::{c_int, c_uint};
 use core::sync::atomic::Ordering;
 use core::time::Duration;
+use core::cell::UnsafeCell;
 use linux_raw::{abort, cstr, syscall_readonly, Fd, Mmap, STDERR_FILENO, STDIN_FILENO};
 use std::borrow::Cow;
 use std::time::Instant;
 use std::sync::Arc;
 
 use super::{SandboxKind, SandboxInit, get_native_page_size, WorkerCache, WorkerCacheKind};
-use crate::api::{BackendAccess, CompiledModuleKind, MemoryAccessError, Module, HostcallHandler};
+use crate::{Gas, InterruptKind, RegValue};
+use crate::api::{CompiledModuleKind, MemoryAccessError, Module};
 use crate::config::Config;
 use crate::compiler::CompiledModule;
 use crate::config::GasMeteringKind;
 use crate::shm_allocator::{ShmAllocator, ShmAllocation};
 
 pub struct GlobalState {
-    shared_memory: ShmAllocator
+    shared_memory: ShmAllocator,
+    uffd_enabled: bool,
 }
+
+const UFFD_REQUIRED_FEATURES: u64 = (linux_raw::UFFD_FEATURE_MISSING_SHMEM | linux_raw::UFFD_FEATURE_MINOR_SHMEM | linux_raw::UFFD_FEATURE_WP_HUGETLBFS_SHMEM) as u64;
 
 impl GlobalState {
     pub fn new(_config: &Config) -> Result<Self, Error> {
+        let uffd_enabled = true;
+        if uffd_enabled {
+            let userfaultfd = linux_raw::sys_userfaultfd(linux_raw::O_CLOEXEC)
+                .map_err(|error| Error::from(format!("failed to create an userfaultfd: {error}")))?;
+
+            let mut api: linux_raw::uffdio_api = linux_raw::uffdio_api {
+                api: linux_raw::UFFD_API,
+                .. linux_raw::uffdio_api::default()
+            };
+
+            linux_raw::sys_uffdio_api(userfaultfd.borrow(), &mut api)
+                .map_err(|error| Error::from(format!("failed to fetch the available userfaultfd features: {error}")))?;
+
+            if (api.features & UFFD_REQUIRED_FEATURES) != UFFD_REQUIRED_FEATURES {
+                return Err(Error::from("not all require userfaultfd features are available; you need to update your Linux kernel to version 5.19 or newer"));
+            }
+
+            userfaultfd.close()?;
+        }
+
         Ok(GlobalState {
-            shared_memory: ShmAllocator::new()?
+            shared_memory: ShmAllocator::new()?,
+            uffd_enabled,
         })
     }
 }
@@ -858,11 +881,20 @@ unsafe fn set_message(vmctx: &VmCtx, message: core::fmt::Arguments) {
     *vmctx.message_length.get() = length as u32;
 }
 
+struct UffdBuffer(Arc<UnsafeCell<linux_raw::uffd_msg>>);
+
+unsafe impl Send for UffdBuffer {}
+unsafe impl Sync for UffdBuffer {}
+
 pub struct Sandbox {
     _lifetime_pipe: Fd,
     vmctx_mmap: Mmap,
-    #[allow(dead_code)] // TODO: Actually use this.
     memory_mmap: Mmap,
+    iouring: Option<linux_raw::IoUring>,
+    iouring_futex_wait_queued: bool,
+    iouring_uffd_read_queued: bool,
+    userfaultfd: Fd,
+    uffd_msg: UffdBuffer,
     child: ChildProcess,
 
     count_wait_loop_start: u64,
@@ -928,7 +960,6 @@ impl AsMut<[usize]> for JumpTableAllocation {
 impl super::Sandbox for Sandbox {
     const KIND: SandboxKind = SandboxKind::Linux;
 
-    type Access<'r> = SandboxAccess<'r>;
     type Config = SandboxConfig;
     type Error = Error;
     type Program = SandboxProgram;
@@ -937,26 +968,20 @@ impl super::Sandbox for Sandbox {
     type JumpTable = JumpTableAllocation;
 
     fn downcast_module(module: &Module) -> &CompiledModule<Self> {
-        match module.compiled_module() {
-            CompiledModuleKind::Linux(ref module) => module,
-            _ => unreachable!(),
-        }
+        let CompiledModuleKind::Linux(ref module) = module.compiled_module() else { unreachable!() };
+        module
     }
 
     fn downcast_global_state(global: &crate::sandbox::GlobalStateKind) -> &Self::GlobalState {
-        #[allow(clippy::match_wildcard_for_single_variants)]
-        match global {
-            crate::sandbox::GlobalStateKind::Linux(ref global) => global,
-            _ => unreachable!(),
-        }
+        #[allow(irrefutable_let_patterns)]
+        let crate::sandbox::GlobalStateKind::Linux(ref global) = global else { unreachable!() };
+        global
     }
 
     fn downcast_worker_cache(cache: &WorkerCacheKind) -> &WorkerCache<Self> {
-        #[allow(clippy::match_wildcard_for_single_variants)]
-        match cache {
-            crate::sandbox::WorkerCacheKind::Linux(ref cache) => cache,
-            _ => unreachable!(),
-        }
+        #[allow(irrefutable_let_patterns)]
+        let crate::sandbox::WorkerCacheKind::Linux(ref cache) = cache else { unreachable!() };
+        cache
     }
 
     fn allocate_jump_table(global: &Self::GlobalState, count: usize) -> Result<Self::JumpTable, Self::Error> {
@@ -1073,7 +1098,6 @@ impl super::Sandbox for Sandbox {
         let sigset = Sigmask::block_all_signals()?;
         let zygote_memfd = prepare_zygote()?;
         let (vmctx_memfd, vmctx_mmap) = prepare_vmctx()?;
-        let (memory_memfd, memory_mmap) = prepare_memory()?;
         let (socket, child_socket) = linux_raw::sys_socketpair(linux_raw::AF_UNIX, linux_raw::SOCK_SEQPACKET | linux_raw::SOCK_CLOEXEC, 0)?;
         let (lifetime_pipe_host, lifetime_pipe_child) = linux_raw::sys_pipe2(linux_raw::O_CLOEXEC)?;
 
@@ -1319,10 +1343,9 @@ impl super::Sandbox for Sandbox {
         }
 
         linux_raw::sendfd(socket.borrow(), lifetime_pipe_child.borrow())?;
-        linux_raw::sendfd(socket.borrow(), global.shared_memory.fd())?;
-        linux_raw::sendfd(socket.borrow(), memory_memfd.borrow())?;
         lifetime_pipe_child.close()?;
-        socket.close()?;
+
+        linux_raw::sendfd(socket.borrow(), global.shared_memory.fd())?;
 
         // Wait until the child process receives the vmctx memfd.
         wait_for_futex(vmctx, &mut child, VMCTX_FUTEX_BUSY, VMCTX_FUTEX_INIT)?;
@@ -1361,9 +1384,47 @@ impl super::Sandbox for Sandbox {
             }
         }
 
+        unsafe {
+            *vmctx.uffd_enabled.get() = global.uffd_enabled;
+        }
+
         // Wake the child so that it finishes initialization.
         vmctx.futex.store(VMCTX_FUTEX_BUSY, Ordering::Release);
         linux_raw::sys_futex_wake_one(&vmctx.futex)?;
+
+        let (iouring, memory_mmap, userfaultfd) = if global.uffd_enabled {
+            let iouring = linux_raw::IoUring::new(2)?;
+            let (memory_memfd, memory_mmap) = prepare_memory()?;
+            linux_raw::sendfd(socket.borrow(), memory_memfd.borrow())?;
+
+            let userfaultfd = linux_raw::recvfd(socket.borrow())
+                .map_err(|error| Error::from(format!("failed to fetch the userfaultfd from the child process: {error}")))?;
+
+            let mut api: linux_raw::uffdio_api = linux_raw::uffdio_api {
+                api: linux_raw::UFFD_API,
+                features: UFFD_REQUIRED_FEATURES,
+                .. Default::default()
+            };
+
+            linux_raw::sys_uffdio_api(userfaultfd.borrow(), &mut api)
+                .map_err(|error| Error::from(format!("failed to initialize the userfaultfd API: {error}")))?;
+
+            linux_raw::sys_uffdio_register(userfaultfd.borrow(), &mut linux_raw::uffdio_register {
+                range: linux_raw::uffdio_range {
+                    start: 0x10000,
+                    len: u64::from(u32::MAX) + 1 - 0x20000,
+                },
+                mode: linux_raw::UFFDIO_REGISTER_MODE_MISSING | linux_raw::UFFDIO_REGISTER_MODE_MINOR | linux_raw::UFFDIO_REGISTER_MODE_WP,
+                .. linux_raw::uffdio_register::default()
+            }).map_err(|error| Error::from(format!("failed to register the guest memory with userfaultfd: {error}")))?;
+
+            (Some(iouring), memory_mmap, userfaultfd)
+        } else {
+            (None, Mmap::default(), Fd::from_raw_unchecked(-1))
+        };
+
+        // Close the socket; we don't need it anymore.
+        socket.close()?;
 
         // Wait for the child to finish initialization.
         wait_for_futex(vmctx, &mut child, VMCTX_FUTEX_BUSY, VMCTX_FUTEX_IDLE)?;
@@ -1372,6 +1433,11 @@ impl super::Sandbox for Sandbox {
             _lifetime_pipe: lifetime_pipe_host,
             vmctx_mmap,
             memory_mmap,
+            iouring,
+            iouring_futex_wait_queued: false,
+            iouring_uffd_read_queued: false,
+            userfaultfd,
+            uffd_msg: UffdBuffer(Arc::new(UnsafeCell::new(linux_raw::uffd_msg::default()))),
             child,
 
             count_wait_loop_start: 0,
@@ -1384,91 +1450,151 @@ impl super::Sandbox for Sandbox {
         })
     }
 
-    fn execute(&mut self, global: &Self::GlobalState, mut args: ExecuteArgs) -> Result<(), ExecutionError<Self::Error>> {
-        self.wait_if_necessary(match args.hostcall_handler {
-            Some(ref mut hostcall_handler) => Some(&mut *hostcall_handler),
-            None => None,
-        }, true)?;
-
-        if args.is_async && args.hostcall_handler.is_some() {
-            return Err(Error::from_str("requested asynchronous execution with a borrowed hostcall handler").into());
-        }
-
-        unsafe {
-            if let Some(module) = args.module {
-                let compiled_module = Self::downcast_module(module);
-                let program = &compiled_module.sandbox_program.0;
-
-                let Some(memory_map) = global.shared_memory.alloc(core::mem::size_of::<VmMap>() * program.memory_map.len()) else {
-                    return Err(Error::from_str("out of shared memory").into());
-                };
-
-                args.flags |= polkavm_common::zygote::VM_RPC_FLAG_RECONFIGURE;
-
-                for (chunk, vm_map) in program.memory_map.iter().zip(memory_map.as_typed_slice_mut::<VmMap>().iter_mut()) {
-                    *vm_map = VmMap {
-                        address: chunk.address,
-                        length: chunk.length,
-                        shm_offset: chunk.initialize_with.as_ref().map_or(u64::MAX, |alloc| alloc.offset() as u64),
-                        is_writable: chunk.is_writable,
-                    };
-                }
-
-                *self.vmctx().heap_info.heap_top.get() = u64::from(module.memory_map().heap_base());
-                *self.vmctx().heap_info.heap_threshold.get() = u64::from(module.memory_map().rw_data_range().end);
-                *self.vmctx().heap_base.get() = module.memory_map().heap_base();
-                *self.vmctx().heap_initial_threshold.get() = module.memory_map().rw_data_range().end;
-                *self.vmctx().heap_max_size.get() = module.memory_map().max_heap_size();
-                *self.vmctx().page_size.get() = module.memory_map().page_size();
-                *self.vmctx().shm_memory_map_offset.get() = memory_map.offset() as u64;
-                *self.vmctx().shm_memory_map_count.get() = program.memory_map.len() as u64;
-                *self.vmctx().shm_code_offset.get() = program.shm_code.offset() as u64;
-                *self.vmctx().shm_code_length.get() = program.shm_code.len() as u64;
-                *self.vmctx().shm_jump_table_offset.get() = program.shm_jump_table.offset() as u64;
-                *self.vmctx().shm_jump_table_length.get() = program.shm_jump_table.len() as u64;
-                *self.vmctx().sysreturn_address.get() = program.sysreturn_address;
-                self.gas_metering = module.gas_metering();
-                self.module = Some(module.clone());
-                self.shm_memory_map = Some(memory_map);
-            }
-
-            if let Some(gas) = crate::sandbox::get_gas(&args, self.gas_metering) {
-                *self.vmctx().gas().get() = gas;
-            }
-
-            *self.vmctx().rpc_address.get() = args.entry_point.map_or(0, |entry_point|
-                Self::downcast_module(self.module.as_ref().unwrap()).export_trampolines.get(&entry_point).copied().unwrap_or(0) as usize
-            ) as u64;
-
-            *self.vmctx().rpc_flags.get() = args.flags;
-            *self.vmctx().rpc_sbrk.get() = args.sbrk;
-
-            if let Some(regs) = args.regs {
-                (*self.vmctx().regs().get()).copy_from_slice(regs);
-            }
-
-            self.vmctx().futex.store(VMCTX_FUTEX_BUSY, Ordering::Release);
-            linux_raw::sys_futex_wake_one(&self.vmctx().futex)?;
-        }
-
-        if !args.is_async {
-            self.wait_if_necessary(match args.hostcall_handler {
-                Some(ref mut hostcall_handler) => Some(&mut *hostcall_handler),
-                None => None,
-            }, args.entry_point.is_none())?;
-        }
-
-        Ok(())
+    fn load_module(&mut self, global: &Self::GlobalState, module: &Module) -> Result<(), Self::Error> {
+        todo!();
     }
 
-    #[inline]
-    fn access(&mut self) -> SandboxAccess {
-        SandboxAccess { sandbox: self }
+    fn recycle(&mut self, global: &Self::GlobalState) -> Result<(), Self::Error> {
+        todo!();
+    }
+
+    fn run(&mut self) -> Result<InterruptKind, Self::Error> {
+        todo!()
+    }
+
+    fn reg(&self, reg: Reg) -> RegValue {
+        todo!()
+    }
+
+    fn set_reg(&mut self, reg: Reg, value: u32) {
+        todo!()
+    }
+
+    fn gas(&self) -> Gas {
+        unsafe { *self.vmctx().gas().get() }
+    }
+
+    fn set_gas(&mut self, gas: Gas) {
+        todo!()
+    }
+
+    fn program_counter(&self) -> Option<u32> {
+        todo!()
+    }
+
+    fn set_program_counter(&mut self, pc: u32) {
+        todo!()
+    }
+
+    fn native_program_counter(&self) -> Option<usize> {
+        todo!();
+    }
+
+    fn reset_memory(&mut self) {
+        todo!();
+    }
+
+    fn read_memory_into<'slice, B>(&self, address: u32, buffer: &'slice mut B) -> Result<&'slice mut [u8], MemoryAccessError> where B: ?Sized + AsUninitSliceMut {
+        todo!();
+    }
+
+    fn write_memory(&mut self, address: u32, data: &[u8]) -> Result<(), MemoryAccessError> {
+        todo!()
+    }
+
+    fn heap_size(&self) -> u32 {
+        todo!()
+    }
+
+    fn sbrk(&mut self, size: u32) -> Option<u32> {
+        todo!()
     }
 
     fn pid(&self) -> Option<u32> {
         Some(self.child.pid as u32)
     }
+
+    // fn execute(&mut self, global: &Self::GlobalState, mut args: ExecuteArgs) -> Result<(), ExecutionError<Self::Error>> {
+    //     self.wait_if_necessary(match args.hostcall_handler {
+    //         Some(ref mut hostcall_handler) => Some(&mut *hostcall_handler),
+    //         None => None,
+    //     }, true)?;
+
+    //     if args.is_async && args.hostcall_handler.is_some() {
+    //         return Err(Error::from_str("requested asynchronous execution with a borrowed hostcall handler").into());
+    //     }
+
+    //     unsafe {
+    //         if let Some(module) = args.module {
+    //             let compiled_module = Self::downcast_module(module);
+    //             let program = &compiled_module.sandbox_program.0;
+
+    //             let Some(memory_map) = global.shared_memory.alloc(core::mem::size_of::<VmMap>() * program.memory_map.len()) else {
+    //                 return Err(Error::from_str("out of shared memory").into());
+    //             };
+
+    //             args.flags |= polkavm_common::zygote::VM_RPC_FLAG_RECONFIGURE;
+
+    //             if !global.uffd_enabled {
+    //                 for (chunk, vm_map) in program.memory_map.iter().zip(memory_map.as_typed_slice_mut::<VmMap>().iter_mut()) {
+    //                     *vm_map = VmMap {
+    //                         address: chunk.address,
+    //                         length: chunk.length,
+    //                         shm_offset: chunk.initialize_with.as_ref().map_or(u64::MAX, |alloc| alloc.offset() as u64),
+    //                         is_writable: chunk.is_writable,
+    //                     };
+    //                 }
+
+    //                 *self.vmctx().shm_memory_map_offset.get() = memory_map.offset() as u64;
+    //                 *self.vmctx().shm_memory_map_count.get() = program.memory_map.len() as u64;
+    //             } else {
+    //                 *self.vmctx().shm_memory_map_count.get() = 0;
+    //             }
+
+    //             *self.vmctx().heap_info.heap_top.get() = u64::from(module.memory_map().heap_base());
+    //             *self.vmctx().heap_info.heap_threshold.get() = u64::from(module.memory_map().rw_data_range().end);
+    //             *self.vmctx().heap_base.get() = module.memory_map().heap_base();
+    //             *self.vmctx().heap_initial_threshold.get() = module.memory_map().rw_data_range().end;
+    //             *self.vmctx().heap_max_size.get() = module.memory_map().max_heap_size();
+    //             *self.vmctx().page_size.get() = module.memory_map().page_size();
+    //             *self.vmctx().shm_code_offset.get() = program.shm_code.offset() as u64;
+    //             *self.vmctx().shm_code_length.get() = program.shm_code.len() as u64;
+    //             *self.vmctx().shm_jump_table_offset.get() = program.shm_jump_table.offset() as u64;
+    //             *self.vmctx().shm_jump_table_length.get() = program.shm_jump_table.len() as u64;
+    //             *self.vmctx().sysreturn_address.get() = program.sysreturn_address;
+    //             self.gas_metering = module.gas_metering();
+    //             self.module = Some(module.clone());
+    //             self.shm_memory_map = Some(memory_map);
+    //         }
+
+    //         if let Some(gas) = crate::sandbox::get_gas(&args, self.gas_metering) {
+    //             *self.vmctx().gas().get() = gas;
+    //         }
+
+    //         *self.vmctx().rpc_address.get() = args.entry_point.map_or(0, |entry_point|
+    //             Self::downcast_module(self.module.as_ref().unwrap()).export_trampolines.get(&entry_point).copied().unwrap_or(0) as usize
+    //         ) as u64;
+
+    //         *self.vmctx().rpc_flags.get() = args.flags;
+    //         *self.vmctx().rpc_sbrk.get() = args.sbrk;
+
+    //         if let Some(regs) = args.regs {
+    //             (*self.vmctx().regs().get()).copy_from_slice(regs);
+    //         }
+
+    //         self.vmctx().futex.store(VMCTX_FUTEX_BUSY, Ordering::Release);
+    //         linux_raw::sys_futex_wake_one(&self.vmctx().futex)?;
+    //     }
+
+    //     if !args.is_async {
+    //         self.wait_if_necessary(match args.hostcall_handler {
+    //             Some(ref mut hostcall_handler) => Some(&mut *hostcall_handler),
+    //             None => None,
+    //         }, args.entry_point.is_none())?;
+    //     }
+
+    //     Ok(())
+    // }
 
     fn address_table() -> AddressTable {
         ZYGOTE_ADDRESS_TABLE
@@ -1486,21 +1612,21 @@ impl super::Sandbox for Sandbox {
         get_field_offset!(VmCtx::new(), |base| base.heap_info())
     }
 
-    fn gas_remaining_impl(&self) -> Result<Option<Gas>, super::OutOfGas> {
-        if self.gas_metering.is_none() { return Ok(None) };
-        let raw_gas = unsafe { *self.vmctx().gas().get() };
-        Gas::from_i64(raw_gas).ok_or(super::OutOfGas).map(Some)
-    }
-
     fn sync(&mut self) -> Result<(), Self::Error> {
-        self.wait_if_necessary(None, true).map_err(|error| {
-            match error {
-                ExecutionError::Trap(..) => Error::from_str("unexpected trap"),
-                ExecutionError::OutOfGas => Error::from_str("unexpected out of gas"),
-                ExecutionError::Error(error) => error,
-            }
-        })
+        match self.wait_if_necessary(true)? {
+            Interrupt::Idle => Ok(()),
+            Interrupt::Trap => Err(Error::from_str("unexpected trap")),
+            Interrupt::Ecalli(_) => Err(Error::from_str("unexpected ecalli")),
+            Interrupt::Step => Err(Error::from_str("unexpected step")),
+        }
     }
+}
+
+enum Interrupt {
+    Idle,
+    Trap,
+    Ecalli(u32),
+    Step,
 }
 
 impl Sandbox {
@@ -1511,7 +1637,7 @@ impl Sandbox {
 
     #[inline(never)]
     #[cold]
-    fn wait(&mut self, mut hostcall_handler: Option<HostcallHandler>, low_latency: bool) -> Result<(), ExecutionError<Error>> {
+    fn run_impl(&mut self, low_latency: bool) -> Result<Interrupt, Error> {
         let mut spin_target = 0;
         let mut yield_target = 0;
         if low_latency {
@@ -1524,7 +1650,7 @@ impl Sandbox {
             let state = self.vmctx().futex.load(Ordering::Relaxed);
             if state == VMCTX_FUTEX_IDLE {
                 core::sync::atomic::fence(Ordering::Acquire);
-                return Ok(());
+                return Ok(Interrupt::Idle);
             }
 
             if state == VMCTX_FUTEX_TRAP {
@@ -1533,76 +1659,123 @@ impl Sandbox {
                 self.vmctx().futex.store(VMCTX_FUTEX_BUSY, Ordering::Release);
                 linux_raw::sys_futex_wake_one(&self.vmctx().futex)?;
 
-                return Err(ExecutionError::Trap(Trap::default()));
+                return Ok(Interrupt::Trap);
             }
 
             if state == VMCTX_FUTEX_HOSTCALL {
                 core::sync::atomic::fence(Ordering::Acquire);
 
-                let hostcall_handler = match hostcall_handler {
-                    Some(ref mut hostcall_handler) => &mut *hostcall_handler,
-                    None => {
-                        unsafe {
-                            *self.vmctx().hostcall().get() = polkavm_common::zygote::HOSTCALL_ABORT_EXECUTION;
-                        }
-                        self.vmctx().futex.store(VMCTX_FUTEX_BUSY, Ordering::Release);
-                        linux_raw::sys_futex_wake_one(&self.vmctx().futex)?;
-
-                        return Err(Error::from_str("hostcall called without any hostcall handler set").into());
-                    }
-                };
-
                 let hostcall = unsafe { *self.vmctx().hostcall().get() };
                 if hostcall == polkavm_common::HOSTCALL_TRACE {
                     // When tracing aggressively spin to avoid having to call into the kernel.
                     spin_target = 512;
+                    return Ok(Interrupt::Step);
+                } else {
+                    return Ok(Interrupt::Ecalli(hostcall));
                 }
 
-                match hostcall_handler(hostcall, super::Sandbox::access(self).into()) {
-                    Ok(()) => {
-                        self.vmctx().futex.store(VMCTX_FUTEX_BUSY, Ordering::Release);
-                        linux_raw::sys_futex_wake_one(&self.vmctx().futex)?;
-                        continue;
-                    }
-                    Err(trap) => {
-                        unsafe {
-                            *self.vmctx().hostcall().get() = polkavm_common::zygote::HOSTCALL_ABORT_EXECUTION;
-                        }
-                        self.vmctx().futex.store(VMCTX_FUTEX_BUSY, Ordering::Release);
-                        linux_raw::sys_futex_wake_one(&self.vmctx().futex)?;
+                // let hostcall_handler = match hostcall_handler {
+                //     Some(ref mut hostcall_handler) => &mut *hostcall_handler,
+                //     None => {
+                //         unsafe {
+                //             *self.vmctx().hostcall().get() = polkavm_common::zygote::HOSTCALL_ABORT_EXECUTION;
+                //         }
+                //         self.vmctx().futex.store(VMCTX_FUTEX_BUSY, Ordering::Release);
+                //         linux_raw::sys_futex_wake_one(&self.vmctx().futex)?;
 
-                        return Err(ExecutionError::Trap(trap));
-                    }
-                }
+                //         return Err(Error::from_str("hostcall called without any hostcall handler set").into());
+                //     }
+                // };
+
+                // match hostcall_handler(hostcall, super::Sandbox::access(self).into()) {
+                //     Ok(()) => {
+                //         self.vmctx().futex.store(VMCTX_FUTEX_BUSY, Ordering::Release);
+                //         linux_raw::sys_futex_wake_one(&self.vmctx().futex)?;
+                //         continue;
+                //     }
+                //     Err(trap) => {
+                //         unsafe {
+                //             *self.vmctx().hostcall().get() = polkavm_common::zygote::HOSTCALL_ABORT_EXECUTION;
+                //         }
+                //         self.vmctx().futex.store(VMCTX_FUTEX_BUSY, Ordering::Release);
+                //         linux_raw::sys_futex_wake_one(&self.vmctx().futex)?;
+
+                //         return Err(ExecutionError::Trap(trap));
+                //     }
+                // }
             }
 
             if state != VMCTX_FUTEX_BUSY {
-                return Err(Error::from_str("internal error: unexpected worker process state").into());
+                return Err(Error::from_str("internal error: unexpected worker process state"));
             }
 
-            for _ in 0..yield_target {
-                let _ = linux_raw::sys_sched_yield();
-                if self.vmctx().futex.load(Ordering::Relaxed) != VMCTX_FUTEX_BUSY {
-                    continue 'outer;
-                }
-            }
+            if let Some(ref mut iouring) = self.iouring {
+                const IO_URING_JOB_FUTEX_WAIT: u64 = 1;
+                const IO_URING_JOB_USERFAULTFD_READ: u64 = 2;
 
-            for _ in 0..spin_target {
-                core::hint::spin_loop();
-                if self.vmctx().futex.load(Ordering::Relaxed) != VMCTX_FUTEX_BUSY {
-                    continue 'outer;
+                if !self.iouring_futex_wait_queued {
+                    self.count_futex_wait += 1;
+                    let vmctx = unsafe { &*self.vmctx_mmap.as_ptr().cast::<VmCtx>() };
+                    iouring.queue_futex_wait(IO_URING_JOB_FUTEX_WAIT, &*vmctx.futex, VMCTX_FUTEX_BUSY).expect("internal error: io_uring queue overflow");
+                    self.iouring_futex_wait_queued = true;
                 }
-            }
 
-            self.count_futex_wait += 1;
-            match linux_raw::sys_futex_wait(&self.vmctx().futex, VMCTX_FUTEX_BUSY, Some(core::time::Duration::from_millis(100))) {
-                Ok(()) => continue,
-                Err(error) if error.errno() == linux_raw::EAGAIN || error.errno() == linux_raw::EINTR => continue,
-                Err(error) if error.errno() == linux_raw::ETIMEDOUT => {
-                    log::trace!("Timeout expired while waiting for child #{}...", self.child.pid);
-                    self.check_child_status()?;
+                if !self.iouring_uffd_read_queued {
+                    iouring.queue_read(IO_URING_JOB_USERFAULTFD_READ, self.userfaultfd.borrow(), self.uffd_msg.0.get().cast(), core::mem::size_of::<linux_raw::uffd_msg>() as u32).expect("internal error: io_uring queue overflow");
+                    self.iouring_uffd_read_queued = true;
                 }
-                Err(error) => return Err(error.into()),
+
+                unsafe {
+                    iouring.submit_and_wait(1).expect("internal error: io_uring failed");
+                }
+
+                while let Some(job) = iouring.pop_finished() {
+                    if job.user_data == IO_URING_JOB_FUTEX_WAIT {
+                        self.iouring_futex_wait_queued = false;
+                    } else if job.user_data == IO_URING_JOB_USERFAULTFD_READ {
+                        job.to_result()?;
+
+                        self.iouring_uffd_read_queued = false;
+                        let msg = unsafe { &mut *self.uffd_msg.0.get() };
+                        let event = u32::from(core::mem::replace(&mut msg.event, 0));
+                        if event == linux_raw::UFFD_EVENT_PAGEFAULT {
+                            let pagefault = unsafe { core::ptr::read_unaligned(core::ptr::addr_of!(msg.arg.pagefault)) };
+                            let address = pagefault.address;
+                            let is_minor = (pagefault.flags & u64::from(linux_raw::UFFD_PAGEFAULT_FLAG_MINOR)) != 0;
+                            let is_write = (pagefault.flags & u64::from(linux_raw::UFFD_PAGEFAULT_FLAG_WRITE)) != 0;
+                            let is_wp = (pagefault.flags & u64::from(linux_raw::UFFD_PAGEFAULT_FLAG_WP)) != 0;
+
+                            log::error!("Child #{}: pagefault: address=0x{address:x}, minor={is_minor}, write={is_write}, wp={is_wp}", self.child.pid);
+                            todo!();
+                        }
+                    } else {
+                        unreachable!("internal error: unknown io_uring job");
+                    }
+                }
+            } else {
+                for _ in 0..yield_target {
+                    let _ = linux_raw::sys_sched_yield();
+                    if self.vmctx().futex.load(Ordering::Relaxed) != VMCTX_FUTEX_BUSY {
+                        continue 'outer;
+                    }
+                }
+
+                for _ in 0..spin_target {
+                    core::hint::spin_loop();
+                    if self.vmctx().futex.load(Ordering::Relaxed) != VMCTX_FUTEX_BUSY {
+                        continue 'outer;
+                    }
+                }
+                self.count_futex_wait += 1;
+                match linux_raw::sys_futex_wait(&self.vmctx().futex, VMCTX_FUTEX_BUSY, Some(core::time::Duration::from_millis(100))) {
+                    Ok(()) => continue,
+                    Err(error) if error.errno() == linux_raw::EAGAIN || error.errno() == linux_raw::EINTR => continue,
+                    Err(error) if error.errno() == linux_raw::ETIMEDOUT => {
+                        log::trace!("Timeout expired while waiting for child #{}...", self.child.pid);
+                        self.check_child_status()?;
+                    }
+                    Err(error) => return Err(error),
+                }
             }
         }
     }
@@ -1623,203 +1796,193 @@ impl Sandbox {
     }
 
     #[inline]
-    fn wait_if_necessary(&mut self, hostcall_handler: Option<HostcallHandler>, low_latency: bool) -> Result<(), ExecutionError<Error>> {
+    fn wait_if_necessary(&mut self, low_latency: bool) -> Result<Interrupt, Error> {
         if self.vmctx().futex.load(Ordering::Relaxed) != VMCTX_FUTEX_IDLE {
-            self.wait(hostcall_handler, low_latency)?;
+            self.run_impl(low_latency)?;
         }
 
         self.shm_memory_map.take();
 
-        Ok(())
+        Ok(Interrupt::Idle)
     }
 }
 
-pub struct SandboxAccess<'a> {
-    sandbox: &'a mut Sandbox,
-}
+// impl<'a> Access<'a> for SandboxAccess<'a> {
+//     type Error = MemoryAccessError<linux_raw::Error>;
 
-impl<'a> From<SandboxAccess<'a>> for BackendAccess<'a> {
-    fn from(access: SandboxAccess<'a>) -> Self {
-        BackendAccess::CompiledLinux(access)
-    }
-}
+//     fn get_reg(&self, reg: Reg) -> u32 {
+//         let regs = unsafe { &*self.sandbox.vmctx().regs().get() };
+//         regs[reg as usize]
+//     }
 
-impl<'a> Access<'a> for SandboxAccess<'a> {
-    type Error = MemoryAccessError<linux_raw::Error>;
+//     fn set_reg(&mut self, reg: Reg, value: u32) {
+//         unsafe {
+//             (*self.sandbox.vmctx().regs().get())[reg as usize] = value;
+//         }
+//     }
 
-    fn get_reg(&self, reg: Reg) -> u32 {
-        let regs = unsafe { &*self.sandbox.vmctx().regs().get() };
-        regs[reg as usize]
-    }
+//     fn read_memory_into_slice<'slice, T>(&self, address: u32, buffer: &'slice mut T) -> Result<&'slice mut [u8], Self::Error>
+//     where
+//         T: ?Sized + AsUninitSliceMut,
+//     {
+//         let slice = buffer.as_uninit_slice_mut();
+//         log::trace!(
+//             "Reading memory: 0x{:x}-0x{:x} ({} bytes)",
+//             address,
+//             address as usize + slice.len(),
+//             slice.len()
+//         );
 
-    fn set_reg(&mut self, reg: Reg, value: u32) {
-        unsafe {
-            (*self.sandbox.vmctx().regs().get())[reg as usize] = value;
-        }
-    }
+//         if address as usize + slice.len() > 0xffffffff {
+//             return Err(MemoryAccessError {
+//                 address,
+//                 length: slice.len() as u64,
+//                 error: Error::from_str("out of range read"),
+//             });
+//         }
 
-    fn read_memory_into_slice<'slice, T>(&self, address: u32, buffer: &'slice mut T) -> Result<&'slice mut [u8], Self::Error>
-    where
-        T: ?Sized + AsUninitSliceMut,
-    {
-        let slice = buffer.as_uninit_slice_mut();
-        log::trace!(
-            "Reading memory: 0x{:x}-0x{:x} ({} bytes)",
-            address,
-            address as usize + slice.len(),
-            slice.len()
-        );
+//         let length = slice.len();
+//         match linux_raw::vm_read_memory(self.sandbox.child.pid, [slice], [(address as usize, length)]) {
+//             Ok(actual_length) if actual_length == length => {
+//                 unsafe { Ok(slice_assume_init_mut(slice)) }
+//             },
+//             Ok(_) => {
+//                 Err(MemoryAccessError {
+//                     address,
+//                     length: slice.len() as u64,
+//                     error: Error::from_str("incomplete read"),
+//                 })
+//             },
+//             Err(error) => {
+//                 Err(MemoryAccessError {
+//                     address,
+//                     length: slice.len() as u64,
+//                     error,
+//                 })
+//             }
+//         }
+//     }
 
-        if address as usize + slice.len() > 0xffffffff {
-            return Err(MemoryAccessError {
-                address,
-                length: slice.len() as u64,
-                error: Error::from_str("out of range read"),
-            });
-        }
+//     fn write_memory(&mut self, address: u32, data: &[u8]) -> Result<(), Self::Error> {
+//         log::trace!(
+//             "Writing memory: 0x{:x}-0x{:x} ({} bytes)",
+//             address,
+//             address as usize + data.len(),
+//             data.len()
+//         );
 
-        let length = slice.len();
-        match linux_raw::vm_read_memory(self.sandbox.child.pid, [slice], [(address as usize, length)]) {
-            Ok(actual_length) if actual_length == length => {
-                unsafe { Ok(slice_assume_init_mut(slice)) }
-            },
-            Ok(_) => {
-                Err(MemoryAccessError {
-                    address,
-                    length: slice.len() as u64,
-                    error: Error::from_str("incomplete read"),
-                })
-            },
-            Err(error) => {
-                Err(MemoryAccessError {
-                    address,
-                    length: slice.len() as u64,
-                    error,
-                })
-            }
-        }
-    }
+//         if address as usize + data.len() > 0xffffffff {
+//             return Err(MemoryAccessError {
+//                 address,
+//                 length: data.len() as u64,
+//                 error: Error::from_str("out of range write"),
+//             });
+//         }
 
-    fn write_memory(&mut self, address: u32, data: &[u8]) -> Result<(), Self::Error> {
-        log::trace!(
-            "Writing memory: 0x{:x}-0x{:x} ({} bytes)",
-            address,
-            address as usize + data.len(),
-            data.len()
-        );
+//         self.sandbox.vmctx().is_memory_dirty.store(true, Ordering::Relaxed);
 
-        if address as usize + data.len() > 0xffffffff {
-            return Err(MemoryAccessError {
-                address,
-                length: data.len() as u64,
-                error: Error::from_str("out of range write"),
-            });
-        }
+//         let length = data.len();
+//         match linux_raw::vm_write_memory(self.sandbox.child.pid, [data], [(address as usize, length)]) {
+//             Ok(actual_length) if actual_length == length => {
+//                 Ok(())
+//             },
+//             Ok(_) => {
+//                 Err(MemoryAccessError {
+//                     address,
+//                     length: data.len() as u64,
+//                     error: Error::from_str("incomplete write"),
+//                 })
+//             },
+//             Err(error) => {
+//                 Err(MemoryAccessError {
+//                     address,
+//                     length: data.len() as u64,
+//                     error,
+//                 })
+//             }
+//         }
+//     }
 
-        self.sandbox.vmctx().is_memory_dirty.store(true, Ordering::Relaxed);
+//     fn sbrk(&mut self, size: u32) -> Option<u32> {
+//         if size == 0 {
+//             return Some(unsafe { *self.sandbox.vmctx().heap_info().heap_top.get() as u32 });
+//         }
 
-        let length = data.len();
-        match linux_raw::vm_write_memory(self.sandbox.child.pid, [data], [(address as usize, length)]) {
-            Ok(actual_length) if actual_length == length => {
-                Ok(())
-            },
-            Ok(_) => {
-                Err(MemoryAccessError {
-                    address,
-                    length: data.len() as u64,
-                    error: Error::from_str("incomplete write"),
-                })
-            },
-            Err(error) => {
-                Err(MemoryAccessError {
-                    address,
-                    length: data.len() as u64,
-                    error,
-                })
-            }
-        }
-    }
+//         debug_assert_eq!(self.sandbox.vmctx().futex.load(Ordering::Relaxed), VMCTX_FUTEX_HOSTCALL);
 
-    fn sbrk(&mut self, size: u32) -> Option<u32> {
-        if size == 0 {
-            return Some(unsafe { *self.sandbox.vmctx().heap_info().heap_top.get() as u32 });
-        }
+//         unsafe {
+//             *self.sandbox.vmctx().rpc_sbrk.get() = size;
+//             *self.sandbox.vmctx().hostcall().get() = polkavm_common::zygote::HOSTCALL_SBRK;
+//         }
 
-        debug_assert_eq!(self.sandbox.vmctx().futex.load(Ordering::Relaxed), VMCTX_FUTEX_HOSTCALL);
+//         self.sandbox.vmctx().futex.store(VMCTX_FUTEX_BUSY, Ordering::Release);
+//         if let Err(error) = linux_raw::sys_futex_wake_one(&self.sandbox.vmctx().futex) {
+//             panic!("sbrk failed: {error}");
+//         }
 
-        unsafe {
-            *self.sandbox.vmctx().rpc_sbrk.get() = size;
-            *self.sandbox.vmctx().hostcall().get() = polkavm_common::zygote::HOSTCALL_SBRK;
-        }
+//         let mut timestamp = Instant::now();
+//         loop {
+//             let _ = linux_raw::sys_sched_yield();
+//             if self.sandbox.vmctx().futex.load(Ordering::Relaxed) == VMCTX_FUTEX_BUSY {
+//                 let new_timestamp = Instant::now();
+//                 let elapsed = new_timestamp - timestamp;
+//                 if elapsed >= Duration::from_millis(100) {
+//                     timestamp = new_timestamp;
+//                     if let Err(error) = self.sandbox.check_child_status() {
+//                         panic!("sbrk failed: {error}");
+//                     }
+//                 }
+//                 continue;
+//             }
 
-        self.sandbox.vmctx().futex.store(VMCTX_FUTEX_BUSY, Ordering::Release);
-        if let Err(error) = linux_raw::sys_futex_wake_one(&self.sandbox.vmctx().futex) {
-            panic!("sbrk failed: {error}");
-        }
+//             core::sync::atomic::fence(Ordering::Acquire);
+//             break;
+//         }
 
-        let mut timestamp = Instant::now();
-        loop {
-            let _ = linux_raw::sys_sched_yield();
-            if self.sandbox.vmctx().futex.load(Ordering::Relaxed) == VMCTX_FUTEX_BUSY {
-                let new_timestamp = Instant::now();
-                let elapsed = new_timestamp - timestamp;
-                if elapsed >= Duration::from_millis(100) {
-                    timestamp = new_timestamp;
-                    if let Err(error) = self.sandbox.check_child_status() {
-                        panic!("sbrk failed: {error}");
-                    }
-                }
-                continue;
-            }
+//         debug_assert_eq!(self.sandbox.vmctx().futex.load(Ordering::Relaxed), VMCTX_FUTEX_HOSTCALL);
 
-            core::sync::atomic::fence(Ordering::Acquire);
-            break;
-        }
+//         let result = unsafe { *self.sandbox.vmctx().rpc_sbrk.get() };
+//         if result == 0 {
+//             None
+//         } else {
+//             Some(result)
+//         }
+//     }
 
-        debug_assert_eq!(self.sandbox.vmctx().futex.load(Ordering::Relaxed), VMCTX_FUTEX_HOSTCALL);
+//     fn heap_size(&self) -> u32 {
+//         let heap_base = unsafe { *self.sandbox.vmctx().heap_base.get() };
+//         let heap_top = unsafe { *self.sandbox.vmctx().heap_info().heap_top.get() };
+//         (heap_top - u64::from(heap_base)) as u32
+//     }
 
-        let result = unsafe { *self.sandbox.vmctx().rpc_sbrk.get() };
-        if result == 0 {
-            None
-        } else {
-            Some(result)
-        }
-    }
+//     fn program_counter(&self) -> Option<u32> {
+//         let value = unsafe { *self.sandbox.vmctx().nth_instruction().get() };
 
-    fn heap_size(&self) -> u32 {
-        let heap_base = unsafe { *self.sandbox.vmctx().heap_base.get() };
-        let heap_top = unsafe { *self.sandbox.vmctx().heap_info().heap_top.get() };
-        (heap_top - u64::from(heap_base)) as u32
-    }
+//         if value == SANDBOX_EMPTY_NTH_INSTRUCTION {
+//             None
+//         } else {
+//             Some(value)
+//         }
+//     }
 
-    fn program_counter(&self) -> Option<u32> {
-        let value = unsafe { *self.sandbox.vmctx().nth_instruction().get() };
+//     fn native_program_counter(&self) -> Option<u64> {
+//         let value = unsafe { *self.sandbox.vmctx().rip().get() };
 
-        if value == SANDBOX_EMPTY_NTH_INSTRUCTION {
-            None
-        } else {
-            Some(value)
-        }
-    }
+//         if value == SANDBOX_EMPTY_NATIVE_PROGRAM_COUNTER {
+//             None
+//         } else {
+//             Some(value)
+//         }
+//     }
 
-    fn native_program_counter(&self) -> Option<u64> {
-        let value = unsafe { *self.sandbox.vmctx().rip().get() };
+//     fn gas_remaining(&self) -> Option<Gas> {
+//         use super::Sandbox;
+//         self.sandbox.gas_remaining_impl().ok().unwrap_or(Some(Gas::MIN))
+//     }
 
-        if value == SANDBOX_EMPTY_NATIVE_PROGRAM_COUNTER {
-            None
-        } else {
-            Some(value)
-        }
-    }
-
-    fn gas_remaining(&self) -> Option<Gas> {
-        use super::Sandbox;
-        self.sandbox.gas_remaining_impl().ok().unwrap_or(Some(Gas::MIN))
-    }
-
-    fn consume_gas(&mut self, gas: u64) {
-        if self.sandbox.gas_metering.is_none() { return }
-        let gas_remaining = unsafe { &mut *self.sandbox.vmctx().gas().get() };
-        *gas_remaining = gas_remaining.checked_sub_unsigned(gas).unwrap_or(-1);
-    }
-}
+//     fn consume_gas(&mut self, gas: u64) {
+//         if self.sandbox.gas_metering.is_none() { return }
+//         let gas_remaining = unsafe { &mut *self.sandbox.vmctx().gas().get() };
+//         *gas_remaining = gas_remaining.checked_sub_unsigned(gas).unwrap_or(-1);
+//     }
+// }
