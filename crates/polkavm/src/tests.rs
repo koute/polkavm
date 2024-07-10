@@ -517,6 +517,46 @@ impl TestInstance {
     }
 }
 
+fn basic_test_blob_invalid_jump() -> ProgramBlob {
+    let memory_map = MemoryMap::new(0x4000, 0, 0x4000, 0).unwrap();
+    let mut builder = ProgramBlobBuilder::new();
+    builder.set_rw_data_size(0x4000);
+    builder.add_export_by_basic_block(0, b"main");
+    builder.set_code(
+        &[
+            asm::store_imm_u32(memory_map.rw_data_address(), 0x12345678),
+            asm::add(S0, A0, A1),
+            asm::jump(0xFFFFFFFF), // This should be an invalid jump address.
+            asm::add(A0, A0, S0),
+            asm::ret(),
+        ],
+        &[],
+    );
+    ProgramBlob::parse(builder.into_vec().into()).unwrap()
+}
+
+fn test_invalid_jump_trap(config: Config) {
+    let _ = env_logger::try_init();
+    let engine = Engine::new(&config).unwrap();
+    let linker: Linker<()> = Linker::new(&engine);
+
+    let invalid_jump_blob = basic_test_blob_invalid_jump();
+
+    let module = Module::from_blob(&engine, &Default::default(), invalid_jump_blob).unwrap();
+    let instance_pre = linker.instantiate_pre(&module).unwrap();
+    let instance = instance_pre.instantiate().unwrap();
+
+    let state_args = StateArgs::default();
+    let ext_main = instance.module().lookup_export("main").unwrap();
+
+    let result = instance.call(state_args, CallArgs::new(&mut (), ext_main));
+
+    match result {
+        Ok(()) => panic!("Expected ExecutionError::Trap, but got Ok"),
+        Err(e) => assert!(matches!(e, ExecutionError::Trap(_)), "Expected ExecutionError::Trap, but got {:?}", e),
+    }
+}
+
 fn test_blob_basic_test(config: Config) {
     let i = TestInstance::new(&config);
     assert_eq!(i.call::<(), u32>("push_one_to_global_vec", ()).unwrap(), 1);
@@ -955,6 +995,8 @@ run_tests! {
     doom_o1_dwarf5
     doom_o3_dwarf2
     pinky
+
+    test_invalid_jump_trap
 
     test_blob_basic_test
     test_blob_atomic_fetch_add
