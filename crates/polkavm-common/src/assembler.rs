@@ -590,12 +590,12 @@ pub fn assemble(code: &str) -> Result<Vec<u8>, String> {
                         let rhs = rhs as u32;
                         emit_and_continue!(match kind {
                             StoreKind::U8 => match u8::try_from(rhs) {
-                              Ok(_) => Instruction::store_imm_u8(offset, rhs),
-                              Err(_) => return Err(format!("cannot parse line {nth_line}: immediate larger than u8"))
-                            } 
-                            StoreKind::U16 => match u16::try_from(rhs){
-                              Ok(_) => Instruction::store_imm_u16(offset, rhs),
-                              Err(_) => return Err(format!("cannot parse line {nth_line}: immediate larger than u16"))
+                                Ok(_) => Instruction::store_imm_u8(offset, rhs),
+                                Err(_) => return Err(format!("cannot parse line {nth_line}: immediate larger than u8")),
+                            },
+                            StoreKind::U16 => match u16::try_from(rhs) {
+                                Ok(_) => Instruction::store_imm_u16(offset, rhs),
+                                Err(_) => return Err(format!("cannot parse line {nth_line}: immediate larger than u16")),
                             },
                             StoreKind::U32 => Instruction::store_imm_u32(offset, rhs),
                         });
@@ -614,13 +614,13 @@ pub fn assemble(code: &str) -> Result<Vec<u8>, String> {
                         let rhs = rhs as u32;
                         emit_and_continue!(match kind {
                             StoreKind::U8 => match u8::try_from(rhs) {
-                              Ok(_) => Instruction::store_imm_indirect_u8(base, offset, rhs),
-                              Err(_) => return Err(format!("cannot parse line {nth_line}: immediate larger than u8"))
-                            }
+                                Ok(_) => Instruction::store_imm_indirect_u8(base, offset, rhs),
+                                Err(_) => return Err(format!("cannot parse line {nth_line}: immediate larger than u8")),
+                            },
                             StoreKind::U16 => match u16::try_from(rhs) {
-                              Ok(_) => Instruction::store_imm_indirect_u16(base, offset, rhs),
-                              Err(_) => return Err(format!("cannot parse line {nth_line}: immediate larger than u16"))
-                            }
+                                Ok(_) => Instruction::store_imm_indirect_u16(base, offset, rhs),
+                                Err(_) => return Err(format!("cannot parse line {nth_line}: immediate larger than u16")),
+                            },
                             StoreKind::U32 => Instruction::store_imm_indirect_u32(base, offset, rhs),
                         });
                     }
