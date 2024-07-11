@@ -1,6 +1,6 @@
-pre: a0 = 0x20000
+pre: a0 = 0x20EFF
 
 %rw_data_size = 1
 
 pub @main:
-    u8 [a0 + 10] = 0x12345678
+    u8 [a0 + 256] = 0x12

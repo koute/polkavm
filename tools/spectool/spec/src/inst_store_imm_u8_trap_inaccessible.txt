@@ -2,4 +2,4 @@
 
 pub @main:
 pub @expected_exit:
-    u8 [0x20000] = 0x12345678
+    u8 [0x20000] = 0x12

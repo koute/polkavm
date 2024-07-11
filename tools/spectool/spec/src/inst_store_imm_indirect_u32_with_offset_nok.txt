@@ -1,7 +1,7 @@
-pre: a0 = 0x20000
+pre: a0 = 0x20FFC
 
-%rw_data_size = 1
+%rw_data_size = 4
 
 pub @main:
 pub @expected_exit:
-    u32 [a0 + 4097] = 0x12345678
+    u32 [a0 + 1] = 0x12345678
