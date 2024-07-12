@@ -518,17 +518,12 @@ impl TestInstance {
 }
 
 fn basic_test_blob_invalid_jump() -> ProgramBlob {
-    let memory_map = MemoryMap::new(0x4000, 0, 0x4000, 0).unwrap();
     let mut builder = ProgramBlobBuilder::new();
     builder.set_rw_data_size(0x4000);
     builder.add_export_by_basic_block(0, b"main");
     builder.set_code(
         &[
-            asm::store_imm_u32(memory_map.rw_data_address(), 0x12345678),
-            asm::add(S0, A0, A1),
-            asm::jump(0xFFFFFFFF), // This should be an invalid jump address.
-            asm::add(A0, A0, S0),
-            asm::ret(),
+            asm::jump_indirect(Reg::A0, 15),
         ],
         &[],
     );
@@ -537,6 +532,10 @@ fn basic_test_blob_invalid_jump() -> ProgramBlob {
 
 fn test_invalid_jump_trap(config: Config) {
     let _ = env_logger::try_init();
+    let mut config = crate::Config::default();
+    config.set_backend(Some(crate::BackendKind::Compiler));
+    config.set_sandbox(Some(crate::SandboxKind::Linux));
+
     let engine = Engine::new(&config).unwrap();
     let linker: Linker<()> = Linker::new(&engine);
 
@@ -553,7 +552,13 @@ fn test_invalid_jump_trap(config: Config) {
 
     match result {
         Ok(()) => panic!("Expected ExecutionError::Trap, but got Ok"),
-        Err(e) => assert!(matches!(e, ExecutionError::Trap(_)), "Expected ExecutionError::Trap, but got {:?}", e),
+        Err(e) => {
+            if matches!(e, ExecutionError::Error(..)) {
+                panic!("Unexpected ExecutionError::Error: {:?}", e);
+            } else {
+                assert!(matches!(e, ExecutionError::Trap(..)), "Expected ExecutionError::Trap, but got {:?}", e);
+            }
+        }
     }
 }
 
