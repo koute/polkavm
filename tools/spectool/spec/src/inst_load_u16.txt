@@ -1,0 +1,5 @@
+%rw_data_size = 4
+%rw_data = 12 34 56 78
+
+pub @main:
+    a0 = u16 [0x20000]

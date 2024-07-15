@@ -1,0 +1,6 @@
+%rw_data_size = 4
+%rw_data = 81 82 83 84
+pre: a0 = 0x20000
+
+pub @main:
+    a1 = i8 [a0 + 1]
