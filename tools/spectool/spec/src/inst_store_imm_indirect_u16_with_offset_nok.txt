@@ -1,0 +1,7 @@
+pre: a0 = 0x20FFE
+
+%rw_data_size = 2
+
+pub @main:
+pub @expected_exit:
+    u16 [a0 + 1] = 0x1234

@@ -1,0 +1,6 @@
+pre: a0 = 0x20FFC
+
+%rw_data_size = 4
+
+pub @main:
+    u32 [a0] = 0x12345678
