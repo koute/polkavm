@@ -1227,9 +1227,11 @@ define_opcodes! {
         load_u16                                 = 76,
         load_i16                                 = 66,
         load_u32                                 = 10,
+        load_u64                                 = 95,
         store_u8                                 = 71,
         store_u16                                = 69,
         store_u32                                = 22,
+        store_u64                                = 96,
     ]
 
     // Instructions with args: reg, imm, offset
@@ -1252,6 +1254,7 @@ define_opcodes! {
         store_imm_indirect_u8                    = 26,
         store_imm_indirect_u16                   = 54,
         store_imm_indirect_u32                   = 13,
+        store_imm_indirect_u64                   = 93,
     ]
 
     // Instructions with args: reg, reg, imm
@@ -1259,11 +1262,13 @@ define_opcodes! {
         store_indirect_u8                        = 16,
         store_indirect_u16                       = 29,
         store_indirect_u32                       = 3,
+        store_indirect_u64                       = 90,
         load_indirect_u8                         = 11,
         load_indirect_i8                         = 21,
         load_indirect_u16                        = 37,
         load_indirect_i16                        = 33,
         load_indirect_u32                        = 1,
+        load_indirect_u64                        = 91,
         add_imm                                  = 2,
         and_imm                                  = 18,
         xor_imm                                  = 31,
@@ -1337,6 +1342,7 @@ define_opcodes! {
         store_imm_u8                             = 62,
         store_imm_u16                            = 79,
         store_imm_u32                            = 38,
+        store_imm_u64                            = 98,
     ]
 
     // Instructions with args: reg, reg
@@ -1845,6 +1851,11 @@ impl<'a, 'b> InstructionVisitor for InstructionFormatter<'a, 'b> {
         write!(self, "u32 [{base} + {offset}] = {value}")
     }
 
+    fn store_imm_indirect_u64(&mut self, base: RawReg, offset: u32, value: u32) -> Self::ReturnTy {
+        let base = self.format_reg(base);
+        write!(self, "u64 [{base} + {offset}] = {value}")
+    }
+
     fn store_indirect_u8(&mut self, src: RawReg, base: RawReg, offset: u32) -> Self::ReturnTy {
         let base = self.format_reg(base);
         if self.format.prefer_unaliased || offset != 0 {
@@ -1874,6 +1885,16 @@ impl<'a, 'b> InstructionVisitor for InstructionFormatter<'a, 'b> {
         }
     }
 
+    fn store_indirect_u64(&mut self, src: RawReg, base: RawReg, offset: u32) -> Self::ReturnTy {
+        let src = self.format_reg(src);
+        let base = self.format_reg(base);
+        if self.format.prefer_unaliased || offset != 0 {
+            write!(self, "u64 [{base} + {offset}] = {src}")
+        } else {
+            write!(self, "u64 [{base}] = {src}")
+        }
+    }
+
     fn store_imm_u8(&mut self, offset: u32, value: u32) -> Self::ReturnTy {
         write!(self, "u8 [0x{offset:x}] = {value}")
     }
@@ -1884,6 +1905,10 @@ impl<'a, 'b> InstructionVisitor for InstructionFormatter<'a, 'b> {
 
     fn store_imm_u32(&mut self, offset: u32, value: u32) -> Self::ReturnTy {
         write!(self, "u32 [0x{offset:x}] = {value}")
+    }
+
+    fn store_imm_u64(&mut self, offset: u32, value: u32) -> Self::ReturnTy {
+        write!(self, "u64 [0x{offset:x}] = {value}")
     }
 
     fn store_u8(&mut self, src: RawReg, offset: u32) -> Self::ReturnTy {
@@ -1899,6 +1924,11 @@ impl<'a, 'b> InstructionVisitor for InstructionFormatter<'a, 'b> {
     fn store_u32(&mut self, src: RawReg, offset: u32) -> Self::ReturnTy {
         let src = self.format_reg(src);
         write!(self, "u32 [0x{offset:x}] = {src}")
+    }
+
+    fn store_u64(&mut self, src: RawReg, offset: u32) -> Self::ReturnTy {
+        let src = self.format_reg(src);
+        write!(self, "u64 [0x{offset:x}] = {src}")
     }
 
     fn load_indirect_u8(&mut self, dst: RawReg, base: RawReg, offset: u32) -> Self::ReturnTy {
@@ -1951,6 +1981,16 @@ impl<'a, 'b> InstructionVisitor for InstructionFormatter<'a, 'b> {
         }
     }
 
+    fn load_indirect_u64(&mut self, dst: RawReg, base: RawReg, offset: u32) -> Self::ReturnTy {
+        let dst = self.format_reg(dst);
+        let base = self.format_reg(base);
+        if self.format.prefer_unaliased || offset != 0 {
+            write!(self, "{} = u64 [{} + {}]", dst, base, offset)
+        } else {
+            write!(self, "{} = u64 [{}]", dst, base)
+        }
+    }
+
     fn load_u8(&mut self, dst: RawReg, offset: u32) -> Self::ReturnTy {
         let dst = self.format_reg(dst);
         write!(self, "{} = u8 [0x{:x}]", dst, offset)
@@ -1974,6 +2014,11 @@ impl<'a, 'b> InstructionVisitor for InstructionFormatter<'a, 'b> {
     fn load_u32(&mut self, dst: RawReg, offset: u32) -> Self::ReturnTy {
         let dst = self.format_reg(dst);
         write!(self, "{} = u32 [0x{:x}]", dst, offset)
+    }
+
+    fn load_u64(&mut self, dst: RawReg, offset: u32) -> Self::ReturnTy {
+        let dst = self.format_reg(dst);
+        write!(self, "{} = u64 [0x{:x}]", dst, offset)
     }
 
     fn branch_less_unsigned(&mut self, s1: RawReg, s2: RawReg, imm: u32) -> Self::ReturnTy {

@@ -88,6 +88,7 @@ pub enum LoadKind {
     U32 = 0b010,
     U8 = 0b100,
     U16 = 0b101,
+    U64 = 0b011,
 }
 
 impl LoadKind {
@@ -99,6 +100,8 @@ impl LoadKind {
             0b010 => Some(LoadKind::U32),
             0b100 => Some(LoadKind::U8),
             0b101 => Some(LoadKind::U16),
+            0b110 => Some(LoadKind::U32),
+            0b011 => Some(LoadKind::U64),
             _ => None,
         }
     }
@@ -110,6 +113,7 @@ pub enum StoreKind {
     U8 = 0b000,
     U16 = 0b001,
     U32 = 0b010,
+    U64 = 0b011,
 }
 
 impl StoreKind {
@@ -119,6 +123,7 @@ impl StoreKind {
             0b000 => Some(StoreKind::U8),
             0b001 => Some(StoreKind::U16),
             0b010 => Some(StoreKind::U32),
+            0b011 => Some(StoreKind::U64),
             _ => None,
         }
     }

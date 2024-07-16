@@ -3647,6 +3647,10 @@ where
                 let section = elf.section_by_index(target.section_index);
                 if section.is_allocated() && !section.is_writable() {
                     let value = match kind {
+                        LoadKind::U64 => section
+                            .data()
+                            .get(target.offset as usize..target.offset as usize + 8)
+                            .map(|xs| u64::from_le_bytes([xs[0], xs[1], xs[2], xs[3], xs[4], xs[5], xs[6], xs[7]]) as i32),
                         LoadKind::U32 => section
                             .data()
                             .get(target.offset as usize..target.offset as usize + 4)
@@ -5260,6 +5264,7 @@ fn emit_code(
                             LoadKind::U32 => load_u32,
                             LoadKind::U8 => load_u8,
                             LoadKind::U16 => load_u16,
+                            LoadKind::U64 => load_u64,
                         }
                     }
                 }
@@ -5271,6 +5276,7 @@ fn emit_code(
                                 args = (conv_reg(src), target),
                                 kind = kind,
                                 {
+                                    StoreKind::U64 => store_u64,
                                     StoreKind::U32 => store_u32,
                                     StoreKind::U16 => store_u16,
                                     StoreKind::U8 => store_u8,
@@ -5282,6 +5288,7 @@ fn emit_code(
                                 args = (target, value),
                                 kind = kind,
                                 {
+                                    StoreKind::U64 => store_imm_u64,
                                     StoreKind::U32 => store_imm_u32,
                                     StoreKind::U16 => store_imm_u16,
                                     StoreKind::U8 => store_imm_u8,
@@ -5300,6 +5307,7 @@ fn emit_code(
                             LoadKind::U32 => load_indirect_u32,
                             LoadKind::U8 => load_indirect_u8,
                             LoadKind::U16 => load_indirect_u16,
+                            LoadKind::U64 => load_indirect_u64,
                         }
                     }
                 }
@@ -5309,6 +5317,7 @@ fn emit_code(
                             args = (conv_reg(src), conv_reg(base), offset as u32),
                             kind = kind,
                             {
+                                StoreKind::U64 => store_indirect_u64,
                                 StoreKind::U32 => store_indirect_u32,
                                 StoreKind::U16 => store_indirect_u16,
                                 StoreKind::U8 => store_indirect_u8,
@@ -5320,6 +5329,7 @@ fn emit_code(
                             args = (conv_reg(base), offset as u32, value),
                             kind = kind,
                             {
+                                StoreKind::U64 => store_imm_indirect_u64,
                                 StoreKind::U32 => store_imm_indirect_u32,
                                 StoreKind::U16 => store_imm_indirect_u16,
                                 StoreKind::U8 => store_imm_indirect_u8,
@@ -5749,6 +5759,18 @@ where
                     }),
                 )
             }
+            (object::RelocationKind::Absolute, _)
+                if relocation.encoding() == object::RelocationEncoding::Generic && relocation.size() == 64 =>
+            {
+                (
+                    "R_RISCV_64",
+                    Kind::Set(RelocationKind::Abs {
+                        target,
+                        size: RelocationSize::U64,
+                    }),
+                )
+            }
+
             (_, object::RelocationFlags::Elf { r_type: reloc_kind }) => match reloc_kind {
                 object::elf::R_RISCV_SET6 => ("R_RISCV_SET6", Kind::Set6 { target }),
                 object::elf::R_RISCV_SUB6 => ("R_RISCV_SUB6", Kind::Sub6 { target }),
@@ -5771,9 +5793,12 @@ where
                 object::elf::R_RISCV_ADD16 => ("R_RISCV_ADD16", Kind::Mut(MutOp::Add, RelocationSize::U16, target)),
                 object::elf::R_RISCV_SUB16 => ("R_RISCV_SUB16", Kind::Mut(MutOp::Sub, RelocationSize::U16, target)),
                 object::elf::R_RISCV_ADD32 => ("R_RISCV_ADD32", Kind::Mut(MutOp::Add, RelocationSize::U32, target)),
+                object::elf::R_RISCV_ADD64 => ("R_RISCV_ADD64", Kind::Mut(MutOp::Add, RelocationSize::U64, target)),
                 object::elf::R_RISCV_SUB32 => ("R_RISCV_SUB32", Kind::Mut(MutOp::Sub, RelocationSize::U32, target)),
+                object::elf::R_RISCV_SUB64 => ("R_RISCV_SUB64", Kind::Mut(MutOp::Sub, RelocationSize::U64, target)),
                 object::elf::R_RISCV_SET_ULEB128 => ("R_RISCV_SET_ULEB128", Kind::SetUleb128 { target }),
                 object::elf::R_RISCV_SUB_ULEB128 => ("R_RISCV_SUB_ULEB128", Kind::SubUleb128 { target }),
+
                 _ => {
                     return Err(ProgramFromElfError::other(format!(
                         "unsupported relocation in data section '{section_name}': {relocation:?}"
@@ -5950,6 +5975,19 @@ fn test_overwrite_uleb128() {
     overwrite_uleb128(&mut data, 0, value).unwrap();
 
     assert_eq!(data, encoded_value);
+}
+
+fn write_u64(data: &mut [u8], relative_address: u64, value: u64) -> Result<(), ProgramFromElfError> {
+    let value = value.to_le_bytes();
+    data[relative_address as usize + 7] = value[7];
+    data[relative_address as usize + 6] = value[6];
+    data[relative_address as usize + 5] = value[5];
+    data[relative_address as usize + 4] = value[4];
+    data[relative_address as usize + 3] = value[3];
+    data[relative_address as usize + 2] = value[2];
+    data[relative_address as usize + 1] = value[1];
+    data[relative_address as usize] = value[0];
+    Ok(())
 }
 
 fn write_u32(data: &mut [u8], relative_address: u64, value: u32) -> Result<(), ProgramFromElfError> {
@@ -6995,7 +7033,13 @@ where
         fn write_generic(size: RelocationSize, data: &mut [u8], relative_address: u64, value: u64) -> Result<(), ProgramFromElfError> {
             match size {
                 RelocationSize::U64 => {
-                    todo!()
+                    let Ok(value) = u64::try_from(value) else {
+                        return Err(ProgramFromElfError::other(
+                            "overflow when applying relocations: value doesn't fit in an u64",
+                        ));
+                    };
+
+                    write_u64(data, relative_address, value)
                 }
                 RelocationSize::U32 => {
                     let Ok(value) = u32::try_from(value) else {

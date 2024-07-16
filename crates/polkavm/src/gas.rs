@@ -266,6 +266,11 @@ impl InstructionVisitor for GasVisitor {
     }
 
     #[inline(always)]
+    fn store_imm_indirect_u64(&mut self, _base: RawReg, _offset: u32, _value: u32) -> Self::ReturnTy {
+        self.cost += 1;
+    }
+
+    #[inline(always)]
     fn store_indirect_u8(&mut self, _src: RawReg, _base: RawReg, _offset: u32) -> Self::ReturnTy {
         self.cost += 1;
     }
@@ -277,6 +282,11 @@ impl InstructionVisitor for GasVisitor {
 
     #[inline(always)]
     fn store_indirect_u32(&mut self, _src: RawReg, _base: RawReg, _offset: u32) -> Self::ReturnTy {
+        self.cost += 1;
+    }
+
+    #[inline(always)]
+    fn store_indirect_u64(&mut self, _src: RawReg, _base: RawReg, _offset: u32) -> Self::ReturnTy {
         self.cost += 1;
     }
 
@@ -296,6 +306,11 @@ impl InstructionVisitor for GasVisitor {
     }
 
     #[inline(always)]
+    fn store_imm_u64(&mut self, _offset: u32, _value: u32) -> Self::ReturnTy {
+        self.cost += 1;
+    }
+
+    #[inline(always)]
     fn store_u8(&mut self, _src: RawReg, _offset: u32) -> Self::ReturnTy {
         self.cost += 1;
     }
@@ -307,6 +322,11 @@ impl InstructionVisitor for GasVisitor {
 
     #[inline(always)]
     fn store_u32(&mut self, _src: RawReg, _offset: u32) -> Self::ReturnTy {
+        self.cost += 1;
+    }
+
+    #[inline(always)]
+    fn store_u64(&mut self, _src: RawReg, _offset: u32) -> Self::ReturnTy {
         self.cost += 1;
     }
 
@@ -336,6 +356,11 @@ impl InstructionVisitor for GasVisitor {
     }
 
     #[inline(always)]
+    fn load_indirect_u64(&mut self, _dst: RawReg, _base: RawReg, _offset: u32) -> Self::ReturnTy {
+        self.cost += 1;
+    }
+
+    #[inline(always)]
     fn load_u8(&mut self, _dst: RawReg, _offset: u32) -> Self::ReturnTy {
         self.cost += 1;
     }
@@ -357,6 +382,11 @@ impl InstructionVisitor for GasVisitor {
 
     #[inline(always)]
     fn load_u32(&mut self, _dst: RawReg, _offset: u32) -> Self::ReturnTy {
+        self.cost += 1;
+    }
+
+    #[inline(always)]
+    fn load_u64(&mut self, _dst: RawReg, _offset: u32) -> Self::ReturnTy {
         self.cost += 1;
     }
 
