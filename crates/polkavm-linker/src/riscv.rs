@@ -85,9 +85,10 @@ impl BranchKind {
 pub enum LoadKind {
     I8 = 0b000,
     I16 = 0b001,
-    U32 = 0b010,
+    I32 = 0b010,
     U8 = 0b100,
     U16 = 0b101,
+    U32 = 0b110,
     U64 = 0b011,
 }
 
@@ -97,7 +98,7 @@ impl LoadKind {
         match value & 0b111 {
             0b000 => Some(LoadKind::I8),
             0b001 => Some(LoadKind::I16),
-            0b010 => Some(LoadKind::U32),
+            0b010 => Some(LoadKind::I32),
             0b100 => Some(LoadKind::U8),
             0b101 => Some(LoadKind::U16),
             0b110 => Some(LoadKind::U32),
@@ -485,7 +486,7 @@ impl Inst {
             }),
             // C.LW expands to lw rd′, offset[6:2](rs1′)
             (0b00, 0b010) => Some(Inst::Load {
-                kind: LoadKind::U32,
+                kind: LoadKind::I32,
                 dst: Reg::decode_compressed(op >> 2),
                 base: Reg::decode_compressed(op >> 7),
                 offset: (bits(3, 5, op, 10) | bits(2, 2, op, 6) | bits(6, 6, op, 5)) as i32,
@@ -624,7 +625,7 @@ impl Inst {
             (0b10, 0b010) => match Reg::decode(op >> 7) {
                 Reg::Zero => None,
                 rd => Some(Inst::Load {
-                    kind: LoadKind::U32,
+                    kind: LoadKind::I32,
                     dst: rd,
                     base: Reg::SP,
                     offset: (bits(5, 5, op, 12) | bits(2, 4, op, 4) | bits(6, 7, op, 2)) as i32,
@@ -1235,7 +1236,7 @@ mod test_decode_compressed {
         assert_eq!(
             Inst::decode_compressed(op),
             Some(Inst::Load {
-                kind: LoadKind::U32,
+                kind: LoadKind::I32,
                 dst: Reg::decode_compressed(0b111),
                 base: Reg::decode_compressed(0b010),
                 offset: 0b1101000
@@ -1562,7 +1563,7 @@ mod test_decode_compressed {
         assert_eq!(
             Inst::decode_compressed(op),
             Some(Inst::Load {
-                kind: LoadKind::U32,
+                kind: LoadKind::I32,
                 dst: Reg::A2,
                 base: Reg::SP,
                 offset: 0b10101000

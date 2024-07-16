@@ -1,18 +1,18 @@
 use polkavm_assembler::amd64::addr::*;
 use polkavm_assembler::amd64::inst::*;
+use polkavm_assembler::amd64::Reg::rsp;
 use polkavm_assembler::amd64::RegIndex as NativeReg;
 use polkavm_assembler::amd64::RegIndex::*;
-use polkavm_assembler::amd64::Reg::rsp;
-use polkavm_assembler::amd64::{Condition, LoadKind, RegSize, Size, MemOp};
-use polkavm_assembler::{ReservedAssembler, Label, U1, U2, U3, U4, NonZero};
+use polkavm_assembler::amd64::{Condition, LoadKind, MemOp, RegSize, Size};
+use polkavm_assembler::{Label, NonZero, ReservedAssembler, U1, U2, U3, U4};
 
-use polkavm_common::program::{InstructionVisitor, Reg, RawReg};
+use polkavm_common::program::{InstructionVisitor, RawReg, Reg};
 use polkavm_common::zygote::VM_ADDR_VMCTX;
 
-use crate::config::GasMeteringKind;
 use crate::compiler::{ArchVisitor, SandboxKind};
-use crate::utils::RegImm;
+use crate::config::GasMeteringKind;
 use crate::sandbox::Sandbox;
+use crate::utils::RegImm;
 
 const TMP_REG: NativeReg = rcx;
 
@@ -75,14 +75,14 @@ macro_rules! with_sandbox_kind {
                 #[allow(non_upper_case_globals)]
                 const $kind: SandboxKind = SandboxKind::Linux;
                 $body
-            },
+            }
             SandboxKind::Generic => {
                 #[allow(non_upper_case_globals)]
                 const $kind: SandboxKind = SandboxKind::Generic;
                 $body
             }
         }
-    }
+    };
 }
 
 macro_rules! load_store_operand {
@@ -99,7 +99,7 @@ macro_rules! load_store_operand {
                         let $op = abs(RegSize::R32, $offset as i32);
                         $body
                     }
-                },
+                }
                 SandboxKind::Generic => {
                     match ($base, $offset) {
                         // [address] = ..
@@ -107,25 +107,29 @@ macro_rules! load_store_operand {
                         (None, _) if $offset as i32 >= 0 => {
                             let $op = reg_indirect(RegSize::R64, GENERIC_SANDBOX_MEMORY_REG + $offset as i32);
                             $body
-                        },
+                        }
 
                         // [address] = ..
                         (None, _) => {
                             $self.push(mov_imm(TMP_REG, imm32($offset)));
                             let $op = base_index(RegSize::R64, GENERIC_SANDBOX_MEMORY_REG, TMP_REG);
                             $body
-                        },
+                        }
 
                         // [base] = ..
                         (Some($base), 0) => {
                             // NOTE: This assumes that `base` has its upper 32-bits clear.
                             let $op = base_index(RegSize::R64, GENERIC_SANDBOX_MEMORY_REG, conv_reg($base));
                             $body
-                        },
+                        }
 
                         // [base + offset] = ..
                         (Some($base), _) => {
-                            $self.push(lea(RegSize::R32, TMP_REG, reg_indirect(RegSize::R32, conv_reg($base) + $offset as i32)));
+                            $self.push(lea(
+                                RegSize::R32,
+                                TMP_REG,
+                                reg_indirect(RegSize::R32, conv_reg($base) + $offset as i32),
+                            ));
                             let $op = base_index(RegSize::R64, GENERIC_SANDBOX_MEMORY_REG, TMP_REG);
                             $body
                         }
@@ -133,7 +137,7 @@ macro_rules! load_store_operand {
                 }
             }
         })
-    }
+    };
 }
 
 enum Signedness {
@@ -164,18 +168,21 @@ fn calculate_label_offset(asm_len: usize, rel8_len: usize, rel32_len: usize, off
 }
 
 #[cfg_attr(not(debug_assertions), inline(always))]
-fn branch_to_label<R>(asm: ReservedAssembler<R>, condition: Condition, label: Label) -> ReservedAssembler<R::Next> where R: NonZero {
+fn branch_to_label<R>(asm: ReservedAssembler<R>, condition: Condition, label: Label) -> ReservedAssembler<R::Next>
+where
+    R: NonZero,
+{
     if let Some(offset) = asm.get_label_origin_offset(label) {
         let offset = calculate_label_offset(
             asm.len(),
             jcc_rel8(condition, i8::MAX).len(),
             jcc_rel32(condition, i32::MAX).len(),
-            offset
+            offset,
         );
 
         match offset {
             Ok(offset) => asm.push(jcc_rel8(condition, offset)),
-            Err(offset) => asm.push(jcc_rel32(condition, offset))
+            Err(offset) => asm.push(jcc_rel32(condition, offset)),
         }
     } else {
         asm.push(jcc_label32(condition, label))
@@ -183,29 +190,33 @@ fn branch_to_label<R>(asm: ReservedAssembler<R>, condition: Condition, label: La
 }
 
 #[cfg_attr(not(debug_assertions), inline(always))]
-fn jump_to_label<R>(asm: ReservedAssembler<R>, label: Label) -> ReservedAssembler<R::Next> where R: NonZero {
+fn jump_to_label<R>(asm: ReservedAssembler<R>, label: Label) -> ReservedAssembler<R::Next>
+where
+    R: NonZero,
+{
     if let Some(offset) = asm.get_label_origin_offset(label) {
-        let offset = calculate_label_offset(
-            asm.len(),
-            jmp_rel8(i8::MAX).len(),
-            jmp_rel32(i32::MAX).len(),
-            offset
-        );
+        let offset = calculate_label_offset(asm.len(), jmp_rel8(i8::MAX).len(), jmp_rel32(i32::MAX).len(), offset);
 
         match offset {
             Ok(offset) => asm.push(jmp_rel8(offset)),
-            Err(offset) => asm.push(jmp_rel32(offset))
+            Err(offset) => asm.push(jmp_rel32(offset)),
         }
     } else {
         asm.push(jmp_label32(label))
     }
 }
 
-impl<'r, 'a, S> ArchVisitor<'r, 'a, S> where S: Sandbox {
+impl<'r, 'a, S> ArchVisitor<'r, 'a, S>
+where
+    S: Sandbox,
+{
     pub const PADDING_BYTE: u8 = 0x90; // NOP
 
     #[inline(always)]
-    fn push<T>(&mut self, inst: polkavm_assembler::Instruction<T>) where T: core::fmt::Display {
+    fn push<T>(&mut self, inst: polkavm_assembler::Instruction<T>)
+    where
+        T: core::fmt::Display,
+    {
         self.0.asm.push(inst);
     }
 
@@ -226,13 +237,11 @@ impl<'r, 'a, S> ArchVisitor<'r, 'a, S> where S: Sandbox {
         load_store_operand!(self, S::KIND, base, offset, |dst| {
             match src {
                 RegImm::Reg(src) => self.push(store(kind, dst, conv_reg(src))),
-                RegImm::Imm(value) => {
-                    match kind {
-                        Size::U8 => self.push(mov_imm(dst, imm8(value as u8))),
-                        Size::U16 => self.push(mov_imm(dst, imm16(value as u16))),
-                        Size::U32 => self.push(mov_imm(dst, imm32(value))),
-                        Size::U64 => unreachable!(),
-                    }
+                RegImm::Imm(value) => match kind {
+                    Size::U8 => self.push(mov_imm(dst, imm8(value as u8))),
+                    Size::U16 => self.push(mov_imm(dst, imm16(value as u16))),
+                    Size::U32 => self.push(mov_imm(dst, imm32(value))),
+                    Size::U64 => unreachable!(),
                 },
             }
         });
@@ -256,7 +265,7 @@ impl<'r, 'a, S> ArchVisitor<'r, 'a, S> where S: Sandbox {
         match self.reg_size() {
             RegSize::R32 => {
                 self.push(mov_imm(conv_reg(reg), imm32(0xffffffff)));
-            },
+            }
             RegSize::R64 => {
                 self.clear_reg(reg);
                 self.push(not(Size::U64, conv_reg(reg)));
@@ -305,12 +314,8 @@ impl<'r, 'a, S> ArchVisitor<'r, 'a, S> where S: Sandbox {
             asm.push(setcc(Condition::NotEqual, d))
         } else {
             let asm = match reg_size {
-                RegSize::R32 => {
-                    asm.push(cmp((s1, imm32(s2))))
-                },
-                RegSize::R64 => {
-                    asm.push(cmp((s1, imm64(s2 as i32))))
-                }
+                RegSize::R32 => asm.push(cmp((s1, imm32(s2)))),
+                RegSize::R64 => asm.push(cmp((s1, imm64(s2 as i32)))),
             };
             asm.push(setcc(condition, d))
         };
@@ -357,10 +362,8 @@ impl<'r, 'a, S> ArchVisitor<'r, 'a, S> where S: Sandbox {
             RegImm::Reg(s1) => {
                 let s1 = conv_reg(s1);
                 asm.push_if(d != s1, mov(reg_size, d, s1))
-            },
-            RegImm::Imm(s1) => {
-                asm.push(mov_imm(d, imm32(s1)))
             }
+            RegImm::Imm(s1) => asm.push(mov_imm(d, imm32(s1))),
         };
 
         // d = d << s2
@@ -368,7 +371,8 @@ impl<'r, 'a, S> ArchVisitor<'r, 'a, S> where S: Sandbox {
             ShiftKind::LogicalLeft => asm.push(shl_cl(reg_size, d)),
             ShiftKind::LogicalRight => asm.push(shr_cl(reg_size, d)),
             ShiftKind::ArithmeticRight => asm.push(sar_cl(reg_size, d)),
-        }.assert_reserved_exactly_as_needed()
+        }
+        .assert_reserved_exactly_as_needed()
     }
 
     #[cfg_attr(not(debug_assertions), inline(always))]
@@ -529,9 +533,7 @@ impl<'r, 'a, S> ArchVisitor<'r, 'a, S> where S: Sandbox {
     #[cfg_attr(not(debug_assertions), inline(always))]
     fn vmctx_field(offset: usize) -> MemOp {
         match S::KIND {
-            SandboxKind::Linux => {
-                reg_indirect(RegSize::R64, LINUX_SANDBOX_VMCTX_REG + offset as i32)
-            },
+            SandboxKind::Linux => reg_indirect(RegSize::R64, LINUX_SANDBOX_VMCTX_REG + offset as i32),
             SandboxKind::Generic => {
                 let offset = crate::sandbox::generic::GUEST_MEMORY_TO_VMCTX_OFFSET as i32 + offset as i32;
                 reg_indirect(RegSize::R64, GENERIC_SANDBOX_MEMORY_REG + offset)
@@ -551,14 +553,22 @@ impl<'r, 'a, S> ArchVisitor<'r, 'a, S> where S: Sandbox {
     fn save_registers_to_vmctx(&mut self) {
         let regs_base = self.load_vmctx_field_address(S::vmctx_regs_offset());
         for (nth, reg) in Reg::ALL.iter().copied().enumerate() {
-            self.push(store(Size::U32, reg_indirect(RegSize::R64, regs_base + nth as i32 * 4), conv_reg(reg.into())));
+            self.push(store(
+                Size::U32,
+                reg_indirect(RegSize::R64, regs_base + nth as i32 * 4),
+                conv_reg(reg.into()),
+            ));
         }
     }
 
     fn restore_registers_from_vmctx(&mut self) {
         let regs_base = self.load_vmctx_field_address(S::vmctx_regs_offset());
         for (nth, reg) in Reg::ALL.iter().copied().enumerate() {
-            self.push(load(LoadKind::U32, conv_reg(reg.into()), reg_indirect(RegSize::R64, regs_base + nth as i32 * 4)));
+            self.push(load(
+                LoadKind::U32,
+                conv_reg(reg.into()),
+                reg_indirect(RegSize::R64, regs_base + nth as i32 * 4),
+            ));
         }
     }
 
@@ -580,7 +590,9 @@ impl<'r, 'a, S> ArchVisitor<'r, 'a, S> where S: Sandbox {
                 self.branch_to_label(Condition::Sign, self.trap_label);
             }
 
-            let target_label = self.get_or_forward_declare_label(export.target_code_offset()).unwrap_or(self.trap_label);
+            let target_label = self
+                .get_or_forward_declare_label(export.target_code_offset())
+                .unwrap_or(self.trap_label);
             self.jump_to_label(target_label);
         }
     }
@@ -608,7 +620,6 @@ impl<'r, 'a, S> ArchVisitor<'r, 'a, S> where S: Sandbox {
         self.push(call(TMP_REG));
         self.restore_registers_from_vmctx();
         self.push(ret());
-
     }
 
     pub(crate) fn emit_trace_trampoline(&mut self) {
@@ -677,11 +688,15 @@ impl<'r, 'a, S> ArchVisitor<'r, 'a, S> where S: Sandbox {
     fn jump_indirect_impl(&mut self, load_imm: Option<(RawReg, u32)>, base: RawReg, offset: u32) {
         match S::KIND {
             SandboxKind::Linux => {
-                use polkavm_assembler::amd64::{SegReg, Scale};
+                use polkavm_assembler::amd64::{Scale, SegReg};
 
                 let asm = self.asm.reserve::<U3>();
                 let (asm, target) = if offset != 0 || load_imm.map_or(false, |(t, _)| t == base) {
-                    let asm = asm.push(lea(RegSize::R32, TMP_REG, reg_indirect(RegSize::R32, conv_reg(base) + offset as i32)));
+                    let asm = asm.push(lea(
+                        RegSize::R32,
+                        TMP_REG,
+                        reg_indirect(RegSize::R32, conv_reg(base) + offset as i32),
+                    ));
                     (asm, TMP_REG)
                 } else {
                     (asm.push_none(), conv_reg(base))
@@ -695,7 +710,7 @@ impl<'r, 'a, S> ArchVisitor<'r, 'a, S> where S: Sandbox {
 
                 let asm = asm.push(jmp(MemOp::IndexScaleOffset(Some(SegReg::gs), RegSize::R64, target, Scale::x8, 0)));
                 asm.assert_reserved_exactly_as_needed();
-            },
+            }
             SandboxKind::Generic => {
                 // TODO: This also could be more efficient.
                 self.push(lea_rip_label(TMP_REG, self.jump_table_label));
@@ -719,8 +734,36 @@ impl<'r, 'a, S> ArchVisitor<'r, 'a, S> where S: Sandbox {
     }
 }
 
-impl<'r, 'a, S> InstructionVisitor for ArchVisitor<'r, 'a, S> where S: Sandbox {
+impl<'r, 'a, S> InstructionVisitor for ArchVisitor<'r, 'a, S>
+where
+    S: Sandbox,
+{
     type ReturnTy = ();
+
+    fn load_i32(&mut self, _: RawReg, _: u32) -> Self::ReturnTy {
+        todo!()
+    }
+    fn load_u64(&mut self, _: RawReg, _: u32) -> Self::ReturnTy {
+        todo!()
+    }
+    fn store_u64(&mut self, _: RawReg, _: u32) -> Self::ReturnTy {
+        todo!()
+    }
+    fn store_imm_indirect_u64(&mut self, _: RawReg, _: u32, _: u32) -> Self::ReturnTy {
+        todo!()
+    }
+    fn store_indirect_u64(&mut self, _: RawReg, _: RawReg, _: u32) -> Self::ReturnTy {
+        todo!()
+    }
+    fn load_indirect_i32(&mut self, _: RawReg, _: RawReg, _: u32) -> Self::ReturnTy {
+        todo!()
+    }
+    fn load_indirect_u64(&mut self, _: RawReg, _: RawReg, _: u32) -> Self::ReturnTy {
+        todo!()
+    }
+    fn store_imm_u64(&mut self, _: u32, _: u32) -> Self::ReturnTy {
+        todo!()
+    }
 
     #[inline(always)]
     fn trap(&mut self) -> Self::ReturnTy {
@@ -735,8 +778,7 @@ impl<'r, 'a, S> InstructionVisitor for ArchVisitor<'r, 'a, S> where S: Sandbox {
     }
 
     #[inline(always)]
-    fn fallthrough(&mut self) -> Self::ReturnTy {
-    }
+    fn fallthrough(&mut self) -> Self::ReturnTy {}
 
     #[inline(always)]
     fn sbrk(&mut self, dst: RawReg, size: RawReg) -> Self::ReturnTy {
@@ -835,12 +877,12 @@ impl<'r, 'a, S> InstructionVisitor for ArchVisitor<'r, 'a, S> where S: Sandbox {
     }
 
     #[inline(always)]
-    fn shift_arithmetic_right_imm_alt(&mut self, d: RawReg, s2: RawReg, s1: u32) -> Self::ReturnTy  {
+    fn shift_arithmetic_right_imm_alt(&mut self, d: RawReg, s2: RawReg, s1: u32) -> Self::ReturnTy {
         self.shift(d, s1, s2, ShiftKind::ArithmeticRight);
     }
 
     #[inline(always)]
-    fn shift_logical_left_imm_alt(&mut self, d: RawReg, s2: RawReg, s1: u32) -> Self::ReturnTy  {
+    fn shift_logical_left_imm_alt(&mut self, d: RawReg, s2: RawReg, s1: u32) -> Self::ReturnTy {
         self.shift(d, s1, s2, ShiftKind::LogicalLeft);
     }
 
@@ -862,7 +904,8 @@ impl<'r, 'a, S> InstructionVisitor for ArchVisitor<'r, 'a, S> where S: Sandbox {
                 let asm = asm.push(mov(reg_size, d, s1));
                 asm.push(xor((reg_size, d, s2)))
             }
-        }.assert_reserved_exactly_as_needed();
+        }
+        .assert_reserved_exactly_as_needed();
     }
 
     #[inline(always)]
@@ -883,7 +926,8 @@ impl<'r, 'a, S> InstructionVisitor for ArchVisitor<'r, 'a, S> where S: Sandbox {
                 let asm = asm.push(mov(reg_size, d, s1));
                 asm.push(and((reg_size, d, s2)))
             }
-        }.assert_reserved_exactly_as_needed();
+        }
+        .assert_reserved_exactly_as_needed();
     }
 
     #[inline(always)]
@@ -904,7 +948,8 @@ impl<'r, 'a, S> InstructionVisitor for ArchVisitor<'r, 'a, S> where S: Sandbox {
                 let asm = asm.push(mov(reg_size, d, s1));
                 asm.push(or((reg_size, d, s2)))
             }
-        }.assert_reserved_exactly_as_needed();
+        }
+        .assert_reserved_exactly_as_needed();
     }
 
     #[inline(always)]
@@ -925,7 +970,8 @@ impl<'r, 'a, S> InstructionVisitor for ArchVisitor<'r, 'a, S> where S: Sandbox {
                 let asm = asm.push_if(d != s1, mov(reg_size, d, s1));
                 asm.push(add((reg_size, d, s2)))
             }
-        }.assert_reserved_exactly_as_needed();
+        }
+        .assert_reserved_exactly_as_needed();
     }
 
     #[inline(always)]
@@ -949,7 +995,8 @@ impl<'r, 'a, S> InstructionVisitor for ArchVisitor<'r, 'a, S> where S: Sandbox {
                 let asm = asm.push(mov(reg_size, d, s1));
                 asm.push(sub((reg_size, d, s2)))
             }
-        }.assert_reserved_exactly_as_needed();
+        }
+        .assert_reserved_exactly_as_needed();
     }
 
     #[inline(always)]
@@ -976,7 +1023,8 @@ impl<'r, 'a, S> InstructionVisitor for ArchVisitor<'r, 'a, S> where S: Sandbox {
                 let asm = asm.push(mov_imm(d, imm32(s2)));
                 asm.push(sub((RegSize::R32, d, s1)))
             }
-        }.assert_reserved_exactly_as_needed();
+        }
+        .assert_reserved_exactly_as_needed();
     }
 
     #[inline(always)]
@@ -997,7 +1045,8 @@ impl<'r, 'a, S> InstructionVisitor for ArchVisitor<'r, 'a, S> where S: Sandbox {
             // d = s1 * s2
             let asm = asm.push(mov(reg_size, d, s1));
             asm.push(imul(reg_size, d, s2))
-        }.assert_reserved_exactly_as_needed();
+        }
+        .assert_reserved_exactly_as_needed();
     }
 
     #[inline(always)]
@@ -1163,7 +1212,8 @@ impl<'r, 'a, S> InstructionVisitor for ArchVisitor<'r, 'a, S> where S: Sandbox {
         } else {
             // d = s1 ^ 0xfffffff
             asm.push(not(reg_size, d))
-        }.assert_reserved_exactly_as_needed();
+        }
+        .assert_reserved_exactly_as_needed();
     }
 
     #[inline(always)]
@@ -1211,7 +1261,8 @@ impl<'r, 'a, S> InstructionVisitor for ArchVisitor<'r, 'a, S> where S: Sandbox {
             }
         } else {
             asm.push(lea(reg_size, d, reg_indirect(reg_size, s1 + s2 as i32)))
-        }.assert_reserved_exactly_as_needed();
+        }
+        .assert_reserved_exactly_as_needed();
     }
 
     #[inline(always)]

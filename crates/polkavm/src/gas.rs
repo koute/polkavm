@@ -356,6 +356,11 @@ impl InstructionVisitor for GasVisitor {
     }
 
     #[inline(always)]
+    fn load_indirect_i32(&mut self, _dst: RawReg, _base: RawReg, _offset: u32) -> Self::ReturnTy {
+        self.cost += 1;
+    }
+
+    #[inline(always)]
     fn load_indirect_u64(&mut self, _dst: RawReg, _base: RawReg, _offset: u32) -> Self::ReturnTy {
         self.cost += 1;
     }
@@ -382,6 +387,11 @@ impl InstructionVisitor for GasVisitor {
 
     #[inline(always)]
     fn load_u32(&mut self, _dst: RawReg, _offset: u32) -> Self::ReturnTy {
+        self.cost += 1;
+    }
+
+    #[inline(always)]
+    fn load_i32(&mut self, _dst: RawReg, _offset: u32) -> Self::ReturnTy {
         self.cost += 1;
     }
 

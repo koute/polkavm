@@ -1178,6 +1178,10 @@ impl<'a, 'b, const DEBUG: bool> InstructionVisitor for Visitor<'a, 'b, DEBUG> {
         self.load::<u32>(dst, None, offset)
     }
 
+    fn load_i32(&mut self, dst: RawReg, offset: u32) -> Self::ReturnTy {
+        todo!()
+    }
+
     fn load_u64(&mut self, dst: RawReg, offset: u32) -> Self::ReturnTy {
         todo!()
     }
@@ -1200,6 +1204,10 @@ impl<'a, 'b, const DEBUG: bool> InstructionVisitor for Visitor<'a, 'b, DEBUG> {
 
     fn load_indirect_u32(&mut self, dst: RawReg, base: RawReg, offset: u32) -> Self::ReturnTy {
         self.load::<u32>(dst, Some(base), offset)
+    }
+
+    fn load_indirect_i32(&mut self, dst: RawReg, base: RawReg, offset: u32) -> Self::ReturnTy {
+        todo!()
     }
 
     fn load_indirect_u64(&mut self, dst: RawReg, base: RawReg, offset: u32) -> Self::ReturnTy {

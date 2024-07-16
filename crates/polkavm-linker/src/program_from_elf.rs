@@ -1739,7 +1739,7 @@ fn convert_instruction(
             };
 
             emit(InstExt::Basic(BasicInst::LoadIndirect {
-                kind: LoadKind::U32,
+                kind: LoadKind::I32,
                 dst,
                 base: src,
                 offset: 0,
@@ -1791,7 +1791,7 @@ fn convert_instruction(
             };
 
             emit(InstExt::Basic(BasicInst::LoadIndirect {
-                kind: LoadKind::U32,
+                kind: LoadKind::I32,
                 dst: old_value,
                 base: addr,
                 offset: 0,
@@ -3655,6 +3655,10 @@ where
                             .data()
                             .get(target.offset as usize..target.offset as usize + 4)
                             .map(|xs| u32::from_le_bytes([xs[0], xs[1], xs[2], xs[3]]) as i32),
+                        LoadKind::I32 => section
+                            .data()
+                            .get(target.offset as usize..target.offset as usize + 4)
+                            .map(|xs| i32::from_le_bytes([xs[0], xs[1], xs[2], xs[3]])),
                         LoadKind::U16 => section
                             .data()
                             .get(target.offset as usize..target.offset as usize + 2)
@@ -4393,7 +4397,7 @@ fn spill_fake_registers(
                         let offset = src_slot.index() * 4;
                         *regspill_size = core::cmp::max(*regspill_size, offset + 4);
                         BasicInst::LoadAbsolute {
-                            kind: LoadKind::U32,
+                            kind: LoadKind::I32,
                             dst: dst_reg,
                             target: SectionTarget {
                                 section_index: section_regspill,
@@ -5261,9 +5265,10 @@ fn emit_code(
                         {
                             LoadKind::I8 => load_i8,
                             LoadKind::I16 => load_i16,
-                            LoadKind::U32 => load_u32,
+                            LoadKind::I32 => load_i32,
                             LoadKind::U8 => load_u8,
                             LoadKind::U16 => load_u16,
+                            LoadKind::U32 => load_u32,
                             LoadKind::U64 => load_u64,
                         }
                     }
@@ -5304,9 +5309,10 @@ fn emit_code(
                         {
                             LoadKind::I8 => load_indirect_i8,
                             LoadKind::I16 => load_indirect_i16,
-                            LoadKind::U32 => load_indirect_u32,
+                            LoadKind::I32 => load_indirect_i32,
                             LoadKind::U8 => load_indirect_u8,
                             LoadKind::U16 => load_indirect_u16,
+                            LoadKind::U32 => load_indirect_u32,
                             LoadKind::U64 => load_indirect_u64,
                         }
                     }
@@ -6480,7 +6486,7 @@ where
 
             match lo_inst {
                 Inst::Load {
-                    kind: LoadKind::U32,
+                    kind: LoadKind::I32,
                     base,
                     dst,
                     ..

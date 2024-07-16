@@ -1227,6 +1227,7 @@ define_opcodes! {
         load_u16                                 = 76,
         load_i16                                 = 66,
         load_u32                                 = 10,
+        load_i32                                 = 100,
         load_u64                                 = 95,
         store_u8                                 = 71,
         store_u16                                = 69,
@@ -1267,6 +1268,7 @@ define_opcodes! {
         load_indirect_i8                         = 21,
         load_indirect_u16                        = 37,
         load_indirect_i16                        = 33,
+        load_indirect_i32                        = 99,
         load_indirect_u32                        = 1,
         load_indirect_u64                        = 91,
         add_imm                                  = 2,
@@ -1981,6 +1983,16 @@ impl<'a, 'b> InstructionVisitor for InstructionFormatter<'a, 'b> {
         }
     }
 
+    fn load_indirect_i32(&mut self, dst: RawReg, base: RawReg, offset: u32) -> Self::ReturnTy {
+        let dst = self.format_reg(dst);
+        let base = self.format_reg(base);
+        if self.format.prefer_unaliased || offset != 0 {
+            write!(self, "{} = i32 [{} + {}]", dst, base, offset)
+        } else {
+            write!(self, "{} = i32 [{}]", dst, base)
+        }
+    }
+
     fn load_indirect_u64(&mut self, dst: RawReg, base: RawReg, offset: u32) -> Self::ReturnTy {
         let dst = self.format_reg(dst);
         let base = self.format_reg(base);
@@ -2009,6 +2021,11 @@ impl<'a, 'b> InstructionVisitor for InstructionFormatter<'a, 'b> {
     fn load_i16(&mut self, dst: RawReg, offset: u32) -> Self::ReturnTy {
         let dst = self.format_reg(dst);
         write!(self, "{} = i16 [0x{:x}]", dst, offset)
+    }
+
+    fn load_i32(&mut self, dst: RawReg, offset: u32) -> Self::ReturnTy {
+        let dst = self.format_reg(dst);
+        write!(self, "{} = i32 [0x{:x}]", dst, offset)
     }
 
     fn load_u32(&mut self, dst: RawReg, offset: u32) -> Self::ReturnTy {

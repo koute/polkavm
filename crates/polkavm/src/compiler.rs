@@ -1,21 +1,19 @@
 use alloc::borrow::Cow;
+use core::marker::PhantomData;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
-use core::marker::PhantomData;
 
 use polkavm_assembler::{Assembler, Label};
-use polkavm_common::program::{ParsedInstruction, ProgramExport, Instructions, JumpTable, RawReg, InstructionVisitor};
-use polkavm_common::zygote::{
-    VM_COMPILER_MAXIMUM_EPILOGUE_LENGTH, VM_COMPILER_MAXIMUM_INSTRUCTION_LENGTH,
-};
 use polkavm_common::abi::VM_CODE_ADDRESS_ALIGNMENT;
+use polkavm_common::program::{InstructionVisitor, Instructions, JumpTable, ParsedInstruction, ProgramExport, RawReg};
+use polkavm_common::zygote::{VM_COMPILER_MAXIMUM_EPILOGUE_LENGTH, VM_COMPILER_MAXIMUM_INSTRUCTION_LENGTH};
 
 use crate::error::Error;
 
-use crate::sandbox::{Sandbox, SandboxProgram, SandboxInit};
 use crate::config::{GasMeteringKind, ModuleConfig, SandboxKind};
-use crate::utils::{FlatMap, GuestInit};
 use crate::gas::GasVisitor;
+use crate::sandbox::{Sandbox, SandboxInit, SandboxProgram};
+use crate::utils::{FlatMap, GuestInit};
 
 #[cfg(target_arch = "x86_64")]
 mod amd64;
@@ -42,7 +40,10 @@ struct Cache {
 #[derive(Clone, Default)]
 pub(crate) struct CompilerCache(Arc<Mutex<Cache>>);
 
-pub(crate) struct CompilerVisitor<'a, S> where S: Sandbox {
+pub(crate) struct CompilerVisitor<'a, S>
+where
+    S: Sandbox,
+{
     init: GuestInit<'a>,
     jump_table: JumpTable<'a>,
     code: &'a [u8],
@@ -71,22 +72,33 @@ pub(crate) struct CompilerVisitor<'a, S> where S: Sandbox {
 }
 
 #[repr(transparent)]
-pub(crate) struct ArchVisitor<'r, 'a, S>(pub &'r mut CompilerVisitor<'a, S>) where S: Sandbox;
+pub(crate) struct ArchVisitor<'r, 'a, S>(pub &'r mut CompilerVisitor<'a, S>)
+where
+    S: Sandbox;
 
-impl<'r, 'a, S> core::ops::Deref for ArchVisitor<'r, 'a, S> where S: Sandbox {
+impl<'r, 'a, S> core::ops::Deref for ArchVisitor<'r, 'a, S>
+where
+    S: Sandbox,
+{
     type Target = CompilerVisitor<'a, S>;
     fn deref(&self) -> &Self::Target {
         self.0
     }
 }
 
-impl<'r, 'a, S> core::ops::DerefMut for ArchVisitor<'r, 'a, S> where S: Sandbox {
+impl<'r, 'a, S> core::ops::DerefMut for ArchVisitor<'r, 'a, S>
+where
+    S: Sandbox,
+{
     fn deref_mut(&mut self) -> &mut Self::Target {
         self.0
     }
 }
 
-impl<'a, S> CompilerVisitor<'a, S> where S: Sandbox {
+impl<'a, S> CompilerVisitor<'a, S>
+where
+    S: Sandbox,
+{
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
         cache: &CompilerCache,
@@ -98,10 +110,17 @@ impl<'a, S> CompilerVisitor<'a, S> where S: Sandbox {
         debug_trace_execution: bool,
         code_length: u32,
         init: GuestInit<'a>,
-    ) -> Result<(Self, S::AddressSpace), Error> where S: Sandbox {
+    ) -> Result<(Self, S::AddressSpace), Error>
+    where
+        S: Sandbox,
+    {
         let native_page_size = crate::sandbox::get_native_page_size();
         if native_page_size > config.page_size as usize || config.page_size as usize % native_page_size != 0 {
-            return Err(format!("configured page size of {} is incompatible with the native page size of {}", config.page_size, native_page_size).into());
+            return Err(format!(
+                "configured page size of {} is incompatible with the native page size of {}",
+                config.page_size, native_page_size
+            )
+            .into());
         }
 
         let address_space = S::reserve_address_space().map_err(Error::from_display)?;
@@ -198,12 +217,21 @@ impl<'a, S> CompilerVisitor<'a, S> where S: Sandbox {
         Ok((visitor, address_space))
     }
 
-    pub(crate) fn finish_compilation(mut self, global: &S::GlobalState, cache: &CompilerCache, address_space: S::AddressSpace) -> Result<CompiledModule<S>, Error> where S: Sandbox {
+    pub(crate) fn finish_compilation(
+        mut self,
+        global: &S::GlobalState,
+        cache: &CompilerCache,
+        address_space: S::AddressSpace,
+    ) -> Result<CompiledModule<S>, Error>
+    where
+        S: Sandbox,
+    {
         // Finish with a trap in case the code doesn't end with a basic block terminator.
         ArchVisitor(&mut self).trap();
 
         let epilogue_start = self.asm.len();
-        self.code_offset_to_native_code_offset.push((self.code_length, epilogue_start as u32));
+        self.code_offset_to_native_code_offset
+            .push((self.code_length, epilogue_start as u32));
         self.code_offset_to_native_code_offset.shrink_to_fit();
 
         let mut gas_metering_stub_offsets = core::mem::take(&mut self.gas_metering_stub_offsets);
@@ -265,7 +293,7 @@ impl<'a, S> CompilerVisitor<'a, S> where S: Sandbox {
             .expect("overflow");
 
         match S::KIND {
-            SandboxKind::Linux => {},
+            SandboxKind::Linux => {}
             SandboxKind::Generic => {
                 let native_page_size = crate::sandbox::get_native_page_size();
                 let padded_length = polkavm_common::utils::align_to_next_page_usize(native_page_size, self.asm.len()).unwrap();
@@ -425,8 +453,36 @@ impl<'a, S> CompilerVisitor<'a, S> where S: Sandbox {
     }
 }
 
-impl<'a, S> polkavm_common::program::ParsingVisitor for CompilerVisitor<'a, S> where S: Sandbox {
+impl<'a, S> polkavm_common::program::ParsingVisitor for CompilerVisitor<'a, S>
+where
+    S: Sandbox,
+{
     type ReturnTy = ();
+
+    fn load_i32(&mut self, code_offset: u32, _args_length: u32, dst: RawReg, offset: u32) -> Self::ReturnTy {
+        self.load_u32(code_offset, _args_length, dst, offset)
+    }
+    fn load_u64(&mut self, _: u32, _: u32, _: RawReg, _: u32) -> Self::ReturnTy {
+        todo!()
+    }
+    fn store_u64(&mut self, _: u32, _: u32, _: RawReg, _: u32) -> Self::ReturnTy {
+        todo!()
+    }
+    fn store_imm_indirect_u64(&mut self, _: u32, _: u32, _: RawReg, _: u32, _: u32) -> Self::ReturnTy {
+        todo!()
+    }
+    fn store_indirect_u64(&mut self, _: u32, _: u32, _: RawReg, _: RawReg, _: u32) -> Self::ReturnTy {
+        todo!()
+    }
+    fn load_indirect_i32(&mut self, code_offset: u32, _args_length: u32, dst: RawReg, base: RawReg, offset: u32) -> Self::ReturnTy {
+        self.load_indirect_u32(code_offset, _args_length, dst, base, offset)
+    }
+    fn load_indirect_u64(&mut self, _: u32, _: u32, _: RawReg, _: RawReg, _: u32) -> Self::ReturnTy {
+        todo!()
+    }
+    fn store_imm_u64(&mut self, _: u32, _: u32, _: u32, _: u32) -> Self::ReturnTy {
+        todo!()
+    }
 
     #[inline(always)]
     fn trap(&mut self, code_offset: u32, args_length: u32) -> Self::ReturnTy {
@@ -1057,7 +1113,14 @@ impl<'a, S> polkavm_common::program::ParsingVisitor for CompilerVisitor<'a, S> w
     }
 
     #[inline(always)]
-    fn branch_greater_or_equal_unsigned_imm(&mut self, code_offset: u32, args_length: u32, s1: RawReg, s2: u32, imm: u32) -> Self::ReturnTy {
+    fn branch_greater_or_equal_unsigned_imm(
+        &mut self,
+        code_offset: u32,
+        args_length: u32,
+        s1: RawReg,
+        s2: u32,
+        imm: u32,
+    ) -> Self::ReturnTy {
         self.before_instruction(code_offset);
         self.gas_visitor.branch_greater_or_equal_unsigned_imm(s1, s2, imm);
         ArchVisitor(self).branch_greater_or_equal_unsigned_imm(s1, s2, imm);
@@ -1128,7 +1191,15 @@ impl<'a, S> polkavm_common::program::ParsingVisitor for CompilerVisitor<'a, S> w
     }
 
     #[inline(always)]
-    fn load_imm_and_jump_indirect(&mut self, code_offset: u32, args_length: u32, ra: RawReg, base: RawReg, value: u32, offset: u32) -> Self::ReturnTy {
+    fn load_imm_and_jump_indirect(
+        &mut self,
+        code_offset: u32,
+        args_length: u32,
+        ra: RawReg,
+        base: RawReg,
+        value: u32,
+        offset: u32,
+    ) -> Self::ReturnTy {
         self.before_instruction(code_offset);
         self.gas_visitor.load_imm_and_jump_indirect(ra, base, value, offset);
         ArchVisitor(self).load_imm_and_jump_indirect(ra, base, value, offset);
@@ -1155,14 +1226,20 @@ impl<'a, S> polkavm_common::program::ParsingVisitor for CompilerVisitor<'a, S> w
     }
 }
 
-pub(crate) struct CompiledModule<S> where S: Sandbox {
+pub(crate) struct CompiledModule<S>
+where
+    S: Sandbox,
+{
     pub(crate) sandbox_program: S::Program,
     pub(crate) export_trampolines: HashMap<u32, u64>,
     code_offset_to_native_code_offset: Vec<(u32, u32)>,
     cache: CompilerCache,
 }
 
-impl<S> CompiledModule<S> where S: Sandbox {
+impl<S> CompiledModule<S>
+where
+    S: Sandbox,
+{
     pub fn machine_code(&self) -> Cow<[u8]> {
         self.sandbox_program.machine_code()
     }
@@ -1172,7 +1249,10 @@ impl<S> CompiledModule<S> where S: Sandbox {
     }
 }
 
-impl<S> Drop for CompiledModule<S> where S: Sandbox {
+impl<S> Drop for CompiledModule<S>
+where
+    S: Sandbox,
+{
     fn drop(&mut self) {
         let mut code_offset_to_native_code_offset = core::mem::take(&mut self.code_offset_to_native_code_offset);
         let mut export_trampolines = core::mem::take(&mut self.export_trampolines);
@@ -1187,7 +1267,7 @@ impl<S> Drop for CompiledModule<S> where S: Sandbox {
                 export_trampolines.clear();
                 cache.per_module.push(CachePerModule {
                     code_offset_to_native_code_offset,
-                    export_trampolines
+                    export_trampolines,
                 });
             }
         }
