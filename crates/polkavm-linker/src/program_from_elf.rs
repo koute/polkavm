@@ -1761,6 +1761,28 @@ fn convert_instruction(
 
             Ok(())
         }
+        Inst::LoadReservedW { dst, src, .. } => {
+            let Some(dst) = cast_reg_non_zero(dst)? else {
+                return Err(ProgramFromElfError::other(
+                    "found an atomic load with a zero register as the destination",
+                ));
+            };
+
+            let Some(src) = cast_reg_non_zero(src)? else {
+                return Err(ProgramFromElfError::other(
+                    "found an atomic load with a zero register as the source",
+                ));
+            };
+
+            emit(InstExt::Basic(BasicInst::LoadIndirect {
+                kind: LoadKind::U64,
+                dst,
+                base: src,
+                offset: 0,
+            }));
+
+            Ok(())
+        }
         Inst::StoreConditional { src, addr, dst, .. } => {
             let Some(addr) = cast_reg_non_zero(addr)? else {
                 return Err(ProgramFromElfError::other(
@@ -1771,6 +1793,28 @@ fn convert_instruction(
             let src = cast_reg_any(src)?;
             emit(InstExt::Basic(BasicInst::StoreIndirect {
                 kind: StoreKind::U32,
+                src,
+                base: addr,
+                offset: 0,
+            }));
+
+            if let Some(dst) = cast_reg_non_zero(dst)? {
+                // The store always succeeds, so write zero here.
+                emit(InstExt::Basic(BasicInst::LoadImmediate { dst, imm: 0 }));
+            }
+
+            Ok(())
+        }
+        Inst::StoreConditionalW { src, addr, dst, .. } => {
+            let Some(addr) = cast_reg_non_zero(addr)? else {
+                return Err(ProgramFromElfError::other(
+                    "found an atomic store with a zero register as the address",
+                ));
+            };
+
+            let src = cast_reg_any(src)?;
+            emit(InstExt::Basic(BasicInst::StoreIndirect {
+                kind: StoreKind::U64,
                 src,
                 base: addr,
                 offset: 0,

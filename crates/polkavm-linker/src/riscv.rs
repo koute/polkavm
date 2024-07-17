@@ -277,6 +277,19 @@ pub enum Inst {
         dst: Reg,
         src: Reg,
     },
+    LoadReservedW {
+        acquire: bool,
+        release: bool,
+        dst: Reg,
+        src: Reg,
+    },
+    StoreConditionalW {
+        acquire: bool,
+        release: bool,
+        addr: Reg,
+        dst: Reg,
+        src: Reg,
+    },
     Atomic {
         acquire: bool,
         release: bool,
@@ -921,21 +934,42 @@ impl Inst {
                     None
                 }
             }
-            0b0101111 if (op >> 12) & 0b111 == 0b010 => {
+            0b0101111 => {
                 let dst = Reg::decode(op >> 7);
                 let src1 = Reg::decode(op >> 15);
                 let src2 = Reg::decode(op >> 20);
                 let kind = op >> 27;
                 let release = ((op >> 25) & 1) != 0;
                 let acquire = ((op >> 26) & 1) != 0;
-                match kind {
-                    0b00010 if src2 == Reg::Zero => Some(Inst::LoadReserved {
+                let funct3 = (op >> 12) & 0b111;
+                let word = match funct3 {
+                    0b010 if !rv64 => true,
+                    0b010 if rv64 => true,
+                    0b011 if rv64 => false,
+                    _ => return None,
+                };
+
+                match (kind, word) {
+                    (0b00010, true) if src2 == Reg::Zero => Some(Inst::LoadReserved {
                         acquire,
                         release,
                         dst,
                         src: src1,
                     }),
-                    0b00011 => Some(Inst::StoreConditional {
+                    (0b00011, true) => Some(Inst::StoreConditional {
+                        acquire,
+                        release,
+                        addr: src1,
+                        dst,
+                        src: src2,
+                    }),
+                    (0b00010, false) if src2 == Reg::Zero => Some(Inst::LoadReservedW {
+                        acquire,
+                        release,
+                        dst,
+                        src: src1,
+                    }),
+                    (0b00011, false) => Some(Inst::StoreConditionalW {
                         acquire,
                         release,
                         addr: src1,
@@ -1120,6 +1154,7 @@ impl Inst {
                     | (u32::from(acquire) << 26)
                     | (0b00010 << 27),
             ),
+            Inst::StoreConditionalW { .. } | Inst::LoadReservedW { .. } => todo!(),
             Inst::StoreConditional {
                 acquire,
                 release,
