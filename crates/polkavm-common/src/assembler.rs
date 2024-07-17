@@ -325,6 +325,50 @@ pub fn assemble(code: &str) -> Result<Vec<u8>, String> {
             }
         }
 
+        // tmp = {base}, {dst} = {value}, jump [tmp + {offset}], where `dest == base` is allowed
+        if let Some(line) = line.trim().strip_prefix("tmp =") {
+            if let Some(index) = line.find(',') {
+                let lhs = line[..index].trim();
+                let line = line[index + 1..].trim();
+
+                if let Some(base) = parse_reg(lhs) {
+                    if let Some(index) = line.find('=') {
+                        let lhs = line[..index].trim();
+                        let line = line[index + 1..].trim();
+
+                        if let Some(dst) = parse_reg(lhs) {
+                            if let Some(index) = line.find(',') {
+                                let lhs = line[..index].trim();
+                                let line = line[index + 1..].trim();
+
+                                if let Some(value) = parse_imm(lhs) {
+                                    if line.trim().strip_prefix("jump [tmp]").is_some() {
+                                        emit_and_continue!(Instruction::load_imm_and_jump_indirect(
+                                            dst.into(),
+                                            base.into(),
+                                            value as u32,
+                                            0
+                                        ));
+                                    }
+
+                                    if let Some(line) = line.strip_prefix("jump [tmp").and_then(|s| s.strip_suffix(']')) {
+                                        if let Some(offset) = parse_imm(line) {
+                                            emit_and_continue!(Instruction::load_imm_and_jump_indirect(
+                                                dst.into(),
+                                                base.into(),
+                                                value as u32,
+                                                offset as u32
+                                            ));
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
         if let Some(index) = line.find('=') {
             let lhs = line[..index].trim();
             let rhs = line[index + 1..].trim();
@@ -335,6 +379,14 @@ pub fn assemble(code: &str) -> Result<Vec<u8>, String> {
                         if let Some(line) = rhs[index + 1..].trim().strip_prefix("jump") {
                             if let Some(label) = line.trim().strip_prefix('@') {
                                 emit_and_continue!(MaybeInstruction::LoadImmAndJump(dst, value, label.to_owned()));
+                            }
+                            if let Some((base, offset)) = parse_indirect_memory_access(line) {
+                                emit_and_continue!(Instruction::load_imm_and_jump_indirect(
+                                    dst.into(),
+                                    base.into(),
+                                    value as u32,
+                                    offset as u32
+                                ));
                             }
                         }
                     }
