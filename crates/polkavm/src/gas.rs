@@ -116,7 +116,17 @@ impl InstructionVisitor for GasVisitor {
     }
 
     #[inline(always)]
+    fn subw(&mut self, _d: RawReg, _s1: RawReg, _s2: RawReg) -> Self::ReturnTy {
+        self.cost += 1;
+    }
+
+    #[inline(always)]
     fn mul(&mut self, _d: RawReg, _s1: RawReg, _s2: RawReg) -> Self::ReturnTy {
+        self.cost += 1;
+    }
+
+    #[inline(always)]
+    fn mulw(&mut self, _d: RawReg, _s1: RawReg, _s2: RawReg) -> Self::ReturnTy {
         self.cost += 1;
     }
 
@@ -152,6 +162,26 @@ impl InstructionVisitor for GasVisitor {
 
     #[inline(always)]
     fn rem_signed(&mut self, _d: RawReg, _s1: RawReg, _s2: RawReg) -> Self::ReturnTy {
+        self.cost += 1;
+    }
+
+    #[inline(always)]
+    fn div_unsignedw(&mut self, _d: RawReg, _s1: RawReg, _s2: RawReg) -> Self::ReturnTy {
+        self.cost += 1;
+    }
+
+    #[inline(always)]
+    fn div_signedw(&mut self, _d: RawReg, _s1: RawReg, _s2: RawReg) -> Self::ReturnTy {
+        self.cost += 1;
+    }
+
+    #[inline(always)]
+    fn rem_unsignedw(&mut self, _d: RawReg, _s1: RawReg, _s2: RawReg) -> Self::ReturnTy {
+        self.cost += 1;
+    }
+
+    #[inline(always)]
+    fn rem_signedw(&mut self, _d: RawReg, _s1: RawReg, _s2: RawReg) -> Self::ReturnTy {
         self.cost += 1;
     }
 

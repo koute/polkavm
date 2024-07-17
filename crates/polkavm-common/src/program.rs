@@ -1316,10 +1316,12 @@ define_opcodes! {
         add                                      = 8,
         addw                                     = 101,
         sub                                      = 20,
+        subw                                     = 112,
         and                                      = 23,
         xor                                      = 28,
         or                                       = 12,
         mul                                      = 34,
+        mulw                                     = 113,
         mul_upper_signed_signed                  = 67,
         mul_upper_unsigned_unsigned              = 57,
         mul_upper_signed_unsigned                = 81,
@@ -1332,9 +1334,13 @@ define_opcodes! {
         shift_arithmetic_right                   = 77,
         shift_arithmetic_right_w                 = 109,
         div_unsigned                             = 68,
+        div_unsignedw                            = 114,
         div_signed                               = 64,
+        div_signedw                              = 115,
         rem_unsigned                             = 73,
+        rem_unsignedw                            = 116,
         rem_signed                               = 70,
+        rem_signedw                              = 117,
 
         cmov_if_zero                             = 83,
         cmov_if_not_zero                         = 84,
@@ -1668,11 +1674,25 @@ impl<'a, 'b> InstructionVisitor for InstructionFormatter<'a, 'b> {
         write!(self, "{d} = {s1} - {s2}")
     }
 
+    fn subw(&mut self, d: RawReg, s1: RawReg, s2: RawReg) -> Self::ReturnTy {
+        let d = self.format_reg(d);
+        let s1 = self.format_reg(s1);
+        let s2 = self.format_reg(s2);
+        write!(self, "i32 {d} = i32 {s1} - i32 {s2}")
+    }
+
     fn mul(&mut self, d: RawReg, s1: RawReg, s2: RawReg) -> Self::ReturnTy {
         let d = self.format_reg(d);
         let s1 = self.format_reg(s1);
         let s2 = self.format_reg(s2);
         write!(self, "{d} = {s1} * {s2}")
+    }
+
+    fn mulw(&mut self, d: RawReg, s1: RawReg, s2: RawReg) -> Self::ReturnTy {
+        let d = self.format_reg(d);
+        let s1 = self.format_reg(s1);
+        let s2 = self.format_reg(s2);
+        write!(self, "i32 {d} = i32 {s1} * i32 {s2}")
     }
 
     fn mul_imm(&mut self, d: RawReg, s1: RawReg, s2: u32) -> Self::ReturnTy {
@@ -1740,6 +1760,34 @@ impl<'a, 'b> InstructionVisitor for InstructionFormatter<'a, 'b> {
         let s1 = self.format_reg(s1);
         let s2 = self.format_reg(s2);
         write!(self, "{d} = {s1} %s {s2}")
+    }
+
+    fn div_unsignedw(&mut self, d: RawReg, s1: RawReg, s2: RawReg) -> Self::ReturnTy {
+        let d = self.format_reg(d);
+        let s1 = self.format_reg(s1);
+        let s2 = self.format_reg(s2);
+        write!(self, "i32 {d} = i32 {s1} /u i32 {s2}")
+    }
+
+    fn div_signedw(&mut self, d: RawReg, s1: RawReg, s2: RawReg) -> Self::ReturnTy {
+        let d = self.format_reg(d);
+        let s1 = self.format_reg(s1);
+        let s2 = self.format_reg(s2);
+        write!(self, "i32 {d} = i32 {s1} /s i32 {s2}")
+    }
+
+    fn rem_unsignedw(&mut self, d: RawReg, s1: RawReg, s2: RawReg) -> Self::ReturnTy {
+        let d = self.format_reg(d);
+        let s1 = self.format_reg(s1);
+        let s2 = self.format_reg(s2);
+        write!(self, "i32 {d} = i32 {s1} %u i32 {s2}")
+    }
+
+    fn rem_signedw(&mut self, d: RawReg, s1: RawReg, s2: RawReg) -> Self::ReturnTy {
+        let d = self.format_reg(d);
+        let s1 = self.format_reg(s1);
+        let s2 = self.format_reg(s2);
+        write!(self, "i32 {d} = i32 {s1} %s i32 {s2}")
     }
 
     fn set_less_than_unsigned_imm(&mut self, d: RawReg, s1: RawReg, s2: u32) -> Self::ReturnTy {

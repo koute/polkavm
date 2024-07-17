@@ -13,6 +13,7 @@ use polkavm_common::utils::{align_to_next_page_usize, byte_slice_init, Access, A
 use polkavm_common::{
     VM_RPC_FLAG_CLEAR_PROGRAM_AFTER_EXECUTION, VM_RPC_FLAG_RESET_MEMORY_AFTER_EXECUTION, VM_RPC_FLAG_RESET_MEMORY_BEFORE_EXECUTION,
 };
+use std::env::consts::ARCH;
 
 type ExecutionError<E = core::convert::Infallible> = polkavm_common::error::ExecutionError<E>;
 
@@ -953,12 +954,20 @@ impl<'a, 'b, const DEBUG: bool> InstructionVisitor for Visitor<'a, 'b, DEBUG> {
         self.set3(d, s1, s2, u32::wrapping_sub)
     }
 
+    fn subw(&mut self, d: RawReg, s1: RawReg, s2: RawReg) -> Self::ReturnTy {
+        todo!()
+    }
+
     fn negate_and_add_imm(&mut self, d: RawReg, s1: RawReg, s2: u32) -> Self::ReturnTy {
         self.set3(d, s1, s2, |s1, s2| s2.wrapping_sub(s1))
     }
 
     fn mul(&mut self, d: RawReg, s1: RawReg, s2: RawReg) -> Self::ReturnTy {
         self.set3(d, s1, s2, u32::wrapping_mul)
+    }
+
+    fn mulw(&mut self, d: RawReg, s1: RawReg, s2: RawReg) -> Self::ReturnTy {
+        todo!()
     }
 
     fn mul_imm(&mut self, d: RawReg, s1: RawReg, s2: u32) -> Self::ReturnTy {
@@ -999,6 +1008,22 @@ impl<'a, 'b, const DEBUG: bool> InstructionVisitor for Visitor<'a, 'b, DEBUG> {
 
     fn rem_signed(&mut self, d: RawReg, s1: RawReg, s2: RawReg) -> Self::ReturnTy {
         self.set3(d, s1, s2, |s1, s2| rem(s1 as i32, s2 as i32) as u32)
+    }
+
+    fn div_unsignedw(&mut self, d: RawReg, s1: RawReg, s2: RawReg) -> Self::ReturnTy {
+        todo!()
+    }
+
+    fn div_signedw(&mut self, d: RawReg, s1: RawReg, s2: RawReg) -> Self::ReturnTy {
+        todo!()
+    }
+
+    fn rem_unsignedw(&mut self, d: RawReg, s1: RawReg, s2: RawReg) -> Self::ReturnTy {
+        todo!()
+    }
+
+    fn rem_signedw(&mut self, d: RawReg, s1: RawReg, s2: RawReg) -> Self::ReturnTy {
+        todo!()
     }
 
     fn set_less_than_unsigned_imm(&mut self, d: RawReg, s1: RawReg, s2: u32) -> Self::ReturnTy {

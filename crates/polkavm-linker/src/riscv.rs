@@ -186,6 +186,17 @@ pub enum RegRegKind {
     DivUnsigned = 0b01101,
     Rem = 0b01110,
     RemUnsigned = 0b01111,
+
+    AddW = 0b10111,
+    SubW,
+    ShiftLogicalLeftW,
+    ShiftLogicalRightW,
+    ShiftArithmeticRightW,
+    MulW,
+    DivW,
+    DivUnsignedW,
+    RemW,
+    RemUnsignedW,
 }
 
 #[derive(Copy, Clone, PartialEq, Eq, Debug, Hash)]
