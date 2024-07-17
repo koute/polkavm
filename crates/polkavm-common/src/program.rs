@@ -1272,6 +1272,7 @@ define_opcodes! {
         load_indirect_u32                        = 1,
         load_indirect_u64                        = 91,
         add_imm                                  = 2,
+        addw_imm                                = 100,
         and_imm                                  = 18,
         xor_imm                                  = 31,
         or_imm                                   = 49,
@@ -1281,14 +1282,20 @@ define_opcodes! {
         set_less_than_unsigned_imm               = 27,
         set_less_than_signed_imm                 = 56,
         shift_logical_left_imm                   = 9,
+        shift_logical_left_w_imm                 = 104,
         shift_logical_right_imm                  = 14,
+        shift_logical_right_w_imm                = 105,
         shift_arithmetic_right_imm               = 25,
+        shift_arithmetic_right_w_imm             = 106,
         negate_and_add_imm                       = 40,
         set_greater_than_unsigned_imm            = 39,
         set_greater_than_signed_imm              = 61,
         shift_logical_right_imm_alt              = 72,
+        shift_logical_right_w_imm_alt            = 102,
         shift_arithmetic_right_imm_alt           = 80,
+        shift_arithmetic_right_w_imm_alt         = 103,
         shift_logical_left_imm_alt               = 75,
+        shift_logical_left_w_imm_alt             = 101,
 
         cmov_if_zero_imm                         = 85,
         cmov_if_not_zero_imm                     = 86,
@@ -1307,6 +1314,7 @@ define_opcodes! {
     // Instructions with args: reg, reg, reg
     [
         add                                      = 8,
+        addw                                     = 99,
         sub                                      = 20,
         and                                      = 23,
         xor                                      = 28,
@@ -1318,8 +1326,11 @@ define_opcodes! {
         set_less_than_unsigned                   = 36,
         set_less_than_signed                     = 58,
         shift_logical_left                       = 55,
+        shift_logical_left_w                     = 107,
         shift_logical_right                      = 51,
+        shift_logical_right_w                    = 108,
         shift_arithmetic_right                   = 77,
+        shift_arithmetic_right_w                 = 109,
         div_unsigned                             = 68,
         div_signed                               = 64,
         rem_unsigned                             = 73,
@@ -1573,6 +1584,27 @@ impl<'a, 'b> InstructionVisitor for InstructionFormatter<'a, 'b> {
         write!(self, "{d} = {s1} <s {s2}")
     }
 
+    fn shift_logical_right_w(&mut self, d: RawReg, s1: RawReg, s2: RawReg) -> Self::ReturnTy {
+        let d = self.format_reg(d);
+        let s1 = self.format_reg(s1);
+        let s2 = self.format_reg(s2);
+        write!(self, "i32 {d} = i32 {s1} >> i32 {s2}")
+    }
+
+    fn shift_arithmetic_right_w(&mut self, d: RawReg, s1: RawReg, s2: RawReg) -> Self::ReturnTy {
+        let d = self.format_reg(d);
+        let s1 = self.format_reg(s1);
+        let s2 = self.format_reg(s2);
+        write!(self, "i32 {d} = i32 {s1} >>a i32 {s2}")
+    }
+
+    fn shift_logical_left_w(&mut self, d: RawReg, s1: RawReg, s2: RawReg) -> Self::ReturnTy {
+        let d = self.format_reg(d);
+        let s1 = self.format_reg(s1);
+        let s2 = self.format_reg(s2);
+        write!(self, "i32 {d} = i32 {s1} << i32 {s2}")
+    }
+
     fn shift_logical_right(&mut self, d: RawReg, s1: RawReg, s2: RawReg) -> Self::ReturnTy {
         let d = self.format_reg(d);
         let s1 = self.format_reg(s1);
@@ -1620,6 +1652,13 @@ impl<'a, 'b> InstructionVisitor for InstructionFormatter<'a, 'b> {
         let s1 = self.format_reg(s1);
         let s2 = self.format_reg(s2);
         write!(self, "{d} = {s1} + {s2}")
+    }
+
+    fn addw(&mut self, d: RawReg, s1: RawReg, s2: RawReg) -> Self::ReturnTy {
+        let d = self.format_reg(d);
+        let s1 = self.format_reg(s1);
+        let s2 = self.format_reg(s2);
+        write!(self, "i32 {d} = {s1} + {s2}")
     }
 
     fn sub(&mut self, d: RawReg, s1: RawReg, s2: RawReg) -> Self::ReturnTy {
@@ -1745,6 +1784,24 @@ impl<'a, 'b> InstructionVisitor for InstructionFormatter<'a, 'b> {
         write!(self, "{d} = {s1} >>a {s2}")
     }
 
+    fn shift_logical_right_w_imm(&mut self, d: RawReg, s1: RawReg, s2: u32) -> Self::ReturnTy {
+        let d = self.format_reg(d);
+        let s1 = self.format_reg(s1);
+        write!(self, "i32 {d} = i32 {s1} >> i32 {s2}")
+    }
+
+    fn shift_logical_right_w_imm_alt(&mut self, d: RawReg, s2: RawReg, s1: u32) -> Self::ReturnTy {
+        let d = self.format_reg(d);
+        let s2 = self.format_reg(s2);
+        write!(self, "i32 {d} = i32 {s1} >> i32 {s2}")
+    }
+
+    fn shift_arithmetic_right_w_imm(&mut self, d: RawReg, s1: RawReg, s2: u32) -> Self::ReturnTy {
+        let d = self.format_reg(d);
+        let s1 = self.format_reg(s1);
+        write!(self, "i32 {d} = i32 {s1} >>a i32 {s2}")
+    }
+
     fn shift_arithmetic_right_imm_alt(&mut self, d: RawReg, s2: RawReg, s1: u32) -> Self::ReturnTy {
         let d = self.format_reg(d);
         let s2 = self.format_reg(s2);
@@ -1761,6 +1818,24 @@ impl<'a, 'b> InstructionVisitor for InstructionFormatter<'a, 'b> {
         let d = self.format_reg(d);
         let s2 = self.format_reg(s2);
         write!(self, "{d} = {s1} << {s2}")
+    }
+
+    fn shift_arithmetic_right_w_imm_alt(&mut self, d: RawReg, s2: RawReg, s1: u32) -> Self::ReturnTy {
+        let d = self.format_reg(d);
+        let s2 = self.format_reg(s2);
+        write!(self, "i32 {d} = i32 {s1} >>a i32 {s2}")
+    }
+
+    fn shift_logical_left_w_imm(&mut self, d: RawReg, s1: RawReg, s2: u32) -> Self::ReturnTy {
+        let d = self.format_reg(d);
+        let s1 = self.format_reg(s1);
+        write!(self, "i32 {d} = i32 {s1} << i32 {s2}")
+    }
+
+    fn shift_logical_left_w_imm_alt(&mut self, d: RawReg, s2: RawReg, s1: u32) -> Self::ReturnTy {
+        let d = self.format_reg(d);
+        let s2 = self.format_reg(s2);
+        write!(self, "i32 {d} = i32 {s1} << i32 {s2}")
     }
 
     fn or_imm(&mut self, d: RawReg, s1: RawReg, s2: u32) -> Self::ReturnTy {
@@ -1816,6 +1891,16 @@ impl<'a, 'b> InstructionVisitor for InstructionFormatter<'a, 'b> {
         let d = self.format_reg(d);
         let c = self.format_reg(c);
         write!(self, "{d} = {s} if {c} != 0")
+    }
+
+    fn addw_imm(&mut self, d: RawReg, s1: RawReg, s2: u32) -> Self::ReturnTy {
+        let d = self.format_reg(d);
+        let s1 = self.format_reg(s1);
+        if !self.format.prefer_unaliased && (s2 as i32) < 0 && (s2 as i32) > -4096 {
+            write!(self, "i32 {d} = i32 {s1} - i32 {s2}", s2 = -(s2 as i32))
+        } else {
+            write!(self, "i32 {d} = i32 {s1} + 0x{s2:x}")
+        }
     }
 
     fn add_imm(&mut self, d: RawReg, s1: RawReg, s2: u32) -> Self::ReturnTy {

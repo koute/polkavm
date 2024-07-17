@@ -1620,14 +1620,18 @@ fn convert_instruction(
             let src = cast_reg_any(src)?;
             let kind = match kind {
                 RegImmKind::Add => AnyAnyKind::Add,
+                RegImmKind::Addw => AnyAnyKind::Addw,
                 RegImmKind::And => AnyAnyKind::And,
                 RegImmKind::Or => AnyAnyKind::Or,
                 RegImmKind::Xor => AnyAnyKind::Xor,
                 RegImmKind::SetLessThanUnsigned => AnyAnyKind::SetLessThanUnsigned,
                 RegImmKind::SetLessThanSigned => AnyAnyKind::SetLessThanSigned,
                 RegImmKind::ShiftLogicalLeft => AnyAnyKind::ShiftLogicalLeft,
+                RegImmKind::ShiftLogicalLeftW => AnyAnyKind::ShiftLogicalLeftW,
                 RegImmKind::ShiftLogicalRight => AnyAnyKind::ShiftLogicalRight,
+                RegImmKind::ShiftLogicalRightW => AnyAnyKind::ShiftLogicalRightW,
                 RegImmKind::ShiftArithmeticRight => AnyAnyKind::ShiftArithmeticRight,
+                RegImmKind::ShiftArithmeticRightW => AnyAnyKind::ShiftArithmeticRightW,
             };
 
             emit(InstExt::Basic(BasicInst::AnyAny {
@@ -3003,6 +3007,7 @@ fn perform_dead_code_elimination(
 #[derive(Copy, Clone, PartialEq, Eq, Debug)]
 pub enum AnyAnyKind {
     Add,
+    Addw,
     Sub,
     And,
     Or,
@@ -3012,6 +3017,9 @@ pub enum AnyAnyKind {
     ShiftLogicalLeft,
     ShiftLogicalRight,
     ShiftArithmeticRight,
+    ShiftLogicalLeftW,
+    ShiftLogicalRightW,
+    ShiftArithmeticRightW,
 
     Mul,
     MulUpperSignedSigned,
@@ -3030,6 +3038,7 @@ pub enum RegRegKind {
 #[derive(Copy, Clone, PartialEq, Eq, Debug)]
 enum OperationKind {
     Add,
+    Addw,
     Sub,
     And,
     Or,
@@ -3037,8 +3046,11 @@ enum OperationKind {
     SetLessThanUnsigned,
     SetLessThanSigned,
     ShiftLogicalLeft,
+    ShiftLogicalLeftW,
     ShiftLogicalRight,
+    ShiftLogicalRightW,
     ShiftArithmeticRight,
+    ShiftArithmeticRightW,
 
     Mul,
     MulUpperSignedSigned,
@@ -3059,6 +3071,7 @@ impl From<AnyAnyKind> for OperationKind {
     fn from(kind: AnyAnyKind) -> Self {
         match kind {
             AnyAnyKind::Add => Self::Add,
+            AnyAnyKind::Addw => Self::Addw,
             AnyAnyKind::Sub => Self::Sub,
             AnyAnyKind::And => Self::And,
             AnyAnyKind::Or => Self::Or,
@@ -3066,8 +3079,11 @@ impl From<AnyAnyKind> for OperationKind {
             AnyAnyKind::SetLessThanUnsigned => Self::SetLessThanUnsigned,
             AnyAnyKind::SetLessThanSigned => Self::SetLessThanSigned,
             AnyAnyKind::ShiftLogicalLeft => Self::ShiftLogicalLeft,
+            AnyAnyKind::ShiftLogicalLeftW => Self::ShiftLogicalLeftW,
             AnyAnyKind::ShiftLogicalRight => Self::ShiftLogicalRight,
+            AnyAnyKind::ShiftLogicalRightW => Self::ShiftLogicalRightW,
             AnyAnyKind::ShiftArithmeticRight => Self::ShiftArithmeticRight,
+            AnyAnyKind::ShiftArithmeticRightW => Self::ShiftArithmeticRightW,
             AnyAnyKind::Mul => Self::Mul,
             AnyAnyKind::MulUpperSignedSigned => Self::MulUpperSignedSigned,
             AnyAnyKind::MulUpperUnsignedUnsigned => Self::MulUpperUnsignedUnsigned,
@@ -3105,7 +3121,7 @@ impl OperationKind {
         use polkavm_common::operation::*;
         #[allow(clippy::unnecessary_cast)]
         match self {
-            Self::Add => lhs.wrapping_add(rhs),
+            Self::Add | Self::Addw => lhs.wrapping_add(rhs),
             Self::Sub => lhs.wrapping_sub(rhs),
             Self::And => lhs & rhs,
             Self::Or => lhs | rhs,
@@ -3113,8 +3129,11 @@ impl OperationKind {
             Self::SetLessThanUnsigned => i32::from((lhs as u32) < (rhs as u32)),
             Self::SetLessThanSigned => i32::from((lhs as i32) < (rhs as i32)),
             Self::ShiftLogicalLeft => ((lhs as u32).wrapping_shl(rhs as u32)) as i32,
+            Self::ShiftLogicalLeftW => ((lhs as u32).wrapping_shl(rhs as u32)) as i32,
             Self::ShiftLogicalRight => ((lhs as u32).wrapping_shr(rhs as u32)) as i32,
+            Self::ShiftLogicalRightW => ((lhs as u32).wrapping_shr(rhs as u32)) as i32,
             Self::ShiftArithmeticRight => (lhs as i32).wrapping_shr(rhs as u32),
+            Self::ShiftArithmeticRightW => (lhs as i32).wrapping_shr(rhs as u32),
 
             Self::Mul => (lhs as i32).wrapping_mul(rhs as i32),
             Self::MulUpperSignedSigned => mulh(lhs, rhs),
@@ -5397,13 +5416,17 @@ fn emit_code(
                                 kind = kind,
                                 {
                                     K::Add => add,
+                                    K::Addw => addw,
                                     K::Sub => sub,
                                     K::ShiftLogicalLeft => shift_logical_left,
+                                    K::ShiftLogicalLeftW => shift_logical_left_w,
                                     K::SetLessThanSigned => set_less_than_signed,
                                     K::SetLessThanUnsigned => set_less_than_unsigned,
                                     K::Xor => xor,
                                     K::ShiftLogicalRight => shift_logical_right,
+                                    K::ShiftLogicalRightW => shift_logical_right_w,
                                     K::ShiftArithmeticRight => shift_arithmetic_right,
+                                    K::ShiftArithmeticRightW => shift_arithmetic_right_w,
                                     K::Or => or,
                                     K::And => and,
                                     K::Mul => mul,
@@ -5417,13 +5440,17 @@ fn emit_code(
                             match kind {
                                 K::Add if src2 == 0 => I::move_reg(dst, src1),
                                 K::Add => I::add_imm(dst, src1, src2),
+                                K::Addw => I::addw_imm(dst, src1, src2),
                                 K::Sub => I::add_imm(dst, src1, (-(src2 as i32)) as u32),
                                 K::ShiftLogicalLeft => I::shift_logical_left_imm(dst, src1, src2),
+                                K::ShiftLogicalLeftW => I::shift_logical_left_w_imm(dst, src1, src2),
                                 K::SetLessThanSigned => I::set_less_than_signed_imm(dst, src1, src2),
                                 K::SetLessThanUnsigned => I::set_less_than_unsigned_imm(dst, src1, src2),
                                 K::Xor => I::xor_imm(dst, src1, src2),
                                 K::ShiftLogicalRight => I::shift_logical_right_imm(dst, src1, src2),
+                                K::ShiftLogicalRightW => I::shift_logical_right_w_imm(dst, src1, src2),
                                 K::ShiftArithmeticRight => I::shift_arithmetic_right_imm(dst, src1, src2),
+                                K::ShiftArithmeticRightW => I::shift_arithmetic_right_w_imm(dst, src1, src2),
                                 K::Or => I::or_imm(dst, src1, src2),
                                 K::And => I::and_imm(dst, src1, src2),
                                 K::Mul => I::mul_imm(dst, src1, src2),
@@ -5435,6 +5462,7 @@ fn emit_code(
                             let src2 = conv_reg(src2);
                             match kind {
                                 K::Add => I::add_imm(dst, src2, src1),
+                                K::Addw => I::addw_imm(dst, src2, src1),
                                 K::Xor => I::xor_imm(dst, src2, src1),
                                 K::Or => I::or_imm(dst, src2, src1),
                                 K::And => I::and_imm(dst, src2, src1),
@@ -5444,10 +5472,13 @@ fn emit_code(
 
                                 K::Sub => I::negate_and_add_imm(dst, src2, src1),
                                 K::ShiftLogicalLeft => I::shift_logical_left_imm_alt(dst, src2, src1),
+                                K::ShiftLogicalLeftW => I::shift_logical_left_w_imm_alt(dst, src2, src1),
                                 K::SetLessThanSigned => I::set_greater_than_signed_imm(dst, src2, src1),
                                 K::SetLessThanUnsigned => I::set_greater_than_unsigned_imm(dst, src2, src1),
                                 K::ShiftLogicalRight => I::shift_logical_right_imm_alt(dst, src2, src1),
-                                K::ShiftArithmeticRight => I::shift_arithmetic_right_imm_alt(dst, src2, src1),
+                                K::ShiftLogicalRightW => I::shift_logical_right_imm_alt(dst, src2, src1),
+                                K::ShiftArithmeticRight => I::shift_arithmetic_right_w_imm_alt(dst, src2, src1),
+                                K::ShiftArithmeticRightW => I::shift_arithmetic_right_w_imm_alt(dst, src2, src1),
                             }
                         }
                         (RegImm::Imm(src1), RegImm::Imm(src2)) => {
