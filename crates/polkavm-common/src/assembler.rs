@@ -35,6 +35,20 @@ fn parse_indirect_memory_access(text: &str) -> Option<(Reg, i32)> {
     }
 }
 
+/// Parses the memory access jump of load_imm_and_jump_indirect long form:
+/// `jump [tmp]` or `jump [tmp + {offset}]`
+fn parse_indirect_jump_memory_access(text: &str) -> Option<i32> {
+    let text = text.trim().strip_prefix("jump [")?.strip_suffix(']')?;
+    if let Some(index) = text.find('+') {
+        let _ = text[..index].trim().strip_prefix("tmp")?;
+        let offset = parse_imm(&text[index + 1..])?;
+        Some(offset)
+    } else {
+        let _ = text.strip_prefix("tmp")?;
+        Some(0)
+    }
+}
+
 #[derive(Copy, Clone)]
 pub enum LoadKind {
     I8,
@@ -342,24 +356,13 @@ pub fn assemble(code: &str) -> Result<Vec<u8>, String> {
                                 let line = line[index + 1..].trim();
 
                                 if let Some(value) = parse_imm(lhs) {
-                                    if line.trim().strip_prefix("jump [tmp]").is_some() {
+                                    if let Some(offset) = parse_indirect_jump_memory_access(line) {
                                         emit_and_continue!(Instruction::load_imm_and_jump_indirect(
                                             dst.into(),
                                             base.into(),
                                             value as u32,
-                                            0
+                                            offset as u32
                                         ));
-                                    }
-
-                                    if let Some(line) = line.strip_prefix("jump [tmp").and_then(|s| s.strip_suffix(']')) {
-                                        if let Some(offset) = parse_imm(line) {
-                                            emit_and_continue!(Instruction::load_imm_and_jump_indirect(
-                                                dst.into(),
-                                                base.into(),
-                                                value as u32,
-                                                offset as u32
-                                            ));
-                                        }
                                     }
                                 }
                             }
