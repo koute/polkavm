@@ -35,17 +35,34 @@ fn parse_indirect_memory_access(text: &str) -> Option<(Reg, i32)> {
     }
 }
 
-/// Parses the memory access jump of load_imm_and_jump_indirect long form:
-/// `jump [tmp]` or `jump [tmp + {offset}]`
-fn parse_indirect_jump_memory_access(text: &str) -> Option<i32> {
-    let text = text.trim().strip_prefix("jump [")?.strip_suffix(']')?;
+/// Parses the long form of load_imm_and_jump_indirect:
+/// `tmp = {base}, {dst} = {value}, jump [tmp + {offset}]`, where `dest == base` is allowed
+fn parse_load_imm_and_jump_indirect(line: &str) -> Option<(Reg, Reg, i32, i32)> {
+    let line = line.trim().strip_prefix("tmp =")?;
+
+    let index = line.find(',')?;
+    let base = parse_reg(line[..index].trim())?;
+    let line = line[index + 1..].trim();
+
+    let index = line.find('=')?;
+    let dst = parse_reg(line[..index].trim())?;
+    let line = line[index + 1..].trim();
+
+    let index = line.find(',')?;
+    let value = parse_imm(line[..index].trim())?;
+    let text = line[index + 1..].trim().strip_prefix("jump [")?.strip_suffix(']')?;
+    
     if let Some(index) = text.find('+') {
-        let _ = text[..index].trim().strip_prefix("tmp")?;
+        if text[..index].trim() != "tmp" {
+            return None;
+        }
         let offset = parse_imm(&text[index + 1..])?;
-        Some(offset)
+        Some((dst, base, value, offset))
     } else {
-        let _ = text.strip_prefix("tmp")?;
-        Some(0)
+        if text.trim() != "tmp" {
+            return None;
+        }
+        Some((dst, base, value, 0))
     }
 }
 
@@ -339,37 +356,13 @@ pub fn assemble(code: &str) -> Result<Vec<u8>, String> {
             }
         }
 
-        // tmp = {base}, {dst} = {value}, jump [tmp + {offset}], where `dest == base` is allowed
-        if let Some(line) = line.trim().strip_prefix("tmp =") {
-            if let Some(index) = line.find(',') {
-                let lhs = line[..index].trim();
-                let line = line[index + 1..].trim();
-
-                if let Some(base) = parse_reg(lhs) {
-                    if let Some(index) = line.find('=') {
-                        let lhs = line[..index].trim();
-                        let line = line[index + 1..].trim();
-
-                        if let Some(dst) = parse_reg(lhs) {
-                            if let Some(index) = line.find(',') {
-                                let lhs = line[..index].trim();
-                                let line = line[index + 1..].trim();
-
-                                if let Some(value) = parse_imm(lhs) {
-                                    if let Some(offset) = parse_indirect_jump_memory_access(line) {
-                                        emit_and_continue!(Instruction::load_imm_and_jump_indirect(
-                                            dst.into(),
-                                            base.into(),
-                                            value as u32,
-                                            offset as u32
-                                        ));
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-            }
+        if let Some((dst, base, value, offset)) = parse_load_imm_and_jump_indirect(line) {
+            emit_and_continue!(Instruction::load_imm_and_jump_indirect(
+                dst.into(),
+                base.into(),
+                value as u32,
+                offset as u32
+            ));
         }
 
         if let Some(index) = line.find('=') {
