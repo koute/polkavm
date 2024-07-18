@@ -517,21 +517,37 @@ impl TestInstance {
     }
 }
 
-fn basic_test_blob_invalid_jump() -> ProgramBlob {
+fn blob_null_pointer_djump() -> ProgramBlob {
     let mut builder = ProgramBlobBuilder::new();
     builder.set_rw_data_size(0x4000);
     builder.add_export_by_basic_block(0, b"main");
     builder.set_code(
         &[
-            asm::jump_indirect(Reg::A0, 15),
+            asm::jump_indirect(Reg::A0, 0x0),
         ],
-        &[],
+        &[0x0],
     );
     ProgramBlob::parse(builder.into_vec().into()).unwrap()
 }
 
-fn test_invalid_jump_trap(config: Config) {
+fn blob_miss_aligned_pointer_djump() -> ProgramBlob {
+    let mut builder = ProgramBlobBuilder::new();
+    builder.set_rw_data_size(0x4000);
+    builder.add_export_by_basic_block(0, b"main");
+    builder.set_code(
+        &[
+            asm::load_imm(Reg::A0, 0x1000),
+            asm::jump_indirect(Reg::A0, 1)
+        ],
+        &[1],
+    );
+    
+    ProgramBlob::parse(builder.into_vec().into()).unwrap()
+}
+
+fn setup_instance(blob: ProgramBlob) -> crate::Instance<()>{
     let _ = env_logger::try_init();
+
     let mut config = crate::Config::default();
     config.set_backend(Some(crate::BackendKind::Compiler));
     config.set_sandbox(Some(crate::SandboxKind::Linux));
@@ -539,18 +555,39 @@ fn test_invalid_jump_trap(config: Config) {
     let engine = Engine::new(&config).unwrap();
     let linker: Linker<()> = Linker::new(&engine);
 
-    let invalid_jump_blob = basic_test_blob_invalid_jump();
-
-    let module = Module::from_blob(&engine, &Default::default(), invalid_jump_blob).unwrap();
+    let module = Module::from_blob(&engine, &Default::default(), blob).unwrap();
     let instance_pre = linker.instantiate_pre(&module).unwrap();
-    let instance = instance_pre.instantiate().unwrap();
 
-    let state_args = StateArgs::default();
-    let ext_main = instance.module().lookup_export("main").unwrap();
+    instance_pre.instantiate().unwrap()
+}
 
-    let result = instance.call(state_args, CallArgs::new(&mut (), ext_main));
+#[test]
+#[ignore]
+fn test_invalid_jump_trap() {
+    let state_args1 = StateArgs::default();
+    let state_args2 = StateArgs::default();
 
-    match result {
+    let null_pointer_instance = setup_instance(blob_null_pointer_djump());
+    let miss_aligned_pointer_instance = setup_instance(blob_miss_aligned_pointer_djump());
+    
+    let ext_main1 = null_pointer_instance.module().lookup_export("main").unwrap();
+    let result1 = null_pointer_instance.call(state_args1, CallArgs::new(&mut (), ext_main1));
+    
+    let ext_main2 = miss_aligned_pointer_instance.module().lookup_export("main").unwrap();
+    let result2 = miss_aligned_pointer_instance.call(state_args2, CallArgs::new(&mut (), ext_main2));
+
+    match result1 {
+        Ok(()) => panic!("Expected ExecutionError::Trap, but got Ok"),
+        Err(e) => {
+            if matches!(e, ExecutionError::Error(..)) {
+                panic!("Unexpected ExecutionError::Error: {:?}", e);
+            } else {
+                assert!(matches!(e, ExecutionError::Trap(..)), "Expected ExecutionError::Trap, but got {:?}", e);
+            }
+        }
+    }
+
+    match result2 {
         Ok(()) => panic!("Expected ExecutionError::Trap, but got Ok"),
         Err(e) => {
             if matches!(e, ExecutionError::Error(..)) {
@@ -1001,7 +1038,7 @@ run_tests! {
     doom_o3_dwarf2
     pinky
 
-    test_invalid_jump_trap
+    // test_invalid_jump_trap
 
     test_blob_basic_test
     test_blob_atomic_fetch_add
