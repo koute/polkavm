@@ -317,7 +317,7 @@ unsafe extern "C" fn signal_handler(signal: u32, _info: &linux_raw::siginfo_t, c
         *VMCTX.rip().get() = SANDBOX_EMPTY_NATIVE_PROGRAM_COUNTER;
         longjmp(addr_of_mut!(RESUME_IDLE_LOOP_JMPBUF), 1);
     } else {
-          abort_with_message("segmentation fault")
+        abort_with_message("segmentation fault")
     }
 }
 
