@@ -1,6 +1,7 @@
 pub @main:
     a0 = @target
-    tmp = a0, a0 = 1234, jump [tmp]
+pub @expected_exit:
+    a1 = 1234, jump [a0 + 1]
     trap
 @target:
     a2 = 0xdeadbeef

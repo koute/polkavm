@@ -51,7 +51,7 @@ fn parse_load_imm_and_jump_indirect(line: &str) -> Option<(Reg, Reg, i32, i32)> 
     let index = line.find(',')?;
     let value = parse_imm(line[..index].trim())?;
     let text = line[index + 1..].trim().strip_prefix("jump [")?.strip_suffix(']')?;
-    
+
     if let Some(index) = text.find('+') {
         if text[..index].trim() != "tmp" {
             return None;
@@ -377,6 +377,9 @@ pub fn assemble(code: &str) -> Result<Vec<u8>, String> {
                                 emit_and_continue!(MaybeInstruction::LoadImmAndJump(dst, value, label.to_owned()));
                             }
                             if let Some((base, offset)) = parse_indirect_memory_access(line) {
+                                if dst == base {
+                                    return Err(format!("cannot parse line {nth_line}: \"{original_line}\"; hint: use long form."));
+                                }
                                 emit_and_continue!(Instruction::load_imm_and_jump_indirect(
                                     dst.into(),
                                     base.into(),

@@ -1,5 +1,5 @@
 pub @main:
-    a0 = @target
+pub @expected_exit:
     tmp = a0, a0 = 1234, jump [tmp]
     trap
 @target:
