@@ -360,7 +360,7 @@ pub fn assemble(code: &str) -> Result<Vec<u8>, String> {
             }
         }
 
-        if let Some((dst, base, value, offset)) = parse_load_imm_and_jump_indirect(line) {
+        if let Some((dst, base, value, offset)) = parse_load_imm_and_jump_indirect_with_tmp(line) {
             emit_and_continue!(Instruction::load_imm_and_jump_indirect(
                 dst.into(),
                 base.into(),
@@ -381,13 +381,9 @@ pub fn assemble(code: &str) -> Result<Vec<u8>, String> {
                                 emit_and_continue!(MaybeInstruction::LoadImmAndJump(dst, value, label.to_owned()));
                             }
                             if let Some((base, offset)) = parse_indirect_memory_access(line) {
-                                let instruction = Instruction::load_imm_and_jump_indirect(
-                                    dst.into(),
-                                    base.into(),
-                                    value as u32,
-                                    offset as u32
-                                );
-                                
+                                let instruction =
+                                    Instruction::load_imm_and_jump_indirect(dst.into(), base.into(), value as u32, offset as u32);
+
                                 if dst == base {
                                     return Err(format!("cannot parse line {nth_line}, expected: \"{instruction}\""));
                                 }
