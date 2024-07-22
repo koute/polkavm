@@ -519,7 +519,6 @@ impl TestInstance {
 
 fn blob_null_pointer_djump() -> ProgramBlob {
     let mut builder = ProgramBlobBuilder::new();
-    builder.set_rw_data_size(0x4000);
     builder.add_export_by_basic_block(0, b"main");
     builder.set_code(
         &[
