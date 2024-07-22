@@ -535,7 +535,6 @@ fn blob_miss_aligned_pointer_djump() -> ProgramBlob {
     builder.add_export_by_basic_block(0, b"main");
     builder.set_code(
         &[
-            asm::load_imm(Reg::A0, 0x1000),
             asm::jump_indirect(Reg::A0, 1)
         ],
         &[1],
