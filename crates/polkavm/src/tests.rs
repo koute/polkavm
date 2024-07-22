@@ -525,7 +525,7 @@ fn blob_null_pointer_djump() -> ProgramBlob {
         &[
             asm::jump_indirect(Reg::A0, 0x0),
         ],
-        &[0x0],
+        &[],
     );
     ProgramBlob::parse(builder.into_vec().into()).unwrap()
 }
