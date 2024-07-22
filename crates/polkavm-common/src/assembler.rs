@@ -37,7 +37,7 @@ fn parse_indirect_memory_access(text: &str) -> Option<(Reg, i32)> {
 
 /// Parses the long form of load_imm_and_jump_indirect:
 /// `tmp = {base}, {dst} = {value}, jump [tmp + {offset}]`, where `dest == base` is allowed
-fn parse_load_imm_and_jump_indirect(line: &str) -> Option<(Reg, Reg, i32, i32)> {
+fn parse_load_imm_and_jump_indirect_with_tmp(line: &str) -> Option<(Reg, Reg, i32, i32)> {
     let line = line.trim().strip_prefix("tmp =")?;
 
     let index = line.find(',')?;
