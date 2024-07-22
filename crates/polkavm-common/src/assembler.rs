@@ -377,15 +377,18 @@ pub fn assemble(code: &str) -> Result<Vec<u8>, String> {
                                 emit_and_continue!(MaybeInstruction::LoadImmAndJump(dst, value, label.to_owned()));
                             }
                             if let Some((base, offset)) = parse_indirect_memory_access(line) {
-                                if dst == base {
-                                    return Err(format!("cannot parse line {nth_line}: \"{original_line}\"; hint: use long form."));
-                                }
-                                emit_and_continue!(Instruction::load_imm_and_jump_indirect(
+                                let instruction = Instruction::load_imm_and_jump_indirect(
                                     dst.into(),
                                     base.into(),
                                     value as u32,
                                     offset as u32
-                                ));
+                                );
+                                
+                                if dst == base {
+                                    return Err(format!("cannot parse line {nth_line}, expected: \"{instruction}\""));
+                                }
+
+                                emit_and_continue!(instruction);
                             }
                         }
                     }
