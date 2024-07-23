@@ -2086,10 +2086,16 @@ impl<'a, 'b> InstructionVisitor for InstructionFormatter<'a, 'b> {
     fn load_imm_and_jump_indirect(&mut self, ra: RawReg, base: RawReg, value: u32, offset: u32) -> Self::ReturnTy {
         let ra = self.format_reg(ra);
         let base = self.format_reg(base);
-        if !self.format.prefer_unaliased && offset == 0 {
-            write!(self, "jump [{base}], {ra} = {value}")
+        if ra != base {
+            if !self.format.prefer_unaliased && offset == 0 {
+                write!(self, "{ra} = {value}, jump [{base}]")
+            } else {
+                write!(self, "{ra} = {value}, jump [{base} + {offset}]")
+            }
+        } else if !self.format.prefer_unaliased && offset == 0 {
+            write!(self, "tmp = {base}, {ra} = {value}, jump [tmp]")
         } else {
-            write!(self, "jump [{base} + {offset}], {ra} = {value}")
+            write!(self, "tmp = {base}, {ra} = {value}, jump [tmp + {offset}]")
         }
     }
 
