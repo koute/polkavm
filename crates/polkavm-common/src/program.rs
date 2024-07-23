@@ -2095,7 +2095,7 @@ impl<'a, 'b> InstructionVisitor for InstructionFormatter<'a, 'b> {
         } else if !self.format.prefer_unaliased && offset == 0 {
             write!(self, "tmp = {base}, {ra} = {value}, jump [tmp]")
         } else {
-            write!(self, "tmp = {base} + {offset}, {ra} = {value}, jump [tmp]")
+            write!(self, "tmp = {base}, {ra} = {value}, jump [tmp + {offset}]")
         }
     }
 
