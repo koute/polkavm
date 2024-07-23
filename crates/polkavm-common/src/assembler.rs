@@ -54,7 +54,8 @@ fn parse_load_imm_and_jump_indirect_with_tmp(line: &str) -> Option<(Reg, Reg, i3
 
     let index = line.find(',')?;
     let value = parse_imm(line[..index].trim())?;
-    let text = line[index + 1..].trim().strip_prefix("jump [")?.strip_suffix(']')?;
+    let line = line[index + 1..].trim().strip_prefix("jump")?;
+    let text = line.trim().strip_prefix('[')?.strip_suffix(']')?;
 
     if let Some(index) = text.find('+') {
         if text[..index].trim() != "tmp" {
