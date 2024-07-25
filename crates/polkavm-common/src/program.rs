@@ -430,10 +430,10 @@ mod kani {
         fn simple_read_args_imm2(code: &[u8], skip: u32) -> (u32, u32) {
             let imm1_aux = i32::from(code[0]) & 0b111;
             let imm1_length = min(4, imm1_aux);
+            let imm2_sext_length = clamp(0..=4, skip as i32 - imm1_aux - 1);
+            let imm2_read_length = min(imm2_sext_length, 8 - imm1_aux);
             let imm1 = sext(read(code, 1, imm1_length), imm1_length);
-            let imm2_length = clamp(0..=4, skip as i32 - 1 - imm1_aux);
-            let imm2_raw = read(code, 1 + imm1_aux, min(imm2_length, 8 - imm1_aux));
-            let imm2 = sext(imm2_raw, imm2_length);
+            let imm2 = sext(read(code, 1 + imm1_aux, imm2_read_length), imm2_sext_length);
             (imm1, imm2)
         }
 
@@ -446,8 +446,7 @@ mod kani {
         fn simple_read_args_reg_imm(code: &[u8], skip: u32) -> (u8, u32) {
             let reg = min(12, code[0] & 0b1111);
             let imm_length = clamp(0..=4, skip as i32 - 1);
-            let imm_raw = read(code, 1, imm_length);
-            let imm = sext(imm_raw, imm_length);
+            let imm = sext(read(code, 1, imm_length), imm_length);
             (reg, imm)
         }
 
@@ -463,11 +462,10 @@ mod kani {
             let reg = min(12, code[0] & 0b1111);
             let imm1_aux = ((code[0] >> 4) & 0b111) as i32;
             let imm1_length = clamp(0..=4, imm1_aux);
-            let imm1_raw = read(code, 1, imm1_length);
-            let imm1 = sext(imm1_raw, imm1_length);
-            let imm2_length = clamp(0..=4, skip as i32 - 1 - imm1_aux);
-            let imm2_raw = read(code, 1 + imm1_aux, min(imm2_length, 8 - imm1_aux));
-            let imm2 = sext(imm2_raw, imm2_length);
+            let imm2_sext_length = clamp(0..=4, skip as i32 - imm1_aux - 1);
+            let imm2_read_length = min(imm2_sext_length, 8 - imm1_aux);
+            let imm1 = sext(read(code, 1, imm1_length), imm1_length);
+            let imm2 = sext(read(code, 1 + imm1_aux, imm2_read_length), imm2_sext_length);
             (reg, imm1, imm2)
         }
 
@@ -484,10 +482,10 @@ mod kani {
             let reg2 = min(12, code[0] >> 4);
             let imm1_aux = i32::from(code[1]) & 0b111;
             let imm1_length = min(4, imm1_aux);
+            let imm2_sext_length = clamp(0..=4, skip as i32 - imm1_aux - 2);
+            let imm2_read_length = min(imm2_sext_length, 8 - imm1_aux);
             let imm1 = sext(read(code, 2, imm1_length), imm1_length);
-            let imm2_length = clamp(0..=4, skip as i32 - 2 - imm1_aux);
-            let imm2_raw = read(code, 2 + imm1_aux, min(imm2_length, 8 - imm1_aux));
-            let imm2 = sext(imm2_raw, imm2_length);
+            let imm2 = sext(read(code, 2 + imm1_aux, imm2_read_length), imm2_sext_length);
             (reg1, reg2, imm1, imm2)
         }
 
@@ -504,8 +502,7 @@ mod kani {
             let reg1 = min(12, code[0] & 0b1111);
             let reg2 = min(12, code[0] >> 4);
             let imm_length = clamp(0..=4, skip as i32 - 1);
-            let imm_raw = read(code, 1, imm_length);
-            let imm = sext(imm_raw, imm_length);
+            let imm = sext(read(code, 1, imm_length), imm_length);
             (reg1, reg2, imm)
         }
 
