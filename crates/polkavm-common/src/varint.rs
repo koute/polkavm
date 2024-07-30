@@ -75,64 +75,6 @@ proptest::proptest! {
     }
 }
 
-static LENGTH_MINUS_TWO_TO_SHIFT: [u32; 256] = {
-    let mut output = [0; 256];
-    let mut index = 0_u32;
-    while index < 256 {
-        let effective_length = if index <= 2 {
-            0
-        } else if index <= 6 {
-            index - 2
-        } else if index <= 24 {
-            4
-        } else {
-            0
-        };
-
-        let shift = match effective_length {
-            0 => 32,
-            1 => 24,
-            2 => 16,
-            3 => 8,
-            4 => 0,
-            _ => unreachable!(),
-        };
-
-        output[index as usize] = shift;
-        index += 1;
-    }
-    output
-};
-
-static LENGTH_MINUS_ONE_TO_SHIFT: [u32; 256] = {
-    let mut output = [0; 256];
-    let mut index = 0_u32;
-    while index < 256 {
-        let effective_length = if index <= 1 {
-            0
-        } else if index <= 5 {
-            index - 1
-        } else if index <= 24 {
-            4
-        } else {
-            0
-        };
-
-        let shift = match effective_length {
-            0 => 32,
-            1 => 24,
-            2 => 16,
-            3 => 8,
-            4 => 0,
-            _ => unreachable!(),
-        };
-
-        output[index as usize] = shift;
-        index += 1;
-    }
-    output
-};
-
 static LENGTH_TO_SHIFT: [u32; 256] = {
     let mut output = [0; 256];
     let mut length = 0_u32;
@@ -154,18 +96,6 @@ static LENGTH_TO_SHIFT: [u32; 256] = {
 #[inline(always)]
 pub(crate) fn read_simple_varint(chunk: u32, length: u32) -> u32 {
     let shift = LENGTH_TO_SHIFT[length as usize];
-    (((u64::from(chunk) << shift) as u32 as i32).wrapping_shr(shift)) as u32
-}
-
-#[inline(always)]
-pub(crate) fn read_length_minus_one_varint(chunk: u32, length: u32) -> u32 {
-    let shift = LENGTH_MINUS_ONE_TO_SHIFT[length as usize];
-    (((u64::from(chunk) << shift) as u32 as i32).wrapping_shr(shift)) as u32
-}
-
-#[inline(always)]
-pub(crate) fn read_length_minus_two_varint(chunk: u32, length: u32) -> u32 {
-    let shift = LENGTH_MINUS_TWO_TO_SHIFT[length as usize];
     (((u64::from(chunk) << shift) as u32 as i32).wrapping_shr(shift)) as u32
 }
 

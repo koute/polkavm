@@ -1,8 +1,6 @@
 use crate::abi::{VM_CODE_ADDRESS_ALIGNMENT, VM_MAXIMUM_CODE_SIZE, VM_MAXIMUM_IMPORT_COUNT, VM_MAXIMUM_JUMP_TABLE_ENTRIES};
 use crate::utils::ArcBytes;
-use crate::varint::{
-    read_length_minus_one_varint, read_length_minus_two_varint, read_simple_varint, read_varint, write_simple_varint, MAX_VARINT_LENGTH,
-};
+use crate::varint::{read_simple_varint, read_varint, write_simple_varint, MAX_VARINT_LENGTH};
 use core::fmt::Write;
 use core::ops::Range;
 
@@ -251,6 +249,105 @@ impl<T> VisitorHelper<T> {
 }
 
 #[inline(always)]
+fn sign_extend_at(value: u32, bits_to_cut: u32) -> u32 {
+    (((u64::from(value) << bits_to_cut) as u32 as i32).wrapping_shr(bits_to_cut)) as u32
+}
+
+type LookupEntry = u32;
+const EMPTY_LOOKUP_ENTRY: LookupEntry = 0;
+
+#[repr(transparent)]
+struct LookupTable([LookupEntry; 256]);
+
+impl LookupTable {
+    const fn pack(imm1_bits: u32, imm1_skip: u32, imm2_bits: u32) -> LookupEntry {
+        assert!(imm1_bits <= 0b111111);
+        assert!(imm2_bits <= 0b111111);
+        assert!(imm1_skip <= 0b111111);
+        (imm1_bits) | ((imm1_skip) << 6) | ((imm2_bits) << 12)
+    }
+
+    #[inline(always)]
+    fn unpack(entry: LookupEntry) -> (u32, u32, u32) {
+        (entry & 0b111111, (entry >> 6) & 0b111111, (entry >> 12) & 0b111111)
+    }
+
+    const fn build(offset: i32) -> Self {
+        const fn min_u32(a: u32, b: u32) -> u32 {
+            if a < b {
+                a
+            } else {
+                b
+            }
+        }
+
+        const fn clamp_i32(range: core::ops::RangeInclusive<i32>, value: i32) -> i32 {
+            if value < *range.start() {
+                *range.start()
+            } else if value > *range.end() {
+                *range.end()
+            } else {
+                value
+            }
+        }
+
+        const fn sign_extend_cutoff_for_length(length: u32) -> u32 {
+            match length {
+                0 => 32,
+                1 => 24,
+                2 => 16,
+                3 => 8,
+                4 => 0,
+                _ => unreachable!(),
+            }
+        }
+
+        let mut output = [EMPTY_LOOKUP_ENTRY; 256];
+        let mut skip = 0;
+        while skip <= 0b11111 {
+            let mut aux = 0;
+            while aux <= 0b111 {
+                let imm1_length = min_u32(4, aux);
+                let imm2_length = clamp_i32(0..=4, skip as i32 - imm1_length as i32 - offset) as u32;
+                let imm1_bits = sign_extend_cutoff_for_length(imm1_length);
+                let imm2_bits = sign_extend_cutoff_for_length(imm2_length);
+                let imm1_skip = imm1_length * 8;
+
+                let index = Self::get_lookup_index(skip, aux);
+                output[index as usize] = Self::pack(imm1_bits, imm1_skip, imm2_bits);
+                aux += 1;
+            }
+            skip += 1;
+        }
+
+        LookupTable(output)
+    }
+
+    #[inline(always)]
+    const fn get_lookup_index(skip: u32, aux: u32) -> u32 {
+        debug_assert!(skip <= 0b11111);
+        let index = skip | ((aux & 0b111) << 5);
+        debug_assert!(index <= 0xff);
+        index
+    }
+
+    #[inline(always)]
+    fn get(&self, skip: u32, aux: u32) -> (u32, u32, u32) {
+        let index = Self::get_lookup_index(skip, aux);
+        debug_assert!((index as usize) < self.0.len());
+
+        #[allow(unsafe_code)]
+        // SAFETY: `index` is composed of a 5-bit `skip` and 3-bit `aux`,
+        // which gives us 8 bits in total, and the table's length is 256,
+        // so out of bounds access in impossible.
+        Self::unpack(*unsafe { self.0.get_unchecked(index as usize) })
+    }
+}
+
+static TABLE_1: LookupTable = LookupTable::build(1);
+static TABLE_2: LookupTable = LookupTable::build(2);
+
+#[inline(always)]
 pub fn read_args_imm(chunk: u128, skip: u32) -> u32 {
     read_simple_varint(chunk as u32, skip)
 }
@@ -262,12 +359,12 @@ pub fn read_args_offset(chunk: u128, instruction_offset: u32, skip: u32) -> u32 
 
 #[inline(always)]
 pub fn read_args_imm2(chunk: u128, skip: u32) -> (u32, u32) {
-    let imm1_aux = (chunk as u32) & 0b111;
+    let (imm1_bits, imm1_skip, imm2_bits) = TABLE_1.get(skip, chunk as u32);
     let chunk = chunk >> 8;
     let chunk = chunk as u64;
-    let imm1 = read_simple_varint(chunk as u32, imm1_aux);
-    let chunk = chunk >> (imm1_aux << 3);
-    let imm2 = read_length_minus_one_varint(chunk as u32, u32::from(skip.wrapping_sub(imm1_aux) as u8));
+    let imm1 = sign_extend_at(chunk as u32, imm1_bits);
+    let chunk = chunk >> imm1_skip;
+    let imm2 = sign_extend_at(chunk as u32, imm2_bits);
     (imm1, imm2)
 }
 
@@ -276,21 +373,20 @@ pub fn read_args_reg_imm(chunk: u128, skip: u32) -> (RawReg, u32) {
     let chunk = chunk as u64;
     let reg = RawReg(chunk as u32);
     let chunk = chunk >> 8;
-    let imm = read_length_minus_one_varint(chunk as u32, skip);
+    let (_, _, imm_bits) = TABLE_1.get(skip, 0);
+    let imm = sign_extend_at(chunk as u32, imm_bits);
     (reg, imm)
 }
 
 #[inline(always)]
 pub fn read_args_reg_imm2(chunk: u128, skip: u32) -> (RawReg, u32, u32) {
-    let (reg, imm1_length) = {
-        let value = chunk as u32;
-        (RawReg(value), (value >> 4) & 0b111)
-    };
+    let reg = RawReg(chunk as u32);
+    let (imm1_bits, imm1_skip, imm2_bits) = TABLE_1.get(skip, chunk as u32 >> 4);
     let chunk = chunk >> 8;
     let chunk = chunk as u64;
-    let imm1 = read_simple_varint(chunk as u32, imm1_length);
-    let chunk = chunk >> (imm1_length << 3);
-    let imm2 = read_length_minus_one_varint(chunk as u32, u32::from(skip.wrapping_sub(imm1_length) as u8));
+    let imm1 = sign_extend_at(chunk as u32, imm1_bits);
+    let chunk = chunk >> imm1_skip;
+    let imm2 = sign_extend_at(chunk as u32, imm2_bits);
     (reg, imm1, imm2)
 }
 
@@ -305,20 +401,15 @@ pub fn read_args_reg_imm_offset(chunk: u128, instruction_offset: u32, skip: u32)
 pub fn read_args_regs2_imm2(chunk: u128, skip: u32) -> (RawReg, RawReg, u32, u32) {
     let (reg1, reg2, imm1_aux) = {
         let value = chunk as u32;
-        (RawReg(value), RawReg(value >> 4), (value >> 8) & 0b111)
+        (RawReg(value), RawReg(value >> 4), value >> 8)
     };
 
-    debug_assert!(imm1_aux <= 7);
-
+    let (imm1_bits, imm1_skip, imm2_bits) = TABLE_2.get(skip, imm1_aux);
     let chunk = chunk >> 16;
     let chunk = chunk as u64;
-    let imm1 = read_simple_varint(chunk as u32, imm1_aux);
-    let chunk = chunk >> (imm1_aux << 3);
-    let imm2_aux = u32::from(skip.wrapping_sub(imm1_aux) as u8);
-    debug_assert!(skip <= 24);
-    debug_assert!(imm2_aux <= 24 || (imm2_aux >= 249 && imm2_aux <= 255));
-
-    let imm2 = read_length_minus_two_varint(chunk as u32, imm2_aux);
+    let imm1 = sign_extend_at(chunk as u32, imm1_bits);
+    let chunk = chunk >> imm1_skip;
+    let imm2 = sign_extend_at(chunk as u32, imm2_bits);
     (reg1, reg2, imm1, imm2)
 }
 
@@ -330,7 +421,8 @@ pub fn read_args_regs2_imm(chunk: u128, skip: u32) -> (RawReg, RawReg, u32) {
         (RawReg(value), RawReg(value >> 4))
     };
     let chunk = chunk >> 8;
-    let imm = read_length_minus_one_varint(chunk as u32, skip);
+    let (_, _, imm_bits) = TABLE_1.get(skip, 0);
+    let imm = sign_extend_at(chunk as u32, imm_bits);
     (reg1, reg2, imm)
 }
 
@@ -427,25 +519,23 @@ mod kani {
 
     #[kani::proof]
     fn verify_read_args_imm2() {
-        fn simple_read_args_imm2(code: &[u8], skip: u32) -> (u32, u32) {
-            let imm1_aux = i32::from(code[0]) & 0b111;
-            let imm1_length = min(4, imm1_aux);
-            let imm2_sext_length = clamp(0..=4, skip as i32 - imm1_aux - 1);
-            let imm2_read_length = min(imm2_sext_length, 8 - imm1_aux);
+        fn simple_read_args_imm2(code: &[u8], skip: i32) -> (u32, u32) {
+            let imm1_length = min(4, i32::from(code[0]) & 0b111);
+            let imm2_length = clamp(0..=4, skip - imm1_length - 1);
             let imm1 = sext(read(code, 1, imm1_length), imm1_length);
-            let imm2 = sext(read(code, 1 + imm1_aux, imm2_read_length), imm2_sext_length);
+            let imm2 = sext(read(code, 1 + imm1_length, imm2_length), imm2_length);
             (imm1, imm2)
         }
 
         let (code, chunk, skip) = args!();
-        assert_eq!(super::read_args_imm2(chunk, skip), simple_read_args_imm2(&code, skip));
+        assert_eq!(super::read_args_imm2(chunk, skip), simple_read_args_imm2(&code, skip as i32));
     }
 
     #[kani::proof]
     fn verify_read_args_reg_imm() {
-        fn simple_read_args_reg_imm(code: &[u8], skip: u32) -> (u8, u32) {
+        fn simple_read_args_reg_imm(code: &[u8], skip: i32) -> (u8, u32) {
             let reg = min(12, code[0] & 0b1111);
-            let imm_length = clamp(0..=4, skip as i32 - 1);
+            let imm_length = clamp(0..=4, skip - 1);
             let imm = sext(read(code, 1, imm_length), imm_length);
             (reg, imm)
         }
@@ -453,39 +543,35 @@ mod kani {
         let (code, chunk, skip) = args!();
         let (reg, imm) = super::read_args_reg_imm(chunk, skip);
         let reg = reg.get() as u8;
-        assert_eq!((reg, imm), simple_read_args_reg_imm(&code, skip));
+        assert_eq!((reg, imm), simple_read_args_reg_imm(&code, skip as i32));
     }
 
     #[kani::proof]
     fn verify_read_args_reg_imm2() {
-        fn simple_read_args_reg_imm2(code: &[u8], skip: u32) -> (u8, u32, u32) {
+        fn simple_read_args_reg_imm2(code: &[u8], skip: i32) -> (u8, u32, u32) {
             let reg = min(12, code[0] & 0b1111);
-            let imm1_aux = ((code[0] >> 4) & 0b111) as i32;
-            let imm1_length = clamp(0..=4, imm1_aux);
-            let imm2_sext_length = clamp(0..=4, skip as i32 - imm1_aux - 1);
-            let imm2_read_length = min(imm2_sext_length, 8 - imm1_aux);
+            let imm1_length = min(4, i32::from(code[0] >> 4) & 0b111);
+            let imm2_length = clamp(0..=4, skip - imm1_length - 1);
             let imm1 = sext(read(code, 1, imm1_length), imm1_length);
-            let imm2 = sext(read(code, 1 + imm1_aux, imm2_read_length), imm2_sext_length);
+            let imm2 = sext(read(code, 1 + imm1_length, imm2_length), imm2_length);
             (reg, imm1, imm2)
         }
 
         let (code, chunk, skip) = args!();
         let (reg, imm1, imm2) = super::read_args_reg_imm2(chunk, skip);
         let reg = reg.get() as u8;
-        assert_eq!((reg, imm1, imm2), simple_read_args_reg_imm2(&code, skip));
+        assert_eq!((reg, imm1, imm2), simple_read_args_reg_imm2(&code, skip as i32));
     }
 
     #[kani::proof]
     fn verify_read_args_regs2_imm2() {
-        fn simple_read_args_regs2_imm2(code: &[u8], skip: u32) -> (u8, u8, u32, u32) {
+        fn simple_read_args_regs2_imm2(code: &[u8], skip: i32) -> (u8, u8, u32, u32) {
             let reg1 = min(12, code[0] & 0b1111);
             let reg2 = min(12, code[0] >> 4);
-            let imm1_aux = i32::from(code[1]) & 0b111;
-            let imm1_length = min(4, imm1_aux);
-            let imm2_sext_length = clamp(0..=4, skip as i32 - imm1_aux - 2);
-            let imm2_read_length = min(imm2_sext_length, 8 - imm1_aux);
+            let imm1_length = min(4, i32::from(code[1]) & 0b111);
+            let imm2_length = clamp(0..=4, skip - imm1_length - 2);
             let imm1 = sext(read(code, 2, imm1_length), imm1_length);
-            let imm2 = sext(read(code, 2 + imm1_aux, imm2_read_length), imm2_sext_length);
+            let imm2 = sext(read(code, 2 + imm1_length, imm2_length), imm2_length);
             (reg1, reg2, imm1, imm2)
         }
 
@@ -493,7 +579,7 @@ mod kani {
         let (reg1, reg2, imm1, imm2) = super::read_args_regs2_imm2(chunk, skip);
         let reg1 = reg1.get() as u8;
         let reg2 = reg2.get() as u8;
-        assert_eq!((reg1, reg2, imm1, imm2), simple_read_args_regs2_imm2(&code, skip))
+        assert_eq!((reg1, reg2, imm1, imm2), simple_read_args_regs2_imm2(&code, skip as i32))
     }
 
     #[kani::proof]
