@@ -1,4 +1,7 @@
 use alloc::sync::Arc;
+use alloc::vec::Vec;
+use alloc::borrow::ToOwned;
+use alloc::format;
 use core::marker::PhantomData;
 use crate::api::RegValue;
 use crate::error::bail;
