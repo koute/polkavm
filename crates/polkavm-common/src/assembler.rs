@@ -1,6 +1,6 @@
 use crate::program::{Instruction, Reg};
 use crate::utils::{parse_imm, parse_reg};
-use crate::writer::{InstructionBuffer, InstructionEx};
+use crate::writer::{InstructionBuffer, InstructionOrBytes};
 use alloc::borrow::ToOwned;
 use alloc::collections::BTreeMap;
 use alloc::format;
@@ -156,13 +156,18 @@ fn parse_condition(text: &str) -> Option<Condition> {
 }
 
 pub fn assemble(code: &str) -> Result<Vec<u8>, String> {
+    enum TargetKind {
+        Label(String),
+        Offset(i32),
+    }
+
     enum MaybeInstruction {
         Instruction(Instruction),
         Jump(String),
         Branch(String, ConditionKind, Reg, Reg),
         BranchImm(String, ConditionKind, Reg, i32),
         LoadLabelAddress(Reg, String),
-        LoadImmAndJump(Reg, i32, String),
+        LoadImmAndJump(Reg, i32, TargetKind),
     }
 
     impl MaybeInstruction {
@@ -380,7 +385,9 @@ pub fn assemble(code: &str) -> Result<Vec<u8>, String> {
                     if let Some(value) = parse_imm(&rhs[..index]) {
                         if let Some(line) = rhs[index + 1..].trim().strip_prefix("jump") {
                             if let Some(label) = line.trim().strip_prefix('@') {
-                                emit_and_continue!(MaybeInstruction::LoadImmAndJump(dst, value, label.to_owned()));
+                                emit_and_continue!(MaybeInstruction::LoadImmAndJump(dst, value, TargetKind::Label(label.to_owned())));
+                            } else if let Some(offset) = parse_imm(line) {
+                                emit_and_continue!(MaybeInstruction::LoadImmAndJump(dst, value, TargetKind::Offset(offset)));
                             }
                             if let Some((base, offset)) = parse_indirect_memory_access(line) {
                                 let instruction =
@@ -687,7 +694,7 @@ pub fn assemble(code: &str) -> Result<Vec<u8>, String> {
         return Err(format!("cannot parse line {nth_line}: \"{original_line}\""));
     }
 
-    let mut code: Vec<InstructionEx> = Vec::new();
+    let mut code: Vec<InstructionOrBytes> = Vec::new();
     let mut jump_table = Vec::new();
     for instruction in instructions {
         match instruction {
@@ -702,21 +709,19 @@ pub fn assemble(code: &str) -> Result<Vec<u8>, String> {
                 jump_table.push(target_index);
                 code.push(Instruction::load_imm(dst.into(), (jump_table.len() as u32) * crate::abi::VM_CODE_ADDRESS_ALIGNMENT).into());
             }
-            MaybeInstruction::LoadImmAndJump(dst, value, label) => {
-                if let Some(invalid_offset) = label.trim().strip_prefix("invalid_offset") {
-                    if let Some(offset) = parse_imm(invalid_offset) {
-                        let instruction = Instruction::load_imm_and_jump(dst.into(), value as u32, offset as u32);
-                        code.push(InstructionBuffer::from((0, instruction)).into());
-                        continue;
-                    }
+            MaybeInstruction::LoadImmAndJump(dst, value, target) => match target {
+                TargetKind::Label(label) => {
+                    let Some(&target_index) = label_to_index.get(&*label) else {
+                        return Err(format!("label is not defined: \"{label}\""));
+                    };
+                    code.push(Instruction::load_imm_and_jump(dst.into(), value as u32, target_index).into());
                 }
-
-                let Some(&target_index) = label_to_index.get(&*label) else {
-                    return Err(format!("label is not defined: \"{label}\""));
-                };
-
-                code.push(Instruction::load_imm_and_jump(dst.into(), value as u32, target_index).into());
-            }
+                TargetKind::Offset(offset) => {
+                    // TODO: unclear how to deal with negative offsets
+                    let instruction = Instruction::load_imm_and_jump(dst.into(), value as u32, offset as u32);
+                    code.push(InstructionBuffer::from((0, instruction)).into());
+                }
+            },
             MaybeInstruction::Jump(label) => {
                 let Some(&target_index) = label_to_index.get(&*label) else {
                     return Err(format!("label is not defined: \"{label}\""));

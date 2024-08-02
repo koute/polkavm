@@ -1,4 +1,4 @@
 pub @main:
-    a0 = 1234, jump @invalid_offset 6
+    a0 = 1234, jump +6
     trap
     a1 = 0xdeadbeef

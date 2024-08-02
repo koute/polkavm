@@ -34,19 +34,6 @@ impl From<(u32, Instruction)> for InstructionBuffer {
     }
 }
 
-impl From<Vec<u8>> for InstructionBuffer {
-    fn from(value: Vec<u8>) -> Self {
-        let mut bytes = [0u8; program::MAX_INSTRUCTION_LENGTH];
-        let slice_size = value.len().min(program::MAX_INSTRUCTION_LENGTH);
-        bytes[..slice_size].copy_from_slice(&value[..slice_size]);
-
-        Self {
-            bytes,
-            length: slice_size as u8,
-        }
-    }
-}
-
 impl Instruction {
     fn target_mut(&mut self) -> Option<&mut u32> {
         match self {
@@ -74,18 +61,18 @@ impl Instruction {
 }
 
 #[derive(Copy, Clone)]
-pub enum InstructionEx {
+pub enum InstructionOrBytes {
     Instruction(Instruction),
     Raw(InstructionBuffer),
 }
 
-impl From<Instruction> for InstructionEx {
+impl From<Instruction> for InstructionOrBytes {
     fn from(value: Instruction) -> Self {
         Self::Instruction(value)
     }
 }
 
-impl From<InstructionBuffer> for InstructionEx {
+impl From<InstructionBuffer> for InstructionOrBytes {
     fn from(value: InstructionBuffer) -> Self {
         Self::Raw(value)
     }
@@ -151,7 +138,8 @@ impl ProgramBlobBuilder {
         self.exports.push((target_basic_block, ProgramSymbol::new(symbol.into())));
     }
 
-    pub fn set_code(&mut self, code: &[impl Into<InstructionEx> + Copy], jump_table: &[u32]) {
+    pub fn set_code(&mut self, code: &[impl Into<InstructionOrBytes> + Copy], jump_table: &[u32]) {
+        let code: Vec<InstructionOrBytes> = code.iter().map(|inst| (*inst).into()).collect();
         fn mutate<T>(slot: &mut T, value: T) -> bool
         where
             T: PartialEq,
@@ -168,7 +156,7 @@ impl ProgramBlobBuilder {
         basic_block_to_instruction_index.push(0);
 
         for (nth_instruction, instruction) in code.iter().enumerate() {
-            if let InstructionEx::Instruction(inst) = (*instruction).into() {
+            if let InstructionOrBytes::Instruction(inst) = instruction {
                 if inst.opcode().starts_new_basic_block() {
                     basic_block_to_instruction_index.push(nth_instruction + 1);
                 }
@@ -181,40 +169,36 @@ impl ProgramBlobBuilder {
         let mut instructions = Vec::new();
         let mut position: u32 = 0;
         for (nth_instruction, instruction) in code.iter().enumerate() {
-            if let InstructionEx::Instruction(mut instruction) = (*instruction).into() {
-                let target = instruction.target_mut();
-                let target_nth_instruction = target.map(|target| {
-                    let target_nth_instruction = basic_block_to_instruction_index[*target as usize];
+            let entry = match instruction {
+                InstructionOrBytes::Instruction(mut instruction) => {
+                    let target = instruction.target_mut();
+                    let target_nth_instruction = target.map(|target| {
+                        let target_nth_instruction = basic_block_to_instruction_index[*target as usize];
 
-                    // This is completely inaccurate, but that's fine.
-                    *target = position.wrapping_add((target_nth_instruction as i32 - nth_instruction as i32) as u32);
-                    target_nth_instruction
-                });
+                        // This is completely inaccurate, but that's fine.
+                        *target = position.wrapping_add((target_nth_instruction as i32 - nth_instruction as i32) as u32);
+                        target_nth_instruction
+                    });
 
-                let entry = SerializedInstruction {
-                    instruction: Some(instruction),
-                    bytes: InstructionBuffer::from((position, instruction)),
-                    target_nth_instruction,
-                    position,
-                };
-
-                position = position.checked_add(entry.bytes.len() as u32).expect("too many instructions");
-                instructions.push(entry);
-            }
-
-            // The instruction in the form of raw bytes, that should only be appended, as we want to
-            // be able to slip in invalid instructions, e.g., jump instruction with an invalid offset
-            if let InstructionEx::Raw(bytes) = (*instruction).into() {
-                let entry = SerializedInstruction {
+                    SerializedInstruction {
+                        instruction: Some(instruction),
+                        bytes: InstructionBuffer::from((position, instruction)),
+                        target_nth_instruction,
+                        position,
+                    }
+                }
+                // The instruction in the form of raw bytes, that should only be appended, as we want to
+                // be able to slip in invalid instructions, e.g., jump instruction with an invalid offset
+                InstructionOrBytes::Raw(bytes) => SerializedInstruction {
                     instruction: None,
-                    bytes,
+                    bytes: *bytes,
                     target_nth_instruction: None,
                     position,
-                };
+                },
+            };
 
-                position = position.checked_add(entry.bytes.len() as u32).expect("too many instructions");
-                instructions.push(entry);
-            }
+            position = position.checked_add(entry.bytes.len() as u32).expect("too many instructions");
+            instructions.push(entry);
         }
 
         // Adjust offsets to other instructions until we reach a steady state.
