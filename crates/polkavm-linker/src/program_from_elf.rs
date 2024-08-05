@@ -1913,7 +1913,9 @@ fn parse_code_section(
 
         if crate::riscv::R(raw_inst).unpack() == (crate::riscv::OPCODE_CUSTOM_0, FUNC3_ECALLI, 0, RReg::Zero, RReg::Zero, RReg::Zero) {
             let initial_offset = relative_offset as u64;
-            if relative_offset + 12 > text.len() {
+
+            // `ret` can be 2 bytes long, so 4 + 4 + 2 = 10
+            if relative_offset + 10 > text.len() {
                 return Err(ProgramFromElfError::other("truncated ecalli instruction"));
             }
 
