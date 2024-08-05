@@ -906,6 +906,14 @@ impl<'a, 'b, const DEBUG: bool> InstructionVisitor for Visitor<'a, 'b, DEBUG> {
         self.set3(d, s1, s2, |s1, s2| u32::from((s1 as i32) < (s2 as i32)))
     }
 
+    fn set_less_than_unsigned_w(&mut self, d: RawReg, s1: RawReg, s2: RawReg) -> Self::ReturnTy {
+        todo!()
+    }
+
+    fn set_less_than_signed_w(&mut self, d: RawReg, s1: RawReg, s2: RawReg) -> Self::ReturnTy {
+        todo!()
+    }
+
     fn shift_logical_right(&mut self, d: RawReg, s1: RawReg, s2: RawReg) -> Self::ReturnTy {
         self.set3(d, s1, s2, u32::wrapping_shr)
     }
@@ -942,6 +950,18 @@ impl<'a, 'b, const DEBUG: bool> InstructionVisitor for Visitor<'a, 'b, DEBUG> {
         self.set3(d, s1, s2, |s1, s2| s1 | s2)
     }
 
+    fn xorw(&mut self, d: RawReg, s1: RawReg, s2: RawReg) -> Self::ReturnTy {
+        todo!()
+    }
+
+    fn andw(&mut self, d: RawReg, s1: RawReg, s2: RawReg) -> Self::ReturnTy {
+        todo!()
+    }
+
+    fn orw(&mut self, d: RawReg, s1: RawReg, s2: RawReg) -> Self::ReturnTy {
+        todo!()
+    }
+
     fn add(&mut self, d: RawReg, s1: RawReg, s2: RawReg) -> Self::ReturnTy {
         self.set3(d, s1, s2, u32::wrapping_add)
     }
@@ -972,6 +992,10 @@ impl<'a, 'b, const DEBUG: bool> InstructionVisitor for Visitor<'a, 'b, DEBUG> {
 
     fn mul_imm(&mut self, d: RawReg, s1: RawReg, s2: u32) -> Self::ReturnTy {
         self.set3(d, s1, s2, u32::wrapping_mul)
+    }
+
+    fn mulw_imm(&mut self, d: RawReg, s1: RawReg, s2: u32) -> Self::ReturnTy {
+        todo!()
     }
 
     fn mul_upper_signed_signed(&mut self, d: RawReg, s1: RawReg, s2: RawReg) -> Self::ReturnTy {
@@ -1042,6 +1066,22 @@ impl<'a, 'b, const DEBUG: bool> InstructionVisitor for Visitor<'a, 'b, DEBUG> {
         self.set3(d, s1, s2, |s1, s2| u32::from((s1 as i32) > (s2 as i32)))
     }
 
+    fn set_less_than_unsigned_w_imm(&mut self, d: RawReg, s1: RawReg, s2: u32) -> Self::ReturnTy {
+        todo!()
+    }
+
+    fn set_greater_than_unsigned_w_imm(&mut self, d: RawReg, s1: RawReg, s2: u32) -> Self::ReturnTy {
+        todo!()
+    }
+
+    fn set_less_than_signed_w_imm(&mut self, d: RawReg, s1: RawReg, s2: u32) -> Self::ReturnTy {
+        todo!()
+    }
+
+    fn set_greater_than_signed_w_imm(&mut self, d: RawReg, s1: RawReg, s2: u32) -> Self::ReturnTy {
+        todo!()
+    }
+
     fn shift_logical_right_imm(&mut self, d: RawReg, s1: RawReg, s2: u32) -> Self::ReturnTy {
         self.set3(d, s1, s2, u32::wrapping_shr)
     }
@@ -1100,6 +1140,18 @@ impl<'a, 'b, const DEBUG: bool> InstructionVisitor for Visitor<'a, 'b, DEBUG> {
 
     fn xor_imm(&mut self, d: RawReg, s1: RawReg, s2: u32) -> Self::ReturnTy {
         self.set3(d, s1, s2, |s1, s2| s1 ^ s2)
+    }
+
+    fn orw_imm(&mut self, d: RawReg, s1: RawReg, s2: u32) -> Self::ReturnTy {
+        todo!()
+    }
+
+    fn andw_imm(&mut self, d: RawReg, s1: RawReg, s2: u32) -> Self::ReturnTy {
+        todo!()
+    }
+
+    fn xorw_imm(&mut self, d: RawReg, s1: RawReg, s2: u32) -> Self::ReturnTy {
+        todo!()
     }
 
     fn load_imm(&mut self, dst: RawReg, imm: u32) -> Self::ReturnTy {

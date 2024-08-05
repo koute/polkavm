@@ -308,15 +308,24 @@ pub enum Inst {
 
 #[derive(Copy, Clone, PartialEq, Eq, Debug, Hash)]
 pub enum AtomicKind {
-    Swap = 0b00001,
-    Add = 0b00000,
-    And = 0b01100,
-    Or = 0b01000,
-    Xor = 0b00100,
-    MaxSigned = 0b10100,
-    MinSigned = 0b10000,
-    MaxUnsigned = 0b11100,
-    MinUnsigned = 0b11000,
+    Swap,
+    SwapW,
+    Add,
+    AddW,
+    And,
+    AndW,
+    Or,
+    OrW,
+    Xor,
+    XorW,
+    MaxSigned,
+    MaxSignedW,
+    MinSigned,
+    MinSignedW,
+    MaxUnsigned,
+    MaxUnsignedW,
+    MinUnsigned,
+    MinUnsignedW,
 }
 
 #[derive(Copy, Clone, PartialEq, Eq, Debug, Hash)]
@@ -942,34 +951,34 @@ impl Inst {
                 let release = ((op >> 25) & 1) != 0;
                 let acquire = ((op >> 26) & 1) != 0;
                 let funct3 = (op >> 12) & 0b111;
-                let word = match funct3 {
+                let is_word = match funct3 {
                     0b010 if !rv64 => true,
                     0b010 if rv64 => true,
                     0b011 if rv64 => false,
                     _ => return None,
                 };
 
-                match (kind, word) {
-                    (0b00010, true) if src2 == Reg::Zero => Some(Inst::LoadReserved {
+                match (kind, is_word) {
+                    (0b00010, true) if src2 == Reg::Zero => Some(Inst::LoadReservedW {
                         acquire,
                         release,
                         dst,
                         src: src1,
                     }),
-                    (0b00011, true) => Some(Inst::StoreConditional {
+                    (0b00011, true) => Some(Inst::StoreConditionalW {
                         acquire,
                         release,
                         addr: src1,
                         dst,
                         src: src2,
                     }),
-                    (0b00010, false) if src2 == Reg::Zero => Some(Inst::LoadReservedW {
+                    (0b00010, false) if src2 == Reg::Zero => Some(Inst::LoadReserved {
                         acquire,
                         release,
                         dst,
                         src: src1,
                     }),
-                    (0b00011, false) => Some(Inst::StoreConditionalW {
+                    (0b00011, false) => Some(Inst::StoreConditional {
                         acquire,
                         release,
                         addr: src1,
@@ -977,16 +986,25 @@ impl Inst {
                         src: src2,
                     }),
                     _ => {
-                        let kind = match kind {
-                            0b00000 => AtomicKind::Add,
-                            0b00001 => AtomicKind::Swap,
-                            0b00100 => AtomicKind::Xor,
-                            0b01100 => AtomicKind::And,
-                            0b01000 => AtomicKind::Or,
-                            0b10000 => AtomicKind::MinSigned,
-                            0b10100 => AtomicKind::MaxSigned,
-                            0b11000 => AtomicKind::MinUnsigned,
-                            0b11100 => AtomicKind::MaxUnsigned,
+                        let kind = match (kind, is_word) {
+                            (0b00000, true) => AtomicKind::Add,
+                            (0b00001, true) => AtomicKind::Swap,
+                            (0b00100, true) => AtomicKind::Xor,
+                            (0b01100, true) => AtomicKind::And,
+                            (0b01000, true) => AtomicKind::Or,
+                            (0b10000, true) => AtomicKind::MinSigned,
+                            (0b10100, true) => AtomicKind::MaxSigned,
+                            (0b11000, true) => AtomicKind::MinUnsigned,
+                            (0b11100, true) => AtomicKind::MaxUnsigned,
+                            (0b00000, false) => AtomicKind::Add,
+                            (0b00001, false) => AtomicKind::Swap,
+                            (0b00100, false) => AtomicKind::Xor,
+                            (0b01100, false) => AtomicKind::And,
+                            (0b01000, false) => AtomicKind::Or,
+                            (0b10000, false) => AtomicKind::MinSigned,
+                            (0b10100, false) => AtomicKind::MaxSigned,
+                            (0b11000, false) => AtomicKind::MinUnsigned,
+                            (0b11100, false) => AtomicKind::MaxUnsigned,
                             _ => return None,
                         };
 

@@ -1449,6 +1449,11 @@ enum MinMax {
     MinSigned,
     MaxUnsigned,
     MinUnsigned,
+
+    MaxSignedW,
+    MinSignedW,
+    MaxUnsignedW,
+    MinUnsignedW,
 }
 
 fn emit_minmax(
@@ -1474,6 +1479,11 @@ fn emit_minmax(
         MinMax::MaxUnsigned => (src2, src1, AnyAnyKind::SetLessThanUnsigned),
         MinMax::MinSigned => (src1, src2, AnyAnyKind::SetLessThanSigned),
         MinMax::MaxSigned => (src2, src1, AnyAnyKind::SetLessThanSigned),
+
+        MinMax::MinUnsignedW => (src1, src2, AnyAnyKind::SetLessThanUnsignedW),
+        MinMax::MaxUnsignedW => (src2, src1, AnyAnyKind::SetLessThanUnsignedW),
+        MinMax::MinSignedW => (src1, src2, AnyAnyKind::SetLessThanSignedW),
+        MinMax::MaxSignedW => (src2, src1, AnyAnyKind::SetLessThanSignedW),
     };
 
     emit(InstExt::Basic(BasicInst::AnyAny {
@@ -1753,7 +1763,7 @@ fn convert_instruction(
             };
 
             emit(InstExt::Basic(BasicInst::LoadIndirect {
-                kind: LoadKind::I32,
+                kind: LoadKind::U64,
                 dst,
                 base: src,
                 offset: 0,
@@ -1775,7 +1785,7 @@ fn convert_instruction(
             };
 
             emit(InstExt::Basic(BasicInst::LoadIndirect {
-                kind: LoadKind::U64,
+                kind: LoadKind::I32,
                 dst,
                 base: src,
                 offset: 0,
@@ -1792,7 +1802,7 @@ fn convert_instruction(
 
             let src = cast_reg_any(src)?;
             emit(InstExt::Basic(BasicInst::StoreIndirect {
-                kind: StoreKind::U32,
+                kind: StoreKind::U64,
                 src,
                 base: addr,
                 offset: 0,
@@ -1814,7 +1824,7 @@ fn convert_instruction(
 
             let src = cast_reg_any(src)?;
             emit(InstExt::Basic(BasicInst::StoreIndirect {
-                kind: StoreKind::U64,
+                kind: StoreKind::U32,
                 src,
                 base: addr,
                 offset: 0,
@@ -1856,6 +1866,14 @@ fn convert_instruction(
             }));
 
             match kind {
+                AtomicKind::SwapW => {
+                    emit(InstExt::Basic(BasicInst::AnyAny {
+                        kind: AnyAnyKind::AddW,
+                        dst: new_value,
+                        src1: operand_regimm,
+                        src2: RegImm::Imm(0),
+                    }));
+                }
                 AtomicKind::Swap => {
                     emit(InstExt::Basic(BasicInst::AnyAny {
                         kind: AnyAnyKind::Add,
@@ -1864,9 +1882,25 @@ fn convert_instruction(
                         src2: RegImm::Imm(0),
                     }));
                 }
+                AtomicKind::AddW => {
+                    emit(InstExt::Basic(BasicInst::AnyAny {
+                        kind: AnyAnyKind::AddW,
+                        dst: new_value,
+                        src1: old_value.into(),
+                        src2: operand_regimm,
+                    }));
+                }
                 AtomicKind::Add => {
                     emit(InstExt::Basic(BasicInst::AnyAny {
                         kind: AnyAnyKind::Add,
+                        dst: new_value,
+                        src1: old_value.into(),
+                        src2: operand_regimm,
+                    }));
+                }
+                AtomicKind::AndW => {
+                    emit(InstExt::Basic(BasicInst::AnyAny {
+                        kind: AnyAnyKind::AndW,
                         dst: new_value,
                         src1: old_value.into(),
                         src2: operand_regimm,
@@ -1880,9 +1914,25 @@ fn convert_instruction(
                         src2: operand_regimm,
                     }));
                 }
+                AtomicKind::OrW => {
+                    emit(InstExt::Basic(BasicInst::AnyAny {
+                        kind: AnyAnyKind::OrW,
+                        dst: new_value,
+                        src1: old_value.into(),
+                        src2: operand_regimm,
+                    }));
+                }
                 AtomicKind::Or => {
                     emit(InstExt::Basic(BasicInst::AnyAny {
                         kind: AnyAnyKind::Or,
+                        dst: new_value,
+                        src1: old_value.into(),
+                        src2: operand_regimm,
+                    }));
+                }
+                AtomicKind::XorW => {
+                    emit(InstExt::Basic(BasicInst::AnyAny {
+                        kind: AnyAnyKind::XorW,
                         dst: new_value,
                         src1: old_value.into(),
                         src2: operand_regimm,
@@ -1907,6 +1957,19 @@ fn convert_instruction(
                 }
                 AtomicKind::MinUnsigned => {
                     emit_minmax(MinMax::MinUnsigned, new_value, Some(old_value), operand, Reg::E2, &mut emit);
+                }
+
+                AtomicKind::MaxSignedW => {
+                    emit_minmax(MinMax::MaxSignedW, new_value, Some(old_value), operand, Reg::E2, &mut emit);
+                }
+                AtomicKind::MinSignedW => {
+                    emit_minmax(MinMax::MinSignedW, new_value, Some(old_value), operand, Reg::E2, &mut emit);
+                }
+                AtomicKind::MaxUnsignedW => {
+                    emit_minmax(MinMax::MaxUnsignedW, new_value, Some(old_value), operand, Reg::E2, &mut emit);
+                }
+                AtomicKind::MinUnsignedW => {
+                    emit_minmax(MinMax::MinUnsignedW, new_value, Some(old_value), operand, Reg::E2, &mut emit);
                 }
             }
 
@@ -3065,10 +3128,15 @@ pub enum AnyAnyKind {
     Sub,
     SubW,
     And,
+    AndW,
     Or,
+    OrW,
     Xor,
+    XorW,
     SetLessThanUnsigned,
     SetLessThanSigned,
+    SetLessThanUnsignedW,
+    SetLessThanSignedW,
     ShiftLogicalLeft,
     ShiftLogicalRight,
     ShiftArithmeticRight,
@@ -3102,10 +3170,15 @@ enum OperationKind {
     Sub,
     SubW,
     And,
+    AndW,
     Or,
+    OrW,
     Xor,
+    XorW,
     SetLessThanUnsigned,
+    SetLessThanUnsignedW,
     SetLessThanSigned,
+    SetLessThanSignedW,
     ShiftLogicalLeft,
     ShiftLogicalLeftW,
     ShiftLogicalRight,
@@ -3141,10 +3214,15 @@ impl From<AnyAnyKind> for OperationKind {
             AnyAnyKind::Sub => Self::Sub,
             AnyAnyKind::SubW => Self::SubW,
             AnyAnyKind::And => Self::And,
+            AnyAnyKind::AndW => Self::AndW,
             AnyAnyKind::Or => Self::Or,
+            AnyAnyKind::OrW => Self::OrW,
             AnyAnyKind::Xor => Self::Xor,
+            AnyAnyKind::XorW => Self::XorW,
             AnyAnyKind::SetLessThanUnsigned => Self::SetLessThanUnsigned,
+            AnyAnyKind::SetLessThanUnsignedW => Self::SetLessThanUnsignedW,
             AnyAnyKind::SetLessThanSigned => Self::SetLessThanSigned,
+            AnyAnyKind::SetLessThanSignedW => Self::SetLessThanSignedW,
             AnyAnyKind::ShiftLogicalLeft => Self::ShiftLogicalLeft,
             AnyAnyKind::ShiftLogicalLeftW => Self::ShiftLogicalLeftW,
             AnyAnyKind::ShiftLogicalRight => Self::ShiftLogicalRight,
@@ -3193,14 +3271,14 @@ impl OperationKind {
         use polkavm_common::operation::*;
         #[allow(clippy::unnecessary_cast)]
         match self {
+            // TODO
             Self::Add | Self::Addw => lhs.wrapping_add(rhs),
-            Self::Sub => lhs.wrapping_sub(rhs),
-            Self::SubW => lhs.wrapping_sub(rhs),
-            Self::And => lhs & rhs,
-            Self::Or => lhs | rhs,
-            Self::Xor => lhs ^ rhs,
-            Self::SetLessThanUnsigned => i32::from((lhs as u32) < (rhs as u32)),
-            Self::SetLessThanSigned => i32::from((lhs as i32) < (rhs as i32)),
+            Self::Sub | Self::SubW => lhs.wrapping_sub(rhs),
+            Self::And | Self::AndW => lhs & rhs,
+            Self::Or | Self::OrW => lhs | rhs,
+            Self::Xor | Self::XorW => lhs ^ rhs,
+            Self::SetLessThanUnsigned | Self::SetLessThanUnsignedW => i32::from((lhs as u32) < (rhs as u32)),
+            Self::SetLessThanSigned | Self::SetLessThanSignedW => i32::from((lhs as i32) < (rhs as i32)),
             Self::ShiftLogicalLeft => ((lhs as u32).wrapping_shl(rhs as u32)) as i32,
             Self::ShiftLogicalLeftW => ((lhs as u32).wrapping_shl(rhs as u32)) as i32,
             Self::ShiftLogicalRight => ((lhs as u32).wrapping_shr(rhs as u32)) as i32,
@@ -3209,17 +3287,21 @@ impl OperationKind {
             Self::ShiftArithmeticRightW => (lhs as i32).wrapping_shr(rhs as u32),
 
             Self::Mul => (lhs as i32).wrapping_mul(rhs as i32),
+            // TODO
             Self::MulW => (lhs as i32).wrapping_mul(rhs as i32),
             Self::MulUpperSignedSigned => mulh(lhs, rhs),
             Self::MulUpperSignedUnsigned => mulhsu(lhs, rhs as u32),
             Self::MulUpperUnsignedUnsigned => mulhu(lhs as u32, rhs as u32) as i32,
             Self::Div => div(lhs, rhs),
+            // TODO
             Self::DivW => div(lhs, rhs),
             Self::DivUnsigned => divu(lhs as u32, rhs as u32) as i32,
             Self::DivUnsignedW => divu(lhs as u32, rhs as u32) as i32,
             Self::Rem => rem(lhs, rhs),
+            // TODO
             Self::RemW => rem(lhs, rhs),
             Self::RemUnsigned => remu(lhs as u32, rhs as u32) as i32,
+            // TODO
             Self::RemUnsignedW => remu(lhs as u32, rhs as u32) as i32,
 
             Self::Eq => i32::from(lhs == rhs),
@@ -5504,14 +5586,19 @@ fn emit_code(
                                     K::ShiftLogicalLeft => shift_logical_left,
                                     K::ShiftLogicalLeftW => shift_logical_left_w,
                                     K::SetLessThanSigned => set_less_than_signed,
+                                    K::SetLessThanSignedW => set_less_than_signed_w,
                                     K::SetLessThanUnsigned => set_less_than_unsigned,
+                                    K::SetLessThanUnsignedW => set_less_than_unsigned_w,
                                     K::Xor => xor,
+                                    K::XorW => xorw,
                                     K::ShiftLogicalRight => shift_logical_right,
                                     K::ShiftLogicalRightW => shift_logical_right_w,
                                     K::ShiftArithmeticRight => shift_arithmetic_right,
                                     K::ShiftArithmeticRightW => shift_arithmetic_right_w,
                                     K::Or => or,
+                                    K::OrW => orw,
                                     K::And => and,
+                                    K::AndW => andw,
                                     K::Mul => mul,
                                     K::MulW => mulw,
                                     K::MulUpperSignedSigned => mul_upper_signed_signed,
@@ -5530,14 +5617,19 @@ fn emit_code(
                                 K::ShiftLogicalLeft => I::shift_logical_left_imm(dst, src1, src2),
                                 K::ShiftLogicalLeftW => I::shift_logical_left_w_imm(dst, src1, src2),
                                 K::SetLessThanSigned => I::set_less_than_signed_imm(dst, src1, src2),
+                                K::SetLessThanSignedW => I::set_less_than_signed_w_imm(dst, src1, src2),
                                 K::SetLessThanUnsigned => I::set_less_than_unsigned_imm(dst, src1, src2),
+                                K::SetLessThanUnsignedW => I::set_less_than_unsigned_w_imm(dst, src1, src2),
                                 K::Xor => I::xor_imm(dst, src1, src2),
+                                K::XorW => I::xorw_imm(dst, src1, src2),
                                 K::ShiftLogicalRight => I::shift_logical_right_imm(dst, src1, src2),
                                 K::ShiftLogicalRightW => I::shift_logical_right_w_imm(dst, src1, src2),
                                 K::ShiftArithmeticRight => I::shift_arithmetic_right_imm(dst, src1, src2),
                                 K::ShiftArithmeticRightW => I::shift_arithmetic_right_w_imm(dst, src1, src2),
                                 K::Or => I::or_imm(dst, src1, src2),
-                                K::And => I::and_imm(dst, src1, src2),
+                                K::OrW => I::orw_imm(dst, src1, src2),
+                                K::And => I::andw_imm(dst, src1, src2),
+                                K::AndW => I::andw_imm(dst, src1, src2),
                                 K::Mul => I::mul_imm(dst, src1, src2),
                                 K::MulW => I::mul_imm(dst, src1, src2),
                                 K::MulUpperSignedSigned => I::mul_upper_signed_signed_imm(dst, src1, src2),
@@ -5550,8 +5642,11 @@ fn emit_code(
                                 K::Add => I::add_imm(dst, src2, src1),
                                 K::AddW => I::addw_imm(dst, src2, src1),
                                 K::Xor => I::xor_imm(dst, src2, src1),
+                                K::XorW => I::xorw_imm(dst, src2, src1),
                                 K::Or => I::or_imm(dst, src2, src1),
+                                K::OrW => I::orw_imm(dst, src2, src1),
                                 K::And => I::and_imm(dst, src2, src1),
+                                K::AndW => I::andw_imm(dst, src2, src1),
                                 K::Mul => I::mul_imm(dst, src2, src1),
                                 K::MulW => I::mul_imm(dst, src2, src1),
                                 K::MulUpperSignedSigned => I::mul_upper_signed_signed_imm(dst, src2, src1),
@@ -5562,7 +5657,9 @@ fn emit_code(
                                 K::ShiftLogicalLeft => I::shift_logical_left_imm_alt(dst, src2, src1),
                                 K::ShiftLogicalLeftW => I::shift_logical_left_w_imm_alt(dst, src2, src1),
                                 K::SetLessThanSigned => I::set_greater_than_signed_imm(dst, src2, src1),
+                                K::SetLessThanSignedW => I::set_greater_than_signed_w_imm(dst, src2, src1),
                                 K::SetLessThanUnsigned => I::set_greater_than_unsigned_imm(dst, src2, src1),
+                                K::SetLessThanUnsignedW => I::set_greater_than_unsigned_w_imm(dst, src2, src1),
                                 K::ShiftLogicalRight => I::shift_logical_right_imm_alt(dst, src2, src1),
                                 K::ShiftLogicalRightW => I::shift_logical_right_imm_alt(dst, src2, src1),
                                 K::ShiftArithmeticRight => I::shift_arithmetic_right_w_imm_alt(dst, src2, src1),

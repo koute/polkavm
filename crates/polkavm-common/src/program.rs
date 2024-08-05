@@ -1274,13 +1274,19 @@ define_opcodes! {
         add_imm                                  = 2,
         addw_imm                                 = 104,
         and_imm                                  = 18,
+        andw_imm                                 = 118,
         xor_imm                                  = 31,
+        xorw_imm                                 = 119,
         or_imm                                   = 49,
+        orw_imm                                  = 120,
         mul_imm                                  = 35,
+        mulw_imm                                 = 121,
         mul_upper_signed_signed_imm              = 65,
         mul_upper_unsigned_unsigned_imm          = 63,
         set_less_than_unsigned_imm               = 27,
+        set_less_than_unsigned_w_imm             = 125,
         set_less_than_signed_imm                 = 56,
+        set_less_than_signed_w_imm               = 126,
         shift_logical_left_imm                   = 9,
         shift_logical_left_w_imm                 = 105,
         shift_logical_right_imm                  = 14,
@@ -1289,7 +1295,9 @@ define_opcodes! {
         shift_arithmetic_right_w_imm             = 107,
         negate_and_add_imm                       = 40,
         set_greater_than_unsigned_imm            = 39,
+        set_greater_than_unsigned_w_imm          = 129,
         set_greater_than_signed_imm              = 61,
+        set_greater_than_signed_w_imm            = 130,
         shift_logical_right_imm_alt              = 72,
         shift_logical_right_w_imm_alt            = 103,
         shift_arithmetic_right_imm_alt           = 80,
@@ -1318,15 +1326,20 @@ define_opcodes! {
         sub                                      = 20,
         subw                                     = 112,
         and                                      = 23,
+        andw                                     = 124,
         xor                                      = 28,
+        xorw                                     = 122,
         or                                       = 12,
+        orw                                      = 123,
         mul                                      = 34,
         mulw                                     = 113,
         mul_upper_signed_signed                  = 67,
         mul_upper_unsigned_unsigned              = 57,
         mul_upper_signed_unsigned                = 81,
         set_less_than_unsigned                   = 36,
+        set_less_than_unsigned_w                 = 127,
         set_less_than_signed                     = 58,
+        set_less_than_signed_w                   = 128,
         shift_logical_left                       = 55,
         shift_logical_left_w                     = 100,
         shift_logical_right                      = 51,
@@ -1590,6 +1603,20 @@ impl<'a, 'b> InstructionVisitor for InstructionFormatter<'a, 'b> {
         write!(self, "{d} = {s1} <s {s2}")
     }
 
+    fn set_less_than_unsigned_w(&mut self, d: RawReg, s1: RawReg, s2: RawReg) -> Self::ReturnTy {
+        let d = self.format_reg(d);
+        let s1 = self.format_reg(s1);
+        let s2 = self.format_reg(s2);
+        write!(self, "i32 {d} = {s1} <u {s2}")
+    }
+
+    fn set_less_than_signed_w(&mut self, d: RawReg, s1: RawReg, s2: RawReg) -> Self::ReturnTy {
+        let d = self.format_reg(d);
+        let s1 = self.format_reg(s1);
+        let s2 = self.format_reg(s2);
+        write!(self, "i32 {d} = {s1} <s {s2}")
+    }
+
     fn shift_logical_right_w(&mut self, d: RawReg, s1: RawReg, s2: RawReg) -> Self::ReturnTy {
         let d = self.format_reg(d);
         let s1 = self.format_reg(s1);
@@ -1653,6 +1680,27 @@ impl<'a, 'b> InstructionVisitor for InstructionFormatter<'a, 'b> {
         write!(self, "{d} = {s1} | {s2}")
     }
 
+    fn xorw(&mut self, d: RawReg, s1: RawReg, s2: RawReg) -> Self::ReturnTy {
+        let d = self.format_reg(d);
+        let s1 = self.format_reg(s1);
+        let s2 = self.format_reg(s2);
+        write!(self, "i32 {d} = {s1} ^ {s2}")
+    }
+
+    fn andw(&mut self, d: RawReg, s1: RawReg, s2: RawReg) -> Self::ReturnTy {
+        let d = self.format_reg(d);
+        let s1 = self.format_reg(s1);
+        let s2 = self.format_reg(s2);
+        write!(self, "i32 {d} = {s1} & {s2}")
+    }
+
+    fn orw(&mut self, d: RawReg, s1: RawReg, s2: RawReg) -> Self::ReturnTy {
+        let d = self.format_reg(d);
+        let s1 = self.format_reg(s1);
+        let s2 = self.format_reg(s2);
+        write!(self, "i32 {d} = {s1} | {s2}")
+    }
+
     fn add(&mut self, d: RawReg, s1: RawReg, s2: RawReg) -> Self::ReturnTy {
         let d = self.format_reg(d);
         let s1 = self.format_reg(s1);
@@ -1699,6 +1747,12 @@ impl<'a, 'b> InstructionVisitor for InstructionFormatter<'a, 'b> {
         let d = self.format_reg(d);
         let s1 = self.format_reg(s1);
         write!(self, "{d} = {s1} * {s2}")
+    }
+
+    fn mulw_imm(&mut self, d: RawReg, s1: RawReg, s2: u32) -> Self::ReturnTy {
+        let d = self.format_reg(d);
+        let s1 = self.format_reg(s1);
+        write!(self, "i32 {d} = {s1} * {s2}")
     }
 
     fn mul_upper_signed_signed(&mut self, d: RawReg, s1: RawReg, s2: RawReg) -> Self::ReturnTy {
@@ -1796,7 +1850,19 @@ impl<'a, 'b> InstructionVisitor for InstructionFormatter<'a, 'b> {
         write!(self, "{d} = {s1} <u 0x{s2:x}")
     }
 
+    fn set_less_than_unsigned_w_imm(&mut self, d: RawReg, s1: RawReg, s2: u32) -> Self::ReturnTy {
+        let d = self.format_reg(d);
+        let s1 = self.format_reg(s1);
+        write!(self, "i32 {d} = {s1} <u 0x{s2:x}")
+    }
+
     fn set_greater_than_unsigned_imm(&mut self, d: RawReg, s1: RawReg, s2: u32) -> Self::ReturnTy {
+        let d = self.format_reg(d);
+        let s1 = self.format_reg(s1);
+        write!(self, "{d} = {s1} >u 0x{s2:x}")
+    }
+
+    fn set_greater_than_unsigned_w_imm(&mut self, d: RawReg, s1: RawReg, s2: u32) -> Self::ReturnTy {
         let d = self.format_reg(d);
         let s1 = self.format_reg(s1);
         write!(self, "{d} = {s1} >u 0x{s2:x}")
@@ -1808,7 +1874,19 @@ impl<'a, 'b> InstructionVisitor for InstructionFormatter<'a, 'b> {
         write!(self, "{d} = {s1} <s {s2}", s2 = s2 as i32)
     }
 
+    fn set_less_than_signed_w_imm(&mut self, d: RawReg, s1: RawReg, s2: u32) -> Self::ReturnTy {
+        let d = self.format_reg(d);
+        let s1 = self.format_reg(s1);
+        write!(self, "i32 {d} = {s1} <s {s2}", s2 = s2 as i32)
+    }
+
     fn set_greater_than_signed_imm(&mut self, d: RawReg, s1: RawReg, s2: u32) -> Self::ReturnTy {
+        let d = self.format_reg(d);
+        let s1 = self.format_reg(s1);
+        write!(self, "{d} = {s1} >s {s2}", s2 = s2 as i32)
+    }
+
+    fn set_greater_than_signed_w_imm(&mut self, d: RawReg, s1: RawReg, s2: u32) -> Self::ReturnTy {
         let d = self.format_reg(d);
         let s1 = self.format_reg(s1);
         write!(self, "{d} = {s1} >s {s2}", s2 = s2 as i32)
@@ -1902,6 +1980,24 @@ impl<'a, 'b> InstructionVisitor for InstructionFormatter<'a, 'b> {
         let d = self.format_reg(d);
         let s1 = self.format_reg(s1);
         write!(self, "{d} = {s1} ^ 0x{s2:x}")
+    }
+
+    fn orw_imm(&mut self, d: RawReg, s1: RawReg, s2: u32) -> Self::ReturnTy {
+        let d = self.format_reg(d);
+        let s1 = self.format_reg(s1);
+        write!(self, "i32 {d} = {s1} | 0x{s2:x}")
+    }
+
+    fn andw_imm(&mut self, d: RawReg, s1: RawReg, s2: u32) -> Self::ReturnTy {
+        let d = self.format_reg(d);
+        let s1 = self.format_reg(s1);
+        write!(self, "i32 {d} = {s1} & 0x{s2:x}")
+    }
+
+    fn xorw_imm(&mut self, d: RawReg, s1: RawReg, s2: u32) -> Self::ReturnTy {
+        let d = self.format_reg(d);
+        let s1 = self.format_reg(s1);
+        write!(self, "i32 {d} = {s1} ^ 0x{s2:x}")
     }
 
     fn load_imm(&mut self, d: RawReg, a: u32) -> Self::ReturnTy {
