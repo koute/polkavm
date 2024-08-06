@@ -1714,7 +1714,7 @@ fn convert_instruction(
                 K::DivUnsignedW => regreg!(DivUnsignedW),
                 K::Rem => regreg!(Rem),
                 K::RemW => regreg!(RemW),
-                K::RemUnsigned => regreg!(RemUnsignedW),
+                K::RemUnsigned => regreg!(RemUnsigned),
                 K::RemUnsignedW => regreg!(RemUnsignedW),
             };
 

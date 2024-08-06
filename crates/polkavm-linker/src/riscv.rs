@@ -513,7 +513,7 @@ impl Inst {
         Self::decode_compressed_internal(op, true)
     }
 
-    fn decode_compressed_internal(op: u32, rv64: bool) -> Option<Self> {
+    fn decode_compressed_internal(op: u32, _rv64: bool) -> Option<Self> {
         let quadrant = op & 0b11;
         let funct3 = (op >> 13) & 0b111;
 
@@ -987,15 +987,15 @@ impl Inst {
                     }),
                     _ => {
                         let kind = match (kind, is_word) {
-                            (0b00000, true) => AtomicKind::Add,
-                            (0b00001, true) => AtomicKind::Swap,
-                            (0b00100, true) => AtomicKind::Xor,
-                            (0b01100, true) => AtomicKind::And,
-                            (0b01000, true) => AtomicKind::Or,
-                            (0b10000, true) => AtomicKind::MinSigned,
-                            (0b10100, true) => AtomicKind::MaxSigned,
-                            (0b11000, true) => AtomicKind::MinUnsigned,
-                            (0b11100, true) => AtomicKind::MaxUnsigned,
+                            (0b00000, true) => AtomicKind::AddW,
+                            (0b00001, true) => AtomicKind::SwapW,
+                            (0b00100, true) => AtomicKind::XorW,
+                            (0b01100, true) => AtomicKind::AndW,
+                            (0b01000, true) => AtomicKind::OrW,
+                            (0b10000, true) => AtomicKind::MinSignedW,
+                            (0b10100, true) => AtomicKind::MaxSignedW,
+                            (0b11000, true) => AtomicKind::MinUnsignedW,
+                            (0b11100, true) => AtomicKind::MaxUnsignedW,
                             (0b00000, false) => AtomicKind::Add,
                             (0b00001, false) => AtomicKind::Swap,
                             (0b00100, false) => AtomicKind::Xor,
