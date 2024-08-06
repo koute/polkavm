@@ -1347,13 +1347,13 @@ define_opcodes! {
         shift_arithmetic_right                   = 77,
         shift_arithmetic_right_w                 = 109,
         div_unsigned                             = 68,
-        div_unsignedw                            = 114,
+        div_unsigned_w                            = 114,
         div_signed                               = 64,
-        div_signedw                              = 115,
+        div_signed_w                              = 115,
         rem_unsigned                             = 73,
-        rem_unsignedw                            = 116,
+        rem_unsigned_w                            = 116,
         rem_signed                               = 70,
-        rem_signedw                              = 117,
+        rem_signed_w                              = 117,
 
         cmov_if_zero                             = 83,
         cmov_if_not_zero                         = 84,
@@ -1816,28 +1816,28 @@ impl<'a, 'b> InstructionVisitor for InstructionFormatter<'a, 'b> {
         write!(self, "{d} = {s1} %s {s2}")
     }
 
-    fn div_unsignedw(&mut self, d: RawReg, s1: RawReg, s2: RawReg) -> Self::ReturnTy {
+    fn div_unsigned_w(&mut self, d: RawReg, s1: RawReg, s2: RawReg) -> Self::ReturnTy {
         let d = self.format_reg(d);
         let s1 = self.format_reg(s1);
         let s2 = self.format_reg(s2);
         write!(self, "i32 {d} = i32 {s1} /u i32 {s2}")
     }
 
-    fn div_signedw(&mut self, d: RawReg, s1: RawReg, s2: RawReg) -> Self::ReturnTy {
+    fn div_signed_w(&mut self, d: RawReg, s1: RawReg, s2: RawReg) -> Self::ReturnTy {
         let d = self.format_reg(d);
         let s1 = self.format_reg(s1);
         let s2 = self.format_reg(s2);
         write!(self, "i32 {d} = i32 {s1} /s i32 {s2}")
     }
 
-    fn rem_unsignedw(&mut self, d: RawReg, s1: RawReg, s2: RawReg) -> Self::ReturnTy {
+    fn rem_unsigned_w(&mut self, d: RawReg, s1: RawReg, s2: RawReg) -> Self::ReturnTy {
         let d = self.format_reg(d);
         let s1 = self.format_reg(s1);
         let s2 = self.format_reg(s2);
         write!(self, "i32 {d} = i32 {s1} %u i32 {s2}")
     }
 
-    fn rem_signedw(&mut self, d: RawReg, s1: RawReg, s2: RawReg) -> Self::ReturnTy {
+    fn rem_signed_w(&mut self, d: RawReg, s1: RawReg, s2: RawReg) -> Self::ReturnTy {
         let d = self.format_reg(d);
         let s1 = self.format_reg(s1);
         let s2 = self.format_reg(s2);

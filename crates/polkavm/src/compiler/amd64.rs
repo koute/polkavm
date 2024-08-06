@@ -764,6 +764,96 @@ where
     fn store_imm_u64(&mut self, _: u32, _: u32) -> Self::ReturnTy {
         todo!()
     }
+    fn addw_imm(&mut self, _: RawReg, _: RawReg, _: u32) -> <Self as InstructionVisitor>::ReturnTy {
+        todo!()
+    }
+    fn andw_imm(&mut self, _: RawReg, _: RawReg, _: u32) -> <Self as InstructionVisitor>::ReturnTy {
+        todo!()
+    }
+    fn xorw_imm(&mut self, _: RawReg, _: RawReg, _: u32) -> <Self as InstructionVisitor>::ReturnTy {
+        todo!()
+    }
+    fn orw_imm(&mut self, _: RawReg, _: RawReg, _: u32) -> <Self as InstructionVisitor>::ReturnTy {
+        todo!()
+    }
+    fn mulw_imm(&mut self, _: RawReg, _: RawReg, _: u32) -> <Self as InstructionVisitor>::ReturnTy {
+        todo!()
+    }
+    fn set_less_than_unsigned_w_imm(&mut self, _: RawReg, _: RawReg, _: u32) -> <Self as InstructionVisitor>::ReturnTy {
+        todo!()
+    }
+    fn set_less_than_signed_w_imm(&mut self, _: RawReg, _: RawReg, _: u32) -> <Self as InstructionVisitor>::ReturnTy {
+        todo!()
+    }
+    fn shift_logical_left_w_imm(&mut self, _: RawReg, _: RawReg, _: u32) -> <Self as InstructionVisitor>::ReturnTy {
+        todo!()
+    }
+    fn shift_logical_right_w_imm(&mut self, _: RawReg, _: RawReg, _: u32) -> <Self as InstructionVisitor>::ReturnTy {
+        todo!()
+    }
+    fn shift_arithmetic_right_w_imm(&mut self, _: RawReg, _: RawReg, _: u32) -> <Self as InstructionVisitor>::ReturnTy {
+        todo!()
+    }
+    fn set_greater_than_unsigned_w_imm(&mut self, _: RawReg, _: RawReg, _: u32) -> <Self as InstructionVisitor>::ReturnTy {
+        todo!()
+    }
+    fn set_greater_than_signed_w_imm(&mut self, _: RawReg, _: RawReg, _: u32) -> <Self as InstructionVisitor>::ReturnTy {
+        todo!()
+    }
+    fn shift_logical_right_w_imm_alt(&mut self, _: RawReg, _: RawReg, _: u32) -> <Self as InstructionVisitor>::ReturnTy {
+        todo!()
+    }
+    fn shift_arithmetic_right_w_imm_alt(&mut self, _: RawReg, _: RawReg, _: u32) -> <Self as InstructionVisitor>::ReturnTy {
+        todo!()
+    }
+    fn shift_logical_left_w_imm_alt(&mut self, _: RawReg, _: RawReg, _: u32) -> <Self as InstructionVisitor>::ReturnTy {
+        todo!()
+    }
+    fn addw(&mut self, _: RawReg, _: RawReg, _: RawReg) -> <Self as InstructionVisitor>::ReturnTy {
+        todo!()
+    }
+    fn subw(&mut self, _: RawReg, _: RawReg, _: RawReg) -> <Self as InstructionVisitor>::ReturnTy {
+        todo!()
+    }
+    fn andw(&mut self, _: RawReg, _: RawReg, _: RawReg) -> <Self as InstructionVisitor>::ReturnTy {
+        todo!()
+    }
+    fn xorw(&mut self, _: RawReg, _: RawReg, _: RawReg) -> <Self as InstructionVisitor>::ReturnTy {
+        todo!()
+    }
+    fn orw(&mut self, _: RawReg, _: RawReg, _: RawReg) -> <Self as InstructionVisitor>::ReturnTy {
+        todo!()
+    }
+    fn mulw(&mut self, _: RawReg, _: RawReg, _: RawReg) -> <Self as InstructionVisitor>::ReturnTy {
+        todo!()
+    }
+    fn set_less_than_unsigned_w(&mut self, _: RawReg, _: RawReg, _: RawReg) -> <Self as InstructionVisitor>::ReturnTy {
+        todo!()
+    }
+    fn set_less_than_signed_w(&mut self, _: RawReg, _: RawReg, _: RawReg) -> <Self as InstructionVisitor>::ReturnTy {
+        todo!()
+    }
+    fn shift_logical_left_w(&mut self, _: RawReg, _: RawReg, _: RawReg) -> <Self as InstructionVisitor>::ReturnTy {
+        todo!()
+    }
+    fn shift_logical_right_w(&mut self, _: RawReg, _: RawReg, _: RawReg) -> <Self as InstructionVisitor>::ReturnTy {
+        todo!()
+    }
+    fn shift_arithmetic_right_w(&mut self, _: RawReg, _: RawReg, _: RawReg) -> <Self as InstructionVisitor>::ReturnTy {
+        todo!()
+    }
+    fn div_unsigned_w(&mut self, _: RawReg, _: RawReg, _: RawReg) -> <Self as InstructionVisitor>::ReturnTy {
+        todo!()
+    }
+    fn div_signed_w(&mut self, _: RawReg, _: RawReg, _: RawReg) -> <Self as InstructionVisitor>::ReturnTy {
+        todo!()
+    }
+    fn rem_unsigned_w(&mut self, _: RawReg, _: RawReg, _: RawReg) -> <Self as InstructionVisitor>::ReturnTy {
+        todo!()
+    }
+    fn rem_signed_w(&mut self, _: RawReg, _: RawReg, _: RawReg) -> <Self as InstructionVisitor>::ReturnTy {
+        todo!()
+    }
 
     #[inline(always)]
     fn trap(&mut self) -> Self::ReturnTy {

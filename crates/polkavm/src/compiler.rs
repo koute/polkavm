@@ -483,6 +483,110 @@ where
     fn store_imm_u64(&mut self, _: u32, _: u32, _: u32, _: u32) -> Self::ReturnTy {
         todo!()
     }
+    fn addw(&mut self, _code_offset: u32, _args_length: u32, _d: RawReg, _s1: RawReg, _s2: RawReg) -> Self::ReturnTy {
+        todo!()
+    }
+    fn subw(&mut self, _code_offset: u32, _args_length: u32, _d: RawReg, _s1: RawReg, _s2: RawReg) -> Self::ReturnTy {
+        todo!()
+    }
+    fn andw(&mut self, _code_offset: u32, _args_length: u32, _d: RawReg, _s1: RawReg, _s2: RawReg) -> Self::ReturnTy {
+        todo!()
+    }
+    fn xorw(&mut self, _code_offset: u32, _args_length: u32, _d: RawReg, _s1: RawReg, _s2: RawReg) -> Self::ReturnTy {
+        todo!()
+    }
+    fn orw(&mut self, _code_offset: u32, _args_length: u32, _d: RawReg, _s1: RawReg, _s2: RawReg) -> Self::ReturnTy {
+        todo!()
+    }
+    fn mulw(&mut self, _code_offset: u32, _args_length: u32, _d: RawReg, _s1: RawReg, _s2: RawReg) -> Self::ReturnTy {
+        todo!()
+    }
+    fn addw_imm(&mut self, _code_offset: u32, _args_length: u32, _d: RawReg, _s: RawReg, _imm: u32) -> Self::ReturnTy {
+        todo!()
+    }
+    fn andw_imm(&mut self, _code_offset: u32, _args_length: u32, _d: RawReg, _s: RawReg, _imm: u32) -> Self::ReturnTy {
+        todo!()
+    }
+    fn xorw_imm(&mut self, _code_offset: u32, _args_length: u32, _d: RawReg, _s: RawReg, _imm: u32) -> Self::ReturnTy {
+        todo!()
+    }
+    fn orw_imm(&mut self, _code_offset: u32, _args_length: u32, _d: RawReg, _s: RawReg, _imm: u32) -> Self::ReturnTy {
+        todo!()
+    }
+    fn mulw_imm(&mut self, _code_offset: u32, _args_length: u32, _d: RawReg, _s1: RawReg, _s2: u32) -> Self::ReturnTy {
+        todo!()
+    }
+    fn set_less_than_signed_w_imm(&mut self, _code_offset: u32, _args_length: u32, _d: RawReg, _s1: RawReg, _s2: u32) -> Self::ReturnTy {
+        todo!()
+    }
+    fn set_less_than_unsigned_w_imm(&mut self, _code_offset: u32, _args_length: u32, _d: RawReg, _s1: RawReg, _s2: u32) -> Self::ReturnTy {
+        todo!()
+    }
+    fn shift_logical_left_w_imm(&mut self, _code_offset: u32, _args_length: u32, _d: RawReg, _s1: RawReg, _s2: u32) -> Self::ReturnTy {
+        todo!()
+    }
+    fn set_less_than_unsigned_w(&mut self, _code_offset: u32, _args_length: u32, _d: RawReg, _s1: RawReg, _s2: RawReg) -> Self::ReturnTy {
+        todo!()
+    }
+    fn set_less_than_signed_w(&mut self, _code_offset: u32, _args_length: u32, _d: RawReg, _s1: RawReg, _s2: RawReg) -> Self::ReturnTy {
+        todo!()
+    }
+    fn shift_logical_right_w_imm(&mut self, _code_offset: u32, _args_length: u32, _d: RawReg, _s1: RawReg, _s2: u32) -> Self::ReturnTy {
+        todo!()
+    }
+    fn shift_arithmetic_right_w_imm(&mut self, _code_offset: u32, _args_length: u32, _d: RawReg, _s1: RawReg, _s2: u32) -> Self::ReturnTy {
+        todo!()
+    }
+    fn set_greater_than_unsigned_w_imm(
+        &mut self,
+        _code_offset: u32,
+        _args_length: u32,
+        _d: RawReg,
+        _s1: RawReg,
+        _s2: u32,
+    ) -> Self::ReturnTy {
+        todo!()
+    }
+    fn set_greater_than_signed_w_imm(&mut self, _code_offset: u32, _args_length: u32, _d: RawReg, _s1: RawReg, _s2: u32) -> Self::ReturnTy {
+        todo!()
+    }
+    fn shift_logical_left_w(&mut self, _code_offset: u32, _args_length: u32, _d: RawReg, _s1: RawReg, _s2: RawReg) -> Self::ReturnTy {
+        todo!()
+    }
+    fn shift_logical_right_w(&mut self, _code_offset: u32, _args_length: u32, _d: RawReg, _s1: RawReg, _s2: RawReg) -> Self::ReturnTy {
+        todo!()
+    }
+    fn shift_arithmetic_right_w(&mut self, _code_offset: u32, _args_length: u32, _d: RawReg, _s1: RawReg, _s2: RawReg) -> Self::ReturnTy {
+        todo!()
+    }
+    fn shift_logical_right_w_imm_alt(&mut self, _code_offset: u32, _args_length: u32, _d: RawReg, _s2: RawReg, _s1: u32) -> Self::ReturnTy {
+        todo!()
+    }
+    fn shift_arithmetic_right_w_imm_alt(
+        &mut self,
+        _code_offset: u32,
+        _args_length: u32,
+        _d: RawReg,
+        _s2: RawReg,
+        _s1: u32,
+    ) -> Self::ReturnTy {
+        todo!()
+    }
+    fn shift_logical_left_w_imm_alt(&mut self, _code_offset: u32, _args_length: u32, _d: RawReg, _s2: RawReg, _s1: u32) -> Self::ReturnTy {
+        todo!()
+    }
+    fn div_unsigned_w(&mut self, _code_offset: u32, _args_length: u32, _d: RawReg, _s1: RawReg, _s2: RawReg) -> Self::ReturnTy {
+        todo!()
+    }
+    fn div_signed_w(&mut self, _code_offset: u32, _args_length: u32, _d: RawReg, _s1: RawReg, _s2: RawReg) -> Self::ReturnTy {
+        todo!()
+    }
+    fn rem_signed_w(&mut self, _code_offset: u32, _args_length: u32, _d: RawReg, _s1: RawReg, _s2: RawReg) -> Self::ReturnTy {
+        todo!()
+    }
+    fn rem_unsigned_w(&mut self, _code_offset: u32, _args_length: u32, _d: RawReg, _s1: RawReg, _s2: RawReg) -> Self::ReturnTy {
+        todo!()
+    }
 
     #[inline(always)]
     fn trap(&mut self, code_offset: u32, args_length: u32) -> Self::ReturnTy {

@@ -5559,13 +5559,13 @@ fn emit_code(
                         {
                             K::MulUpperSignedUnsigned => mul_upper_signed_unsigned,
                             K::Div => div_signed,
-                            K::DivW => div_signedw,
+                            K::DivW => div_signed_w,
                             K::DivUnsigned => div_unsigned,
-                            K::DivUnsignedW => div_unsignedw,
+                            K::DivUnsignedW => div_unsigned_w,
                             K::Rem => rem_signed,
-                            K::RemW => rem_signedw,
+                            K::RemW => rem_signed_w,
                             K::RemUnsigned => rem_unsigned,
-                            K::RemUnsignedW => rem_unsignedw,
+                            K::RemUnsignedW => rem_unsigned_w,
                         }
                     }
                 }

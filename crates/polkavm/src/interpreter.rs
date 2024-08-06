@@ -1034,19 +1034,19 @@ impl<'a, 'b, const DEBUG: bool> InstructionVisitor for Visitor<'a, 'b, DEBUG> {
         self.set3(d, s1, s2, |s1, s2| rem(s1 as i32, s2 as i32) as u32)
     }
 
-    fn div_unsignedw(&mut self, d: RawReg, s1: RawReg, s2: RawReg) -> Self::ReturnTy {
+    fn div_unsigned_w(&mut self, d: RawReg, s1: RawReg, s2: RawReg) -> Self::ReturnTy {
         todo!()
     }
 
-    fn div_signedw(&mut self, d: RawReg, s1: RawReg, s2: RawReg) -> Self::ReturnTy {
+    fn div_signed_w(&mut self, d: RawReg, s1: RawReg, s2: RawReg) -> Self::ReturnTy {
         todo!()
     }
 
-    fn rem_unsignedw(&mut self, d: RawReg, s1: RawReg, s2: RawReg) -> Self::ReturnTy {
+    fn rem_unsigned_w(&mut self, d: RawReg, s1: RawReg, s2: RawReg) -> Self::ReturnTy {
         todo!()
     }
 
-    fn rem_signedw(&mut self, d: RawReg, s1: RawReg, s2: RawReg) -> Self::ReturnTy {
+    fn rem_signed_w(&mut self, d: RawReg, s1: RawReg, s2: RawReg) -> Self::ReturnTy {
         todo!()
     }
 
