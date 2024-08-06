@@ -513,7 +513,7 @@ impl Inst {
         Self::decode_compressed_internal(op, true)
     }
 
-    fn decode_compressed_internal(op: u32, _rv64: bool) -> Option<Self> {
+    fn decode_compressed_internal(op: u32, rv64: bool) -> Option<Self> {
         let quadrant = op & 0b11;
         let funct3 = (op >> 13) & 0b111;
 
@@ -537,12 +537,26 @@ impl Inst {
                 base: Reg::decode_compressed(op >> 7),
                 offset: (bits(3, 5, op, 10) | bits(2, 2, op, 6) | bits(6, 6, op, 5)) as i32,
             }),
+            // C.LD expands ld rd′, offset[7:3](rs1′)
+            (0b00, 0b011) if rv64 => Some(Inst::Load {
+                kind: LoadKind::U64,
+                dst: Reg::decode_compressed(op >> 2),
+                base: Reg::decode_compressed(op >> 7),
+                offset: (bits(3, 5, op, 10) | bits(6, 7, op, 5)) as i32,
+            }),
             // C.SW expands to sw rs2′, offset[6:2](rs1′)
             (0b00, 0b110) => Some(Inst::Store {
                 kind: StoreKind::U32,
                 src: Reg::decode_compressed(op >> 2),
                 base: Reg::decode_compressed(op >> 7),
                 offset: (bits(3, 5, op, 10) | bits(2, 2, op, 6) | bits(6, 6, op, 5)) as i32,
+            }),
+            // C.SD expands to sd rs2′, offset[7:3](rs1′)
+            (0b00, 0b111) if rv64 => Some(Inst::Store {
+                kind: StoreKind::U64,
+                src: Reg::decode_compressed(op >> 2),
+                base: Reg::decode_compressed(op >> 7),
+                offset: (bits(3, 5, op, 10) | bits(6, 7, op, 5)) as i32,
             }),
 
             // RVC, Quadrant 1
@@ -568,10 +582,21 @@ impl Inst {
                 })
             }
             // C.JAL expands to jal x1, offset[11:1]
-            (0b01, 0b001) => Some(Inst::JumpAndLink {
+            (0b01, 0b001) if !rv64 => Some(Inst::JumpAndLink {
                 dst: Reg::RA,
                 target: bits_imm_c_jump(op),
             }),
+            // C.ADDIW extends to addiw rd, rd, imm[5:0]
+            (0b01, 0b001) => {
+                let imm = bits(5, 5, op, 12) | bits(0, 4, op, 2);
+                let rd = Reg::decode(op >> 7);
+                Some(Inst::RegImm {
+                    kind: RegImmKind::Addw,
+                    dst: rd,
+                    src: rd,
+                    imm: sign_ext(imm, 6),
+                })
+            }
             // C.LI expands into addi rd, x0, imm[5:0]
             (0b01, 0b010) if op & 0b00001111_10000000 != 0 => Some(Inst::RegImm {
                 kind: RegImmKind::Add,
@@ -624,13 +649,17 @@ impl Inst {
                     // C.XOR expands into xor rd′, rd′, rs2′
                     // C.OR expands into or rd′, rd′, rs2′
                     // C.AND expands into and rd′, rd′, rs2′
+                    // C.ADDW expands into addw rd′, rd′, rs2′
+                    // C.SUBW expands into subw rd′, rd′, rs2′
                     (0b011, _) => Some(Inst::RegReg {
-                        kind: match (op >> 5) & 0b11 {
-                            0b00 => RegRegKind::Sub,
-                            0b01 => RegRegKind::Xor,
-                            0b10 => RegRegKind::Or,
-                            0b11 => RegRegKind::And,
-                            _ => unreachable!(),
+                        kind: match ((op >> 12) & 0b1, (op >> 5) & 0b11) {
+                            (0b0, 0b00) => RegRegKind::Sub,
+                            (0b0, 0b01) => RegRegKind::Xor,
+                            (0b0, 0b10) => RegRegKind::Or,
+                            (0b0, 0b11) => RegRegKind::And,
+                            (0b1, 0b00) => RegRegKind::AddW,
+                            (0b1, 0b01) => RegRegKind::SubW,
+                            _ => return None,
                         },
                         dst: rd,
                         src1: rd,
@@ -677,6 +706,16 @@ impl Inst {
                     offset: (bits(5, 5, op, 12) | bits(2, 4, op, 4) | bits(6, 7, op, 2)) as i32,
                 }),
             },
+            // C.LDSP expands to ld rd, offset[8:3](x2)
+            (0b10, 0b011) if rv64 => match Reg::decode(op >> 7) {
+                Reg::Zero => None,
+                rd => Some(Inst::Load {
+                    kind: LoadKind::U64,
+                    dst: rd,
+                    base: Reg::SP,
+                    offset: (bits(5, 5, op, 12) | bits(3, 4, op, 5) | bits(6, 8, op, 2)) as i32,
+                }),
+            },
             (0b10, 0b100) => match ((op >> 12) & 0b1, Reg::decode(op >> 7), Reg::decode(op >> 2)) {
                 (0b0, Reg::Zero, _) | (0b1, Reg::Zero, _) => None,
                 // C.JR expands to jalr x0, rs1, 0
@@ -713,6 +752,13 @@ impl Inst {
                 src: Reg::decode(op >> 2),
                 base: Reg::SP,
                 offset: (bits(2, 5, op, 9) | bits(6, 7, op, 7)) as i32,
+            }),
+            // C.SDSP expands to sd rs2, offset[8:3](x2)
+            (0b10, 0b111) => Some(Inst::Store {
+                kind: StoreKind::U64,
+                src: Reg::decode(op >> 2),
+                base: Reg::SP,
+                offset: (bits(3, 5, op, 10) | bits(6, 8, op, 7)) as i32,
             }),
 
             // F, D, ebreak, reserved, hint, NSE and illegal instructions
