@@ -2107,7 +2107,7 @@ where
 
             let (next_inst_size, next_raw_inst) = read_instruction_bytes(text, relative_offset);
 
-            if Inst::decode(next_raw_inst) != Some(INST_RET) {
+            if Inst::decode(next_raw_inst, elf.is_64()) != Some(INST_RET) {
                 return Err(ProgramFromElfError::other("external call shim doesn't end with a 'ret'"));
             }
 
@@ -2155,7 +2155,7 @@ where
 
         relative_offset += inst_size as usize;
 
-        let Some(original_inst) = Inst::decode(raw_inst) else {
+        let Some(original_inst) = Inst::decode(raw_inst, elf.is_64()) else {
             return Err(ProgramFromElfErrorKind::UnsupportedInstruction {
                 section: section.name().into(),
                 offset: current_location.offset,
@@ -2176,7 +2176,7 @@ where
             {
                 if relative_offset < text.len() {
                     let (next_inst_size, next_inst) = read_instruction_bytes(text, relative_offset);
-                    let next_inst = Inst::decode(next_inst);
+                    let next_inst = Inst::decode(next_inst, elf.is_64());
 
                     if let Some(Inst::JumpAndLinkRegister { dst: ra_dst, base, value }) = next_inst {
                         if base == ra_dst && base == base_upper {
@@ -6323,14 +6323,14 @@ where
                         };
 
                         let hi_inst_raw = u32::from_le_bytes([xs[0], xs[1], xs[2], xs[3]]);
-                        let Some(hi_inst) = Inst::decode(hi_inst_raw) else {
+                        let Some(hi_inst) = Inst::decode(hi_inst_raw, elf.is_64()) else {
                             return Err(ProgramFromElfError::other(format!(
                                 "R_RISCV_CALL_PLT for an unsupported instruction (1st): 0x{hi_inst_raw:08}"
                             )));
                         };
 
                         let lo_inst_raw = u32::from_le_bytes([xs[4], xs[5], xs[6], xs[7]]);
-                        let Some(lo_inst) = Inst::decode(lo_inst_raw) else {
+                        let Some(lo_inst) = Inst::decode(lo_inst_raw, elf.is_64()) else {
                             return Err(ProgramFromElfError::other(format!(
                                 "R_RISCV_CALL_PLT for an unsupported instruction (2nd): 0x{lo_inst_raw:08}"
                             )));
@@ -6427,7 +6427,7 @@ where
                     }
                     object::elf::R_RISCV_JAL => {
                         let inst_raw = read_u32(section_data, relative_address)?;
-                        let Some(inst) = Inst::decode(inst_raw) else {
+                        let Some(inst) = Inst::decode(inst_raw, elf.is_64()) else {
                             return Err(ProgramFromElfError::other(format!(
                                 "R_RISCV_JAL for an unsupported instruction: 0x{inst_raw:08}"
                             )));
@@ -6450,7 +6450,7 @@ where
                     }
                     object::elf::R_RISCV_BRANCH => {
                         let inst_raw = read_u32(section_data, relative_address)?;
-                        let Some(inst) = Inst::decode(inst_raw) else {
+                        let Some(inst) = Inst::decode(inst_raw, elf.is_64()) else {
                             return Err(ProgramFromElfError::other(format!(
                                 "R_RISCV_BRANCH for an unsupported instruction: 0x{inst_raw:08}"
                             )));
@@ -6483,7 +6483,7 @@ where
                     object::elf::R_RISCV_HI20 => {
                         // This relocation is for a LUI.
                         let inst_raw = read_u32(section_data, relative_address)?;
-                        let Some(inst) = Inst::decode(inst_raw) else {
+                        let Some(inst) = Inst::decode(inst_raw, elf.is_64()) else {
                             return Err(ProgramFromElfError::other(format!(
                                 "R_RISCV_HI20 for an unsupported instruction: 0x{inst_raw:08}"
                             )));
@@ -6511,7 +6511,7 @@ where
                     }
                     object::elf::R_RISCV_LO12_I => {
                         let inst_raw = read_u32(section_data, relative_address)?;
-                        let Some(inst) = Inst::decode(inst_raw) else {
+                        let Some(inst) = Inst::decode(inst_raw, elf.is_64()) else {
                             return Err(ProgramFromElfError::other(format!(
                                 "R_RISCV_LO12_I for an unsupported instruction: 0x{inst_raw:08}"
                             )));
@@ -6560,7 +6560,7 @@ where
                     }
                     object::elf::R_RISCV_LO12_S => {
                         let inst_raw = read_u32(section_data, relative_address)?;
-                        let Some(inst) = Inst::decode(inst_raw) else {
+                        let Some(inst) = Inst::decode(inst_raw, elf.is_64()) else {
                             return Err(ProgramFromElfError::other(format!(
                                 "R_RISCV_LO12_S for an unsupported instruction: 0x{inst_raw:08}"
                             )));
@@ -6595,7 +6595,7 @@ where
                     }
                     object::elf::R_RISCV_RVC_JUMP => {
                         let inst_raw = read_u16(section_data, relative_address)?;
-                        let Some(inst) = Inst::decode(inst_raw.into()) else {
+                        let Some(inst) = Inst::decode(inst_raw.into(), elf.is_64()) else {
                             return Err(ProgramFromElfError::other(format!(
                                 "R_RISCV_RVC_JUMP for an unsupported instruction: 0x{inst_raw:04}"
                             )));
@@ -6618,7 +6618,7 @@ where
                     }
                     object::elf::R_RISCV_RVC_BRANCH => {
                         let inst_raw = read_u16(section_data, relative_address)?;
-                        let Some(inst) = Inst::decode_compressed(inst_raw.into()) else {
+                        let Some(inst) = Inst::decode_compressed(inst_raw.into(), elf.is_64()) else {
                             return Err(ProgramFromElfError::other(format!(
                                 "R_RISCV_RVC_BRANCH for an unsupported instruction: 0x{inst_raw:04}"
                             )));
@@ -6671,10 +6671,10 @@ where
     for (relative_lo, (lo_rel_name, relative_hi)) in pcrel_relocations.reloc_pcrel_lo12 {
         let lo_inst_raw = &section_data[relative_lo as usize..][..4];
         let lo_inst_raw = u32::from_le_bytes([lo_inst_raw[0], lo_inst_raw[1], lo_inst_raw[2], lo_inst_raw[3]]);
-        let lo_inst = Inst::decode(lo_inst_raw);
+        let lo_inst = Inst::decode(lo_inst_raw, elf.is_64());
         let hi_inst_raw = &section_data[relative_hi as usize..][..4];
         let hi_inst_raw = u32::from_le_bytes([hi_inst_raw[0], hi_inst_raw[1], hi_inst_raw[2], hi_inst_raw[3]]);
-        let hi_inst = Inst::decode(hi_inst_raw);
+        let hi_inst = Inst::decode(hi_inst_raw, elf.is_64());
 
         let Some((hi_kind, target)) = pcrel_relocations.reloc_pcrel_hi20.get(&relative_hi).copied() else {
             return Err(ProgramFromElfError::other(format!("{lo_rel_name} relocation at '{section_name}'0x{relative_lo:x} targets '{section_name}'0x{relative_hi:x} which doesn't have a R_RISCV_PCREL_HI20 or R_RISCV_GOT_HI20 relocation")));
