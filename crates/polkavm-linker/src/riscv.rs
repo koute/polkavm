@@ -762,7 +762,7 @@ impl Inst {
                 offset: (bits(2, 5, op, 9) | bits(6, 7, op, 7)) as i32,
             }),
             // C.SDSP expands to sd rs2, offset[8:3](x2)
-            (0b10, 0b111) => Some(Inst::Store {
+            (0b10, 0b111) if rv64 => Some(Inst::Store {
                 kind: StoreKind::U64,
                 src: Reg::decode(op >> 2),
                 base: Reg::SP,
@@ -1519,6 +1519,33 @@ mod test_decode_compressed {
                 offset: 0b1101000
             })
         );
+
+        assert_eq!(
+            Inst::decode_compressed(op, true),
+            Some(Inst::Load {
+                kind: LoadKind::I32,
+                dst: Reg::decode_compressed(0b111),
+                base: Reg::decode_compressed(0b010),
+                offset: 0b1101000
+            })
+        );
+    }
+
+    #[test]
+    fn c_ld() {
+        let op = 0b011_110_110_10_101_00;
+
+        assert_eq!(
+            Inst::decode_compressed(op, true),
+            Some(Inst::Load {
+                kind: LoadKind::U64,
+                dst: Reg::A3,
+                base: Reg::A4,
+                offset: 0b10110000
+            })
+        );
+
+        assert_eq!(Inst::decode_compressed(op, false), None);
     }
 
     #[test]
@@ -1534,6 +1561,33 @@ mod test_decode_compressed {
                 offset: 0b1101000
             })
         );
+
+        assert_eq!(
+            Inst::decode_compressed(op, true),
+            Some(Inst::Store {
+                kind: StoreKind::U32,
+                src: Reg::decode_compressed(0b111),
+                base: Reg::decode_compressed(0b010),
+                offset: 0b1101000
+            })
+        );
+    }
+
+    #[test]
+    fn c_sd() {
+        let op = 0b111_101_010_01_111_00;
+
+        assert_eq!(
+            Inst::decode_compressed(op, true),
+            Some(Inst::Store {
+                kind: StoreKind::U64,
+                src: Reg::decode_compressed(0b111),
+                base: Reg::decode_compressed(0b010),
+                offset: 0b01101000
+            })
+        );
+
+        assert_eq!(Inst::decode_compressed(op, false), None);
     }
 
     #[test]
@@ -1579,6 +1633,21 @@ mod test_decode_compressed {
             Some(Inst::JumpAndLink {
                 dst: Reg::RA,
                 target: bits_imm_c_jump(op)
+            })
+        );
+    }
+
+    #[test]
+    fn c_addiw() {
+        let op = 0b001_10101010101_01;
+
+        assert_eq!(
+            Inst::decode_compressed(op, true),
+            Some(Inst::RegImm {
+                kind: RegImmKind::AddW,
+                dst: Reg::A0,
+                src: Reg::A0,
+                imm: 0b11111111_11111111_11111111_11110101u32 as i32
             })
         );
     }
@@ -1853,6 +1922,27 @@ mod test_decode_compressed {
     }
 
     #[test]
+    fn c_ldsp() {
+        let op = 0b011_1_01100_01010_10;
+
+        assert_eq!(
+            Inst::decode_compressed(op, true),
+            Some(Inst::Load {
+                kind: LoadKind::U64,
+                dst: Reg::A2,
+                base: Reg::SP,
+                offset: 0b010101000
+            })
+        );
+
+        assert_eq!(Inst::decode_compressed(op, false), None);
+
+        let op = 0b011_1_00000_01010_10;
+        // RES, rd=0
+        assert_eq!(Inst::decode_compressed(op, true), None);
+    }
+
+    #[test]
     fn c_jr() {
         let op = 0b100_0_01100_00000_10;
 
@@ -1942,6 +2032,23 @@ mod test_decode_compressed {
                 offset: 0b10101000
             })
         )
+    }
+
+    #[test]
+    fn c_sdsp() {
+        let op = 0b111_101010_01100_10;
+
+        assert_eq!(
+            Inst::decode_compressed(op, true),
+            Some(Inst::Store {
+                kind: StoreKind::U64,
+                src: Reg::A2,
+                base: Reg::SP,
+                offset: 0b010101000
+            })
+        );
+
+        assert_eq!(Inst::decode_compressed(op, false), None);
     }
 
     proptest::proptest! {
