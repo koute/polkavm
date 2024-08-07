@@ -1630,7 +1630,7 @@ fn convert_instruction(
             let src = cast_reg_any(src)?;
             let kind = match kind {
                 RegImmKind::Add => AnyAnyKind::Add,
-                RegImmKind::Addw => AnyAnyKind::AddW,
+                RegImmKind::AddW => AnyAnyKind::AddW,
                 RegImmKind::And => AnyAnyKind::And,
                 RegImmKind::Or => AnyAnyKind::Or,
                 RegImmKind::Xor => AnyAnyKind::Xor,
@@ -1763,7 +1763,7 @@ fn convert_instruction(
             };
 
             emit(InstExt::Basic(BasicInst::LoadIndirect {
-                kind: LoadKind::U64,
+                kind: LoadKind::U32,
                 dst,
                 base: src,
                 offset: 0,
@@ -1802,7 +1802,7 @@ fn convert_instruction(
 
             let src = cast_reg_any(src)?;
             emit(InstExt::Basic(BasicInst::StoreIndirect {
-                kind: StoreKind::U64,
+                kind: StoreKind::U32,
                 src,
                 base: addr,
                 offset: 0,
@@ -1859,7 +1859,7 @@ fn convert_instruction(
             };
 
             emit(InstExt::Basic(BasicInst::LoadIndirect {
-                kind: LoadKind::I32,
+                kind: LoadKind::U32,
                 dst: old_value,
                 base: addr,
                 offset: 0,
@@ -4578,7 +4578,7 @@ fn spill_fake_registers(
                         let offset = src_slot.index() * 4;
                         *regspill_size = core::cmp::max(*regspill_size, offset + 4);
                         BasicInst::LoadAbsolute {
-                            kind: LoadKind::I32,
+                            kind: LoadKind::U32,
                             dst: dst_reg,
                             target: SectionTarget {
                                 section_index: section_regspill,
@@ -5615,7 +5615,7 @@ fn emit_code(
                                 K::Add => I::add_imm(dst, src1, src2),
                                 K::AddW => I::addw_imm(dst, src1, src2),
                                 K::Sub => I::add_imm(dst, src1, (-(src2 as i32)) as u32),
-                                K::SubW => I::add_imm(dst, src1, (-(src2 as i32)) as u32),
+                                K::SubW => I::addw_imm(dst, src1, (-(src2 as i32)) as u32),
                                 K::ShiftLogicalLeft => I::shift_logical_left_imm(dst, src1, src2),
                                 K::ShiftLogicalLeftW => I::shift_logical_left_w_imm(dst, src1, src2),
                                 K::SetLessThanSigned => I::set_less_than_signed_imm(dst, src1, src2),
@@ -5630,7 +5630,7 @@ fn emit_code(
                                 K::ShiftArithmeticRightW => I::shift_arithmetic_right_w_imm(dst, src1, src2),
                                 K::Or => I::or_imm(dst, src1, src2),
                                 K::OrW => I::orw_imm(dst, src1, src2),
-                                K::And => I::andw_imm(dst, src1, src2),
+                                K::And => I::and_imm(dst, src1, src2),
                                 K::AndW => I::andw_imm(dst, src1, src2),
                                 K::Mul => I::mul_imm(dst, src1, src2),
                                 K::MulW => I::mul_imm(dst, src1, src2),
@@ -5664,7 +5664,7 @@ fn emit_code(
                                 K::SetLessThanUnsignedW => I::set_greater_than_unsigned_w_imm(dst, src2, src1),
                                 K::ShiftLogicalRight => I::shift_logical_right_imm_alt(dst, src2, src1),
                                 K::ShiftLogicalRightW => I::shift_logical_right_imm_alt(dst, src2, src1),
-                                K::ShiftArithmeticRight => I::shift_arithmetic_right_w_imm_alt(dst, src2, src1),
+                                K::ShiftArithmeticRight => I::shift_arithmetic_right_imm_alt(dst, src2, src1),
                                 K::ShiftArithmeticRightW => I::shift_arithmetic_right_w_imm_alt(dst, src2, src1),
                             }
                         }
@@ -6704,7 +6704,7 @@ where
 
             match lo_inst {
                 Inst::Load {
-                    kind: LoadKind::I32,
+                    kind: LoadKind::U32,
                     base,
                     dst,
                     ..
@@ -6873,10 +6873,8 @@ pub fn program_from_elf(config: Config, data: &[u8]) -> Result<Vec<u8>, ProgramF
     match Elf::<object::elf::FileHeader32<object::endian::LittleEndian>>::parse(data) {
         Ok(elf) => program_from_elf_internal(config, elf, Bitness::B32),
         Err(ProgramFromElfError(ProgramFromElfErrorKind::FailedToParseElf(e))) if e.to_string() == "Unsupported ELF header" => {
-            match Elf::<object::elf::FileHeader64<object::endian::LittleEndian>>::parse(data) {
-                Ok(elf) => program_from_elf_internal(config, elf, Bitness::B64),
-                Err(e) => Err(e),
-            }
+            let elf = Elf::<object::elf::FileHeader64<object::endian::LittleEndian>>::parse(data)?;
+            program_from_elf_internal(config, elf, Bitness::B64)
         }
         Err(e) => Err(e),
     }
