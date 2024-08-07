@@ -56,6 +56,16 @@ impl InstructionVisitor for GasVisitor {
     }
 
     #[inline(always)]
+    fn set_less_than_unsigned_w(&mut self, _d: RawReg, _s1: RawReg, _s2: RawReg) -> Self::ReturnTy {
+        self.cost += 1;
+    }
+
+    #[inline(always)]
+    fn set_less_than_signed_w(&mut self, _d: RawReg, _s1: RawReg, _s2: RawReg) -> Self::ReturnTy {
+        self.cost += 1;
+    }
+
+    #[inline(always)]
     fn shift_logical_right(&mut self, _d: RawReg, _s1: RawReg, _s2: RawReg) -> Self::ReturnTy {
         self.cost += 1;
     }
@@ -67,6 +77,21 @@ impl InstructionVisitor for GasVisitor {
 
     #[inline(always)]
     fn shift_logical_left(&mut self, _d: RawReg, _s1: RawReg, _s2: RawReg) -> Self::ReturnTy {
+        self.cost += 1;
+    }
+
+    #[inline(always)]
+    fn shift_logical_right_w(&mut self, _d: RawReg, _s1: RawReg, _s2: RawReg) -> Self::ReturnTy {
+        self.cost += 1;
+    }
+
+    #[inline(always)]
+    fn shift_arithmetic_right_w(&mut self, _d: RawReg, _s1: RawReg, _s2: RawReg) -> Self::ReturnTy {
+        self.cost += 1;
+    }
+
+    #[inline(always)]
+    fn shift_logical_left_w(&mut self, _d: RawReg, _s1: RawReg, _s2: RawReg) -> Self::ReturnTy {
         self.cost += 1;
     }
 
@@ -84,9 +109,28 @@ impl InstructionVisitor for GasVisitor {
     fn or(&mut self, _d: RawReg, _s1: RawReg, _s2: RawReg) -> Self::ReturnTy {
         self.cost += 1;
     }
-
     #[inline(always)]
     fn add(&mut self, _d: RawReg, _s1: RawReg, _s2: RawReg) -> Self::ReturnTy {
+        self.cost += 1;
+    }
+
+    #[inline(always)]
+    fn xorw(&mut self, _d: RawReg, _s1: RawReg, _s2: RawReg) -> Self::ReturnTy {
+        self.cost += 1;
+    }
+
+    #[inline(always)]
+    fn andw(&mut self, _d: RawReg, _s1: RawReg, _s2: RawReg) -> Self::ReturnTy {
+        self.cost += 1;
+    }
+
+    #[inline(always)]
+    fn orw(&mut self, _d: RawReg, _s1: RawReg, _s2: RawReg) -> Self::ReturnTy {
+        self.cost += 1;
+    }
+
+    #[inline(always)]
+    fn addw(&mut self, _d: RawReg, _s1: RawReg, _s2: RawReg) -> Self::ReturnTy {
         self.cost += 1;
     }
 
@@ -96,7 +140,17 @@ impl InstructionVisitor for GasVisitor {
     }
 
     #[inline(always)]
+    fn subw(&mut self, _d: RawReg, _s1: RawReg, _s2: RawReg) -> Self::ReturnTy {
+        self.cost += 1;
+    }
+
+    #[inline(always)]
     fn mul(&mut self, _d: RawReg, _s1: RawReg, _s2: RawReg) -> Self::ReturnTy {
+        self.cost += 1;
+    }
+
+    #[inline(always)]
+    fn mulw(&mut self, _d: RawReg, _s1: RawReg, _s2: RawReg) -> Self::ReturnTy {
         self.cost += 1;
     }
 
@@ -136,7 +190,32 @@ impl InstructionVisitor for GasVisitor {
     }
 
     #[inline(always)]
+    fn div_unsigned_w(&mut self, _d: RawReg, _s1: RawReg, _s2: RawReg) -> Self::ReturnTy {
+        self.cost += 1;
+    }
+
+    #[inline(always)]
+    fn div_signed_w(&mut self, _d: RawReg, _s1: RawReg, _s2: RawReg) -> Self::ReturnTy {
+        self.cost += 1;
+    }
+
+    #[inline(always)]
+    fn rem_unsigned_w(&mut self, _d: RawReg, _s1: RawReg, _s2: RawReg) -> Self::ReturnTy {
+        self.cost += 1;
+    }
+
+    #[inline(always)]
+    fn rem_signed_w(&mut self, _d: RawReg, _s1: RawReg, _s2: RawReg) -> Self::ReturnTy {
+        self.cost += 1;
+    }
+
+    #[inline(always)]
     fn mul_imm(&mut self, _d: RawReg, _s1: RawReg, _s2: u32) -> Self::ReturnTy {
+        self.cost += 1;
+    }
+
+    #[inline(always)]
+    fn mulw_imm(&mut self, _d: RawReg, _s1: RawReg, _s2: u32) -> Self::ReturnTy {
         self.cost += 1;
     }
 
@@ -156,7 +235,17 @@ impl InstructionVisitor for GasVisitor {
     }
 
     #[inline(always)]
+    fn set_less_than_unsigned_w_imm(&mut self, _d: RawReg, _s1: RawReg, _s2: u32) -> Self::ReturnTy {
+        self.cost += 1;
+    }
+
+    #[inline(always)]
     fn set_less_than_signed_imm(&mut self, _d: RawReg, _s1: RawReg, _s2: u32) -> Self::ReturnTy {
+        self.cost += 1;
+    }
+
+    #[inline(always)]
+    fn set_less_than_signed_w_imm(&mut self, _d: RawReg, _s1: RawReg, _s2: u32) -> Self::ReturnTy {
         self.cost += 1;
     }
 
@@ -166,7 +255,17 @@ impl InstructionVisitor for GasVisitor {
     }
 
     #[inline(always)]
+    fn set_greater_than_unsigned_w_imm(&mut self, _d: RawReg, _s1: RawReg, _s2: u32) -> Self::ReturnTy {
+        self.cost += 1;
+    }
+
+    #[inline(always)]
     fn set_greater_than_signed_imm(&mut self, _d: RawReg, _s1: RawReg, _s2: u32) -> Self::ReturnTy {
+        self.cost += 1;
+    }
+
+    #[inline(always)]
+    fn set_greater_than_signed_w_imm(&mut self, _d: RawReg, _s1: RawReg, _s2: u32) -> Self::ReturnTy {
         self.cost += 1;
     }
 
@@ -201,6 +300,36 @@ impl InstructionVisitor for GasVisitor {
     }
 
     #[inline(always)]
+    fn shift_logical_right_w_imm(&mut self, _d: RawReg, _s1: RawReg, _s2: u32) -> Self::ReturnTy {
+        self.cost += 1;
+    }
+
+    #[inline(always)]
+    fn shift_arithmetic_right_w_imm(&mut self, _d: RawReg, _s1: RawReg, _s2: u32) -> Self::ReturnTy {
+        self.cost += 1;
+    }
+
+    #[inline(always)]
+    fn shift_logical_left_w_imm(&mut self, _d: RawReg, _s1: RawReg, _s2: u32) -> Self::ReturnTy {
+        self.cost += 1;
+    }
+
+    #[inline(always)]
+    fn shift_logical_right_w_imm_alt(&mut self, _d: RawReg, _s2: RawReg, _s1: u32) -> Self::ReturnTy {
+        self.cost += 1;
+    }
+
+    #[inline(always)]
+    fn shift_arithmetic_right_w_imm_alt(&mut self, _d: RawReg, _s2: RawReg, _s1: u32) -> Self::ReturnTy {
+        self.cost += 1;
+    }
+
+    #[inline(always)]
+    fn shift_logical_left_w_imm_alt(&mut self, _d: RawReg, _s2: RawReg, _s1: u32) -> Self::ReturnTy {
+        self.cost += 1;
+    }
+
+    #[inline(always)]
     fn or_imm(&mut self, _d: RawReg, _s: RawReg, _imm: u32) -> Self::ReturnTy {
         self.cost += 1;
     }
@@ -212,6 +341,21 @@ impl InstructionVisitor for GasVisitor {
 
     #[inline(always)]
     fn xor_imm(&mut self, _d: RawReg, _s: RawReg, _imm: u32) -> Self::ReturnTy {
+        self.cost += 1;
+    }
+
+    #[inline(always)]
+    fn orw_imm(&mut self, _d: RawReg, _s: RawReg, _imm: u32) -> Self::ReturnTy {
+        self.cost += 1;
+    }
+
+    #[inline(always)]
+    fn andw_imm(&mut self, _d: RawReg, _s: RawReg, _imm: u32) -> Self::ReturnTy {
+        self.cost += 1;
+    }
+
+    #[inline(always)]
+    fn xorw_imm(&mut self, _d: RawReg, _s: RawReg, _imm: u32) -> Self::ReturnTy {
         self.cost += 1;
     }
 
@@ -246,6 +390,11 @@ impl InstructionVisitor for GasVisitor {
     }
 
     #[inline(always)]
+    fn addw_imm(&mut self, _d: RawReg, _s: RawReg, _imm: u32) -> Self::ReturnTy {
+        self.cost += 1;
+    }
+
+    #[inline(always)]
     fn negate_and_add_imm(&mut self, _d: RawReg, _s1: RawReg, _s2: u32) -> Self::ReturnTy {
         self.cost += 1;
     }
@@ -266,6 +415,11 @@ impl InstructionVisitor for GasVisitor {
     }
 
     #[inline(always)]
+    fn store_imm_indirect_u64(&mut self, _base: RawReg, _offset: u32, _value: u32) -> Self::ReturnTy {
+        self.cost += 1;
+    }
+
+    #[inline(always)]
     fn store_indirect_u8(&mut self, _src: RawReg, _base: RawReg, _offset: u32) -> Self::ReturnTy {
         self.cost += 1;
     }
@@ -277,6 +431,11 @@ impl InstructionVisitor for GasVisitor {
 
     #[inline(always)]
     fn store_indirect_u32(&mut self, _src: RawReg, _base: RawReg, _offset: u32) -> Self::ReturnTy {
+        self.cost += 1;
+    }
+
+    #[inline(always)]
+    fn store_indirect_u64(&mut self, _src: RawReg, _base: RawReg, _offset: u32) -> Self::ReturnTy {
         self.cost += 1;
     }
 
@@ -296,6 +455,11 @@ impl InstructionVisitor for GasVisitor {
     }
 
     #[inline(always)]
+    fn store_imm_u64(&mut self, _offset: u32, _value: u32) -> Self::ReturnTy {
+        self.cost += 1;
+    }
+
+    #[inline(always)]
     fn store_u8(&mut self, _src: RawReg, _offset: u32) -> Self::ReturnTy {
         self.cost += 1;
     }
@@ -307,6 +471,11 @@ impl InstructionVisitor for GasVisitor {
 
     #[inline(always)]
     fn store_u32(&mut self, _src: RawReg, _offset: u32) -> Self::ReturnTy {
+        self.cost += 1;
+    }
+
+    #[inline(always)]
+    fn store_u64(&mut self, _src: RawReg, _offset: u32) -> Self::ReturnTy {
         self.cost += 1;
     }
 
@@ -336,6 +505,16 @@ impl InstructionVisitor for GasVisitor {
     }
 
     #[inline(always)]
+    fn load_indirect_i32(&mut self, _dst: RawReg, _base: RawReg, _offset: u32) -> Self::ReturnTy {
+        self.cost += 1;
+    }
+
+    #[inline(always)]
+    fn load_indirect_u64(&mut self, _dst: RawReg, _base: RawReg, _offset: u32) -> Self::ReturnTy {
+        self.cost += 1;
+    }
+
+    #[inline(always)]
     fn load_u8(&mut self, _dst: RawReg, _offset: u32) -> Self::ReturnTy {
         self.cost += 1;
     }
@@ -357,6 +536,16 @@ impl InstructionVisitor for GasVisitor {
 
     #[inline(always)]
     fn load_u32(&mut self, _dst: RawReg, _offset: u32) -> Self::ReturnTy {
+        self.cost += 1;
+    }
+
+    #[inline(always)]
+    fn load_i32(&mut self, _dst: RawReg, _offset: u32) -> Self::ReturnTy {
+        self.cost += 1;
+    }
+
+    #[inline(always)]
+    fn load_u64(&mut self, _dst: RawReg, _offset: u32) -> Self::ReturnTy {
         self.cost += 1;
     }
 

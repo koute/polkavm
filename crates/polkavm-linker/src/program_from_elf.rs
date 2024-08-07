@@ -368,11 +368,17 @@ fn test_extract_delimited() {
 }
 
 impl SectionTarget {
-    fn fmt_human_readable(&self, elf: &Elf) -> String {
+    fn fmt_human_readable<H>(&self, elf: &Elf<H>) -> String
+    where
+        H: object::read::elf::FileHeader<Endian = object::LittleEndian>,
+    {
         Self::make_human_readable_in_debug_string(elf, &self.to_string())
     }
 
-    fn make_human_readable_in_debug_string(elf: &Elf, mut str: &str) -> String {
+    fn make_human_readable_in_debug_string<H>(elf: &Elf<H>, mut str: &str) -> String
+    where
+        H: object::read::elf::FileHeader<Endian = object::LittleEndian>,
+    {
         // A hack-ish way to make nested `Debug` error messages more readable by replacing
         // raw section indexes and offsets with a more human readable string.
 
@@ -988,13 +994,16 @@ fn get_padding(memory_end: u64, align: u64) -> Option<u64> {
     }
 }
 
-fn process_sections(
-    elf: &Elf,
+fn process_sections<H>(
+    elf: &Elf<H>,
     current_address: &mut u64,
     chunks: &mut Vec<DataRef>,
     base_address_for_section: &mut HashMap<SectionIndex, u64>,
     sections: impl IntoIterator<Item = SectionIndex>,
-) -> u64 {
+) -> u64
+where
+    H: object::read::elf::FileHeader<Endian = object::LittleEndian>,
+{
     for section_index in sections {
         let section = elf.section_by_index(section_index);
         assert!(section.size() >= section.data().len() as u64);
@@ -1046,14 +1055,17 @@ fn process_sections(
 }
 
 #[allow(clippy::too_many_arguments)]
-fn extract_memory_config(
-    elf: &Elf,
+fn extract_memory_config<H>(
+    elf: &Elf<H>,
     sections_ro_data: &[SectionIndex],
     sections_rw_data: &[SectionIndex],
     sections_bss: &[SectionIndex],
     sections_min_stack_size: &[SectionIndex],
     base_address_for_section: &mut HashMap<SectionIndex, u64>,
-) -> Result<MemoryConfig, ProgramFromElfError> {
+) -> Result<MemoryConfig, ProgramFromElfError>
+where
+    H: object::read::elf::FileHeader<Endian = object::LittleEndian>,
+{
     let mut current_address = u64::from(VM_MAX_PAGE_SIZE);
 
     let mut ro_data = Vec::new();
@@ -1139,11 +1151,14 @@ struct Export {
     metadata: ExternMetadata,
 }
 
-fn extract_exports(
-    elf: &Elf,
+fn extract_exports<H>(
+    elf: &Elf<H>,
     relocations: &BTreeMap<SectionTarget, RelocationKind>,
     section: &Section,
-) -> Result<Vec<Export>, ProgramFromElfError> {
+) -> Result<Vec<Export>, ProgramFromElfError>
+where
+    H: object::read::elf::FileHeader<Endian = object::LittleEndian>,
+{
     let mut b = polkavm_common::elf::Reader::from(section.data());
     let mut exports = Vec::new();
     loop {
@@ -1267,11 +1282,14 @@ impl Import {
     }
 }
 
-fn parse_extern_metadata_impl(
-    elf: &Elf,
+fn parse_extern_metadata_impl<H>(
+    elf: &Elf<H>,
     relocations: &BTreeMap<SectionTarget, RelocationKind>,
     target: SectionTarget,
-) -> Result<ExternMetadata, String> {
+) -> Result<ExternMetadata, String>
+where
+    H: object::read::elf::FileHeader<Endian = object::LittleEndian>,
+{
     let section = elf.section_by_index(target.section_index);
     let mut b = polkavm_common::elf::Reader::from(section.data());
     let _ = b.read(target.offset as usize)?;
@@ -1295,7 +1313,7 @@ fn parse_extern_metadata_impl(
 
     let RelocationKind::Abs {
         target: symbol_location,
-        size: RelocationSize::U32,
+        size: RelocationSize::U32 | RelocationSize::U64,
     } = symbol_relocation
     else {
         return Err(format!("unexpected relocation for the symbol: {symbol_relocation:?}"));
@@ -1331,11 +1349,14 @@ fn parse_extern_metadata_impl(
     })
 }
 
-fn parse_extern_metadata(
-    elf: &Elf,
+fn parse_extern_metadata<H>(
+    elf: &Elf<H>,
     relocations: &BTreeMap<SectionTarget, RelocationKind>,
     target: SectionTarget,
-) -> Result<ExternMetadata, ProgramFromElfError> {
+) -> Result<ExternMetadata, ProgramFromElfError>
+where
+    H: object::read::elf::FileHeader<Endian = object::LittleEndian>,
+{
     parse_extern_metadata_impl(elf, relocations, target)
         .map_err(|error| ProgramFromElfError::other(format!("failed to parse extern metadata: {}", error)))
 }
@@ -1372,7 +1393,10 @@ fn check_imports_and_assign_indexes(imports: &mut [Import], used_imports: &HashS
     Ok(())
 }
 
-fn get_relocation_target(elf: &Elf, relocation: &object::read::Relocation) -> Result<Option<SectionTarget>, ProgramFromElfError> {
+fn get_relocation_target<H>(elf: &Elf<H>, relocation: &object::read::Relocation) -> Result<Option<SectionTarget>, ProgramFromElfError>
+where
+    H: object::read::elf::FileHeader<Endian = object::LittleEndian>,
+{
     match relocation.target() {
         object::RelocationTarget::Absolute => {
             // Example of such relocation:
@@ -1425,6 +1449,11 @@ enum MinMax {
     MinSigned,
     MaxUnsigned,
     MinUnsigned,
+
+    MaxSignedW,
+    MinSignedW,
+    MaxUnsignedW,
+    MinUnsignedW,
 }
 
 fn emit_minmax(
@@ -1450,6 +1479,11 @@ fn emit_minmax(
         MinMax::MaxUnsigned => (src2, src1, AnyAnyKind::SetLessThanUnsigned),
         MinMax::MinSigned => (src1, src2, AnyAnyKind::SetLessThanSigned),
         MinMax::MaxSigned => (src2, src1, AnyAnyKind::SetLessThanSigned),
+
+        MinMax::MinUnsignedW => (src1, src2, AnyAnyKind::SetLessThanUnsignedW),
+        MinMax::MaxUnsignedW => (src2, src1, AnyAnyKind::SetLessThanUnsignedW),
+        MinMax::MinSignedW => (src1, src2, AnyAnyKind::SetLessThanSignedW),
+        MinMax::MaxSignedW => (src2, src1, AnyAnyKind::SetLessThanSignedW),
     };
 
     emit(InstExt::Basic(BasicInst::AnyAny {
@@ -1483,6 +1517,7 @@ fn convert_instruction(
     current_location: SectionTarget,
     instruction: Inst,
     instruction_size: u64,
+    rv64: bool,
     mut emit: impl FnMut(InstExt<SectionTarget, SectionTarget>),
 ) -> Result<(), ProgramFromElfError> {
     match instruction {
@@ -1596,14 +1631,18 @@ fn convert_instruction(
             let src = cast_reg_any(src)?;
             let kind = match kind {
                 RegImmKind::Add => AnyAnyKind::Add,
+                RegImmKind::AddW => AnyAnyKind::AddW,
                 RegImmKind::And => AnyAnyKind::And,
                 RegImmKind::Or => AnyAnyKind::Or,
                 RegImmKind::Xor => AnyAnyKind::Xor,
                 RegImmKind::SetLessThanUnsigned => AnyAnyKind::SetLessThanUnsigned,
                 RegImmKind::SetLessThanSigned => AnyAnyKind::SetLessThanSigned,
                 RegImmKind::ShiftLogicalLeft => AnyAnyKind::ShiftLogicalLeft,
+                RegImmKind::ShiftLogicalLeftW => AnyAnyKind::ShiftLogicalLeftW,
                 RegImmKind::ShiftLogicalRight => AnyAnyKind::ShiftLogicalRight,
+                RegImmKind::ShiftLogicalRightW => AnyAnyKind::ShiftLogicalRightW,
                 RegImmKind::ShiftArithmeticRight => AnyAnyKind::ShiftArithmeticRight,
+                RegImmKind::ShiftArithmeticRightW => AnyAnyKind::ShiftArithmeticRightW,
             };
 
             emit(InstExt::Basic(BasicInst::AnyAny {
@@ -1650,24 +1689,34 @@ fn convert_instruction(
             use crate::riscv::RegRegKind as K;
             let instruction = match kind {
                 K::Add => anyany!(Add),
+                K::AddW => anyany!(AddW),
                 K::Sub => anyany!(Sub),
+                K::SubW => anyany!(SubW),
                 K::And => anyany!(And),
                 K::Or => anyany!(Or),
                 K::Xor => anyany!(Xor),
                 K::SetLessThanUnsigned => anyany!(SetLessThanUnsigned),
                 K::SetLessThanSigned => anyany!(SetLessThanSigned),
                 K::ShiftLogicalLeft => anyany!(ShiftLogicalLeft),
+                K::ShiftLogicalLeftW => anyany!(ShiftLogicalLeftW),
                 K::ShiftLogicalRight => anyany!(ShiftLogicalRight),
+                K::ShiftLogicalRightW => anyany!(ShiftLogicalRightW),
                 K::ShiftArithmeticRight => anyany!(ShiftArithmeticRight),
+                K::ShiftArithmeticRightW => anyany!(ShiftArithmeticRightW),
                 K::Mul => anyany!(Mul),
+                K::MulW => anyany!(MulW),
                 K::MulUpperSignedSigned => anyany!(MulUpperSignedSigned),
                 K::MulUpperUnsignedUnsigned => anyany!(MulUpperUnsignedUnsigned),
 
                 K::MulUpperSignedUnsigned => regreg!(MulUpperSignedUnsigned),
                 K::Div => regreg!(Div),
+                K::DivW => regreg!(DivW),
                 K::DivUnsigned => regreg!(DivUnsigned),
+                K::DivUnsignedW => regreg!(DivUnsignedW),
                 K::Rem => regreg!(Rem),
+                K::RemW => regreg!(RemW),
                 K::RemUnsigned => regreg!(RemUnsigned),
+                K::RemUnsignedW => regreg!(RemUnsignedW),
             };
 
             emit(InstExt::Basic(instruction));
@@ -1715,7 +1764,29 @@ fn convert_instruction(
             };
 
             emit(InstExt::Basic(BasicInst::LoadIndirect {
-                kind: LoadKind::U32,
+                kind: if rv64 { LoadKind::U64 } else { LoadKind::U32 },
+                dst,
+                base: src,
+                offset: 0,
+            }));
+
+            Ok(())
+        }
+        Inst::LoadReservedW { dst, src, .. } => {
+            let Some(dst) = cast_reg_non_zero(dst)? else {
+                return Err(ProgramFromElfError::other(
+                    "found an atomic load with a zero register as the destination",
+                ));
+            };
+
+            let Some(src) = cast_reg_non_zero(src)? else {
+                return Err(ProgramFromElfError::other(
+                    "found an atomic load with a zero register as the source",
+                ));
+            };
+
+            emit(InstExt::Basic(BasicInst::LoadIndirect {
+                kind: LoadKind::I32,
                 dst,
                 base: src,
                 offset: 0,
@@ -1724,6 +1795,28 @@ fn convert_instruction(
             Ok(())
         }
         Inst::StoreConditional { src, addr, dst, .. } => {
+            let Some(addr) = cast_reg_non_zero(addr)? else {
+                return Err(ProgramFromElfError::other(
+                    "found an atomic store with a zero register as the address",
+                ));
+            };
+
+            let src = cast_reg_any(src)?;
+            emit(InstExt::Basic(BasicInst::StoreIndirect {
+                kind: if rv64 { StoreKind::U64 } else { StoreKind::U32 },
+                src,
+                base: addr,
+                offset: 0,
+            }));
+
+            if let Some(dst) = cast_reg_non_zero(dst)? {
+                // The store always succeeds, so write zero here.
+                emit(InstExt::Basic(BasicInst::LoadImmediate { dst, imm: 0 }));
+            }
+
+            Ok(())
+        }
+        Inst::StoreConditionalW { src, addr, dst, .. } => {
             let Some(addr) = cast_reg_non_zero(addr)? else {
                 return Err(ProgramFromElfError::other(
                     "found an atomic store with a zero register as the address",
@@ -1774,6 +1867,14 @@ fn convert_instruction(
             }));
 
             match kind {
+                AtomicKind::SwapW => {
+                    emit(InstExt::Basic(BasicInst::AnyAny {
+                        kind: AnyAnyKind::AddW,
+                        dst: new_value,
+                        src1: operand_regimm,
+                        src2: RegImm::Imm(0),
+                    }));
+                }
                 AtomicKind::Swap => {
                     emit(InstExt::Basic(BasicInst::AnyAny {
                         kind: AnyAnyKind::Add,
@@ -1782,9 +1883,25 @@ fn convert_instruction(
                         src2: RegImm::Imm(0),
                     }));
                 }
+                AtomicKind::AddW => {
+                    emit(InstExt::Basic(BasicInst::AnyAny {
+                        kind: AnyAnyKind::AddW,
+                        dst: new_value,
+                        src1: old_value.into(),
+                        src2: operand_regimm,
+                    }));
+                }
                 AtomicKind::Add => {
                     emit(InstExt::Basic(BasicInst::AnyAny {
                         kind: AnyAnyKind::Add,
+                        dst: new_value,
+                        src1: old_value.into(),
+                        src2: operand_regimm,
+                    }));
+                }
+                AtomicKind::AndW => {
+                    emit(InstExt::Basic(BasicInst::AnyAny {
+                        kind: AnyAnyKind::AndW,
                         dst: new_value,
                         src1: old_value.into(),
                         src2: operand_regimm,
@@ -1798,9 +1915,25 @@ fn convert_instruction(
                         src2: operand_regimm,
                     }));
                 }
+                AtomicKind::OrW => {
+                    emit(InstExt::Basic(BasicInst::AnyAny {
+                        kind: AnyAnyKind::OrW,
+                        dst: new_value,
+                        src1: old_value.into(),
+                        src2: operand_regimm,
+                    }));
+                }
                 AtomicKind::Or => {
                     emit(InstExt::Basic(BasicInst::AnyAny {
                         kind: AnyAnyKind::Or,
+                        dst: new_value,
+                        src1: old_value.into(),
+                        src2: operand_regimm,
+                    }));
+                }
+                AtomicKind::XorW => {
+                    emit(InstExt::Basic(BasicInst::AnyAny {
+                        kind: AnyAnyKind::XorW,
                         dst: new_value,
                         src1: old_value.into(),
                         src2: operand_regimm,
@@ -1825,6 +1958,19 @@ fn convert_instruction(
                 }
                 AtomicKind::MinUnsigned => {
                     emit_minmax(MinMax::MinUnsigned, new_value, Some(old_value), operand, Reg::E2, &mut emit);
+                }
+
+                AtomicKind::MaxSignedW => {
+                    emit_minmax(MinMax::MaxSignedW, new_value, Some(old_value), operand, Reg::E2, &mut emit);
+                }
+                AtomicKind::MinSignedW => {
+                    emit_minmax(MinMax::MinSignedW, new_value, Some(old_value), operand, Reg::E2, &mut emit);
+                }
+                AtomicKind::MaxUnsignedW => {
+                    emit_minmax(MinMax::MaxUnsignedW, new_value, Some(old_value), operand, Reg::E2, &mut emit);
+                }
+                AtomicKind::MinUnsignedW => {
+                    emit_minmax(MinMax::MinUnsignedW, new_value, Some(old_value), operand, Reg::E2, &mut emit);
                 }
             }
 
@@ -1880,14 +2026,17 @@ fn read_instruction_bytes(text: &[u8], relative_offset: usize) -> (u64, u32) {
     }
 }
 
-fn parse_code_section(
-    elf: &Elf,
+fn parse_code_section<H>(
+    elf: &Elf<H>,
     section: &Section,
     relocations: &BTreeMap<SectionTarget, RelocationKind>,
     imports: &mut Vec<Import>,
     instruction_overrides: &mut HashMap<SectionTarget, InstExt<SectionTarget, SectionTarget>>,
     output: &mut Vec<(Source, InstExt<SectionTarget, SectionTarget>)>,
-) -> Result<(), ProgramFromElfError> {
+) -> Result<(), ProgramFromElfError>
+where
+    H: object::read::elf::FileHeader<Endian = object::LittleEndian>,
+{
     let section_index = section.index();
     let section_name = section.name();
     let text = &section.data();
@@ -1958,7 +2107,7 @@ fn parse_code_section(
 
             let (next_inst_size, next_raw_inst) = read_instruction_bytes(text, relative_offset);
 
-            if Inst::decode(next_raw_inst) != Some(INST_RET) {
+            if Inst::decode(next_raw_inst, elf.is_64()) != Some(INST_RET) {
                 return Err(ProgramFromElfError::other("external call shim doesn't end with a 'ret'"));
             }
 
@@ -2006,7 +2155,7 @@ fn parse_code_section(
 
         relative_offset += inst_size as usize;
 
-        let Some(original_inst) = Inst::decode(raw_inst) else {
+        let Some(original_inst) = Inst::decode(raw_inst, elf.is_64()) else {
             return Err(ProgramFromElfErrorKind::UnsupportedInstruction {
                 section: section.name().into(),
                 offset: current_location.offset,
@@ -2027,7 +2176,7 @@ fn parse_code_section(
             {
                 if relative_offset < text.len() {
                     let (next_inst_size, next_inst) = read_instruction_bytes(text, relative_offset);
-                    let next_inst = Inst::decode(next_inst);
+                    let next_inst = Inst::decode(next_inst, elf.is_64());
 
                     if let Some(Inst::JumpAndLinkRegister { dst: ra_dst, base, value }) = next_inst {
                         if base == ra_dst && base == base_upper {
@@ -2058,7 +2207,7 @@ fn parse_code_section(
             }
 
             let original_length = output.len();
-            convert_instruction(section, current_location, original_inst, inst_size, |inst| {
+            convert_instruction(section, current_location, original_inst, inst_size, elf.is_64(), |inst| {
                 output.push((source, inst));
             })?;
 
@@ -2070,11 +2219,14 @@ fn parse_code_section(
     Ok(())
 }
 
-fn split_code_into_basic_blocks(
-    elf: &Elf,
+fn split_code_into_basic_blocks<H>(
+    elf: &Elf<H>,
     jump_targets: &HashSet<SectionTarget>,
     instructions: Vec<(Source, InstExt<SectionTarget, SectionTarget>)>,
-) -> Result<Vec<BasicBlock<SectionTarget, SectionTarget>>, ProgramFromElfError> {
+) -> Result<Vec<BasicBlock<SectionTarget, SectionTarget>>, ProgramFromElfError>
+where
+    H: object::read::elf::FileHeader<Endian = object::LittleEndian>,
+{
     let mut blocks: Vec<BasicBlock<SectionTarget, SectionTarget>> = Vec::new();
     let mut current_block: Vec<(SourceStack, BasicInst<SectionTarget>)> = Vec::new();
     let mut block_start_opt = None;
@@ -2975,51 +3127,81 @@ fn perform_dead_code_elimination(
 #[derive(Copy, Clone, PartialEq, Eq, Debug)]
 pub enum AnyAnyKind {
     Add,
+    AddW,
     Sub,
+    SubW,
     And,
+    AndW,
     Or,
+    OrW,
     Xor,
+    XorW,
     SetLessThanUnsigned,
     SetLessThanSigned,
+    SetLessThanUnsignedW,
+    SetLessThanSignedW,
     ShiftLogicalLeft,
     ShiftLogicalRight,
     ShiftArithmeticRight,
+    ShiftLogicalLeftW,
+    ShiftLogicalRightW,
+    ShiftArithmeticRightW,
 
     Mul,
     MulUpperSignedSigned,
     MulUpperUnsignedUnsigned,
+    MulW,
 }
 
 #[derive(Copy, Clone, PartialEq, Eq, Debug)]
 pub enum RegRegKind {
     MulUpperSignedUnsigned,
     Div,
+    DivW,
     DivUnsigned,
+    DivUnsignedW,
     Rem,
+    RemW,
     RemUnsigned,
+    RemUnsignedW,
 }
 
 #[derive(Copy, Clone, PartialEq, Eq, Debug)]
 enum OperationKind {
     Add,
+    Addw,
     Sub,
+    SubW,
     And,
+    AndW,
     Or,
+    OrW,
     Xor,
+    XorW,
     SetLessThanUnsigned,
+    SetLessThanUnsignedW,
     SetLessThanSigned,
+    SetLessThanSignedW,
     ShiftLogicalLeft,
+    ShiftLogicalLeftW,
     ShiftLogicalRight,
+    ShiftLogicalRightW,
     ShiftArithmeticRight,
+    ShiftArithmeticRightW,
 
     Mul,
+    MulW,
     MulUpperSignedSigned,
     MulUpperSignedUnsigned,
     MulUpperUnsignedUnsigned,
     Div,
+    DivW,
     DivUnsigned,
+    DivUnsignedW,
     Rem,
+    RemW,
     RemUnsigned,
+    RemUnsignedW,
 
     Eq,
     NotEq,
@@ -3031,16 +3213,27 @@ impl From<AnyAnyKind> for OperationKind {
     fn from(kind: AnyAnyKind) -> Self {
         match kind {
             AnyAnyKind::Add => Self::Add,
+            AnyAnyKind::AddW => Self::Addw,
             AnyAnyKind::Sub => Self::Sub,
+            AnyAnyKind::SubW => Self::SubW,
             AnyAnyKind::And => Self::And,
+            AnyAnyKind::AndW => Self::AndW,
             AnyAnyKind::Or => Self::Or,
+            AnyAnyKind::OrW => Self::OrW,
             AnyAnyKind::Xor => Self::Xor,
+            AnyAnyKind::XorW => Self::XorW,
             AnyAnyKind::SetLessThanUnsigned => Self::SetLessThanUnsigned,
+            AnyAnyKind::SetLessThanUnsignedW => Self::SetLessThanUnsignedW,
             AnyAnyKind::SetLessThanSigned => Self::SetLessThanSigned,
+            AnyAnyKind::SetLessThanSignedW => Self::SetLessThanSignedW,
             AnyAnyKind::ShiftLogicalLeft => Self::ShiftLogicalLeft,
+            AnyAnyKind::ShiftLogicalLeftW => Self::ShiftLogicalLeftW,
             AnyAnyKind::ShiftLogicalRight => Self::ShiftLogicalRight,
+            AnyAnyKind::ShiftLogicalRightW => Self::ShiftLogicalRightW,
             AnyAnyKind::ShiftArithmeticRight => Self::ShiftArithmeticRight,
+            AnyAnyKind::ShiftArithmeticRightW => Self::ShiftArithmeticRightW,
             AnyAnyKind::Mul => Self::Mul,
+            AnyAnyKind::MulW => Self::MulW,
             AnyAnyKind::MulUpperSignedSigned => Self::MulUpperSignedSigned,
             AnyAnyKind::MulUpperUnsignedUnsigned => Self::MulUpperUnsignedUnsigned,
         }
@@ -3052,9 +3245,13 @@ impl From<RegRegKind> for OperationKind {
         match kind {
             RegRegKind::MulUpperSignedUnsigned => Self::MulUpperSignedUnsigned,
             RegRegKind::Div => Self::Div,
+            RegRegKind::DivW => Self::DivW,
             RegRegKind::DivUnsigned => Self::DivUnsigned,
+            RegRegKind::DivUnsignedW => Self::DivUnsignedW,
             RegRegKind::Rem => Self::Rem,
+            RegRegKind::RemW => Self::RemW,
             RegRegKind::RemUnsigned => Self::RemUnsigned,
+            RegRegKind::RemUnsignedW => Self::RemUnsignedW,
         }
     }
 }
@@ -3077,25 +3274,38 @@ impl OperationKind {
         use polkavm_common::operation::*;
         #[allow(clippy::unnecessary_cast)]
         match self {
-            Self::Add => lhs.wrapping_add(rhs),
-            Self::Sub => lhs.wrapping_sub(rhs),
-            Self::And => lhs & rhs,
-            Self::Or => lhs | rhs,
-            Self::Xor => lhs ^ rhs,
-            Self::SetLessThanUnsigned => i32::from((lhs as u32) < (rhs as u32)),
-            Self::SetLessThanSigned => i32::from((lhs as i32) < (rhs as i32)),
+            // TODO
+            Self::Add | Self::Addw => lhs.wrapping_add(rhs),
+            Self::Sub | Self::SubW => lhs.wrapping_sub(rhs),
+            Self::And | Self::AndW => lhs & rhs,
+            Self::Or | Self::OrW => lhs | rhs,
+            Self::Xor | Self::XorW => lhs ^ rhs,
+            Self::SetLessThanUnsigned | Self::SetLessThanUnsignedW => i32::from((lhs as u32) < (rhs as u32)),
+            Self::SetLessThanSigned | Self::SetLessThanSignedW => i32::from((lhs as i32) < (rhs as i32)),
             Self::ShiftLogicalLeft => ((lhs as u32).wrapping_shl(rhs as u32)) as i32,
+            Self::ShiftLogicalLeftW => ((lhs as u32).wrapping_shl(rhs as u32)) as i32,
             Self::ShiftLogicalRight => ((lhs as u32).wrapping_shr(rhs as u32)) as i32,
+            Self::ShiftLogicalRightW => ((lhs as u32).wrapping_shr(rhs as u32)) as i32,
             Self::ShiftArithmeticRight => (lhs as i32).wrapping_shr(rhs as u32),
+            Self::ShiftArithmeticRightW => (lhs as i32).wrapping_shr(rhs as u32),
 
             Self::Mul => (lhs as i32).wrapping_mul(rhs as i32),
+            // TODO
+            Self::MulW => (lhs as i32).wrapping_mul(rhs as i32),
             Self::MulUpperSignedSigned => mulh(lhs, rhs),
             Self::MulUpperSignedUnsigned => mulhsu(lhs, rhs as u32),
             Self::MulUpperUnsignedUnsigned => mulhu(lhs as u32, rhs as u32) as i32,
             Self::Div => div(lhs, rhs),
+            // TODO
+            Self::DivW => div(lhs, rhs),
             Self::DivUnsigned => divu(lhs as u32, rhs as u32) as i32,
+            Self::DivUnsignedW => divu(lhs as u32, rhs as u32) as i32,
             Self::Rem => rem(lhs, rhs),
+            // TODO
+            Self::RemW => rem(lhs, rhs),
             Self::RemUnsigned => remu(lhs as u32, rhs as u32) as i32,
+            // TODO
+            Self::RemUnsignedW => remu(lhs as u32, rhs as u32) as i32,
 
             Self::Eq => i32::from(lhs == rhs),
             Self::NotEq => i32::from(lhs != rhs),
@@ -3570,16 +3780,19 @@ impl BlockRegs {
 }
 
 #[allow(clippy::too_many_arguments)]
-fn perform_constant_propagation(
+fn perform_constant_propagation<H>(
     imports: &[Import],
-    elf: &Elf,
+    elf: &Elf<H>,
     all_blocks: &mut [BasicBlock<AnyTarget, BlockTarget>],
     regs_for_block: &mut [BlockRegs],
     unknown_counter: &mut u64,
     reachability_graph: &mut ReachabilityGraph,
     mut optimize_queue: Option<&mut VecSet<BlockTarget>>,
     mut current: BlockTarget,
-) -> bool {
+) -> bool
+where
+    H: object::read::elf::FileHeader<Endian = object::LittleEndian>,
+{
     let mut regs = regs_for_block[current.index()].clone();
     let mut modified = false;
     let mut seen = HashSet::new();
@@ -3616,10 +3829,18 @@ fn perform_constant_propagation(
                 let section = elf.section_by_index(target.section_index);
                 if section.is_allocated() && !section.is_writable() {
                     let value = match kind {
+                        LoadKind::U64 => section
+                            .data()
+                            .get(target.offset as usize..target.offset as usize + 8)
+                            .map(|xs| u64::from_le_bytes([xs[0], xs[1], xs[2], xs[3], xs[4], xs[5], xs[6], xs[7]]) as i32),
                         LoadKind::U32 => section
                             .data()
                             .get(target.offset as usize..target.offset as usize + 4)
                             .map(|xs| u32::from_le_bytes([xs[0], xs[1], xs[2], xs[3]]) as i32),
+                        LoadKind::I32 => section
+                            .data()
+                            .get(target.offset as usize..target.offset as usize + 4)
+                            .map(|xs| i32::from_le_bytes([xs[0], xs[1], xs[2], xs[3]])),
                         LoadKind::U16 => section
                             .data()
                             .get(target.offset as usize..target.offset as usize + 2)
@@ -3772,13 +3993,15 @@ fn perform_load_address_and_jump_fusion(all_blocks: &mut [BasicBlock<AnyTarget, 
     }
 }
 
-fn optimize_program(
+fn optimize_program<H>(
     config: &Config,
-    elf: &Elf,
+    elf: &Elf<H>,
     imports: &[Import],
     all_blocks: &mut [BasicBlock<AnyTarget, BlockTarget>],
     reachability_graph: &mut ReachabilityGraph,
-) {
+) where
+    H: object::read::elf::FileHeader<Endian = object::LittleEndian>,
+{
     let mut optimize_queue = VecSet::new();
     for current in (0..all_blocks.len()).map(BlockTarget::from_raw) {
         if !reachability_graph.is_code_reachable(current) {
@@ -4525,14 +4748,17 @@ fn replace_immediates_with_registers(
     }
 }
 
-fn harvest_all_jump_targets(
-    elf: &Elf,
+fn harvest_all_jump_targets<H>(
+    elf: &Elf<H>,
     data_sections_set: &HashSet<SectionIndex>,
     code_sections_set: &HashSet<SectionIndex>,
     instructions: &[(Source, InstExt<SectionTarget, SectionTarget>)],
     relocations: &BTreeMap<SectionTarget, RelocationKind>,
     exports: &[Export],
-) -> Result<HashSet<SectionTarget>, ProgramFromElfError> {
+) -> Result<HashSet<SectionTarget>, ProgramFromElfError>
+where
+    H: object::read::elf::FileHeader<Endian = object::LittleEndian>,
+{
     let mut all_jump_targets = HashSet::new();
     for (_, instruction) in instructions {
         match instruction {
@@ -5221,9 +5447,11 @@ fn emit_code(
                         {
                             LoadKind::I8 => load_i8,
                             LoadKind::I16 => load_i16,
-                            LoadKind::U32 => load_u32,
+                            LoadKind::I32 => load_i32,
                             LoadKind::U8 => load_u8,
                             LoadKind::U16 => load_u16,
+                            LoadKind::U32 => load_u32,
+                            LoadKind::U64 => load_u64,
                         }
                     }
                 }
@@ -5235,6 +5463,7 @@ fn emit_code(
                                 args = (conv_reg(src), target),
                                 kind = kind,
                                 {
+                                    StoreKind::U64 => store_u64,
                                     StoreKind::U32 => store_u32,
                                     StoreKind::U16 => store_u16,
                                     StoreKind::U8 => store_u8,
@@ -5246,6 +5475,7 @@ fn emit_code(
                                 args = (target, value),
                                 kind = kind,
                                 {
+                                    StoreKind::U64 => store_imm_u64,
                                     StoreKind::U32 => store_imm_u32,
                                     StoreKind::U16 => store_imm_u16,
                                     StoreKind::U8 => store_imm_u8,
@@ -5261,9 +5491,11 @@ fn emit_code(
                         {
                             LoadKind::I8 => load_indirect_i8,
                             LoadKind::I16 => load_indirect_i16,
-                            LoadKind::U32 => load_indirect_u32,
+                            LoadKind::I32 => load_indirect_i32,
                             LoadKind::U8 => load_indirect_u8,
                             LoadKind::U16 => load_indirect_u16,
+                            LoadKind::U32 => load_indirect_u32,
+                            LoadKind::U64 => load_indirect_u64,
                         }
                     }
                 }
@@ -5273,6 +5505,7 @@ fn emit_code(
                             args = (conv_reg(src), conv_reg(base), offset as u32),
                             kind = kind,
                             {
+                                StoreKind::U64 => store_indirect_u64,
                                 StoreKind::U32 => store_indirect_u32,
                                 StoreKind::U16 => store_indirect_u16,
                                 StoreKind::U8 => store_indirect_u8,
@@ -5284,6 +5517,7 @@ fn emit_code(
                             args = (conv_reg(base), offset as u32, value),
                             kind = kind,
                             {
+                                StoreKind::U64 => store_imm_indirect_u64,
                                 StoreKind::U32 => store_imm_indirect_u32,
                                 StoreKind::U16 => store_imm_indirect_u16,
                                 StoreKind::U8 => store_imm_indirect_u8,
@@ -5328,9 +5562,13 @@ fn emit_code(
                         {
                             K::MulUpperSignedUnsigned => mul_upper_signed_unsigned,
                             K::Div => div_signed,
+                            K::DivW => div_signed_w,
                             K::DivUnsigned => div_unsigned,
+                            K::DivUnsignedW => div_unsigned_w,
                             K::Rem => rem_signed,
+                            K::RemW => rem_signed_w,
                             K::RemUnsigned => rem_unsigned,
+                            K::RemUnsignedW => rem_unsigned_w,
                         }
                     }
                 }
@@ -5345,16 +5583,27 @@ fn emit_code(
                                 kind = kind,
                                 {
                                     K::Add => add,
+                                    K::AddW => addw,
                                     K::Sub => sub,
+                                    K::SubW => subw,
                                     K::ShiftLogicalLeft => shift_logical_left,
+                                    K::ShiftLogicalLeftW => shift_logical_left_w,
                                     K::SetLessThanSigned => set_less_than_signed,
+                                    K::SetLessThanSignedW => set_less_than_signed_w,
                                     K::SetLessThanUnsigned => set_less_than_unsigned,
+                                    K::SetLessThanUnsignedW => set_less_than_unsigned_w,
                                     K::Xor => xor,
+                                    K::XorW => xorw,
                                     K::ShiftLogicalRight => shift_logical_right,
+                                    K::ShiftLogicalRightW => shift_logical_right_w,
                                     K::ShiftArithmeticRight => shift_arithmetic_right,
+                                    K::ShiftArithmeticRightW => shift_arithmetic_right_w,
                                     K::Or => or,
+                                    K::OrW => orw,
                                     K::And => and,
+                                    K::AndW => andw,
                                     K::Mul => mul,
+                                    K::MulW => mulw,
                                     K::MulUpperSignedSigned => mul_upper_signed_signed,
                                     K::MulUpperUnsignedUnsigned => mul_upper_unsigned_unsigned,
                                 }
@@ -5365,16 +5614,27 @@ fn emit_code(
                             match kind {
                                 K::Add if src2 == 0 => I::move_reg(dst, src1),
                                 K::Add => I::add_imm(dst, src1, src2),
+                                K::AddW => I::addw_imm(dst, src1, src2),
                                 K::Sub => I::add_imm(dst, src1, (-(src2 as i32)) as u32),
+                                K::SubW => I::addw_imm(dst, src1, (-(src2 as i32)) as u32),
                                 K::ShiftLogicalLeft => I::shift_logical_left_imm(dst, src1, src2),
+                                K::ShiftLogicalLeftW => I::shift_logical_left_w_imm(dst, src1, src2),
                                 K::SetLessThanSigned => I::set_less_than_signed_imm(dst, src1, src2),
+                                K::SetLessThanSignedW => I::set_less_than_signed_w_imm(dst, src1, src2),
                                 K::SetLessThanUnsigned => I::set_less_than_unsigned_imm(dst, src1, src2),
+                                K::SetLessThanUnsignedW => I::set_less_than_unsigned_w_imm(dst, src1, src2),
                                 K::Xor => I::xor_imm(dst, src1, src2),
+                                K::XorW => I::xorw_imm(dst, src1, src2),
                                 K::ShiftLogicalRight => I::shift_logical_right_imm(dst, src1, src2),
+                                K::ShiftLogicalRightW => I::shift_logical_right_w_imm(dst, src1, src2),
                                 K::ShiftArithmeticRight => I::shift_arithmetic_right_imm(dst, src1, src2),
+                                K::ShiftArithmeticRightW => I::shift_arithmetic_right_w_imm(dst, src1, src2),
                                 K::Or => I::or_imm(dst, src1, src2),
+                                K::OrW => I::orw_imm(dst, src1, src2),
                                 K::And => I::and_imm(dst, src1, src2),
+                                K::AndW => I::andw_imm(dst, src1, src2),
                                 K::Mul => I::mul_imm(dst, src1, src2),
+                                K::MulW => I::mul_imm(dst, src1, src2),
                                 K::MulUpperSignedSigned => I::mul_upper_signed_signed_imm(dst, src1, src2),
                                 K::MulUpperUnsignedUnsigned => I::mul_upper_unsigned_unsigned_imm(dst, src1, src2),
                             }
@@ -5383,19 +5643,30 @@ fn emit_code(
                             let src2 = conv_reg(src2);
                             match kind {
                                 K::Add => I::add_imm(dst, src2, src1),
+                                K::AddW => I::addw_imm(dst, src2, src1),
                                 K::Xor => I::xor_imm(dst, src2, src1),
+                                K::XorW => I::xorw_imm(dst, src2, src1),
                                 K::Or => I::or_imm(dst, src2, src1),
+                                K::OrW => I::orw_imm(dst, src2, src1),
                                 K::And => I::and_imm(dst, src2, src1),
+                                K::AndW => I::andw_imm(dst, src2, src1),
                                 K::Mul => I::mul_imm(dst, src2, src1),
+                                K::MulW => I::mul_imm(dst, src2, src1),
                                 K::MulUpperSignedSigned => I::mul_upper_signed_signed_imm(dst, src2, src1),
                                 K::MulUpperUnsignedUnsigned => I::mul_upper_unsigned_unsigned_imm(dst, src2, src1),
 
                                 K::Sub => I::negate_and_add_imm(dst, src2, src1),
+                                K::SubW => I::negate_and_add_imm(dst, src2, src1),
                                 K::ShiftLogicalLeft => I::shift_logical_left_imm_alt(dst, src2, src1),
+                                K::ShiftLogicalLeftW => I::shift_logical_left_w_imm_alt(dst, src2, src1),
                                 K::SetLessThanSigned => I::set_greater_than_signed_imm(dst, src2, src1),
+                                K::SetLessThanSignedW => I::set_greater_than_signed_w_imm(dst, src2, src1),
                                 K::SetLessThanUnsigned => I::set_greater_than_unsigned_imm(dst, src2, src1),
+                                K::SetLessThanUnsignedW => I::set_greater_than_unsigned_w_imm(dst, src2, src1),
                                 K::ShiftLogicalRight => I::shift_logical_right_imm_alt(dst, src2, src1),
+                                K::ShiftLogicalRightW => I::shift_logical_right_imm_alt(dst, src2, src1),
                                 K::ShiftArithmeticRight => I::shift_arithmetic_right_imm_alt(dst, src2, src1),
+                                K::ShiftArithmeticRightW => I::shift_arithmetic_right_w_imm_alt(dst, src2, src1),
                             }
                         }
                         (RegImm::Imm(src1), RegImm::Imm(src2)) => {
@@ -5579,12 +5850,14 @@ fn emit_code(
 #[derive(Copy, Clone, PartialEq, Eq, Debug)]
 enum Bitness {
     B32,
+    B64,
 }
 
 impl From<Bitness> for u64 {
     fn from(value: Bitness) -> Self {
         match value {
             Bitness::B32 => 4,
+            Bitness::B64 => 8,
         }
     }
 }
@@ -5593,6 +5866,7 @@ impl From<Bitness> for RelocationSize {
     fn from(value: Bitness) -> Self {
         match value {
             Bitness::B32 => RelocationSize::U32,
+            Bitness::B64 => RelocationSize::U64,
         }
     }
 }
@@ -5602,6 +5876,7 @@ pub(crate) enum RelocationSize {
     U8,
     U16,
     U32,
+    U64,
 }
 
 #[derive(Copy, Clone, Debug)]
@@ -5648,12 +5923,15 @@ impl RelocationKind {
     }
 }
 
-fn harvest_data_relocations(
-    elf: &Elf,
+fn harvest_data_relocations<H>(
+    elf: &Elf<H>,
     code_sections_set: &HashSet<SectionIndex>,
     section: &Section,
     relocations: &mut BTreeMap<SectionTarget, RelocationKind>,
-) -> Result<(), ProgramFromElfError> {
+) -> Result<(), ProgramFromElfError>
+where
+    H: object::read::elf::FileHeader<Endian = object::LittleEndian>,
+{
     #[derive(Debug)]
     enum MutOp {
         Add,
@@ -5706,6 +5984,18 @@ fn harvest_data_relocations(
                     }),
                 )
             }
+            (object::RelocationKind::Absolute, _)
+                if relocation.encoding() == object::RelocationEncoding::Generic && relocation.size() == 64 =>
+            {
+                (
+                    "R_RISCV_64",
+                    Kind::Set(RelocationKind::Abs {
+                        target,
+                        size: RelocationSize::U64,
+                    }),
+                )
+            }
+
             (_, object::RelocationFlags::Elf { r_type: reloc_kind }) => match reloc_kind {
                 object::elf::R_RISCV_SET6 => ("R_RISCV_SET6", Kind::Set6 { target }),
                 object::elf::R_RISCV_SUB6 => ("R_RISCV_SUB6", Kind::Sub6 { target }),
@@ -5728,9 +6018,12 @@ fn harvest_data_relocations(
                 object::elf::R_RISCV_ADD16 => ("R_RISCV_ADD16", Kind::Mut(MutOp::Add, RelocationSize::U16, target)),
                 object::elf::R_RISCV_SUB16 => ("R_RISCV_SUB16", Kind::Mut(MutOp::Sub, RelocationSize::U16, target)),
                 object::elf::R_RISCV_ADD32 => ("R_RISCV_ADD32", Kind::Mut(MutOp::Add, RelocationSize::U32, target)),
+                object::elf::R_RISCV_ADD64 => ("R_RISCV_ADD64", Kind::Mut(MutOp::Add, RelocationSize::U64, target)),
                 object::elf::R_RISCV_SUB32 => ("R_RISCV_SUB32", Kind::Mut(MutOp::Sub, RelocationSize::U32, target)),
+                object::elf::R_RISCV_SUB64 => ("R_RISCV_SUB64", Kind::Mut(MutOp::Sub, RelocationSize::U64, target)),
                 object::elf::R_RISCV_SET_ULEB128 => ("R_RISCV_SET_ULEB128", Kind::SetUleb128 { target }),
                 object::elf::R_RISCV_SUB_ULEB128 => ("R_RISCV_SUB_ULEB128", Kind::SubUleb128 { target }),
+
                 _ => {
                     return Err(ProgramFromElfError::other(format!(
                         "unsupported relocation in data section '{section_name}': {relocation:?}"
@@ -5909,6 +6202,19 @@ fn test_overwrite_uleb128() {
     assert_eq!(data, encoded_value);
 }
 
+fn write_u64(data: &mut [u8], relative_address: u64, value: u64) -> Result<(), ProgramFromElfError> {
+    let value = value.to_le_bytes();
+    data[relative_address as usize + 7] = value[7];
+    data[relative_address as usize + 6] = value[6];
+    data[relative_address as usize + 5] = value[5];
+    data[relative_address as usize + 4] = value[4];
+    data[relative_address as usize + 3] = value[3];
+    data[relative_address as usize + 2] = value[2];
+    data[relative_address as usize + 1] = value[1];
+    data[relative_address as usize] = value[0];
+    Ok(())
+}
+
 fn write_u32(data: &mut [u8], relative_address: u64, value: u32) -> Result<(), ProgramFromElfError> {
     let value = value.to_le_bytes();
     data[relative_address as usize + 3] = value[3];
@@ -5925,12 +6231,15 @@ fn write_u16(data: &mut [u8], relative_address: u64, value: u16) -> Result<(), P
     Ok(())
 }
 
-fn harvest_code_relocations(
-    elf: &Elf,
+fn harvest_code_relocations<H>(
+    elf: &Elf<H>,
     section: &Section,
     instruction_overrides: &mut HashMap<SectionTarget, InstExt<SectionTarget, SectionTarget>>,
     data_relocations: &mut BTreeMap<SectionTarget, RelocationKind>,
-) -> Result<(), ProgramFromElfError> {
+) -> Result<(), ProgramFromElfError>
+where
+    H: object::read::elf::FileHeader<Endian = object::LittleEndian>,
+{
     fn jump_or_call<T>(ra: RReg, target: T, target_return: T) -> Result<ControlInst<T>, ProgramFromElfError> {
         if let Some(ra) = cast_reg_non_zero(ra)? {
             Ok(ControlInst::Call { ra, target, target_return })
@@ -6014,14 +6323,14 @@ fn harvest_code_relocations(
                         };
 
                         let hi_inst_raw = u32::from_le_bytes([xs[0], xs[1], xs[2], xs[3]]);
-                        let Some(hi_inst) = Inst::decode(hi_inst_raw) else {
+                        let Some(hi_inst) = Inst::decode(hi_inst_raw, elf.is_64()) else {
                             return Err(ProgramFromElfError::other(format!(
                                 "R_RISCV_CALL_PLT for an unsupported instruction (1st): 0x{hi_inst_raw:08}"
                             )));
                         };
 
                         let lo_inst_raw = u32::from_le_bytes([xs[4], xs[5], xs[6], xs[7]]);
-                        let Some(lo_inst) = Inst::decode(lo_inst_raw) else {
+                        let Some(lo_inst) = Inst::decode(lo_inst_raw, elf.is_64()) else {
                             return Err(ProgramFromElfError::other(format!(
                                 "R_RISCV_CALL_PLT for an unsupported instruction (2nd): 0x{lo_inst_raw:08}"
                             )));
@@ -6118,7 +6427,7 @@ fn harvest_code_relocations(
                     }
                     object::elf::R_RISCV_JAL => {
                         let inst_raw = read_u32(section_data, relative_address)?;
-                        let Some(inst) = Inst::decode(inst_raw) else {
+                        let Some(inst) = Inst::decode(inst_raw, elf.is_64()) else {
                             return Err(ProgramFromElfError::other(format!(
                                 "R_RISCV_JAL for an unsupported instruction: 0x{inst_raw:08}"
                             )));
@@ -6141,7 +6450,7 @@ fn harvest_code_relocations(
                     }
                     object::elf::R_RISCV_BRANCH => {
                         let inst_raw = read_u32(section_data, relative_address)?;
-                        let Some(inst) = Inst::decode(inst_raw) else {
+                        let Some(inst) = Inst::decode(inst_raw, elf.is_64()) else {
                             return Err(ProgramFromElfError::other(format!(
                                 "R_RISCV_BRANCH for an unsupported instruction: 0x{inst_raw:08}"
                             )));
@@ -6174,7 +6483,7 @@ fn harvest_code_relocations(
                     object::elf::R_RISCV_HI20 => {
                         // This relocation is for a LUI.
                         let inst_raw = read_u32(section_data, relative_address)?;
-                        let Some(inst) = Inst::decode(inst_raw) else {
+                        let Some(inst) = Inst::decode(inst_raw, elf.is_64()) else {
                             return Err(ProgramFromElfError::other(format!(
                                 "R_RISCV_HI20 for an unsupported instruction: 0x{inst_raw:08}"
                             )));
@@ -6202,7 +6511,7 @@ fn harvest_code_relocations(
                     }
                     object::elf::R_RISCV_LO12_I => {
                         let inst_raw = read_u32(section_data, relative_address)?;
-                        let Some(inst) = Inst::decode(inst_raw) else {
+                        let Some(inst) = Inst::decode(inst_raw, elf.is_64()) else {
                             return Err(ProgramFromElfError::other(format!(
                                 "R_RISCV_LO12_I for an unsupported instruction: 0x{inst_raw:08}"
                             )));
@@ -6251,7 +6560,7 @@ fn harvest_code_relocations(
                     }
                     object::elf::R_RISCV_LO12_S => {
                         let inst_raw = read_u32(section_data, relative_address)?;
-                        let Some(inst) = Inst::decode(inst_raw) else {
+                        let Some(inst) = Inst::decode(inst_raw, elf.is_64()) else {
                             return Err(ProgramFromElfError::other(format!(
                                 "R_RISCV_LO12_S for an unsupported instruction: 0x{inst_raw:08}"
                             )));
@@ -6286,7 +6595,7 @@ fn harvest_code_relocations(
                     }
                     object::elf::R_RISCV_RVC_JUMP => {
                         let inst_raw = read_u16(section_data, relative_address)?;
-                        let Some(inst) = Inst::decode(inst_raw.into()) else {
+                        let Some(inst) = Inst::decode(inst_raw.into(), elf.is_64()) else {
                             return Err(ProgramFromElfError::other(format!(
                                 "R_RISCV_RVC_JUMP for an unsupported instruction: 0x{inst_raw:04}"
                             )));
@@ -6309,7 +6618,7 @@ fn harvest_code_relocations(
                     }
                     object::elf::R_RISCV_RVC_BRANCH => {
                         let inst_raw = read_u16(section_data, relative_address)?;
-                        let Some(inst) = Inst::decode_compressed(inst_raw.into()) else {
+                        let Some(inst) = Inst::decode_compressed(inst_raw.into(), elf.is_64()) else {
                             return Err(ProgramFromElfError::other(format!(
                                 "R_RISCV_RVC_BRANCH for an unsupported instruction: 0x{inst_raw:04}"
                             )));
@@ -6362,10 +6671,10 @@ fn harvest_code_relocations(
     for (relative_lo, (lo_rel_name, relative_hi)) in pcrel_relocations.reloc_pcrel_lo12 {
         let lo_inst_raw = &section_data[relative_lo as usize..][..4];
         let lo_inst_raw = u32::from_le_bytes([lo_inst_raw[0], lo_inst_raw[1], lo_inst_raw[2], lo_inst_raw[3]]);
-        let lo_inst = Inst::decode(lo_inst_raw);
+        let lo_inst = Inst::decode(lo_inst_raw, elf.is_64());
         let hi_inst_raw = &section_data[relative_hi as usize..][..4];
         let hi_inst_raw = u32::from_le_bytes([hi_inst_raw[0], hi_inst_raw[1], hi_inst_raw[2], hi_inst_raw[3]]);
-        let hi_inst = Inst::decode(hi_inst_raw);
+        let hi_inst = Inst::decode(hi_inst_raw, elf.is_64());
 
         let Some((hi_kind, target)) = pcrel_relocations.reloc_pcrel_hi20.get(&relative_hi).copied() else {
             return Err(ProgramFromElfError::other(format!("{lo_rel_name} relocation at '{section_name}'0x{relative_lo:x} targets '{section_name}'0x{relative_hi:x} which doesn't have a R_RISCV_PCREL_HI20 or R_RISCV_GOT_HI20 relocation")));
@@ -6396,7 +6705,7 @@ fn harvest_code_relocations(
 
             match lo_inst {
                 Inst::Load {
-                    kind: LoadKind::U32,
+                    kind: LoadKind::U32 | LoadKind::U64 | LoadKind::I32,
                     base,
                     dst,
                     ..
@@ -6488,7 +6797,10 @@ fn harvest_code_relocations(
     Ok(())
 }
 
-fn parse_function_symbols(elf: &Elf) -> Result<Vec<(Source, String)>, ProgramFromElfError> {
+fn parse_function_symbols<H>(elf: &Elf<H>) -> Result<Vec<(Source, String)>, ProgramFromElfError>
+where
+    H: object::read::elf::FileHeader<Endian = object::LittleEndian>,
+{
     let mut functions = Vec::new();
     for sym in elf.symbols() {
         match sym.kind() {
@@ -6559,14 +6871,26 @@ impl Config {
 }
 
 pub fn program_from_elf(config: Config, data: &[u8]) -> Result<Vec<u8>, ProgramFromElfError> {
-    let mut elf = Elf::parse(data)?;
+    match Elf::<object::elf::FileHeader32<object::endian::LittleEndian>>::parse(data) {
+        Ok(elf) => program_from_elf_internal(config, elf),
+        Err(ProgramFromElfError(ProgramFromElfErrorKind::FailedToParseElf(e))) if e.to_string() == "Unsupported ELF header" => {
+            let _elf = Elf::<object::elf::FileHeader64<object::endian::LittleEndian>>::parse(data)?;
+            todo!("64bit isn't fully supported yet");
+            //program_from_elf_internal(config, _elf)
+        }
+        Err(e) => Err(e),
+    }
+}
+
+fn program_from_elf_internal<H>(config: Config, mut elf: Elf<H>) -> Result<Vec<u8>, ProgramFromElfError>
+where
+    H: object::read::elf::FileHeader<Endian = object::LittleEndian>,
+{
+    let bitness = if elf.is_64() { Bitness::B64 } else { Bitness::B32 };
 
     if elf.section_by_name(".got").next().is_none() {
         elf.add_empty_data_section(".got");
     }
-
-    // TODO: 64-bit support.
-    let bitness = Bitness::B32;
 
     let mut sections_ro_data = Vec::new();
     let mut sections_rw_data = Vec::new();
@@ -6934,6 +7258,7 @@ pub fn program_from_elf(config: Config, data: &[u8]) -> Result<Vec<u8>, ProgramF
 
         fn write_generic(size: RelocationSize, data: &mut [u8], relative_address: u64, value: u64) -> Result<(), ProgramFromElfError> {
             match size {
+                RelocationSize::U64 => write_u64(data, relative_address, value),
                 RelocationSize::U32 => {
                     let Ok(value) = u32::try_from(value) else {
                         return Err(ProgramFromElfError::other(

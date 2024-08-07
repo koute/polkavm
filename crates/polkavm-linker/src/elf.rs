@@ -1,12 +1,11 @@
-use object::{LittleEndian, Object, ObjectSection, ObjectSymbol};
+use object::{read::elf::Sym, LittleEndian, Object, ObjectSection, ObjectSymbol};
 use std::borrow::Cow;
 use std::collections::HashMap;
 
 use crate::program_from_elf::ProgramFromElfError;
 
-type ElfFile<'a> = object::read::elf::ElfFile<'a, object::elf::FileHeader32<object::endian::LittleEndian>, &'a [u8]>;
-type ElfSymbol<'data, 'file> =
-    object::read::elf::ElfSymbol<'data, 'file, object::elf::FileHeader32<object::endian::LittleEndian>, &'data [u8]>;
+type ElfFile<'a, H> = object::read::elf::ElfFile<'a, H, &'a [u8]>;
+type ElfSymbol<'data, 'file, H> = object::read::elf::ElfSymbol<'data, 'file, H, &'data [u8]>;
 type ElfSectionIndex = object::read::SectionIndex;
 
 #[derive(Copy, Clone, PartialEq, Eq, PartialOrd, Ord, Debug, Hash)]
@@ -69,13 +68,19 @@ impl<'a> Section<'a> {
     }
 }
 
-pub struct Symbol<'data, 'file> {
-    elf: &'file Elf<'data>,
-    elf_symbol: ElfSymbol<'data, 'file>,
+pub struct Symbol<'data, 'file, H>
+where
+    H: object::read::elf::FileHeader,
+{
+    elf: &'file Elf<'data, H>,
+    elf_symbol: ElfSymbol<'data, 'file, H>,
 }
 
-impl<'data, 'file> Symbol<'data, 'file> {
-    fn new(elf: &'file Elf<'data>, elf_symbol: ElfSymbol<'data, 'file>) -> Self {
+impl<'data, 'file, H> Symbol<'data, 'file, H>
+where
+    H: object::read::elf::FileHeader<Endian = object::LittleEndian>,
+{
+    fn new(elf: &'file Elf<'data, H>, elf_symbol: ElfSymbol<'data, 'file, H>) -> Self {
         Symbol { elf, elf_symbol }
     }
 
@@ -122,33 +127,36 @@ impl<'data, 'file> Symbol<'data, 'file> {
     }
 }
 
-pub struct Elf<'data> {
+pub struct Elf<'data, H>
+where
+    H: object::read::elf::FileHeader,
+{
     sections: Vec<Section<'data>>,
     section_index_by_name: HashMap<String, Vec<SectionIndex>>,
     section_index_map: HashMap<ElfSectionIndex, SectionIndex>,
-    raw_elf: ElfFile<'data>,
+    raw_elf: ElfFile<'data, H>,
 }
 
-impl<'data> Elf<'data> {
+impl<'data, H> Elf<'data, H>
+where
+    H: object::read::elf::FileHeader<Endian = object::LittleEndian>,
+{
     pub fn parse(data: &'data [u8]) -> Result<Self, ProgramFromElfError> {
-        let elf = ElfFile::parse(data)?;
-        if elf.elf_header().e_ident.data != object::elf::ELFDATA2LSB {
+        let elf: ElfFile<H> = ElfFile::parse(data)?;
+        if elf.elf_header().e_ident().data != object::elf::ELFDATA2LSB {
             return Err(ProgramFromElfError::other("file is not a little endian ELF file"));
         }
 
-        let os_abi = elf.elf_header().e_ident.os_abi;
+        let os_abi = elf.elf_header().e_ident().os_abi;
         if os_abi != object::elf::ELFOSABI_SYSV && os_abi != object::elf::ELFOSABI_GNU {
             return Err(ProgramFromElfError::other("file doesn't use the System V nor GNU ABI"));
         }
 
-        if !matches!(
-            elf.elf_header().e_type.get(LittleEndian),
-            object::elf::ET_EXEC | object::elf::ET_REL
-        ) {
+        if !matches!(elf.elf_header().e_type(LittleEndian), object::elf::ET_EXEC | object::elf::ET_REL) {
             return Err(ProgramFromElfError::other("file is not a supported ELF file (ET_EXEC or ET_REL)"));
         }
 
-        if elf.elf_header().e_machine.get(LittleEndian) != object::elf::EM_RISCV {
+        if elf.elf_header().e_machine(LittleEndian) != object::elf::EM_RISCV {
             return Err(ProgramFromElfError::other("file is not a RISC-V file (EM_RISCV)"));
         }
 
@@ -209,7 +217,7 @@ impl<'data> Elf<'data> {
         })
     }
 
-    pub fn symbol_by_index(&self, symbol_index: object::SymbolIndex) -> Result<Symbol, object::Error> {
+    pub fn symbol_by_index(&self, symbol_index: object::SymbolIndex) -> Result<Symbol<H>, object::Error> {
         self.raw_elf
             .symbol_by_index(symbol_index)
             .map(|elf_symbol| Symbol::new(self, elf_symbol))
@@ -233,7 +241,7 @@ impl<'data> Elf<'data> {
         self.sections.iter()
     }
 
-    pub fn symbols<'r>(&'r self) -> impl Iterator<Item = Symbol<'data, 'r>> + 'r {
+    pub fn symbols<'r>(&'r self) -> impl Iterator<Item = Symbol<'data, 'r, H>> + 'r {
         self.raw_elf.symbols().map(|elf_symbol| Symbol::new(self, elf_symbol))
     }
 
@@ -275,5 +283,9 @@ impl<'data> Elf<'data> {
             .and_then(move |index| self.raw_elf.section_by_index(index).ok())
             .into_iter()
             .flat_map(|raw_section| raw_section.relocations())
+    }
+
+    pub fn is_64(&self) -> bool {
+        self.raw_elf.is_64()
     }
 }
