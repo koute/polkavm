@@ -35,6 +35,42 @@ fn parse_indirect_memory_access(text: &str) -> Option<(Reg, i32)> {
     }
 }
 
+/// Parses the long form of load_imm_and_jump_indirect:
+/// `tmp = {base}, {dst} = {value}, jump [tmp + {offset}]`, where `dest == base` is allowed
+fn parse_load_imm_and_jump_indirect_with_tmp(line: &str) -> Option<(Reg, Reg, i32, i32)> {
+    let line = line.trim().strip_prefix("tmp")?;
+    if !line.starts_with('=') && line.trim_start() == line {
+        return None;
+    }
+    let line = line.trim().strip_prefix('=')?;
+
+    let index = line.find(',')?;
+    let base = parse_reg(line[..index].trim())?;
+    let line = line[index + 1..].trim();
+
+    let index = line.find('=')?;
+    let dst = parse_reg(line[..index].trim())?;
+    let line = line[index + 1..].trim();
+
+    let index = line.find(',')?;
+    let value = parse_imm(line[..index].trim())?;
+    let line = line[index + 1..].trim().strip_prefix("jump")?;
+    let text = line.trim().strip_prefix('[')?.strip_suffix(']')?;
+
+    if let Some(index) = text.find('+') {
+        if text[..index].trim() != "tmp" {
+            return None;
+        }
+        let offset = parse_imm(&text[index + 1..])?;
+        Some((dst, base, value, offset))
+    } else {
+        if text.trim() != "tmp" {
+            return None;
+        }
+        Some((dst, base, value, 0))
+    }
+}
+
 #[derive(Copy, Clone)]
 pub enum LoadKind {
     I8,
@@ -325,6 +361,15 @@ pub fn assemble(code: &str) -> Result<Vec<u8>, String> {
             }
         }
 
+        if let Some((dst, base, value, offset)) = parse_load_imm_and_jump_indirect_with_tmp(line) {
+            emit_and_continue!(Instruction::load_imm_and_jump_indirect(
+                dst.into(),
+                base.into(),
+                value as u32,
+                offset as u32
+            ));
+        }
+
         if let Some(index) = line.find('=') {
             let lhs = line[..index].trim();
             let rhs = line[index + 1..].trim();
@@ -335,6 +380,16 @@ pub fn assemble(code: &str) -> Result<Vec<u8>, String> {
                         if let Some(line) = rhs[index + 1..].trim().strip_prefix("jump") {
                             if let Some(label) = line.trim().strip_prefix('@') {
                                 emit_and_continue!(MaybeInstruction::LoadImmAndJump(dst, value, label.to_owned()));
+                            }
+                            if let Some((base, offset)) = parse_indirect_memory_access(line) {
+                                let instruction =
+                                    Instruction::load_imm_and_jump_indirect(dst.into(), base.into(), value as u32, offset as u32);
+
+                                if dst == base {
+                                    return Err(format!("cannot parse line {nth_line}, expected: \"{instruction}\""));
+                                }
+
+                                emit_and_continue!(instruction);
                             }
                         }
                     }
