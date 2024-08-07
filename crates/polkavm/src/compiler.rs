@@ -459,8 +459,8 @@ where
 {
     type ReturnTy = ();
 
-    fn load_i32(&mut self, code_offset: u32, _args_length: u32, dst: RawReg, offset: u32) -> Self::ReturnTy {
-        self.load_u32(code_offset, _args_length, dst, offset)
+    fn load_i32(&mut self, _code_offset: u32, _args_length: u32, _dst: RawReg, _offset: u32) -> Self::ReturnTy {
+        todo!()
     }
     fn load_u64(&mut self, _: u32, _: u32, _: RawReg, _: u32) -> Self::ReturnTy {
         todo!()
@@ -474,8 +474,8 @@ where
     fn store_indirect_u64(&mut self, _: u32, _: u32, _: RawReg, _: RawReg, _: u32) -> Self::ReturnTy {
         todo!()
     }
-    fn load_indirect_i32(&mut self, code_offset: u32, _args_length: u32, dst: RawReg, base: RawReg, offset: u32) -> Self::ReturnTy {
-        self.load_indirect_u32(code_offset, _args_length, dst, base, offset)
+    fn load_indirect_i32(&mut self, _code_offset: u32, _args_length: u32, _dst: RawReg, _base: RawReg, _offset: u32) -> Self::ReturnTy {
+        todo!()
     }
     fn load_indirect_u64(&mut self, _: u32, _: u32, _: RawReg, _: RawReg, _: u32) -> Self::ReturnTy {
         todo!()

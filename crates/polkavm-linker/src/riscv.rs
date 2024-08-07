@@ -526,7 +526,7 @@ impl Inst {
         Self::decode_compressed_internal(op, false)
     }
 
-    pub fn decode_compressed_64(op: u32) -> Option<Self> {
+    pub fn _decode_compressed_64(op: u32) -> Option<Self> {
         Self::decode_compressed_internal(op, true)
     }
 
@@ -787,7 +787,7 @@ impl Inst {
         Self::decode_internal(op, false)
     }
 
-    pub fn decode_64(op: u32) -> Option<Self> {
+    pub fn _decode_64(op: u32) -> Option<Self> {
         Self::decode_internal(op, true)
     }
 
@@ -1116,6 +1116,16 @@ impl Inst {
 
     #[cfg(test)]
     pub fn encode(self) -> Option<u32> {
+        self.encode_32()
+    }
+
+    #[cfg(test)]
+    pub fn _encode_64(self) -> Option<u32> {
+        todo!()
+    }
+
+    #[cfg(test)]
+    pub fn encode_32(self) -> Option<u32> {
         match self {
             Inst::LoadUpperImmediate { dst, value } => {
                 if value & 0xfff != 0 {
@@ -1235,7 +1245,9 @@ impl Inst {
                     | (u32::from(acquire) << 26)
                     | (0b00010 << 27),
             ),
-            Inst::StoreConditionalW { .. } | Inst::LoadReservedW { .. } => todo!(),
+            Inst::StoreConditionalW { .. } | Inst::LoadReservedW { .. } => {
+                unreachable!("internal error: encoding a 64bit instruction in a 32bit context")
+            }
             Inst::StoreConditional {
                 acquire,
                 release,
