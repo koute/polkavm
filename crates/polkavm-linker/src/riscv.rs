@@ -861,7 +861,7 @@ impl Inst {
             }),
             0b0010011 => match (op >> 12) & 0b111 {
                 0b001 => {
-                    if op & 0xfe000000 != 0 {
+                    if !rv64 && op & 0xfe000000 != 0 {
                         return None;
                     }
 
@@ -874,7 +874,8 @@ impl Inst {
                     })
                 }
                 0b101 => {
-                    let kind = match (op & 0xfe000000) >> 24 {
+                    let mask = if rv64 { 0xfc000000 } else { 0xfe000000 };
+                    let kind = match (op & mask) >> 24 {
                         0b00000000 => RegImmKind::ShiftLogicalRight,
                         0b01000000 => RegImmKind::ShiftArithmeticRight,
                         _ => return None,
