@@ -14,7 +14,6 @@ use polkavm_common::{
     VM_RPC_FLAG_CLEAR_PROGRAM_AFTER_EXECUTION, VM_RPC_FLAG_RESET_MEMORY_AFTER_EXECUTION, VM_RPC_FLAG_RESET_MEMORY_BEFORE_EXECUTION,
 };
 
-
 type ExecutionError<E = core::convert::Infallible> = polkavm_common::error::ExecutionError<E>;
 
 // Define a custom trait instead of just using `Into<RegImm>` to make sure this is always inlined.
