@@ -6872,19 +6872,22 @@ impl Config {
 
 pub fn program_from_elf(config: Config, data: &[u8]) -> Result<Vec<u8>, ProgramFromElfError> {
     match Elf::<object::elf::FileHeader32<object::endian::LittleEndian>>::parse(data) {
-        Ok(elf) => program_from_elf_internal(config, elf, Bitness::B32),
+        Ok(elf) => program_from_elf_internal(config, elf),
         Err(ProgramFromElfError(ProgramFromElfErrorKind::FailedToParseElf(e))) if e.to_string() == "Unsupported ELF header" => {
-            let elf = Elf::<object::elf::FileHeader64<object::endian::LittleEndian>>::parse(data)?;
-            program_from_elf_internal(config, elf, Bitness::B64)
+            let _elf = Elf::<object::elf::FileHeader64<object::endian::LittleEndian>>::parse(data)?;
+            todo!("64bit isn't fully supported yet");
+            //program_from_elf_internal(config, _elf)
         }
         Err(e) => Err(e),
     }
 }
 
-fn program_from_elf_internal<H>(config: Config, mut elf: Elf<H>, bitness: Bitness) -> Result<Vec<u8>, ProgramFromElfError>
+fn program_from_elf_internal<H>(config: Config, mut elf: Elf<H>) -> Result<Vec<u8>, ProgramFromElfError>
 where
     H: object::read::elf::FileHeader<Endian = object::LittleEndian>,
 {
+    let bitness = if elf.is_64() { Bitness::B64 } else { Bitness::B32 };
+
     if elf.section_by_name(".got").next().is_none() {
         elf.add_empty_data_section(".got");
     }
