@@ -1313,7 +1313,7 @@ where
 
     let RelocationKind::Abs {
         target: symbol_location,
-        size: RelocationSize::U32,
+        size: RelocationSize::U32 | RelocationSize::U64,
     } = symbol_relocation
     else {
         return Err(format!("unexpected relocation for the symbol: {symbol_relocation:?}"));
@@ -1517,6 +1517,7 @@ fn convert_instruction(
     current_location: SectionTarget,
     instruction: Inst,
     instruction_size: u64,
+    rv64: bool,
     mut emit: impl FnMut(InstExt<SectionTarget, SectionTarget>),
 ) -> Result<(), ProgramFromElfError> {
     match instruction {
@@ -1763,7 +1764,7 @@ fn convert_instruction(
             };
 
             emit(InstExt::Basic(BasicInst::LoadIndirect {
-                kind: LoadKind::U32,
+                kind: if rv64 { LoadKind::U64 } else { LoadKind::U32 },
                 dst,
                 base: src,
                 offset: 0,
@@ -1802,7 +1803,7 @@ fn convert_instruction(
 
             let src = cast_reg_any(src)?;
             emit(InstExt::Basic(BasicInst::StoreIndirect {
-                kind: StoreKind::U32,
+                kind: if rv64 { StoreKind::U64 } else { StoreKind::U32 },
                 src,
                 base: addr,
                 offset: 0,
@@ -2206,7 +2207,7 @@ where
             }
 
             let original_length = output.len();
-            convert_instruction(section, current_location, original_inst, inst_size, |inst| {
+            convert_instruction(section, current_location, original_inst, inst_size, elf.is_64(), |inst| {
                 output.push((source, inst));
             })?;
 
@@ -6704,7 +6705,7 @@ where
 
             match lo_inst {
                 Inst::Load {
-                    kind: LoadKind::U32,
+                    kind: LoadKind::U32 | LoadKind::U64 | LoadKind::I32,
                     base,
                     dst,
                     ..
@@ -7254,15 +7255,7 @@ where
 
         fn write_generic(size: RelocationSize, data: &mut [u8], relative_address: u64, value: u64) -> Result<(), ProgramFromElfError> {
             match size {
-                RelocationSize::U64 => {
-                    let Ok(value) = u64::try_from(value) else {
-                        return Err(ProgramFromElfError::other(
-                            "overflow when applying relocations: value doesn't fit in an u64",
-                        ));
-                    };
-
-                    write_u64(data, relative_address, value)
-                }
+                RelocationSize::U64 => write_u64(data, relative_address, value),
                 RelocationSize::U32 => {
                     let Ok(value) = u32::try_from(value) else {
                         return Err(ProgramFromElfError::other(

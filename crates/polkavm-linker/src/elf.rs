@@ -284,4 +284,8 @@ where
             .into_iter()
             .flat_map(|raw_section| raw_section.relocations())
     }
+
+    pub fn is_64(&self) -> bool {
+        self.raw_elf.is_64()
+    }
 }
