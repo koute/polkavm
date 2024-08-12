@@ -67,9 +67,15 @@ fn main() {
         "ESPIPE",
         "ESRCH",
         "ETIMEDOUT",
+        "ETOOMANYREFS",
         "ETXTBSY",
         "EXDEV",
         "_?UFFD.+",
+        "_IOC.*",
+        "IORING.+",
+        "IOSQE.+",
+        "FUTEX2.+",
+        "PTRACE_.+",
     ]
     .join("|");
 
@@ -91,6 +97,9 @@ fn main() {
         "sigset_t",
         "timespec",
         "uffd_msg",
+        "uffdio.+",
+        "io_uring.+",
+        "new_utsname",
     ]
     .join("|");
 
@@ -107,14 +116,14 @@ fn main() {
         .clang_arg("-nostdinc")
         .clang_arg("-I")
         .clang_arg(
-            root.join("linux/linux-6.5-headers/include")
+            root.join("linux/linux-6.9.3-headers/include")
                 .canonicalize()
                 .unwrap()
                 .to_str()
                 .unwrap(),
         )
         .clang_arg("-I")
-        .clang_arg(root.join("linux/linux-6.5/include").canonicalize().unwrap().to_str().unwrap())
+        .clang_arg(root.join("linux/linux-6.9.3/include").canonicalize().unwrap().to_str().unwrap())
         .sort_semantically(true)
         .generate()
         .unwrap();

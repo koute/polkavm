@@ -1,6 +1,9 @@
 #include <asm/signal.h>
 #include <asm/unistd_64.h>
 #include <asm/prctl.h>
+#include <asm/ioctl.h>
+#include <asm/ptrace.h>
+#include <asm/ptrace-abi.h>
 
 #include <asm-generic/resource.h>
 #include <asm-generic/fcntl.h>
@@ -28,6 +31,9 @@
 #include <linux/wait.h>
 #include <linux/falloc.h>
 #include <linux/userfaultfd.h>
+#include <linux/io_uring.h>
+#include <linux/utsname.h>
+#include <linux/ptrace.h>
 
 #define u64 __u64
 #define s64 __s64

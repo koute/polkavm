@@ -1,4 +1,4 @@
-use crate::program::{self, Instruction, ProgramSymbol};
+use crate::program::{self, Instruction, ProgramCounter, ProgramSymbol};
 use alloc::boxed::Box;
 use alloc::vec::Vec;
 use core::ops::Range;
@@ -327,11 +327,10 @@ impl ProgramBlobBuilder {
 
             for ((offset, mut instruction), entry) in parsed.into_iter().zip(instructions.into_iter()) {
                 if let Some(entry_instruction) = entry.instruction {
-                    // @Jan: Don't know why this is allways failing
                     assert_eq!(instruction, entry_instruction, "broken serialization: {:?}", entry.bytes.bytes);
-                    assert_eq!(entry.position, offset);
+                    assert_eq!(entry.position, offset.0);
                     if let Some(target) = instruction.target_mut() {
-                        assert!(offsets.contains(target));
+                        assert!(offsets.contains(&ProgramCounter(*target)));
                     }
                 }
             }
@@ -343,6 +342,10 @@ impl ProgramBlobBuilder {
     }
 
     pub fn into_vec(self) -> Vec<u8> {
+        self.to_vec()
+    }
+
+    pub fn to_vec(&self) -> Vec<u8> {
         let mut output = Vec::new();
         let mut writer = Writer::new(&mut output);
 
@@ -377,8 +380,8 @@ impl ProgramBlobBuilder {
         if !self.exports.is_empty() {
             writer.push_section_inplace(program::SECTION_EXPORTS, |writer| {
                 writer.push_varint(self.exports.len().try_into().expect("too many exports"));
-                for (target_basic_block, symbol) in self.exports {
-                    let nth_instruction = self.basic_block_to_instruction_index[target_basic_block as usize];
+                for (target_basic_block, symbol) in &self.exports {
+                    let nth_instruction = self.basic_block_to_instruction_index[*target_basic_block as usize];
                     let offset = self.instruction_index_to_code_offset[nth_instruction];
                     writer.push_varint(offset);
                     writer.push_bytes_with_length(symbol.as_bytes());
@@ -395,8 +398,8 @@ impl ProgramBlobBuilder {
             writer.push_raw_bytes(&self.bitmask);
         });
 
-        for (section, contents) in self.custom {
-            writer.push_section(section, &contents);
+        for (section, contents) in &self.custom {
+            writer.push_section(*section, contents);
         }
 
         writer.push_raw_bytes(&[program::SECTION_END_OF_FILE]);

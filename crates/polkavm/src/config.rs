@@ -85,7 +85,7 @@ impl SandboxKind {
             {
                 match self {
                     SandboxKind::Linux => cfg!(target_os = "linux"),
-                    SandboxKind::Generic => true
+                    SandboxKind::Generic => cfg!(feature = "generic-sandbox"),
                 }
             } else {
                 false
@@ -98,9 +98,10 @@ impl SandboxKind {
 pub struct Config {
     pub(crate) backend: Option<BackendKind>,
     pub(crate) sandbox: Option<SandboxKind>,
-    pub(crate) trace_execution: bool,
-    pub(crate) allow_insecure: bool,
+    pub(crate) crosscheck: bool,
+    pub(crate) allow_experimental: bool,
     pub(crate) worker_count: usize,
+    pub(crate) dynamic_paging: bool,
 }
 
 impl Default for Config {
@@ -124,15 +125,33 @@ fn env_bool(name: &str) -> Result<Option<bool>, Error> {
     }
 }
 
+#[cfg(feature = "std")]
+fn env_usize(name: &str) -> Result<Option<usize>, Error> {
+    if let Some(value) = std::env::var_os(name) {
+        if let Ok(value) = value.into_string() {
+            if let Ok(value) = value.parse() {
+                Ok(Some(value))
+            } else {
+                bail!("invalid value of {name}; must be a positive integer")
+            }
+        } else {
+            bail!("invalid value of {name}; must be a positive integer")
+        }
+    } else {
+        Ok(None)
+    }
+}
+
 impl Config {
     /// Creates a new default configuration.
     pub fn new() -> Self {
         Config {
             backend: None,
             sandbox: None,
-            trace_execution: false,
-            allow_insecure: false,
+            crosscheck: false,
+            allow_experimental: false,
             worker_count: 2,
+            dynamic_paging: false,
         }
     }
 
@@ -148,12 +167,16 @@ impl Config {
             config.sandbox = SandboxKind::from_os_str(&value)?;
         }
 
-        if let Some(value) = env_bool("POLKAVM_TRACE_EXECUTION")? {
-            config.trace_execution = value;
+        if let Some(value) = env_bool("POLKAVM_CROSSCHECK")? {
+            config.crosscheck = value;
         }
 
-        if let Some(value) = env_bool("POLKAVM_ALLOW_INSECURE")? {
-            config.allow_insecure = value;
+        if let Some(value) = env_bool("POLKAVM_ALLOW_EXPERIMENTAL")? {
+            config.allow_experimental = value;
+        }
+
+        if let Some(value) = env_usize("POLKAVM_WORKER_COUNT")? {
+            config.worker_count = value;
         }
 
         Ok(config)
@@ -189,33 +212,36 @@ impl Config {
         self.sandbox
     }
 
-    /// Enables execution tracing.
+    /// Enables execution cross-checking.
     ///
-    /// **Requires `set_allow_insecure` to be `true`.**
-    ///
-    /// Default: `false`
-    ///
-    /// Corresponding environment variable: `POLKAVM_TRACE_EXECUTION` (`true`, `false`)
-    pub fn set_trace_execution(&mut self, value: bool) -> &mut Self {
-        self.trace_execution = value;
-        self
-    }
-
-    /// Returns whether the execution tracing is enabled.
-    pub fn trace_execution(&self) -> bool {
-        self.trace_execution
-    }
-
-    /// Enabling this makes it possible to enable other settings
-    /// which can introduce unsafety or break determinism.
+    /// This will run an interpreter alongside the recompiler and cross-check their execution.
     ///
     /// Should only be used for debugging purposes and *never* enabled by default in production.
     ///
     /// Default: `false`
     ///
-    /// Corresponding environment variable: `POLKAVM_ALLOW_INSECURE` (`true`, `false`)
-    pub fn set_allow_insecure(&mut self, value: bool) -> &mut Self {
-        self.allow_insecure = value;
+    /// Corresponding environment variable: `POLKAVM_CROSSCHECK` (`false`, `true`)
+    pub fn set_crosscheck(&mut self, value: bool) -> &mut Self {
+        self.crosscheck = value;
+        self
+    }
+
+    /// Returns whether cross-checking is enabled.
+    pub fn crosscheck(&self) -> bool {
+        self.crosscheck
+    }
+
+    /// Enabling this makes it possible to enable other experimental settings
+    /// which are not meant for general use and can introduce unsafety,
+    /// break determinism, or just simply be totally broken.
+    ///
+    /// This should NEVER be used in production unless you know what you're doing.
+    ///
+    /// Default: `false`
+    ///
+    /// Corresponding environment variable: `POLKAVM_ALLOW_EXPERIMENTAL` (`true`, `false`)
+    pub fn set_allow_experimental(&mut self, value: bool) -> &mut Self {
+        self.allow_experimental = value;
         self
     }
 
@@ -229,8 +255,28 @@ impl Config {
     /// This only has an effect when using a recompiler. For the interpreter this setting will be ignored.
     ///
     /// Default: `2`
+    ///
+    /// Corresponding environment variable: `POLKAVM_WORKER_COUNT`
     pub fn set_worker_count(&mut self, value: usize) -> &mut Self {
         self.worker_count = value;
+        self
+    }
+
+    /// Returns the number of worker sandboxes that will be permanently kept alive by the engine.
+    pub fn worker_count(&self) -> usize {
+        self.worker_count
+    }
+
+    /// Returns whether dynamic paging is enabled.
+    pub fn dynamic_paging(&self) -> bool {
+        self.dynamic_paging
+    }
+
+    /// Sets whether dynamic paging is enabled.
+    ///
+    /// Default: `false`
+    pub fn set_dynamic_paging(&mut self, value: bool) -> &mut Self {
+        self.dynamic_paging = value;
         self
     }
 }
@@ -259,6 +305,7 @@ pub struct ModuleConfig {
     pub(crate) page_size: u32,
     pub(crate) gas_metering: Option<GasMeteringKind>,
     pub(crate) is_strict: bool,
+    pub(crate) step_tracing: bool,
 }
 
 impl Default for ModuleConfig {
@@ -274,6 +321,7 @@ impl ModuleConfig {
             page_size: 0x1000,
             gas_metering: None,
             is_strict: false,
+            step_tracing: false,
         }
     }
 
@@ -293,8 +341,23 @@ impl ModuleConfig {
         self
     }
 
+    /// Sets whether step tracing is enabled.
+    ///
+    /// When enabled [`InterruptKind::Step`](crate::InterruptKind::Step) will be returned by [`RawInstance::run`](crate::RawInstance::run)
+    /// for each executed instruction.
+    ///
+    /// Should only be used for debugging.
+    ///
+    /// Default: `false`
+    pub fn set_step_tracing(&mut self, enabled: bool) -> &mut Self {
+        self.step_tracing = enabled;
+        self
+    }
+
     /// Sets the strict mode. When disabled it's guaranteed that the semantics
     /// of lazy execution match the semantics of eager execution.
+    ///
+    /// Should only be used for debugging.
     ///
     /// Default: `false`
     pub fn set_strict(&mut self, is_strict: bool) -> &mut Self {

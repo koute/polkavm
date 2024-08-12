@@ -170,6 +170,7 @@ impl ShmAllocator {
 
 #[test]
 fn test_shm_allocator() {
+    crate::sandbox::init_native_page_size();
     let page_size = get_native_page_size();
     let shm = ShmAllocator::new().unwrap();
     let allocation = shm.alloc(1).unwrap();

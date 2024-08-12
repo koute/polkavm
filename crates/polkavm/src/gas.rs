@@ -504,3 +504,9 @@ pub fn calculate_for_block(mut instructions: Instructions) -> (u32, bool) {
         (visitor.last_block_cost.unwrap(), started_out_of_bounds)
     }
 }
+
+pub fn trap_cost() -> u32 {
+    let mut gas_visitor = GasVisitor::default();
+    gas_visitor.trap();
+    gas_visitor.take_block_cost().unwrap()
+}
