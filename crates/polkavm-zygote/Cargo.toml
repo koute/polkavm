@@ -8,7 +8,7 @@ publish = false
 
 [dependencies]
 polkavm-linux-raw = { path = "../polkavm-linux-raw" }
-polkavm-common = { path = "../polkavm-common" }
+polkavm-common = { path = "../polkavm-common", features = ["regmap"] }
 
 [build-dependencies]
 polkavm-common = { path = "../polkavm-common" }

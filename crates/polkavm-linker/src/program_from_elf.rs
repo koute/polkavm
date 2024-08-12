@@ -1,5 +1,5 @@
 use polkavm_common::abi::{MemoryMap, VM_CODE_ADDRESS_ALIGNMENT, VM_MAX_PAGE_SIZE, VM_MIN_PAGE_SIZE};
-use polkavm_common::program::{self, FrameKind, Instruction, LineProgramOp, ProgramBlob, ProgramSymbol};
+use polkavm_common::program::{self, FrameKind, Instruction, LineProgramOp, ProgramBlob, ProgramCounter, ProgramSymbol};
 use polkavm_common::utils::{align_to_next_page_u32, align_to_next_page_u64};
 use polkavm_common::varint;
 use polkavm_common::writer::{ProgramBlobBuilder, Writer};
@@ -7257,20 +7257,28 @@ pub fn program_from_elf(config: Config, data: &[u8]) -> Result<Vec<u8>, ProgramF
 
     builder.set_code(&raw_code, &jump_table);
 
+    let mut offsets = Vec::new();
     if !config.strip {
-        emit_debug_info(&mut builder, &locations_for_instruction);
+        let blob = ProgramBlob::parse(builder.to_vec().into())?;
+        offsets = blob
+            .instructions()
+            .map(|instruction| (instruction.offset, instruction.next_offset()))
+            .collect();
+        assert_eq!(offsets.len(), locations_for_instruction.len());
+
+        emit_debug_info(&mut builder, &locations_for_instruction, &offsets);
     }
 
-    let raw_blob = builder.into_vec();
+    let raw_blob = builder.to_vec();
 
     log::debug!("Built a program of {} bytes", raw_blob.len());
     let blob = ProgramBlob::parse(raw_blob[..].into())?;
 
     // Sanity check that our debug info was properly emitted and can be parsed.
     if cfg!(debug_assertions) && !config.strip {
-        'outer: for (instruction_position, locations) in locations_for_instruction.iter().enumerate() {
-            let instruction_position = instruction_position as u32;
-            let line_program = blob.get_debug_line_program_at(instruction_position).unwrap();
+        'outer: for (nth_instruction, locations) in locations_for_instruction.iter().enumerate() {
+            let (program_counter, _) = offsets[nth_instruction];
+            let line_program = blob.get_debug_line_program_at(program_counter).unwrap();
             let Some(locations) = locations else {
                 assert!(line_program.is_none());
                 continue;
@@ -7278,7 +7286,7 @@ pub fn program_from_elf(config: Config, data: &[u8]) -> Result<Vec<u8>, ProgramF
 
             let mut line_program = line_program.unwrap();
             while let Some(region_info) = line_program.run().unwrap() {
-                if !region_info.instruction_range().contains(&instruction_position) {
+                if !region_info.instruction_range().contains(&program_counter) {
                     continue;
                 }
 
@@ -7333,7 +7341,11 @@ fn simplify_path(path: &str) -> Cow<str> {
     path.into()
 }
 
-fn emit_debug_info(builder: &mut ProgramBlobBuilder, locations_for_instruction: &[Option<Arc<[Location]>>]) {
+fn emit_debug_info(
+    builder: &mut ProgramBlobBuilder,
+    locations_for_instruction: &[Option<Arc<[Location]>>],
+    offsets: &[(ProgramCounter, ProgramCounter)],
+) {
     #[derive(Default)]
     struct DebugStringsBuilder<'a> {
         map: HashMap<Cow<'a, str>, u32>,
@@ -7373,6 +7385,8 @@ fn emit_debug_info(builder: &mut ProgramBlobBuilder, locations_for_instruction: 
         path: Option<Cow<'a, str>>,
         instruction_position: usize,
         instruction_count: usize,
+        program_counter_start: ProgramCounter,
+        program_counter_end: ProgramCounter,
     }
 
     impl<'a> Group<'a> {
@@ -7405,6 +7419,8 @@ fn emit_debug_info(builder: &mut ProgramBlobBuilder, locations_for_instruction: 
                 path: location.source_code_location.as_ref().map(|target| simplify_path(target.path())),
                 instruction_position,
                 instruction_count: 1,
+                program_counter_start: offsets[instruction_position].0,
+                program_counter_end: offsets[instruction_position].1,
             }
         } else {
             Group {
@@ -7413,6 +7429,8 @@ fn emit_debug_info(builder: &mut ProgramBlobBuilder, locations_for_instruction: 
                 path: None,
                 instruction_position,
                 instruction_count: 1,
+                program_counter_start: offsets[instruction_position].0,
+                program_counter_end: offsets[instruction_position].1,
             }
         };
 
@@ -7420,6 +7438,7 @@ fn emit_debug_info(builder: &mut ProgramBlobBuilder, locations_for_instruction: 
             if last_group.key() == group.key() {
                 assert_eq!(last_group.instruction_position + last_group.instruction_count, instruction_position);
                 last_group.instruction_count += 1;
+                last_group.program_counter_end = group.program_counter_end;
                 continue;
             }
         }
@@ -7507,8 +7526,8 @@ fn emit_debug_info(builder: &mut ProgramBlobBuilder, locations_for_instruction: 
                     self.stack_depth = depth;
                 }
 
-                fn finish_instruction(&mut self, writer: &mut Writer, next_depth: usize) {
-                    self.queued_count += 1;
+                fn finish_instruction(&mut self, writer: &mut Writer, next_depth: usize, instruction_length: u32) {
+                    self.queued_count += instruction_length;
 
                     enum Direction {
                         GoDown,
@@ -7657,7 +7676,7 @@ fn emit_debug_info(builder: &mut ProgramBlobBuilder, locations_for_instruction: 
                     .get(nth_instruction + 1)
                     .and_then(|next_locations| next_locations.as_ref().map(|xs| xs.len()))
                     .unwrap_or(0);
-                state.finish_instruction(writer, next_depth);
+                state.finish_instruction(writer, next_depth, (offsets[nth_instruction].1).0 - (offsets[nth_instruction].0).0);
             }
 
             state.flush_if_any_are_queued(writer);
@@ -7671,8 +7690,8 @@ fn emit_debug_info(builder: &mut ProgramBlobBuilder, locations_for_instruction: 
     {
         let mut writer = Writer::new(&mut section_line_program_ranges);
         for (group, info_offset) in groups.iter().zip(info_offsets.into_iter()) {
-            writer.push_u32(group.instruction_position.try_into().expect("overflow"));
-            writer.push_u32((group.instruction_position + group.instruction_count).try_into().expect("overflow"));
+            writer.push_u32(group.program_counter_start.0);
+            writer.push_u32(group.program_counter_end.0);
             writer.push_u32(info_offset);
         }
     }

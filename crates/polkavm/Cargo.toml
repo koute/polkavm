@@ -12,8 +12,8 @@ description = "A fast and secure RISC-V based virtual machine"
 
 [dependencies]
 log = { workspace = true }
-polkavm-assembler = { workspace = true }
-polkavm-common = { workspace = true, features = ["alloc", "logging"] }
+polkavm-assembler = { workspace = true, features = ["alloc"] }
+polkavm-common = { workspace = true, features = ["alloc", "logging", "regmap"] }
 
 [target.'cfg(all(not(miri), target_arch = "x86_64", target_os = "linux"))'.dependencies]
 polkavm-linux-raw = { workspace = true, features = ["std"] }
@@ -33,3 +33,9 @@ workspace = true
 [features]
 default = ["std"]
 std = ["ruzstd/std"]
+
+# Whether to enable a cross-platform, generic sandbox for the recompiler backend.
+#
+# This is required on non-Linux systems to use the recompiler. On Linux it is unnecessary.
+# This sandbox is EXPERIMENTAL and is not meant for production use.
+generic-sandbox = []

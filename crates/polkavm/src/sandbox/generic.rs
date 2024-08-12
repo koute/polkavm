@@ -3,7 +3,7 @@
 use polkavm_common::{
     error::{ExecutionError, Trap},
     program::Reg,
-    utils::{align_to_next_page_usize, byte_slice_init, Access, AsUninitSliceMut, Gas},
+    utils::{align_to_next_page_usize, byte_slice_init, AsUninitSliceMut},
     zygote::{
         AddressTable,
         AddressTableRaw,
@@ -13,12 +13,7 @@ use polkavm_common::{
         VM_SANDBOX_MAXIMUM_NATIVE_CODE_SIZE,
         VM_SANDBOX_MAXIMUM_JUMP_TABLE_VIRTUAL_SIZE,
     },
-    VM_RPC_FLAG_CLEAR_PROGRAM_AFTER_EXECUTION,
-    VM_RPC_FLAG_RESET_MEMORY_AFTER_EXECUTION,
-    VM_RPC_FLAG_RESET_MEMORY_BEFORE_EXECUTION,
 };
-
-use super::ExecuteArgs;
 
 use core::ops::Range;
 use core::cell::UnsafeCell;
@@ -27,9 +22,16 @@ use std::borrow::Cow;
 use std::sync::Arc;
 
 use super::{SandboxKind, SandboxInit, get_native_page_size, WorkerCache, WorkerCacheKind};
-use crate::api::{BackendAccess, CompiledModuleKind, MemoryAccessError, Module, HostcallHandler};
+use crate::api::{CompiledModuleKind, MemoryAccessError, Module};
 use crate::config::Config;
 use crate::compiler::CompiledModule;
+use crate::{Gas, ProgramCounter};
+
+#[inline(always)]
+pub(crate) fn as_bytes(slice: &[usize]) -> &[u8] {
+    // SAFETY: Casting a &[usize] into a &[u8] is always safe as `u8` doesn't have any alignment requirements.
+    unsafe { core::slice::from_raw_parts(slice.as_ptr().cast(), core::mem::size_of_val(slice)) }
+}
 
 #[repr(transparent)]
 struct Cast<T, U>(T, core::marker::PhantomData<U>);
@@ -485,7 +487,6 @@ struct VmCtx {
     trap_kind: TrapKind,
 
     regs: CacheAligned<[u32; REG_COUNT]>,
-    hostcall_handler: Option<HostcallHandler<'static>>,
     sandbox: *mut Sandbox,
     instruction_number: Option<u32>,
     native_program_counter: Option<u64>,
@@ -511,7 +512,6 @@ impl VmCtx {
             maps: Vec::new(),
             gas: 0,
             regs: CacheAligned([0; REG_COUNT]),
-            hostcall_handler: None,
             sandbox: core::ptr::null_mut(),
             instruction_number: None,
             native_program_counter: None,
@@ -531,7 +531,10 @@ pub struct GlobalState {
 }
 
 impl GlobalState {
-    pub fn new(_config: &Config) -> Result<Self, Error> {
+    pub fn new(config: &Config) -> Result<Self, Error> {
+        if config.dynamic_paging {
+            return Err(Error::from_str("dynamic paging is currently not supported by the generic sandbox"));
+        }
         Ok(GlobalState {})
     }
 }
@@ -558,7 +561,7 @@ unsafe fn conjure_vmctx<'a>() -> &'a mut VmCtx {
     &mut *THREAD_VMCTX.with(|thread_ctx| *thread_ctx.get())
 }
 
-unsafe extern "C" fn syscall_hostcall(hostcall: u32) {
+unsafe extern "C" fn syscall_hostcall() -> ! {
     // SAFETY: We were called from the inside of the guest program, so vmctx must be valid.
     let vmctx = unsafe { conjure_vmctx() };
 
@@ -578,7 +581,7 @@ unsafe extern "C" fn syscall_hostcall(hostcall: u32) {
     }
 }
 
-unsafe extern "C" fn syscall_trace(instruction_number: u32, rip: u64) {
+unsafe extern "C" fn syscall_step() -> ! {
     // SAFETY: We were called from the inside of the guest program, so vmctx must be valid.
     let vmctx = unsafe { conjure_vmctx() };
 
@@ -697,8 +700,8 @@ struct SandboxProgramInner {
 }
 
 impl super::SandboxProgram for SandboxProgram {
-    fn machine_code(&self) -> Cow<[u8]> {
-        Cow::Borrowed(&self.0.code_memory.as_slice()[..self.0.code_length])
+    fn machine_code(&self) -> &[u8] {
+        &self.0.code_memory.as_slice()[..self.0.code_length]
     }
 }
 
@@ -1053,7 +1056,7 @@ impl Sandbox {
 }
 
 impl super::SandboxAddressSpace for Mmap {
-    fn native_code_address(&self) -> u64 {
+    fn native_code_origin(&self) -> u64 {
         self.as_ptr() as u64
     }
 }
@@ -1061,7 +1064,6 @@ impl super::SandboxAddressSpace for Mmap {
 impl super::Sandbox for Sandbox {
     const KIND: SandboxKind = SandboxKind::Generic;
 
-    type Access<'r> = SandboxAccess<'r>;
     type Config = SandboxConfig;
     type Error = Error;
     type Program = SandboxProgram;
@@ -1104,7 +1106,7 @@ impl super::Sandbox for Sandbox {
     fn prepare_program(_global: &Self::GlobalState, init: SandboxInit<Self>, mut map: Self::AddressSpace) -> Result<Self::Program, Self::Error> {
         let native_page_size = get_native_page_size();
         let cfg = init.guest_init.memory_map()?;
-        let jump_table = crate::utils::as_bytes(&init.jump_table);
+        let jump_table = as_bytes(&init.jump_table);
 
         let code_size = align_to_next_page_usize(native_page_size, init.code.len()).unwrap();
         let jump_table_size = align_to_next_page_usize(native_page_size, jump_table.len()).unwrap();
@@ -1269,7 +1271,7 @@ impl super::Sandbox for Sandbox {
                 self.poison = Poison::Poisoned;
                 result
             }
-            result @ (Ok(()) | Err(ExecutionError::Trap(_) | ExecutionError::OutOfGas)) => {
+            result @ (Ok(()) | Err(ExecutionError::Trap(_) | ExecutionError::NotEnoughGas)) => {
                 self.poison = Poison::None;
                 result
             }
@@ -1290,7 +1292,7 @@ impl super::Sandbox for Sandbox {
             syscall_hostcall,
             syscall_trap,
             syscall_return,
-            syscall_trace,
+            syscall_step,
             syscall_sbrk,
         })
     }
@@ -1307,32 +1309,11 @@ impl super::Sandbox for Sandbox {
         get_field_offset!(VmCtx::new(), |base| &base.heap_info)
     }
 
-    fn gas_remaining_impl(&self) -> Result<Option<Gas>, super::OutOfGas> {
-        let Some(module) = self.module.as_ref() else { return Ok(None) };
-        if module.gas_metering().is_none() { return Ok(None) };
-        let raw_gas = self.vmctx().gas;
-        Gas::from_i64(raw_gas).ok_or(super::OutOfGas).map(Some)
-    }
-
     fn sync(&mut self) -> Result<(), Self::Error> {
         Ok(())
     }
-}
 
-pub struct SandboxAccess<'a> {
-    sandbox: &'a mut Sandbox,
-}
-
-impl<'a> From<SandboxAccess<'a>> for BackendAccess<'a> {
-    fn from(access: SandboxAccess<'a>) -> Self {
-        BackendAccess::CompiledGeneric(access)
-    }
-}
-
-impl<'a> Access<'a> for SandboxAccess<'a> {
-    type Error = MemoryAccessError<&'static str>;
-
-    fn get_reg(&self, reg: Reg) -> u32 {
+    fn reg(&self, reg: Reg) -> u32 {
         assert!(!matches!(self.sandbox.poison, Poison::Poisoned), "sandbox has been poisoned");
         self.sandbox.vmctx().regs[reg as usize]
     }
@@ -1417,25 +1398,19 @@ impl<'a> Access<'a> for SandboxAccess<'a> {
         (heap_top - u64::from(heap_base)) as u32
     }
 
-    fn program_counter(&self) -> Option<u32> {
+    fn program_counter(&self) -> Option<ProgramCounter> {
         self.sandbox.vmctx().instruction_number
+    }
+
+    fn gas(&self) -> Gas {
+        self.vmctx().gas
+    }
+
+    fn set_gas(&mut self, gas: Gas) {
+        self.vmctx().gas = gas;
     }
 
     fn native_program_counter(&self) -> Option<u64> {
         self.sandbox.vmctx().native_program_counter
-    }
-
-    fn gas_remaining(&self) -> Option<Gas> {
-        use super::Sandbox;
-        self.sandbox.gas_remaining_impl().ok().unwrap_or(Some(Gas::MIN))
-    }
-
-    fn consume_gas(&mut self, gas: u64) {
-        if self.sandbox.module.as_ref().and_then(|module| module.gas_metering()).is_none() {
-            return;
-        }
-
-        let gas_remaining = &mut self.sandbox.vmctx_mut().gas;
-        *gas_remaining = gas_remaining.checked_sub_unsigned(gas).unwrap_or(-1);
     }
 }
