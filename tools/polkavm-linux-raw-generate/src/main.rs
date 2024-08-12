@@ -67,6 +67,7 @@ fn main() {
         "ESPIPE",
         "ESRCH",
         "ETIMEDOUT",
+        "ETOOMANYREFS",
         "ETXTBSY",
         "EXDEV",
         "_?UFFD.+",

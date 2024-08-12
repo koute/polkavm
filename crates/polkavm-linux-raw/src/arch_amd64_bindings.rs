@@ -826,6 +826,7 @@ pub const EPIPE: u32 = 32;
 pub const EDOM: u32 = 33;
 pub const ERANGE: u32 = 34;
 pub const EOPNOTSUPP: u32 = 95;
+pub const ETOOMANYREFS: u32 = 109;
 pub const ETIMEDOUT: u32 = 110;
 pub const FUTEX_WAIT: u32 = 0;
 pub const FUTEX_WAKE: u32 = 1;
