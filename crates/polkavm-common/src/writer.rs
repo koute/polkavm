@@ -4,7 +4,7 @@ use alloc::vec::Vec;
 use core::ops::Range;
 
 #[derive(Copy, Clone)]
-pub struct InstructionBuffer {
+struct InstructionBuffer {
     bytes: [u8; program::MAX_INSTRUCTION_LENGTH],
     length: u8,
 }
@@ -61,9 +61,24 @@ impl Instruction {
 }
 
 #[derive(Copy, Clone)]
+pub struct RawInstruction {
+    buffer: InstructionBuffer,
+    starts_new_basic_block: bool,
+}
+
+impl From<(u32, Instruction)> for RawInstruction {
+    fn from((position, instruction): (u32, Instruction)) -> Self {
+        Self {
+            buffer: InstructionBuffer::from((position, instruction)),
+            starts_new_basic_block: instruction.opcode().starts_new_basic_block(),
+        }
+    }
+}
+
+#[derive(Copy, Clone)]
 pub enum InstructionOrBytes {
     Instruction(Instruction),
-    Raw(InstructionBuffer),
+    Raw(RawInstruction),
 }
 
 impl From<Instruction> for InstructionOrBytes {
@@ -72,8 +87,8 @@ impl From<Instruction> for InstructionOrBytes {
     }
 }
 
-impl From<InstructionBuffer> for InstructionOrBytes {
-    fn from(value: InstructionBuffer) -> Self {
+impl From<RawInstruction> for InstructionOrBytes {
+    fn from(value: RawInstruction) -> Self {
         Self::Raw(value)
     }
 }
@@ -161,6 +176,12 @@ impl ProgramBlobBuilder {
                     basic_block_to_instruction_index.push(nth_instruction + 1);
                 }
             }
+
+            if let InstructionOrBytes::Raw(raw_inst) = instruction {
+                if raw_inst.starts_new_basic_block {
+                    basic_block_to_instruction_index.push(nth_instruction + 1);
+                }
+            }
         }
 
         self.jump_table.clear();
@@ -189,9 +210,9 @@ impl ProgramBlobBuilder {
                 }
                 // The instruction in the form of raw bytes, that should only be appended, as we want to
                 // be able to slip in invalid instructions, e.g., jump instruction with an invalid offset
-                InstructionOrBytes::Raw(bytes) => SerializedInstruction {
+                InstructionOrBytes::Raw(raw_inst) => SerializedInstruction {
                     instruction: None,
-                    bytes: *bytes,
+                    bytes: raw_inst.buffer,
                     target_nth_instruction: None,
                     position,
                 },
@@ -307,7 +328,7 @@ impl ProgramBlobBuilder {
             for ((offset, mut instruction), entry) in parsed.into_iter().zip(instructions.into_iter()) {
                 if let Some(entry_instruction) = entry.instruction {
                     // @Jan: Don't know why this is allways failing
-                    // assert_eq!(instruction, entry_instruction, "broken serialization: {:?}", entry.bytes.bytes);
+                    assert_eq!(instruction, entry_instruction, "broken serialization: {:?}", entry.bytes.bytes);
                     assert_eq!(entry.position, offset);
                     if let Some(target) = instruction.target_mut() {
                         assert!(offsets.contains(target));

@@ -95,7 +95,7 @@ fn main_generate() {
         let path = entry.unwrap().path();
         let name = path.file_stem().unwrap().to_string_lossy();
 
-        if !name.ends_with("_F") {
+        if !name.ends_with("_@@@") {
             continue;
         }
         println!("=====> {name}");

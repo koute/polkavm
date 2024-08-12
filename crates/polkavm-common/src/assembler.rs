@@ -1,6 +1,6 @@
 use crate::program::{Instruction, Reg};
 use crate::utils::{parse_imm, parse_reg};
-use crate::writer::{InstructionBuffer, InstructionOrBytes};
+use crate::writer::{InstructionOrBytes, RawInstruction};
 use alloc::borrow::ToOwned;
 use alloc::collections::BTreeMap;
 use alloc::format;
@@ -69,6 +69,22 @@ fn parse_load_imm_and_jump_indirect_with_tmp(line: &str) -> Option<(Reg, Reg, i3
             return None;
         }
         Some((dst, base, value, 0))
+    }
+}
+
+/// Parses an offset with an explicitly required sign, e.g., `+10` or `-10`.
+pub fn parse_explicitly_signed_offset(text: &str) -> Option<i32> {
+    let text = text.trim();
+    if text.starts_with('+') || text.starts_with('-') {
+        let (sign, text) = text.split_at(1);
+        let parsed_value = parse_imm(text)?;
+        if sign == "-" {
+            Some(-parsed_value)
+        } else {
+            Some(parsed_value)
+        }
+    } else {
+        None
     }
 }
 
@@ -386,7 +402,7 @@ pub fn assemble(code: &str) -> Result<Vec<u8>, String> {
                         if let Some(line) = rhs[index + 1..].trim().strip_prefix("jump") {
                             if let Some(label) = line.trim().strip_prefix('@') {
                                 emit_and_continue!(MaybeInstruction::LoadImmAndJump(dst, value, TargetKind::Label(label.to_owned())));
-                            } else if let Some(offset) = parse_imm(line) {
+                            } else if let Some(offset) = parse_explicitly_signed_offset(line) {
                                 emit_and_continue!(MaybeInstruction::LoadImmAndJump(dst, value, TargetKind::Offset(offset)));
                             }
                             if let Some((base, offset)) = parse_indirect_memory_access(line) {
@@ -717,9 +733,8 @@ pub fn assemble(code: &str) -> Result<Vec<u8>, String> {
                     code.push(Instruction::load_imm_and_jump(dst.into(), value as u32, target_index).into());
                 }
                 TargetKind::Offset(offset) => {
-                    // TODO: unclear how to deal with negative offsets
                     let instruction = Instruction::load_imm_and_jump(dst.into(), value as u32, offset as u32);
-                    code.push(InstructionBuffer::from((0, instruction)).into());
+                    code.push(RawInstruction::from((0, instruction)).into());
                 }
             },
             MaybeInstruction::Jump(label) => {
