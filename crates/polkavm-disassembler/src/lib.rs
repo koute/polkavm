@@ -1,6 +1,6 @@
 use std::{collections::HashMap, io::Write};
 
-use polkavm_common::program::ProgramBlob;
+use polkavm_common::program::{ProgramBlob, ProgramCounter};
 
 #[derive(Copy, Clone, Debug, clap::ValueEnum)]
 pub enum DisassemblyFormat {
@@ -13,7 +13,7 @@ pub enum DisassemblyFormat {
 struct NativeCode {
     machine_code_origin: u64,
     machine_code: Vec<u8>,
-    instruction_map: Vec<(u32, u32)>,
+    instruction_map: Vec<(ProgramCounter, u32)>,
 }
 
 impl TryFrom<&'_ ProgramBlob> for NativeCode {
@@ -34,13 +34,13 @@ impl TryFrom<&'_ ProgramBlob> for NativeCode {
             return Err("currently selected VM backend doesn't provide raw machine code".into());
         };
 
-        let Some(instruction_map) = module.code_offset_to_native_code_offset() else {
+        let Some(instruction_map) = module.program_counter_to_machine_code_offset() else {
             return Err("currently selected VM backend doesn't provide a machine code map".into());
         };
 
         Ok(Self {
             machine_code_origin: module.machine_code_origin().unwrap_or(0),
-            machine_code: machine_code.into_owned(),
+            machine_code: machine_code.into(),
             instruction_map: instruction_map.to_vec(),
         })
     }
@@ -113,7 +113,7 @@ impl AssemblyFormatter {
 pub struct Disassembler<'a> {
     blob: &'a ProgramBlob,
     format: DisassemblyFormat,
-    gas_cost_map: Option<HashMap<u32, i64>>,
+    gas_cost_map: Option<HashMap<ProgramCounter, i64>>,
     native: Option<NativeCode>,
     show_raw_bytes: bool,
     prefer_non_abi_reg_names: bool,
@@ -180,7 +180,7 @@ impl<'a> Disassembler<'a> {
         for instruction in self.blob.instructions() {
             if in_new_block {
                 in_new_block = false;
-                if let Some(cost) = module.gas_cost_for_code_offset(instruction.offset) {
+                if let Some(cost) = module.calculate_gas_cost_for(instruction.offset) {
                     gas_cost_map.insert(instruction.offset, cost);
                 }
             }
@@ -203,7 +203,7 @@ impl<'a> Disassembler<'a> {
         let mut exports_for_code_offset = HashMap::new();
         for (nth_export, export) in self.blob.exports().enumerate() {
             exports_for_code_offset
-                .entry(export.target_code_offset())
+                .entry(export.program_counter())
                 .or_insert_with(Vec::new)
                 .push((nth_export, export));
         }
@@ -234,7 +234,7 @@ impl<'a> Disassembler<'a> {
             w!();
         }
 
-        let format_jump_target = |target_offset: u32, basic_block_counter: u32| {
+        let format_jump_target = |target_offset: ProgramCounter, basic_block_counter: u32| {
             use core::fmt::Write;
 
             let mut buf = String::new();
@@ -280,7 +280,7 @@ impl<'a> Disassembler<'a> {
             let offset = instruction.offset;
             let length = instruction.length;
             let instruction = instruction.kind;
-            let raw_bytes = &self.blob.code()[offset as usize..offset as usize + length as usize];
+            let raw_bytes = &self.blob.code()[offset.0 as usize..offset.0 as usize + length as usize];
 
             let instruction_s = instruction.display(&disassembly_format);
             let instruction_s = if let polkavm_common::program::Instruction::ecalli(nth_import) = instruction {
@@ -293,7 +293,7 @@ impl<'a> Disassembler<'a> {
                 instruction_s.to_string()
             };
 
-            let line_program = self.blob.get_debug_line_program_at(nth_instruction as u32)?;
+            let line_program = self.blob.get_debug_line_program_at(offset)?;
 
             if let Some(mut line_program) = line_program {
                 if last_line_program_entry != Some(line_program.entry_index()) {
@@ -313,7 +313,7 @@ impl<'a> Disassembler<'a> {
                             }
                         };
 
-                        if region.instruction_range().contains(&(nth_instruction as u32)) {
+                        if region.instruction_range().contains(&offset) {
                             let frame = region.frames().next().unwrap();
                             let full_name = match frame.full_name() {
                                 Ok(full_name) => full_name,
@@ -387,7 +387,7 @@ impl<'a> Disassembler<'a> {
 
             if matches!(self.format, DisassemblyFormat::Native | DisassemblyFormat::GuestAndNative) {
                 let native = self.native.as_ref().unwrap();
-                assert_eq!(offset, native.instruction_map[nth_instruction].0);
+                assert_eq!(offset.0, native.instruction_map[nth_instruction].0 .0);
 
                 let machine_code_position = native.instruction_map[nth_instruction].1 as usize;
                 let machine_next_code_position = native.instruction_map[nth_instruction + 1].1 as usize;

@@ -1,5 +1,5 @@
 use core::mem::MaybeUninit;
-use polkavm::{Caller, Config, Engine, ExecutionError, Instance, Linker, Module, ModuleConfig, ProgramBlob, Trap};
+use polkavm::{CallError, Caller, Config, Engine, Instance, Linker, Module, ModuleConfig, ProgramBlob};
 
 struct State {
     rom: Vec<u8>,
@@ -11,9 +11,11 @@ struct State {
     on_audio_frame: Option<Box<dyn FnMut(&[i16])>>,
 }
 
+pub type Error = Box<dyn std::error::Error>;
+
 pub struct Vm {
     state: State,
-    instance: Instance<State>,
+    instance: Instance<State, Error>,
 }
 
 impl Vm {
@@ -23,79 +25,80 @@ impl Vm {
         let mut module_config = ModuleConfig::new();
         module_config.set_page_size(0x4000);
         let module = Module::from_blob(&engine, &module_config, blob)?;
-        let mut linker = Linker::new(&engine);
+        let mut linker = Linker::new();
 
-        linker.func_wrap(
+        linker.define_typed(
             "ext_output_video",
-            |caller: Caller<State>, address: u32, width: u32, height: u32| -> Result<(), Trap> {
-                let (caller, state) = caller.split();
+            |caller: Caller<State>, address: u32, width: u32, height: u32| -> Result<(), Error> {
                 let length = width * height * 4;
-                state.frame.clear();
-                state.frame.reserve(length as usize);
-                caller.read_memory_into_slice(address, &mut state.frame.spare_capacity_mut()[..length as usize])?;
+                caller.user_data.frame.clear();
+                caller.user_data.frame.reserve(length as usize);
+                caller
+                    .instance
+                    .read_memory_into(address, &mut caller.user_data.frame.spare_capacity_mut()[..length as usize])?;
                 unsafe {
-                    state.frame.set_len(length as usize);
+                    caller.user_data.frame.set_len(length as usize);
                 }
-                state.frame_width = width;
-                state.frame_height = height;
+                caller.user_data.frame_width = width;
+                caller.user_data.frame_height = height;
 
                 Ok(())
             },
         )?;
 
-        linker.func_wrap(
+        linker.define_typed(
             "ext_output_audio",
-            |caller: Caller<State>, address: u32, samples: u32| -> Result<(), Trap> {
-                let (caller, state) = caller.split();
-                let Some(on_audio_frame) = state.on_audio_frame.as_mut() else {
+            |caller: Caller<State>, address: u32, samples: u32| -> Result<(), Error> {
+                let Some(on_audio_frame) = caller.user_data.on_audio_frame.as_mut() else {
                     return Ok(());
                 };
 
-                state.audio_buffer.reserve(samples as usize * 2);
+                caller.user_data.audio_buffer.reserve(samples as usize * 2);
 
                 {
-                    let audio_buffer: &mut [MaybeUninit<i16>] = &mut state.audio_buffer.spare_capacity_mut()[..samples as usize * 2];
+                    let audio_buffer: &mut [MaybeUninit<i16>] =
+                        &mut caller.user_data.audio_buffer.spare_capacity_mut()[..samples as usize * 2];
                     let audio_buffer: &mut [MaybeUninit<u8>] = unsafe {
                         core::slice::from_raw_parts_mut(audio_buffer.as_mut_ptr().cast(), audio_buffer.len() * core::mem::size_of::<i16>())
                     };
-                    caller.read_memory_into_slice(address, audio_buffer)?;
+                    caller.instance.read_memory_into(address, audio_buffer)?;
                 }
 
                 unsafe {
-                    let new_length = state.audio_buffer.len() + samples as usize * 2;
-                    state.audio_buffer.set_len(new_length);
+                    let new_length = caller.user_data.audio_buffer.len() + samples as usize * 2;
+                    caller.user_data.audio_buffer.set_len(new_length);
                 }
 
-                on_audio_frame(&state.audio_buffer);
-                state.audio_buffer.clear();
+                on_audio_frame(&caller.user_data.audio_buffer);
+                caller.user_data.audio_buffer.clear();
                 Ok(())
             },
         )?;
 
-        linker.func_wrap("ext_rom_size", |caller: Caller<State>| -> u32 { caller.data().rom.len() as u32 })?;
+        linker.define_typed("ext_rom_size", |caller: Caller<State>| -> u32 { caller.user_data.rom.len() as u32 })?;
 
-        linker.func_wrap(
+        linker.define_typed(
             "ext_rom_read",
-            |caller: Caller<State>, pointer: u32, offset: u32, length: u32| -> Result<(), Trap> {
-                let (mut caller, state) = caller.split();
-                let chunk = state
+            |caller: Caller<State>, pointer: u32, offset: u32, length: u32| -> Result<(), Error> {
+                let chunk = caller
+                    .user_data
                     .rom
                     .get(offset as usize..offset as usize + length as usize)
-                    .ok_or_else(Trap::default)?;
+                    .ok_or_else(|| format!("invalid ROM read: offset = 0x{offset:x}, length = {length}"))?;
 
-                caller.write_memory(pointer, chunk)
+                Ok(caller.instance.write_memory(pointer, chunk)?)
             },
         )?;
 
-        linker.func_wrap(
+        linker.define_typed(
             "ext_stdout",
-            |caller: Caller<State>, buffer: u32, length: u32| -> Result<i32, Trap> {
+            |caller: Caller<State>, buffer: u32, length: u32| -> Result<i32, Error> {
                 if length == 0 {
                     return Ok(0);
                 }
 
                 use std::io::Write;
-                let buffer = caller.read_memory_into_vec(buffer, length)?;
+                let buffer = caller.instance.read_memory(buffer, length)?;
                 let stdout = std::io::stdout();
                 let mut stdout = stdout.lock();
                 if stdout.write_all(&buffer).is_ok() {
@@ -126,17 +129,17 @@ impl Vm {
         self.state.on_audio_frame = Some(Box::new(callback));
     }
 
-    pub fn initialize(&mut self, rom: impl Into<Vec<u8>>) -> Result<(), ExecutionError<polkavm::Error>> {
+    pub fn initialize(&mut self, rom: impl Into<Vec<u8>>) -> Result<(), CallError<Error>> {
         self.state.rom = rom.into();
         self.instance.call_typed(&mut self.state, "ext_initialize", ())
     }
 
-    pub fn run_for_a_frame(&mut self) -> Result<(u32, u32, &[u8]), ExecutionError<polkavm::Error>> {
+    pub fn run_for_a_frame(&mut self) -> Result<(u32, u32, &[u8]), CallError<Error>> {
         self.instance.call_typed(&mut self.state, "ext_tick", ())?;
         Ok((self.state.frame_width, self.state.frame_height, &self.state.frame))
     }
 
-    pub fn on_keychange(&mut self, key: u8, is_pressed: bool) -> Result<(), ExecutionError<polkavm::Error>> {
+    pub fn on_keychange(&mut self, key: u8, is_pressed: bool) -> Result<(), CallError<Error>> {
         self.instance
             .call_typed(&mut self.state, "ext_on_keychange", (key as u32, is_pressed as u32))
     }

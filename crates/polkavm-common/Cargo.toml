@@ -10,12 +10,14 @@ description = "The common crate for PolkaVM"
 
 [dependencies]
 log = { workspace = true, optional = true }
+polkavm-assembler = { workspace = true, optional = true }
 
 [features]
 default = []
 alloc = []
 std = ["alloc"]
 logging = ["dep:log"]
+regmap = ["dep:polkavm-assembler"]
 
 [dev-dependencies]
 proptest = { workspace = true }
