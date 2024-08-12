@@ -1756,6 +1756,10 @@ pub fn recvfd(socket: FdRef) -> Result<Fd, Error> {
     };
 
     let count = sys_recvmsg(socket, &mut header, 0)?;
+    if count == 0 {
+        return Err(Error::from_str("recvfd failed: received zero bytes"));
+    }
+
     if count != core::mem::size_of::<c_int>() {
         return Err(Error::from_str("recvfd failed: received unexpected number of bytes"));
     }
