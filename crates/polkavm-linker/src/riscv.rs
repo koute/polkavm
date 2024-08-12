@@ -140,20 +140,32 @@ pub enum RegImmKind {
     Or = 0b110,                  // ORI
     And = 0b111,                 // ANDI
 
+    Add64 = 0b1000,
+    SetLessThanSigned64 = 0b1010,
+    SetLessThanUnsigned64 = 0b1011,
+    Xor64 = 0b1100,
+    Or64 = 0b1110,
+    And64 = 0b1111,
+
     ShiftLogicalLeft,
     ShiftLogicalRight,
     ShiftArithmeticRight,
 
-    AddW, // ADDIW
-    ShiftLogicalLeftW,
-    ShiftLogicalRightW,
-    ShiftArithmeticRightW,
+    ShiftLogicalLeft64,
+    ShiftLogicalRight64,
+    ShiftArithmeticRight64,
 }
 
 impl RegImmKind {
     #[inline(always)]
-    const fn decode(value: u32) -> Option<Self> {
+    const fn decode(value: u32, rv64: bool) -> Option<Self> {
         match value & 0b111 {
+            0b000 if rv64 => Some(Self::Add64),
+            0b010 if rv64 => Some(Self::SetLessThanSigned64),
+            0b011 if rv64 => Some(Self::SetLessThanUnsigned64),
+            0b100 if rv64 => Some(Self::Xor64),
+            0b110 if rv64 => Some(Self::Or64),
+            0b111 if rv64 => Some(Self::And64),
             0b000 => Some(Self::Add),
             0b010 => Some(Self::SetLessThanSigned),
             0b011 => Some(Self::SetLessThanUnsigned),
@@ -187,16 +199,24 @@ pub enum RegRegKind {
     Rem = 0b01110,
     RemUnsigned = 0b01111,
 
-    AddW = 0b100000,
-    SubW = 0b110000,
-    ShiftLogicalLeftW = 0b100001,
-    ShiftLogicalRightW = 0b100101,
-    ShiftArithmeticRightW = 0b110101,
-    MulW = 0b101000,
-    DivW = 0b101100,
-    DivUnsignedW = 0b101101,
-    RemW = 0b101110,
-    RemUnsignedW = 0b101111,
+    Add64 = 0b100000,
+    Sub64 = 0b110000,
+    SetLessThanSigned64 = 0b100010,
+    SetLessThanUnsigned64 = 0b100011,
+    ShiftLogicalLeft64 = 0b100001,
+    ShiftLogicalRight64 = 0b100101,
+    ShiftArithmeticRight64 = 0b110101,
+    MulUpperSignedSigned64 = 0b101001,
+    MulUpperSignedUnsigned64 = 0b101010,
+    MulUpperUnsignedUnsigned64 = 0b101011,
+    Or64 = 0b100110,
+    And64 = 0b100111,
+    Xor64 = 0b100100,
+    Mul64 = 0b101000,
+    Div64 = 0b101100,
+    DivUnsigned64 = 0b101101,
+    Rem64 = 0b101110,
+    RemUnsigned64 = 0b101111,
 }
 
 #[derive(Copy, Clone, PartialEq, Eq, Debug, Hash)]
@@ -277,13 +297,13 @@ pub enum Inst {
         dst: Reg,
         src: Reg,
     },
-    LoadReservedW {
+    LoadReserved64 {
         acquire: bool,
         release: bool,
         dst: Reg,
         src: Reg,
     },
-    StoreConditionalW {
+    StoreConditional64 {
         acquire: bool,
         release: bool,
         addr: Reg,
@@ -309,37 +329,37 @@ pub enum Inst {
 #[derive(Copy, Clone, PartialEq, Eq, Debug, Hash)]
 pub enum AtomicKind {
     Swap = 0b100001,
-    SwapW = 0b00001,
+    Swap64 = 0b00001,
     Add = 0b100000,
-    AddW = 0b00000,
+    Add64 = 0b00000,
     And = 0b101100,
-    AndW = 0b01100,
+    And64 = 0b01100,
     Or = 0b101000,
-    OrW = 0b01000,
+    Or64 = 0b01000,
     Xor = 0b100100,
-    XorW = 0b00100,
+    Xor64 = 0b00100,
     MaxSigned = 0b110100,
-    MaxSignedW = 0b10100,
+    MaxSigned64 = 0b10100,
     MinSigned = 0b110000,
-    MinSignedW = 0b10000,
+    MinSigned64 = 0b10000,
     MaxUnsigned = 0b111100,
-    MaxUnsignedW = 0b11100,
+    MaxUnsigned64 = 0b11100,
     MinUnsigned = 0b111000,
-    MinUnsignedW = 0b11000,
+    MinUnsigned64 = 0b11000,
 }
 
 impl From<AtomicKind> for u32 {
     fn from(value: AtomicKind) -> Self {
         match value {
-            AtomicKind::Add | AtomicKind::AddW => 0b00000,
-            AtomicKind::Swap | AtomicKind::SwapW => 0b00001,
-            AtomicKind::And | AtomicKind::AndW => 0b01100,
-            AtomicKind::Or | AtomicKind::OrW => 0b01000,
-            AtomicKind::Xor | AtomicKind::XorW => 0b00100,
-            AtomicKind::MaxSigned | AtomicKind::MaxSignedW => 0b10100,
-            AtomicKind::MinSigned | AtomicKind::MinSignedW => 0b10000,
-            AtomicKind::MaxUnsigned | AtomicKind::MaxUnsignedW => 0b11100,
-            AtomicKind::MinUnsigned | AtomicKind::MinUnsignedW => 0b11000,
+            AtomicKind::Add | AtomicKind::Add64 => 0b00000,
+            AtomicKind::Swap | AtomicKind::Swap64 => 0b00001,
+            AtomicKind::And | AtomicKind::And64 => 0b01100,
+            AtomicKind::Or | AtomicKind::Or64 => 0b01000,
+            AtomicKind::Xor | AtomicKind::Xor64 => 0b00100,
+            AtomicKind::MaxSigned | AtomicKind::MaxSigned64 => 0b10100,
+            AtomicKind::MinSigned | AtomicKind::MinSigned64 => 0b10000,
+            AtomicKind::MaxUnsigned | AtomicKind::MaxUnsigned64 => 0b11100,
+            AtomicKind::MinUnsigned | AtomicKind::MinUnsigned64 => 0b11000,
         }
     }
 }
@@ -516,12 +536,28 @@ impl R {
     }
 }
 
+macro_rules! ctx {
+    ($is_rv64:expr) => {
+        macro_rules! xlen {
+            ($path:tt, $variant_32:ident, $variant_64:ident) => {
+                if $is_rv64 {
+                    <$path>::$variant_64
+                } else {
+                    <$path>::$variant_32
+                }
+            };
+        }
+    };
+}
+
 impl Inst {
     pub const fn is_compressed(op: u8) -> bool {
         op & 0b00000011 < 0b00000011
     }
 
     pub fn decode_compressed(op: u32, rv64: bool) -> Option<Self> {
+        ctx!(rv64);
+
         let quadrant = op & 0b11;
         let funct3 = (op >> 13) & 0b111;
 
@@ -533,7 +569,7 @@ impl Inst {
             // RVC, Quadrant 0
             // C.ADDI4SPN expands to addi rd′, x2, nzuimm[9:2]
             (0b00, 0b000) if op & 0b00011111_11100000 != 0 => Some(Inst::RegImm {
-                kind: RegImmKind::Add,
+                kind: xlen!(RegImmKind, Add, Add64),
                 dst: Reg::decode_compressed(op >> 2),
                 src: Reg::SP,
                 imm: (bits(4, 5, op, 11) | bits(6, 9, op, 7) | bits(2, 2, op, 6) | bits(3, 3, op, 5)) as i32,
@@ -570,7 +606,7 @@ impl Inst {
             // RVC, Quadrant 1
             // C.NOP expands to addi x0, x0, 0
             (0b01, 0b000) if op & 0b11111111_11111110 == 0 => Some(Inst::RegImm {
-                kind: RegImmKind::Add,
+                kind: xlen!(RegImmKind, Add, Add64),
                 dst: Reg::Zero,
                 src: Reg::Zero,
                 imm: 0,
@@ -582,7 +618,7 @@ impl Inst {
                 (imm != 0).then(|| {
                     let rd = Reg::decode(op >> 7);
                     Inst::RegImm {
-                        kind: RegImmKind::Add,
+                        kind: if rv64 { RegImmKind::Add64 } else { RegImmKind::Add },
                         dst: rd,
                         src: rd,
                         imm: sign_ext(imm, 6),
@@ -599,7 +635,7 @@ impl Inst {
                 let imm = bits(5, 5, op, 12) | bits(0, 4, op, 2);
                 let rd = Reg::decode(op >> 7);
                 Some(Inst::RegImm {
-                    kind: RegImmKind::AddW,
+                    kind: RegImmKind::Add,
                     dst: rd,
                     src: rd,
                     imm: sign_ext(imm, 6),
@@ -607,14 +643,14 @@ impl Inst {
             }
             // C.LI expands into addi rd, x0, imm[5:0]
             (0b01, 0b010) if op & 0b00001111_10000000 != 0 => Some(Inst::RegImm {
-                kind: RegImmKind::Add,
+                kind: xlen!(RegImmKind, Add, Add64),
                 dst: Reg::decode(op >> 7),
                 src: Reg::Zero,
                 imm: sign_ext(bits(5, 5, op, 12) | bits(0, 4, op, 2), 6),
             }),
             // C.ADDI16SP expands into addi x2, x2, nzimm[9:4]
             (0b01, 0b011) if Reg::decode(op >> 7) == Reg::SP && op & 0b00010000_01111100 != 0 => Some(Inst::RegImm {
-                kind: RegImmKind::Add,
+                kind: xlen!(RegImmKind, Add, Add64),
                 dst: Reg::SP,
                 src: Reg::SP,
                 imm: sign_ext(
@@ -634,21 +670,21 @@ impl Inst {
                     (0b000, 0) | (0b001, 0) => None,
                     // C.SRLI expands into srli rd′, rd′, shamt[5:0]
                     (0b000, shamt) => Some(Inst::RegImm {
-                        kind: RegImmKind::ShiftLogicalRight,
+                        kind: xlen!(RegImmKind, ShiftLogicalRight, ShiftLogicalRight64),
                         dst: rd,
                         src: rd,
                         imm: shamt as i32,
                     }),
                     // C.SRAI expands into srai rd′, rd′, shamt[5:0]
                     (0b001, shamt) => Some(Inst::RegImm {
-                        kind: RegImmKind::ShiftArithmeticRight,
+                        kind: xlen!(RegImmKind, ShiftArithmeticRight, ShiftArithmeticRight64),
                         dst: rd,
                         src: rd,
                         imm: shamt as i32,
                     }),
                     // C.ANDI expands to andi rd′, rd′, imm[5:0]
                     (0b110, imm4_0) | (0b010, imm4_0) => Some(Inst::RegImm {
-                        kind: RegImmKind::And,
+                        kind: xlen!(RegImmKind, And, And64),
                         dst: rd,
                         src: rd,
                         imm: sign_ext(bits(5, 5, op, 12) | imm4_0, 6),
@@ -661,12 +697,12 @@ impl Inst {
                     // C.SUBW expands into subw rd′, rd′, rs2′
                     (0b011, _) => Some(Inst::RegReg {
                         kind: match ((op >> 12) & 0b1, (op >> 5) & 0b11) {
-                            (0b0, 0b00) => RegRegKind::Sub,
-                            (0b0, 0b01) => RegRegKind::Xor,
-                            (0b0, 0b10) => RegRegKind::Or,
-                            (0b0, 0b11) => RegRegKind::And,
-                            (0b1, 0b00) if rv64 => RegRegKind::AddW,
-                            (0b1, 0b01) if rv64 => RegRegKind::SubW,
+                            (0b0, 0b00) => xlen!(RegRegKind, Sub, Sub64),
+                            (0b0, 0b01) => xlen!(RegRegKind, Xor, Xor64),
+                            (0b0, 0b10) => xlen!(RegRegKind, Or, Or64),
+                            (0b0, 0b11) => xlen!(RegRegKind, And, And64),
+                            (0b1, 0b00) if rv64 => RegRegKind::Add64,
+                            (0b1, 0b01) if rv64 => RegRegKind::Sub64,
                             _ => return None,
                         },
                         dst: rd,
@@ -698,7 +734,7 @@ impl Inst {
             (0b10, 0b000) if (op >> 12) & 0b1 == 0 => match (Reg::decode(op >> 7), bits(0, 4, op, 2)) {
                 (Reg::Zero, _) | (_, 0) => None,
                 (rd, shamt) => Some(Inst::RegImm {
-                    kind: RegImmKind::ShiftLogicalLeft,
+                    kind: xlen!(RegImmKind, ShiftLogicalLeft, ShiftLogicalLeft64),
                     dst: rd,
                     src: rd,
                     imm: shamt as i32,
@@ -708,7 +744,7 @@ impl Inst {
             (0b10, 0b010) => match Reg::decode(op >> 7) {
                 Reg::Zero => None,
                 rd => Some(Inst::Load {
-                    kind: if rv64 { LoadKind::I32 } else { LoadKind::U32 },
+                    kind: xlen!(LoadKind, U32, I32),
                     dst: rd,
                     base: Reg::SP,
                     offset: (bits(5, 5, op, 12) | bits(2, 4, op, 4) | bits(6, 7, op, 2)) as i32,
@@ -734,7 +770,7 @@ impl Inst {
                 }),
                 // C.MV expands to add rd, x0, rs2
                 (0b0, rd, rs2) => Some(Inst::RegReg {
-                    kind: RegRegKind::Add,
+                    kind: xlen!(RegRegKind, Add, Add64),
                     dst: rd,
                     src1: Reg::Zero,
                     src2: rs2,
@@ -747,7 +783,7 @@ impl Inst {
                 }),
                 // C.ADD expands to add rd, rd, rs2
                 (0b1, rd, rs2) => Some(Inst::RegReg {
-                    kind: RegRegKind::Add,
+                    kind: xlen!(RegRegKind, Add, Add64),
                     dst: rd,
                     src1: rd,
                     src2: rs2,
@@ -775,6 +811,8 @@ impl Inst {
     }
 
     pub fn decode(op: u32, rv64: bool) -> Option<Self> {
+        ctx!(rv64);
+
         if let Some(compressed_instruction) = Self::decode_compressed(op, rv64) {
             return Some(compressed_instruction);
         }
@@ -853,7 +891,7 @@ impl Inst {
 
                     let end = if rv64 { 5 } else { 4 };
                     Some(Inst::RegImm {
-                        kind: RegImmKind::ShiftLogicalLeft,
+                        kind: xlen!(RegImmKind, ShiftLogicalLeft, ShiftLogicalLeft64),
                         dst: Reg::decode(op >> 7),
                         src: Reg::decode(op >> 15),
                         imm: bits(0, end, op, 20) as i32,
@@ -862,8 +900,8 @@ impl Inst {
                 0b101 => {
                     let mask = if rv64 { 0xfc000000 } else { 0xfe000000 };
                     let kind = match (op & mask) >> 24 {
-                        0b00000000 => RegImmKind::ShiftLogicalRight,
-                        0b01000000 => RegImmKind::ShiftArithmeticRight,
+                        0b00000000 => xlen!(RegImmKind, ShiftLogicalRight, ShiftLogicalRight64),
+                        0b01000000 => xlen!(RegImmKind, ShiftArithmeticRight, ShiftArithmeticRight64),
                         _ => return None,
                     };
 
@@ -876,7 +914,7 @@ impl Inst {
                     })
                 }
                 _ => Some(Inst::RegImm {
-                    kind: RegImmKind::decode(op >> 12)?,
+                    kind: RegImmKind::decode(op >> 12, rv64)?,
                     dst: Reg::decode(op >> 7),
                     src: Reg::decode(op >> 15),
                     imm: sign_ext(op >> 20, 12),
@@ -884,21 +922,21 @@ impl Inst {
             },
             0b0011011 if rv64 => match (op >> 12) & 0b111 {
                 0b000 => Some(Inst::RegImm {
-                    kind: RegImmKind::AddW,
+                    kind: RegImmKind::Add,
                     dst: Reg::decode(op >> 7),
                     src: Reg::decode(op >> 15),
                     imm: sign_ext(op >> 20, 12),
                 }),
                 0b001 if op >> 24 == 0 => Some(Inst::RegImm {
-                    kind: RegImmKind::ShiftLogicalLeftW,
+                    kind: RegImmKind::ShiftLogicalLeft,
                     dst: Reg::decode(op >> 7),
                     src: Reg::decode(op >> 15),
                     imm: bits(0, 4, op, 20) as i32,
                 }),
                 0b101 if op >> 24 == 0 || op >> 24 == 0b01000000 => {
                     let kind = match (op & 0xfe000000) >> 24 {
-                        0b00000000 => RegImmKind::ShiftLogicalRightW,
-                        0b01000000 => RegImmKind::ShiftArithmeticRightW,
+                        0b00000000 => RegImmKind::ShiftLogicalRight,
+                        0b01000000 => RegImmKind::ShiftArithmeticRight,
                         _ => return None,
                     };
 
@@ -916,25 +954,25 @@ impl Inst {
                 let src1 = Reg::decode(op >> 15);
                 let src2 = Reg::decode(op >> 20);
                 let kind = match op & 0b1111111_00000_00000_111_00000_0000000 {
-                    0b0000000_00000_00000_000_00000_0000000 => RegRegKind::Add,
-                    0b0100000_00000_00000_000_00000_0000000 => RegRegKind::Sub,
-                    0b0000000_00000_00000_001_00000_0000000 => RegRegKind::ShiftLogicalLeft,
-                    0b0000000_00000_00000_010_00000_0000000 => RegRegKind::SetLessThanSigned,
-                    0b0000000_00000_00000_011_00000_0000000 => RegRegKind::SetLessThanUnsigned,
-                    0b0000000_00000_00000_100_00000_0000000 => RegRegKind::Xor,
-                    0b0000000_00000_00000_101_00000_0000000 => RegRegKind::ShiftLogicalRight,
-                    0b0100000_00000_00000_101_00000_0000000 => RegRegKind::ShiftArithmeticRight,
-                    0b0000000_00000_00000_110_00000_0000000 => RegRegKind::Or,
-                    0b0000000_00000_00000_111_00000_0000000 => RegRegKind::And,
+                    0b0000000_00000_00000_000_00000_0000000 => xlen!(RegRegKind, Add, Add64),
+                    0b0100000_00000_00000_000_00000_0000000 => xlen!(RegRegKind, Sub, Sub64),
+                    0b0000000_00000_00000_001_00000_0000000 => xlen!(RegRegKind, ShiftLogicalLeft, ShiftLogicalLeft64),
+                    0b0000000_00000_00000_010_00000_0000000 => xlen!(RegRegKind, SetLessThanSigned, SetLessThanSigned64),
+                    0b0000000_00000_00000_011_00000_0000000 => xlen!(RegRegKind, SetLessThanUnsigned, SetLessThanUnsigned64),
+                    0b0000000_00000_00000_100_00000_0000000 => xlen!(RegRegKind, Xor, Xor64),
+                    0b0000000_00000_00000_101_00000_0000000 => xlen!(RegRegKind, ShiftLogicalRight, ShiftLogicalRight64),
+                    0b0100000_00000_00000_101_00000_0000000 => xlen!(RegRegKind, ShiftArithmeticRight, ShiftArithmeticRight64),
+                    0b0000000_00000_00000_110_00000_0000000 => xlen!(RegRegKind, Or, Or64),
+                    0b0000000_00000_00000_111_00000_0000000 => xlen!(RegRegKind, And, And64),
 
-                    0b0000001_00000_00000_000_00000_0000000 => RegRegKind::Mul,
-                    0b0000001_00000_00000_001_00000_0000000 => RegRegKind::MulUpperSignedSigned,
-                    0b0000001_00000_00000_010_00000_0000000 => RegRegKind::MulUpperSignedUnsigned,
-                    0b0000001_00000_00000_011_00000_0000000 => RegRegKind::MulUpperUnsignedUnsigned,
-                    0b0000001_00000_00000_100_00000_0000000 => RegRegKind::Div,
-                    0b0000001_00000_00000_101_00000_0000000 => RegRegKind::DivUnsigned,
-                    0b0000001_00000_00000_110_00000_0000000 => RegRegKind::Rem,
-                    0b0000001_00000_00000_111_00000_0000000 => RegRegKind::RemUnsigned,
+                    0b0000001_00000_00000_000_00000_0000000 => xlen!(RegRegKind, Mul, Mul64),
+                    0b0000001_00000_00000_001_00000_0000000 => xlen!(RegRegKind, MulUpperSignedSigned, MulUpperSignedSigned64),
+                    0b0000001_00000_00000_010_00000_0000000 => xlen!(RegRegKind, MulUpperSignedUnsigned, MulUpperSignedUnsigned64),
+                    0b0000001_00000_00000_011_00000_0000000 => xlen!(RegRegKind, MulUpperUnsignedUnsigned, MulUpperUnsignedUnsigned64),
+                    0b0000001_00000_00000_100_00000_0000000 => xlen!(RegRegKind, Div, Div64),
+                    0b0000001_00000_00000_101_00000_0000000 => xlen!(RegRegKind, DivUnsigned, DivUnsigned64),
+                    0b0000001_00000_00000_110_00000_0000000 => xlen!(RegRegKind, Rem, Rem64),
+                    0b0000001_00000_00000_111_00000_0000000 => xlen!(RegRegKind, RemUnsigned, RemUnsigned64),
 
                     _ => return None,
                 };
@@ -947,17 +985,17 @@ impl Inst {
                 let src2 = Reg::decode(op >> 20);
 
                 let kind = match op & 0b1111111_00000_00000_111_00000_0000000 {
-                    0b0000000_00000_00000_000_00000_0000000 => RegRegKind::AddW,
-                    0b0100000_00000_00000_000_00000_0000000 => RegRegKind::SubW,
-                    0b0000000_00000_00000_001_00000_0000000 => RegRegKind::ShiftLogicalLeftW,
-                    0b0000000_00000_00000_101_00000_0000000 => RegRegKind::ShiftLogicalRightW,
-                    0b0100000_00000_00000_101_00000_0000000 => RegRegKind::ShiftArithmeticRightW,
+                    0b0000000_00000_00000_000_00000_0000000 => RegRegKind::Add,
+                    0b0100000_00000_00000_000_00000_0000000 => RegRegKind::Sub,
+                    0b0000000_00000_00000_001_00000_0000000 => RegRegKind::ShiftLogicalLeft,
+                    0b0000000_00000_00000_101_00000_0000000 => RegRegKind::ShiftLogicalRight,
+                    0b0100000_00000_00000_101_00000_0000000 => RegRegKind::ShiftArithmeticRight,
 
-                    0b0000001_00000_00000_000_00000_0000000 => RegRegKind::MulW,
-                    0b0000001_00000_00000_100_00000_0000000 => RegRegKind::DivW,
-                    0b0000001_00000_00000_101_00000_0000000 => RegRegKind::DivUnsignedW,
-                    0b0000001_00000_00000_110_00000_0000000 => RegRegKind::RemW,
-                    0b0000001_00000_00000_111_00000_0000000 => RegRegKind::RemUnsignedW,
+                    0b0000001_00000_00000_000_00000_0000000 => RegRegKind::Mul,
+                    0b0000001_00000_00000_100_00000_0000000 => RegRegKind::Div,
+                    0b0000001_00000_00000_101_00000_0000000 => RegRegKind::DivUnsigned,
+                    0b0000001_00000_00000_110_00000_0000000 => RegRegKind::Rem,
+                    0b0000001_00000_00000_111_00000_0000000 => RegRegKind::RemUnsigned,
 
                     _ => return None,
                 };
@@ -1009,13 +1047,13 @@ impl Inst {
                 };
 
                 match (kind, is_word) {
-                    (0b00010, true) if src2 == Reg::Zero => Some(Inst::LoadReservedW {
+                    (0b00010, true) if src2 == Reg::Zero => Some(Inst::LoadReserved64 {
                         acquire,
                         release,
                         dst,
                         src: src1,
                     }),
-                    (0b00011, true) => Some(Inst::StoreConditionalW {
+                    (0b00011, true) => Some(Inst::StoreConditional64 {
                         acquire,
                         release,
                         addr: src1,
@@ -1037,15 +1075,15 @@ impl Inst {
                     }),
                     _ => {
                         let kind = match (kind, is_word) {
-                            (0b00000, true) => AtomicKind::AddW,
-                            (0b00001, true) => AtomicKind::SwapW,
-                            (0b00100, true) => AtomicKind::XorW,
-                            (0b01100, true) => AtomicKind::AndW,
-                            (0b01000, true) => AtomicKind::OrW,
-                            (0b10000, true) => AtomicKind::MinSignedW,
-                            (0b10100, true) => AtomicKind::MaxSignedW,
-                            (0b11000, true) => AtomicKind::MinUnsignedW,
-                            (0b11100, true) => AtomicKind::MaxUnsignedW,
+                            (0b00000, true) => AtomicKind::Add64,
+                            (0b00001, true) => AtomicKind::Swap64,
+                            (0b00100, true) => AtomicKind::Xor64,
+                            (0b01100, true) => AtomicKind::And64,
+                            (0b01000, true) => AtomicKind::Or64,
+                            (0b10000, true) => AtomicKind::MinSigned64,
+                            (0b10100, true) => AtomicKind::MaxSigned64,
+                            (0b11000, true) => AtomicKind::MinUnsigned64,
+                            (0b11100, true) => AtomicKind::MaxUnsigned64,
                             (0b00000, false) => AtomicKind::Add,
                             (0b00001, false) => AtomicKind::Swap,
                             (0b00100, false) => AtomicKind::Xor,
@@ -1161,16 +1199,15 @@ impl Inst {
             }
             Inst::RegImm { kind, dst, src, mut imm } => match kind {
                 RegImmKind::ShiftLogicalLeft | RegImmKind::ShiftLogicalRight | RegImmKind::ShiftArithmeticRight => {
-                    let max_imm = if rv64 { 64 } else { 32 };
-                    if imm > max_imm {
-                        imm = max_imm;
+                    if imm > 32 {
+                        imm = 32;
                     } else if imm < 0 {
                         imm = 0;
                     }
 
                     let end = if rv64 { 5 } else { 4 };
                     Some(
-                        0b0010011
+                        if rv64 { 0b0011011 } else { 0b0010011 }
                             | match kind {
                                 RegImmKind::ShiftLogicalLeft => 0b001 << 12,
                                 RegImmKind::ShiftLogicalRight => 0b101 << 12,
@@ -1182,33 +1219,38 @@ impl Inst {
                             | unbits(0, end, imm as u32, 20),
                     )
                 }
-                RegImmKind::AddW if rv64 => Some(0b0011011 | ((dst as u32) << 7) | ((src as u32) << 15) | unbits(0, 11, imm as u32, 20)),
-                RegImmKind::ShiftLogicalLeftW | RegImmKind::ShiftLogicalRightW | RegImmKind::ShiftArithmeticRightW if rv64 => {
-                    if imm > 32 {
-                        imm = 32;
+                RegImmKind::Add if rv64 => Some(0b0011011 | ((dst as u32) << 7) | ((src as u32) << 15) | unbits(0, 11, imm as u32, 20)),
+                RegImmKind::ShiftLogicalLeft64 | RegImmKind::ShiftLogicalRight64 | RegImmKind::ShiftArithmeticRight64 if rv64 => {
+                    let max_imm = if rv64 { 64 } else { 32 };
+                    if imm > max_imm {
+                        imm = max_imm;
                     } else if imm < 0 {
                         imm = 0;
                     }
 
                     Some(
-                        0b0011011
+                        0b0010011
                             | match kind {
-                                RegImmKind::ShiftLogicalLeftW => 0b001 << 12,
-                                RegImmKind::ShiftLogicalRightW => 0b101 << 12,
-                                RegImmKind::ShiftArithmeticRightW => (0b101 << 12) | (1 << 30),
+                                RegImmKind::ShiftLogicalLeft64 => 0b001 << 12,
+                                RegImmKind::ShiftLogicalRight64 => 0b101 << 12,
+                                RegImmKind::ShiftArithmeticRight64 => (0b101 << 12) | (1 << 30),
                                 _ => unreachable!(),
                             }
                             | ((dst as u32) << 7)
                             | ((src as u32) << 15)
-                            | unbits(0, 4, imm as u32, 20),
+                            | unbits(0, 5, imm as u32, 20),
                     )
                 }
-                _ => {
-                    Some(0b0010011 | ((kind as u32) << 12) | ((dst as u32) << 7) | ((src as u32) << 15) | sign_unext(imm as u32, 12)? << 20)
-                }
+                _ => Some(
+                    0b0010011
+                        | (((kind as u32) & 0b111) << 12)
+                        | ((dst as u32) << 7)
+                        | ((src as u32) << 15)
+                        | sign_unext(imm as u32, 12)? << 20,
+                ),
             },
 
-            Inst::RegReg { kind, dst, src1, src2 } if (kind as u32) < (RegRegKind::AddW as u32) => Some(
+            Inst::RegReg { kind, dst, src1, src2 } if (kind as u32) >= (RegRegKind::Add64 as u32) => Some(
                 0b0110011
                     | ((kind as u32 & 0b00111) << 12)
                     | ((kind as u32 & 0b01000) << 22)
@@ -1217,14 +1259,19 @@ impl Inst {
                     | ((src1 as u32) << 15)
                     | ((src2 as u32) << 20),
             ),
-            Inst::RegReg { kind, dst, src1, src2 } if rv64 => {
+            Inst::RegReg { kind, dst, src1, src2 } => {
                 let op = match kind {
-                    RegRegKind::AddW
-                    | RegRegKind::SubW
-                    | RegRegKind::ShiftLogicalLeftW
-                    | RegRegKind::ShiftLogicalRightW
-                    | RegRegKind::ShiftArithmeticRightW => 0b0111011,
-                    _ => 0b0111011,
+                    RegRegKind::Add
+                    | RegRegKind::Sub
+                    | RegRegKind::ShiftLogicalLeft
+                    | RegRegKind::ShiftLogicalRight
+                    | RegRegKind::ShiftArithmeticRight
+                        if rv64 =>
+                    {
+                        0b0111011
+                    }
+                    _ if rv64 => 0b0111011,
+                    _ => 0b0110011,
                 };
 
                 Some(
@@ -1236,7 +1283,6 @@ impl Inst {
                         | ((src2 as u32) << 20),
                 )
             }
-            Inst::RegReg { .. } => unreachable!(),
             Inst::Ecall => Some(0x00000073),
             Inst::FenceI => Some(0x0000100f),
             Inst::Fence { predecessor, successor } => Some(
@@ -1265,7 +1311,7 @@ impl Inst {
                     | (u32::from(acquire) << 26)
                     | (0b00010 << 27),
             ),
-            Inst::LoadReservedW {
+            Inst::LoadReserved64 {
                 acquire,
                 release,
                 dst,
@@ -1295,7 +1341,7 @@ impl Inst {
                     | (u32::from(acquire) << 26)
                     | (0b00011 << 27),
             ),
-            Inst::StoreConditionalW {
+            Inst::StoreConditional64 {
                 acquire,
                 release,
                 addr,
@@ -1311,7 +1357,7 @@ impl Inst {
                     | (u32::from(acquire) << 26)
                     | (0b00011 << 27),
             ),
-            Inst::StoreConditionalW { .. } | Inst::LoadReservedW { .. } => {
+            Inst::StoreConditional64 { .. } | Inst::LoadReserved64 { .. } => {
                 unreachable!("internal error: encoding a 64bit instruction in a 32bit context")
             }
             Inst::Atomic {
@@ -1644,7 +1690,7 @@ mod test_decode_compressed {
         assert_eq!(
             Inst::decode_compressed(op, true),
             Some(Inst::RegImm {
-                kind: RegImmKind::AddW,
+                kind: RegImmKind::Add,
                 dst: Reg::A0,
                 src: Reg::A0,
                 imm: 0b11111111_11111111_11111111_11110101u32 as i32
