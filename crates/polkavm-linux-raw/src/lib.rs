@@ -195,6 +195,7 @@ pub use crate::arch_amd64_bindings::{
     ESPIPE,
     ESRCH,
     ETIMEDOUT,
+    ETOOMANYREFS,
     ETXTBSY,
     EXDEV,
     F_ADD_SEALS,
@@ -934,6 +935,7 @@ impl Error {
             EDOM => Some("EDOM"),
             ERANGE => Some("ERANGE"),
             EOPNOTSUPP => Some("EOPNOTSUPP"),
+            ETOOMANYREFS => Some("ETOOMANYREFS"),
             _ => None,
         };
 
