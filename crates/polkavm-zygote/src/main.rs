@@ -375,7 +375,7 @@ unsafe fn initialize(mut stack: *mut usize) {
     */
     let argc = *stack;
     stack = stack.add(1);
-    let argv = stack.cast::<*mut u8>();
+    let argv = stack.cast::<*mut *mut u8>();
     let envp = argv.add(argc + 1);
     let auxv = {
         let mut p = envp;
