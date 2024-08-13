@@ -1,7 +1,7 @@
 use crate::mutex::Mutex;
 use crate::{
     BackendKind, CallError, Caller, Config, Engine, GasMeteringKind, InterruptKind, Linker, MemoryAccessError, MemoryMap, Module,
-    ModuleConfig, ProgramBlob, ProgramCounter, Reg, Segfault, Trap,
+    ModuleConfig, ProgramBlob, ProgramCounter, Reg, Segfault,
 };
 use alloc::collections::BTreeMap;
 use alloc::format;
@@ -153,7 +153,7 @@ fn fallback_hostcall_handler_works(config: Config) {
     let module = Module::from_blob(&engine, &Default::default(), blob).unwrap();
     let mut linker = Linker::new();
 
-    linker.define_fallback(move |caller: Caller<()>, num: u32| -> Result<(), Trap> {
+    linker.define_fallback(move |caller: Caller<()>, num: u32| -> Result<(), ()> {
         assert_eq!(num, 0);
         caller.instance.set_reg(Reg::A0, 100);
         Ok(())
@@ -1668,5 +1668,4 @@ assert_send_sync! {
     crate::Module,
     crate::ModuleConfig,
     crate::ProgramBlob,
-    crate::Trap,
 }

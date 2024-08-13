@@ -91,10 +91,6 @@ pub struct Segfault {
     pub page_size: u32,
 }
 
-#[allow(clippy::exhaustive_structs)]
-#[derive(Clone, PartialEq, Eq, Debug, Default)]
-pub struct Trap;
-
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub enum InterruptKind {
     /// The execution finished normally.
