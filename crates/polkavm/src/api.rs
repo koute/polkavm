@@ -502,7 +502,7 @@ impl Module {
     }
 
     /// Returns the module's exports.
-    pub fn exports(&self) -> impl Iterator<Item = crate::ProgramExport<&[u8]>> + Clone {
+    pub fn exports(&self) -> impl Iterator<Item = crate::program::ProgramExport<&[u8]>> + Clone {
         self.0.blob.exports()
     }
 
