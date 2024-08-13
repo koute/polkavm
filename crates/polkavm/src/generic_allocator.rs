@@ -196,8 +196,9 @@ pub trait AllocatorConfig {
 }
 
 // TODO: Remove this once this is fixed: https://github.com/rust-lang/rust/issues/60551
+#[doc(hidden)]
 #[macro_export]
-macro_rules! allocator_config {
+macro_rules! _allocator_config {
     (
         impl AllocatorConfig for $type:ty {
             const MAX_ALLOCATION_SIZE: u32 = $max_allocation_size:expr;
@@ -217,7 +218,7 @@ macro_rules! allocator_config {
     }
 }
 
-pub use allocator_config;
+pub use _allocator_config as allocator_config;
 
 const EMPTY: u32 = u32::MAX;
 
