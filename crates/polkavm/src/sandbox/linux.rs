@@ -45,7 +45,13 @@ impl GlobalState {
         let uffd_enabled = config.dynamic_paging;
         if uffd_enabled {
             let userfaultfd = linux_raw::sys_userfaultfd(linux_raw::O_CLOEXEC)
-                .map_err(|error| Error::from(format!("failed to create an userfaultfd: {error}")))?;
+                .map_err(|error| {
+                    if error.errno() == linux_raw::EPERM && std::fs::read("/proc/sys/vm/unprivileged_userfaultfd").map(|blob| blob == b"0\n").unwrap_or(false) {
+                        Error::from("failed to create an userfaultfd: permission denied; run 'sysctl -w vm.unprivileged_userfaultfd=1' to enable it")
+                    } else {
+                        Error::from(format!("failed to create an userfaultfd: {error}"))
+                    }
+                })?;
 
             let mut api: linux_raw::uffdio_api = linux_raw::uffdio_api {
                 api: linux_raw::UFFD_API,
