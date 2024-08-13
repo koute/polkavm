@@ -204,8 +204,6 @@ pub struct VmCtx {
     pub jump_into: AtomicU64,
 
     /// The address of the instruction currently being executed.
-    ///
-    /// Should be treated as empty if equal to `INVALID_PROGRAM_COUNTER`.
     pub program_counter: AtomicU32,
 
     /// The address of the next instruction to be executed.
@@ -355,9 +353,7 @@ impl VmCtx {
 
     /// Creates a fresh VM context.
     pub const fn new() -> Self {
-        let mut vmctx = Self::zeroed();
-        vmctx.program_counter = AtomicU32::new(crate::INVALID_PROGRAM_COUNTER.0);
-        vmctx
+        Self::zeroed()
     }
 }
 

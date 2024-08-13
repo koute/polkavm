@@ -28,7 +28,6 @@ use polkavm_common::{
         VMCTX_FUTEX_GUEST_SIGNAL,
         VMCTX_FUTEX_IDLE,
     },
-    INVALID_PROGRAM_COUNTER,
 };
 use polkavm_linux_raw as linux_raw;
 
@@ -346,7 +345,6 @@ unsafe extern "C" fn signal_handler(signal: u32, _info: &linux_raw::siginfo_t, c
         VMCTX.regs[reg as usize].store(value as u32, Ordering::Relaxed);
     }
 
-    VMCTX.next_program_counter.store(INVALID_PROGRAM_COUNTER.0, Ordering::Relaxed);
     VMCTX.next_native_program_counter.store(rip, Ordering::Relaxed);
 
     signal_host_and_longjmp(VMCTX_FUTEX_GUEST_SIGNAL);
