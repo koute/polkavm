@@ -11,7 +11,6 @@ use polkavm_common::{
         VmCtx, VmMap, VMCTX_FUTEX_BUSY,
         VMCTX_FUTEX_GUEST_ECALLI, VMCTX_FUTEX_IDLE, VMCTX_FUTEX_GUEST_STEP, VMCTX_FUTEX_GUEST_TRAP, VMCTX_FUTEX_GUEST_SIGNAL, VM_ADDR_NATIVE_CODE,
     },
-    INVALID_PROGRAM_COUNTER
 };
 
 pub use linux_raw::Error;
@@ -46,7 +45,13 @@ impl GlobalState {
         let uffd_enabled = config.dynamic_paging;
         if uffd_enabled {
             let userfaultfd = linux_raw::sys_userfaultfd(linux_raw::O_CLOEXEC)
-                .map_err(|error| Error::from(format!("failed to create an userfaultfd: {error}")))?;
+                .map_err(|error| {
+                    if error.errno() == linux_raw::EPERM && std::fs::read("/proc/sys/vm/unprivileged_userfaultfd").map(|blob| blob == b"0\n").unwrap_or(false) {
+                        Error::from("failed to create an userfaultfd: permission denied; run 'sysctl -w vm.unprivileged_userfaultfd=1' to enable it")
+                    } else {
+                        Error::from(format!("failed to create an userfaultfd: {error}"))
+                    }
+                })?;
 
             let mut api: linux_raw::uffdio_api = linux_raw::uffdio_api {
                 api: linux_raw::UFFD_API,
@@ -1540,8 +1545,8 @@ impl super::Sandbox for Sandbox {
             *self.vmctx().sysreturn_address.get() = program.sysreturn_address;
         }
 
-        self.vmctx().program_counter.store(INVALID_PROGRAM_COUNTER.0, Ordering::Relaxed);
-        self.vmctx().next_program_counter.store(INVALID_PROGRAM_COUNTER.0, Ordering::Relaxed);
+        self.vmctx().program_counter.store(0, Ordering::Relaxed);
+        self.vmctx().next_program_counter.store(0, Ordering::Relaxed);
         self.vmctx().next_native_program_counter.store(0, Ordering::Relaxed);
         self.vmctx().jump_into.store(ZYGOTE_TABLES.1.ext_load_program, Ordering::Relaxed);
         self.vmctx().gas.store(0, Ordering::Relaxed);
@@ -1589,7 +1594,6 @@ impl super::Sandbox for Sandbox {
                     self.vmctx().next_native_program_counter.store(compiled_module.invalid_code_offset_address, Ordering::Relaxed);
                     return Ok(InterruptKind::Step);
                 } else {
-                    self.vmctx().next_program_counter.store(INVALID_PROGRAM_COUNTER.0, Ordering::Relaxed);
                     self.vmctx().next_native_program_counter.store(0, Ordering::Relaxed);
                     return Ok(InterruptKind::Trap);
                 }

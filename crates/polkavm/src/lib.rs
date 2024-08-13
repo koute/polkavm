@@ -97,9 +97,25 @@ if_compiler_is_supported! {
 
 pub use polkavm_common::{
     abi::MemoryMap,
-    program::{ProgramBlob, ProgramCounter, ProgramExport, ProgramParseError, ProgramParts, ProgramSymbol, Reg},
+    program::{ProgramBlob, ProgramCounter, ProgramParts, Reg},
     utils::{ArcBytes, AsUninitSliceMut},
 };
+
+/// Miscellaneous types related to debug info.
+pub mod debug_info {
+    pub use polkavm_common::program::{FrameInfo, FrameKind, LineProgram, RegionInfo, SourceLocation};
+
+    #[cfg(feature = "std")]
+    pub use crate::source_cache::SourceCache;
+}
+
+/// Miscellaneous types related to program blobs.
+pub mod program {
+    pub use polkavm_common::program::{
+        Imports, ImportsIter, Instruction, Instructions, JumpTable, JumpTableIter, Opcode, ProgramExport, ProgramParseError, ProgramSymbol,
+        RawReg,
+    };
+}
 
 pub type Gas = i64;
 
@@ -107,9 +123,7 @@ pub use crate::api::{Engine, MemoryAccessError, Module, RawInstance, RegValue};
 pub use crate::config::{BackendKind, Config, GasMeteringKind, ModuleConfig, SandboxKind};
 pub use crate::error::Error;
 pub use crate::linker::{CallError, Caller, Instance, InstancePre, Linker};
-#[cfg(feature = "std")]
-pub use crate::source_cache::SourceCache;
-pub use crate::utils::{InterruptKind, Segfault, Trap};
+pub use crate::utils::{InterruptKind, Segfault};
 
 pub const RETURN_TO_HOST: u32 = polkavm_common::abi::VM_ADDR_RETURN_TO_HOST;
 

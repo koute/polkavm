@@ -8,7 +8,6 @@ use polkavm_assembler::{Label, NonZero, ReservedAssembler, U1, U2, U3, U4};
 
 use polkavm_common::program::{RawReg, Reg};
 use polkavm_common::zygote::VM_ADDR_VMCTX;
-use polkavm_common::INVALID_PROGRAM_COUNTER;
 
 use crate::compiler::{ArchVisitor, SandboxKind};
 use crate::config::GasMeteringKind;
@@ -197,6 +196,121 @@ where
     S: Sandbox,
 {
     pub const PADDING_BYTE: u8 = 0x90; // NOP
+
+    pub fn _load_i32(&mut self, _: RawReg, _: u32) {
+        todo!()
+    }
+    pub fn _load_u64(&mut self, _: RawReg, _: u32) {
+        todo!()
+    }
+    pub fn _store_u64(&mut self, _: RawReg, _: u32) {
+        todo!()
+    }
+    pub fn _store_imm_indirect_u64(&mut self, _: RawReg, _: u32, _: u32) {
+        todo!()
+    }
+    pub fn _store_indirect_u64(&mut self, _: RawReg, _: RawReg, _: u32) {
+        todo!()
+    }
+    pub fn _load_indirect_i32(&mut self, _: RawReg, _: RawReg, _: u32) {
+        todo!()
+    }
+    pub fn _load_indirect_u64(&mut self, _: RawReg, _: RawReg, _: u32) {
+        todo!()
+    }
+    pub fn _store_imm_u64(&mut self, _: u32, _: u32) {
+        todo!()
+    }
+    pub fn _addw_imm(&mut self, _: RawReg, _: RawReg, _: u32) {
+        todo!()
+    }
+    pub fn _andw_imm(&mut self, _: RawReg, _: RawReg, _: u32) {
+        todo!()
+    }
+    pub fn _xorw_imm(&mut self, _: RawReg, _: RawReg, _: u32) {
+        todo!()
+    }
+    pub fn _orw_imm(&mut self, _: RawReg, _: RawReg, _: u32) {
+        todo!()
+    }
+    pub fn _mulw_imm(&mut self, _: RawReg, _: RawReg, _: u32) {
+        todo!()
+    }
+    pub fn _set_less_than_unsigned_w_imm(&mut self, _: RawReg, _: RawReg, _: u32) {
+        todo!()
+    }
+    pub fn _set_less_than_signed_w_imm(&mut self, _: RawReg, _: RawReg, _: u32) {
+        todo!()
+    }
+    pub fn _shift_logical_left_w_imm(&mut self, _: RawReg, _: RawReg, _: u32) {
+        todo!()
+    }
+    pub fn _shift_logical_right_w_imm(&mut self, _: RawReg, _: RawReg, _: u32) {
+        todo!()
+    }
+    pub fn _shift_arithmetic_right_w_imm(&mut self, _: RawReg, _: RawReg, _: u32) {
+        todo!()
+    }
+    pub fn _set_greater_than_unsigned_w_imm(&mut self, _: RawReg, _: RawReg, _: u32) {
+        todo!()
+    }
+    pub fn _set_greater_than_signed_w_imm(&mut self, _: RawReg, _: RawReg, _: u32) {
+        todo!()
+    }
+    pub fn _shift_logical_right_w_imm_alt(&mut self, _: RawReg, _: RawReg, _: u32) {
+        todo!()
+    }
+    pub fn _shift_arithmetic_right_w_imm_alt(&mut self, _: RawReg, _: RawReg, _: u32) {
+        todo!()
+    }
+    pub fn _shift_logical_left_w_imm_alt(&mut self, _: RawReg, _: RawReg, _: u32) {
+        todo!()
+    }
+    pub fn _addw(&mut self, _: RawReg, _: RawReg, _: RawReg) {
+        todo!()
+    }
+    pub fn _subw(&mut self, _: RawReg, _: RawReg, _: RawReg) {
+        todo!()
+    }
+    pub fn _andw(&mut self, _: RawReg, _: RawReg, _: RawReg) {
+        todo!()
+    }
+    pub fn _xorw(&mut self, _: RawReg, _: RawReg, _: RawReg) {
+        todo!()
+    }
+    pub fn _orw(&mut self, _: RawReg, _: RawReg, _: RawReg) {
+        todo!()
+    }
+    pub fn _mulw(&mut self, _: RawReg, _: RawReg, _: RawReg) {
+        todo!()
+    }
+    pub fn _set_less_than_unsigned_w(&mut self, _: RawReg, _: RawReg, _: RawReg) {
+        todo!()
+    }
+    pub fn _set_less_than_signed_w(&mut self, _: RawReg, _: RawReg, _: RawReg) {
+        todo!()
+    }
+    pub fn _shift_logical_left_w(&mut self, _: RawReg, _: RawReg, _: RawReg) {
+        todo!()
+    }
+    pub fn _shift_logical_right_w(&mut self, _: RawReg, _: RawReg, _: RawReg) {
+        todo!()
+    }
+    pub fn _shift_arithmetic_right_w(&mut self, _: RawReg, _: RawReg, _: RawReg) {
+        todo!()
+    }
+    pub fn _div_unsigned_w(&mut self, _: RawReg, _: RawReg, _: RawReg) {
+        todo!()
+    }
+    pub fn _div_signed_w(&mut self, _: RawReg, _: RawReg, _: RawReg) {
+        todo!()
+    }
+    pub fn _rem_unsigned_w(&mut self, _: RawReg, _: RawReg, _: RawReg) {
+        todo!()
+    }
+    pub fn _rem_signed_w(&mut self, _: RawReg, _: RawReg, _: RawReg) {
+        todo!()
+    }
 
     #[inline(always)]
     fn push<T>(&mut self, inst: polkavm_assembler::Instruction<T>)
@@ -584,14 +698,6 @@ where
         log::trace!("Emitting trampoline: sysreturn");
         let label = self.asm.create_label();
 
-        self.push(mov_imm(
-            Self::vmctx_field(S::offset_table().program_counter),
-            imm32(INVALID_PROGRAM_COUNTER.0),
-        ));
-        self.push(mov_imm(
-            Self::vmctx_field(S::offset_table().next_program_counter),
-            imm32(INVALID_PROGRAM_COUNTER.0),
-        ));
         self.push(mov_imm(Self::vmctx_field(S::offset_table().next_native_program_counter), imm64(0)));
         self.save_registers_to_vmctx();
         self.push(mov_imm64(TMP_REG, S::address_table().syscall_return));
@@ -628,10 +734,6 @@ where
         self.define_label(label);
 
         self.save_registers_to_vmctx();
-        self.push(mov_imm(
-            Self::vmctx_field(S::offset_table().next_program_counter),
-            imm32(INVALID_PROGRAM_COUNTER.0),
-        ));
         self.push(mov_imm(Self::vmctx_field(S::offset_table().next_native_program_counter), imm64(0)));
         self.push(mov_imm64(TMP_REG, S::address_table().syscall_trap));
         self.push(jmp(TMP_REG));
@@ -744,121 +846,6 @@ where
                 self.push(jmp(TMP_REG));
             }
         }
-    }
-
-    fn load_i32(&mut self, _: RawReg, _: u32) {
-        todo!()
-    }
-    fn load_u64(&mut self, _: RawReg, _: u32) {
-        todo!()
-    }
-    fn store_u64(&mut self, _: RawReg, _: u32) {
-        todo!()
-    }
-    fn store_imm_indirect_u64(&mut self, _: RawReg, _: u32, _: u32) {
-        todo!()
-    }
-    fn store_indirect_u64(&mut self, _: RawReg, _: RawReg, _: u32) {
-        todo!()
-    }
-    fn load_indirect_i32(&mut self, _: RawReg, _: RawReg, _: u32) {
-        todo!()
-    }
-    fn load_indirect_u64(&mut self, _: RawReg, _: RawReg, _: u32) {
-        todo!()
-    }
-    fn store_imm_u64(&mut self, _: u32, _: u32) {
-        todo!()
-    }
-    fn addw_imm(&mut self, _: RawReg, _: RawReg, _: u32) {
-        todo!()
-    }
-    fn andw_imm(&mut self, _: RawReg, _: RawReg, _: u32) {
-        todo!()
-    }
-    fn xorw_imm(&mut self, _: RawReg, _: RawReg, _: u32) {
-        todo!()
-    }
-    fn orw_imm(&mut self, _: RawReg, _: RawReg, _: u32) {
-        todo!()
-    }
-    fn mulw_imm(&mut self, _: RawReg, _: RawReg, _: u32) {
-        todo!()
-    }
-    fn set_less_than_unsigned_w_imm(&mut self, _: RawReg, _: RawReg, _: u32) {
-        todo!()
-    }
-    fn set_less_than_signed_w_imm(&mut self, _: RawReg, _: RawReg, _: u32) {
-        todo!()
-    }
-    fn shift_logical_left_w_imm(&mut self, _: RawReg, _: RawReg, _: u32) {
-        todo!()
-    }
-    fn shift_logical_right_w_imm(&mut self, _: RawReg, _: RawReg, _: u32) {
-        todo!()
-    }
-    fn shift_arithmetic_right_w_imm(&mut self, _: RawReg, _: RawReg, _: u32) {
-        todo!()
-    }
-    fn set_greater_than_unsigned_w_imm(&mut self, _: RawReg, _: RawReg, _: u32) {
-        todo!()
-    }
-    fn set_greater_than_signed_w_imm(&mut self, _: RawReg, _: RawReg, _: u32) {
-        todo!()
-    }
-    fn shift_logical_right_w_imm_alt(&mut self, _: RawReg, _: RawReg, _: u32) {
-        todo!()
-    }
-    fn shift_arithmetic_right_w_imm_alt(&mut self, _: RawReg, _: RawReg, _: u32) {
-        todo!()
-    }
-    fn shift_logical_left_w_imm_alt(&mut self, _: RawReg, _: RawReg, _: u32) {
-        todo!()
-    }
-    fn addw(&mut self, _: RawReg, _: RawReg, _: RawReg) {
-        todo!()
-    }
-    fn subw(&mut self, _: RawReg, _: RawReg, _: RawReg) {
-        todo!()
-    }
-    fn andw(&mut self, _: RawReg, _: RawReg, _: RawReg) {
-        todo!()
-    }
-    fn xorw(&mut self, _: RawReg, _: RawReg, _: RawReg) {
-        todo!()
-    }
-    fn orw(&mut self, _: RawReg, _: RawReg, _: RawReg) {
-        todo!()
-    }
-    fn mulw(&mut self, _: RawReg, _: RawReg, _: RawReg) {
-        todo!()
-    }
-    fn set_less_than_unsigned_w(&mut self, _: RawReg, _: RawReg, _: RawReg) {
-        todo!()
-    }
-    fn set_less_than_signed_w(&mut self, _: RawReg, _: RawReg, _: RawReg) {
-        todo!()
-    }
-    fn shift_logical_left_w(&mut self, _: RawReg, _: RawReg, _: RawReg) {
-        todo!()
-    }
-    fn shift_logical_right_w(&mut self, _: RawReg, _: RawReg, _: RawReg) {
-        todo!()
-    }
-    fn shift_arithmetic_right_w(&mut self, _: RawReg, _: RawReg, _: RawReg) {
-        todo!()
-    }
-    fn div_unsigned_w(&mut self, _: RawReg, _: RawReg, _: RawReg) {
-        todo!()
-    }
-    fn div_signed_w(&mut self, _: RawReg, _: RawReg, _: RawReg) {
-        todo!()
-    }
-    fn rem_unsigned_w(&mut self, _: RawReg, _: RawReg, _: RawReg) {
-        todo!()
-    }
-    fn rem_signed_w(&mut self, _: RawReg, _: RawReg, _: RawReg) {
-        todo!()
     }
 
     #[inline(always)]

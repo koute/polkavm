@@ -36,6 +36,3 @@ pub mod zygote;
 
 #[cfg(feature = "regmap")]
 pub mod regmap;
-
-/// A sentinel value to indicate that the program counter is not available.
-pub const INVALID_PROGRAM_COUNTER: crate::program::ProgramCounter = crate::program::ProgramCounter(!0);
