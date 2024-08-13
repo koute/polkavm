@@ -1,27 +1,46 @@
-use crate::api::{BackendAccess, ExecuteArgs, HostcallHandler, MemoryAccessError, Module};
+#![allow(unknown_lints)] // Because of `non_local_definitions` on older rustc versions.
+#![allow(non_local_definitions)]
+use crate::api::{MemoryAccessError, Module, RegValue};
 use crate::error::Error;
-use crate::utils::GuestInit;
-use crate::utils::{FlatMap, RegImm};
+use crate::gas::GasVisitor;
+use crate::utils::{FlatMap, GuestInit, InterruptKind};
+use crate::{Gas, GasMeteringKind, ProgramCounter};
 use alloc::vec::Vec;
 use core::mem::MaybeUninit;
 use core::num::NonZeroU32;
 use polkavm_common::abi::VM_ADDR_RETURN_TO_HOST;
-use polkavm_common::error::Trap;
 use polkavm_common::operation::*;
-use polkavm_common::program::{Instruction, InstructionVisitor, ParsedInstruction, RawReg, Reg};
-use polkavm_common::utils::{align_to_next_page_usize, byte_slice_init, Access, AsUninitSliceMut, Gas};
-use polkavm_common::{
-    VM_RPC_FLAG_CLEAR_PROGRAM_AFTER_EXECUTION, VM_RPC_FLAG_RESET_MEMORY_AFTER_EXECUTION, VM_RPC_FLAG_RESET_MEMORY_BEFORE_EXECUTION,
-};
+use polkavm_common::program::{asm, InstructionVisitor, RawReg, Reg};
+use polkavm_common::utils::{align_to_next_page_usize, byte_slice_init, AsUninitSliceMut};
 
-type ExecutionError<E = core::convert::Infallible> = polkavm_common::error::ExecutionError<E>;
+type Target = usize;
+
+#[derive(Copy, Clone)]
+pub enum RegImm {
+    Reg(Reg),
+    Imm(u32),
+}
+
+impl From<Reg> for RegImm {
+    #[inline]
+    fn from(reg: Reg) -> Self {
+        RegImm::Reg(reg)
+    }
+}
+
+impl From<u32> for RegImm {
+    #[inline]
+    fn from(value: u32) -> Self {
+        RegImm::Imm(value)
+    }
+}
 
 // Define a custom trait instead of just using `Into<RegImm>` to make sure this is always inlined.
 trait IntoRegImm {
     fn into(self) -> RegImm;
 }
 
-impl IntoRegImm for RawReg {
+impl IntoRegImm for Reg {
     #[inline(always)]
     fn into(self) -> RegImm {
         RegImm::Reg(self)
@@ -53,30 +72,6 @@ impl InterpretedModule {
     }
 }
 
-pub(crate) type OnSetReg<'a> = &'a mut dyn FnMut(Reg, u32) -> Result<(), Trap>;
-pub(crate) type OnStore<'a> = &'a mut dyn for<'r> FnMut(u32, &'r [u8]) -> Result<(), Trap>;
-
-#[derive(Default)]
-pub(crate) struct InterpreterContext<'a> {
-    on_hostcall: Option<HostcallHandler<'a>>,
-    on_set_reg: Option<OnSetReg<'a>>,
-    on_store: Option<OnStore<'a>>,
-}
-
-impl<'a> InterpreterContext<'a> {
-    pub fn set_on_hostcall(&mut self, on_hostcall: HostcallHandler<'a>) {
-        self.on_hostcall = Some(on_hostcall);
-    }
-
-    pub fn set_on_set_reg(&mut self, on_set_reg: OnSetReg<'a>) {
-        self.on_set_reg = Some(on_set_reg);
-    }
-
-    pub fn set_on_store(&mut self, on_store: OnStore<'a>) {
-        self.on_store = Some(on_store);
-    }
-}
-
 pub(crate) struct BasicMemory {
     rw_data: Vec<u8>,
     stack: Vec<u8>,
@@ -92,15 +87,6 @@ impl BasicMemory {
             is_memory_dirty: false,
             heap_size: 0,
         }
-    }
-
-    fn new_reusing(memory: &mut BasicMemory) -> Self {
-        let mut new_memory = Self::new();
-        memory.rw_data.clear();
-        memory.stack.clear();
-        new_memory.rw_data = core::mem::take(&mut memory.rw_data);
-        new_memory.stack = core::mem::take(&mut memory.stack);
-        new_memory
     }
 
     fn heap_size(&self) -> u32 {
@@ -165,9 +151,21 @@ impl BasicMemory {
     }
 
     fn sbrk(&mut self, module: &Module, size: u32) -> Option<u32> {
-        let new_heap_size = self.heap_size.checked_add(size)?;
+        let Some(new_heap_size) = self.heap_size.checked_add(size) else {
+            log::trace!(
+                "sbrk: heap size overflow; ignoring request: heap_size={} + size={} > 0xffffffff",
+                self.heap_size,
+                size
+            );
+            return None;
+        };
         let memory_map = module.memory_map();
         if new_heap_size > memory_map.max_heap_size() {
+            log::trace!(
+                "sbrk: new heap size is too large; ignoring request: {} > {}",
+                new_heap_size,
+                memory_map.max_heap_size()
+            );
             return None;
         }
 
@@ -186,383 +184,129 @@ impl BasicMemory {
     }
 }
 
-#[derive(Copy, Clone)]
-#[repr(transparent)]
-struct GasCost(NonZeroU32);
+macro_rules! emit {
+    ($self:ident, $handler_name:ident($($args:tt)*)) => {
+        $self.compiled_handlers.push(raw_handlers::$handler_name::<DEBUG> as Handler);
+        $self.compiled_args.push(Args::$handler_name($($args)*));
+    };
+}
 
-impl GasCost {
-    fn new(cost: u32) -> Self {
-        GasCost(NonZeroU32::new(cost + 1).expect("invalid gas"))
-    }
-
-    fn get(self) -> u32 {
-        self.0.get() - 1
-    }
+macro_rules! emit_branch {
+    ($self:ident, $name:ident, $s1:ident, $s2:ident, $i:ident) => {
+        let target_true = ProgramCounter($i);
+        if !$self.is_branch_valid(target_true) {
+            emit!($self, invalid_branch($self.program_counter));
+        } else {
+            let target_false = $self.next_program_counter();
+            emit!($self, $name($s1, $s2, target_true, target_false));
+        }
+    };
 }
 
 pub(crate) struct InterpretedInstance {
     module: Module,
     memory: BasicMemory,
     regs: [u32; Reg::ALL.len()],
-    instruction_offset: u32,
-    instruction_length: u32,
-    return_to_host: bool,
+    program_counter: ProgramCounter,
+    program_counter_valid: bool,
+    next_program_counter: Option<ProgramCounter>,
+    next_program_counter_changed: bool,
     cycle_counter: u64,
-    gas_cost_for_block: FlatMap<GasCost>,
-    gas_remaining: Option<i64>,
-    in_new_execution: bool,
+    gas: i64,
     compiled_offset_for_block: FlatMap<NonZeroU32>,
-    compiled_instructions: Vec<ParsedInstruction>,
+    compiled_handlers: Vec<Handler>,
+    compiled_args: Vec<Args>,
     compiled_offset: usize,
+    interrupt: InterruptKind,
+    step_tracing: bool,
 }
 
 impl InterpretedInstance {
-    pub fn new_from_module(module: Module) -> Self {
+    pub fn new_from_module(module: Module, force_step_tracing: bool) -> Self {
+        let step_tracing = module.is_step_tracing() || force_step_tracing;
         let mut instance = Self {
             compiled_offset_for_block: FlatMap::new(module.code_len()),
-            compiled_instructions: Default::default(),
-            gas_cost_for_block: FlatMap::new(module.code_len()),
+            compiled_handlers: Default::default(),
+            compiled_args: Default::default(),
             module,
             memory: BasicMemory::new(),
             regs: [0; Reg::ALL.len()],
-            instruction_offset: 0,
-            instruction_length: 0,
-            return_to_host: true,
+            program_counter: ProgramCounter(!0),
+            program_counter_valid: false,
+            next_program_counter: None,
+            next_program_counter_changed: true,
             cycle_counter: 0,
-            gas_remaining: None,
-            in_new_execution: false,
+            gas: 0,
             compiled_offset: 0,
+            interrupt: InterruptKind::Finished,
+            step_tracing,
         };
 
         instance.initialize_module();
         instance
     }
 
-    pub fn execute(&mut self, mut args: ExecuteArgs) -> Result<(), ExecutionError<Error>> {
-        self.prepare_for_execution(&args);
-
-        let mut ctx = InterpreterContext::default();
-        if let Some(hostcall_handler) = args.hostcall_handler.take() {
-            ctx.set_on_hostcall(hostcall_handler);
-        }
-
-        let result = if args.entry_point.is_some() { self.run(ctx) } else { Ok(()) };
-
-        self.finish_execution(args.flags);
-        result
+    pub fn reg(&self, reg: Reg) -> RegValue {
+        self.regs[reg as usize]
     }
 
-    pub fn run(&mut self, ctx: InterpreterContext) -> Result<(), ExecutionError<Error>> {
-        if log::log_enabled!(target: "polkavm", log::Level::Debug)
-            || log::log_enabled!(target: "polkavm::interpreter", log::Level::Debug)
-            || cfg!(test)
-        {
-            self.run_impl::<true>(ctx)
+    pub fn set_reg(&mut self, reg: Reg, value: u32) {
+        self.regs[reg as usize] = value;
+    }
+
+    pub fn gas(&self) -> Gas {
+        self.gas
+    }
+
+    pub fn set_gas(&mut self, gas: Gas) {
+        self.gas = gas;
+    }
+
+    pub fn program_counter(&self) -> Option<ProgramCounter> {
+        if !self.program_counter_valid {
+            None
         } else {
-            self.run_impl::<false>(ctx)
+            Some(self.program_counter)
         }
     }
 
-    #[inline(never)]
-    fn run_impl<const DEBUG: bool>(&mut self, ctx: InterpreterContext) -> Result<(), ExecutionError<Error>> {
-        #[cold]
-        fn translate_error(error: ExecutionError) -> ExecutionError<Error> {
-            match error {
-                ExecutionError::Trap(trap) => ExecutionError::Trap(trap),
-                ExecutionError::OutOfGas => ExecutionError::OutOfGas,
-                ExecutionError::Error(_) => unreachable!(),
-            }
-        }
-
-        #[cold]
-        fn trap() -> ExecutionError<Error> {
-            ExecutionError::Trap(Default::default())
-        }
-
-        self.memory.mark_dirty();
-
-        if self.in_new_execution {
-            self.in_new_execution = false;
-            if let Err(error) = self.on_start_new_basic_block::<DEBUG>() {
-                return Err(translate_error(error));
-            }
-        }
-
-        let mut visitor = Visitor::<DEBUG> { inner: self, ctx };
-        loop {
-            visitor.inner.cycle_counter += 1;
-            let Some(&instruction) = visitor.inner.compiled_instructions.get(visitor.inner.compiled_offset) else {
-                if DEBUG {
-                    log::trace!("Trap at {}: no instruction found", visitor.inner.instruction_offset);
-                }
-                return Err(trap());
-            };
-
-            visitor.inner.instruction_offset = instruction.offset;
-            visitor.inner.instruction_length = instruction.length;
-            visitor.trace_current_instruction(&instruction);
-            if let Err(error) = instruction.visit(&mut visitor) {
-                return Err(translate_error(error));
-            }
-
-            if visitor.inner.return_to_host {
-                break;
-            }
-        }
-
-        Ok(())
+    pub fn next_program_counter(&self) -> Option<ProgramCounter> {
+        self.next_program_counter
     }
 
-    pub fn step_once(&mut self, ctx: InterpreterContext) -> Result<(), ExecutionError> {
-        if self.in_new_execution {
-            self.in_new_execution = false;
-            self.on_start_new_basic_block::<true>()?;
-        }
-
-        self.cycle_counter += 1;
-        let Some(mut instructions) = self.module.instructions_at(self.instruction_offset) else {
-            return Err(ExecutionError::Trap(Default::default()));
-        };
-
-        let Some(instruction) = instructions.next() else {
-            return Err(ExecutionError::Trap(Default::default()));
-        };
-
-        self.instruction_offset = instruction.offset;
-        self.instruction_length = instruction.length;
-        let mut visitor = Visitor::<true> { inner: self, ctx };
-
-        visitor.trace_current_instruction(&instruction);
-        instruction.visit(&mut visitor)?;
-
-        Ok(())
+    pub fn set_next_program_counter(&mut self, pc: ProgramCounter) {
+        self.program_counter_valid = false;
+        self.next_program_counter = Some(pc);
+        self.next_program_counter_changed = true;
     }
 
-    fn clear_instance(&mut self) {
-        *self = Self {
-            memory: BasicMemory::new_reusing(&mut self.memory),
-            ..Self::new_from_module(Module::empty())
-        };
+    #[allow(clippy::unused_self)]
+    pub fn next_native_program_counter(&self) -> Option<usize> {
+        None
     }
 
-    pub fn reset_memory(&mut self) {
-        self.memory.reset(&self.module);
-    }
-
-    pub fn sbrk(&mut self, size: u32) -> Option<u32> {
-        self.memory.sbrk(&self.module, size)
-    }
-
-    fn initialize_module(&mut self) {
-        if self.module.gas_metering().is_some() {
-            self.gas_remaining = Some(0);
-        }
-
-        self.memory.force_reset(&self.module);
-    }
-
-    pub fn prepare_for_execution(&mut self, args: &ExecuteArgs) {
-        if let Some(module) = args.module {
-            if module.interpreted_module().is_none() {
-                panic!("internal_error: an interpreter cannot be created from the given module");
-            }
-
-            self.clear_instance();
-            self.module = module.clone();
-            self.initialize_module();
-        }
-
-        if let Some(regs) = args.regs {
-            self.regs.copy_from_slice(regs);
-        }
-
-        if self.module.gas_metering().is_some() {
-            if let Some(gas) = args.gas {
-                self.gas_remaining = Some(gas.get() as i64);
-            }
-        } else {
-            self.gas_remaining = None;
-        }
-
-        if let Some(entry_point) = args.entry_point {
-            self.instruction_offset = entry_point;
-        }
-
-        if args.flags & VM_RPC_FLAG_RESET_MEMORY_BEFORE_EXECUTION != 0 {
-            self.reset_memory();
-        }
-
-        if args.sbrk > 0 {
-            self.sbrk(args.sbrk).expect("internal error: sbrk failed");
-        }
-
-        self.return_to_host = false;
-        self.in_new_execution = true;
-    }
-
-    pub fn finish_execution(&mut self, flags: u32) {
-        if flags & VM_RPC_FLAG_CLEAR_PROGRAM_AFTER_EXECUTION != 0 {
-            self.clear_instance();
-        } else if flags & VM_RPC_FLAG_RESET_MEMORY_AFTER_EXECUTION != 0 {
-            self.reset_memory();
-        }
-    }
-
-    pub fn access(&mut self) -> InterpretedAccess {
-        InterpretedAccess { instance: self }
-    }
-
-    #[cfg_attr(not(debug_assertions), inline(always))]
-    fn on_start_new_basic_block<const DEBUG: bool>(&mut self) -> Result<(), ExecutionError> {
-        let instruction_offset = self.instruction_offset;
-        if let Some(compiled_offset) = self.compiled_offset_for_block.get(instruction_offset) {
-            self.compiled_offset = (compiled_offset.get() - 1) as usize;
-        } else {
-            self.compiled_offset = self.compiled_instructions.len();
-            self.compile_block::<DEBUG>()?;
-        }
-
-        if self.gas_remaining.is_some() {
-            let gas_cost: i64 = if let Some(cost) = self.gas_cost_for_block.get(instruction_offset) {
-                u64::from(cost.get()) as i64
-            } else {
-                self.calculate_gas_cost::<DEBUG>()
-            };
-
-            let gas_remaining = self.gas_remaining.as_mut().unwrap();
-            if DEBUG {
-                log::trace!(
-                    "Consume gas at {}: {} ({} -> {})",
-                    instruction_offset,
-                    gas_cost,
-                    *gas_remaining,
-                    *gas_remaining - gas_cost
-                );
-            }
-
-            *gas_remaining -= gas_cost;
-            if *gas_remaining < 0 {
-                return Err(ExecutionError::OutOfGas);
-            }
-        }
-
-        Ok(())
-    }
-
-    #[inline(never)]
-    #[cold]
-    fn calculate_gas_cost<const DEBUG: bool>(&mut self) -> i64 {
-        let instruction_offset = self.instruction_offset;
-        let Some(instructions) = self.module.instructions_at(instruction_offset) else {
-            return 0;
-        };
-
-        let (cost, started_out_of_bounds) = crate::gas::calculate_for_block(instructions);
-        if DEBUG {
-            log::trace!("Calculated gas cost for block at {instruction_offset}: {cost}");
-        }
-
-        if !started_out_of_bounds {
-            self.gas_cost_for_block.insert(instruction_offset, GasCost::new(cost));
-        }
-
-        u64::from(cost) as i64
-    }
-
-    #[inline(never)]
-    #[cold]
-    fn compile_block<const DEBUG: bool>(&mut self) -> Result<(), ExecutionError> {
-        let Some(instructions) = self.module.instructions_at(self.instruction_offset) else {
-            return Err(ExecutionError::Trap(Default::default()));
-        };
-
-        if DEBUG {
-            log::debug!("Compiling block at {}:", self.instruction_offset);
-        }
-
-        let starting_offset = self.compiled_instructions.len();
-        for instruction in instructions {
-            if DEBUG {
-                log::debug!(
-                    "  [{}]: {}: {}",
-                    self.compiled_instructions.len(),
-                    instruction.offset,
-                    instruction.kind
-                );
-            }
-
-            self.compiled_instructions.push(instruction);
-            if instruction.opcode().starts_new_basic_block() {
-                break;
-            }
-        }
-
-        if self.compiled_instructions.len() == starting_offset {
-            return Ok(());
-        }
-
-        self.compiled_offset_for_block
-            .insert(self.instruction_offset, NonZeroU32::new((starting_offset + 1) as u32).unwrap());
-
-        Ok(())
-    }
-
-    fn check_gas(&mut self) -> Result<(), ExecutionError> {
-        if let Some(ref mut gas_remaining) = self.gas_remaining {
-            if *gas_remaining < 0 {
-                return Err(ExecutionError::OutOfGas);
-            }
-        }
-
-        Ok(())
-    }
-}
-
-pub struct InterpretedAccess<'a> {
-    instance: &'a mut InterpretedInstance,
-}
-
-impl<'a> Access<'a> for InterpretedAccess<'a> {
-    type Error = MemoryAccessError<&'static str>;
-
-    fn get_reg(&self, reg: Reg) -> u32 {
-        self.instance.regs[reg as usize]
-    }
-
-    fn set_reg(&mut self, reg: Reg, value: u32) {
-        self.instance.regs[reg as usize] = value;
-    }
-
-    fn read_memory_into_slice<'slice, T>(&self, address: u32, buffer: &'slice mut T) -> Result<&'slice mut [u8], Self::Error>
+    pub fn read_memory_into<'slice, B>(&self, address: u32, buffer: &'slice mut B) -> Result<&'slice mut [u8], MemoryAccessError>
     where
-        T: ?Sized + AsUninitSliceMut,
+        B: ?Sized + AsUninitSliceMut,
     {
         let buffer: &mut [MaybeUninit<u8>] = buffer.as_uninit_slice_mut();
-        let Some(slice) = self
-            .instance
-            .memory
-            .get_memory_slice(&self.instance.module, address, buffer.len() as u32)
-        else {
+        let Some(slice) = self.memory.get_memory_slice(&self.module, address, buffer.len() as u32) else {
             return Err(MemoryAccessError {
                 address,
                 length: buffer.len() as u64,
-                error: "out of range read",
+                error: "out of range read".into(),
             });
         };
 
         Ok(byte_slice_init(buffer, slice))
     }
 
-    fn write_memory(&mut self, address: u32, data: &[u8]) -> Result<(), Self::Error> {
-        let Some(slice) = self
-            .instance
-            .memory
-            .get_memory_slice_mut(&self.instance.module, address, data.len() as u32)
-        else {
+    pub fn write_memory(&mut self, address: u32, data: &[u8]) -> Result<(), MemoryAccessError> {
+        let Some(slice) = self.memory.get_memory_slice_mut(&self.module, address, data.len() as u32) else {
             return Err(MemoryAccessError {
                 address,
                 length: data.len() as u64,
-                error: "out of range write",
+                error: "out of range write".into(),
             });
         };
 
@@ -570,155 +314,350 @@ impl<'a> Access<'a> for InterpretedAccess<'a> {
         Ok(())
     }
 
-    fn sbrk(&mut self, size: u32) -> Option<u32> {
-        self.instance.sbrk(size)
+    pub fn zero_memory(&mut self, address: u32, length: u32) -> Result<(), MemoryAccessError> {
+        let Some(slice) = self.memory.get_memory_slice_mut(&self.module, address, length) else {
+            return Err(MemoryAccessError {
+                address,
+                length: u64::from(length),
+                error: "out of range write (of zeroes)".into(),
+            });
+        };
+
+        slice.fill(0);
+        Ok(())
     }
 
-    fn heap_size(&self) -> u32 {
-        self.instance.memory.heap_size()
+    pub fn free_pages(&mut self, _address: u32, _length: u32) {
+        todo!()
     }
 
-    fn program_counter(&self) -> Option<u32> {
-        Some(self.instance.instruction_offset)
+    pub fn heap_size(&self) -> u32 {
+        self.memory.heap_size()
     }
 
-    fn native_program_counter(&self) -> Option<u64> {
+    pub fn sbrk(&mut self, size: u32) -> Option<u32> {
+        self.memory.sbrk(&self.module, size)
+    }
+
+    #[allow(clippy::unused_self)]
+    pub fn pid(&self) -> Option<u32> {
         None
     }
 
-    fn gas_remaining(&self) -> Option<Gas> {
-        let gas = self.instance.gas_remaining?;
-        Some(Gas::new(gas as u64).unwrap_or(Gas::MIN))
-    }
-
-    fn consume_gas(&mut self, gas: u64) {
-        if let Some(ref mut gas_remaining) = self.instance.gas_remaining {
-            *gas_remaining = gas_remaining.checked_sub_unsigned(gas).unwrap_or(-1);
+    pub fn run(&mut self) -> Result<InterruptKind, Error> {
+        #[allow(clippy::collapsible_else_if)]
+        if log::log_enabled!(target: "polkavm", log::Level::Debug)
+            || log::log_enabled!(target: "polkavm::interpreter", log::Level::Debug)
+            || cfg!(test)
+        {
+            if !self.step_tracing {
+                Ok(self.run_impl::<true, false>())
+            } else {
+                Ok(self.run_impl::<true, true>())
+            }
+        } else {
+            if !self.step_tracing {
+                Ok(self.run_impl::<false, false>())
+            } else {
+                Ok(self.run_impl::<false, true>())
+            }
         }
     }
+
+    #[inline(never)]
+    fn run_impl<const DEBUG: bool, const STEP_TRACING: bool>(&mut self) -> InterruptKind {
+        self.memory.mark_dirty();
+
+        if self.next_program_counter_changed {
+            let Some(program_counter) = self.next_program_counter.take() else {
+                panic!("failed to run: next program counter is not set");
+            };
+
+            self.program_counter = program_counter;
+            self.compiled_offset = self.resolve_arbitrary_jump::<DEBUG>(program_counter).unwrap_or(TARGET_OUT_OF_RANGE);
+
+            if DEBUG {
+                log::debug!("Starting execution at: {} [{}]", program_counter, self.compiled_offset);
+            }
+        } else if DEBUG {
+            log::trace!("Implicitly resuming at: [{}]", self.compiled_offset);
+        }
+
+        let mut offset = self.compiled_offset;
+        loop {
+            if DEBUG {
+                self.cycle_counter += 1;
+            }
+
+            let handler = self.compiled_handlers[offset];
+            let mut visitor = Visitor { inner: self };
+            if let Some(next_offset) = handler(&mut visitor) {
+                offset = next_offset;
+                self.compiled_offset = offset;
+            } else {
+                return self.interrupt.clone();
+            }
+        }
+    }
+
+    pub fn reset_memory(&mut self) {
+        self.memory.reset(&self.module);
+    }
+
+    fn initialize_module(&mut self) {
+        if self.module.gas_metering().is_some() {
+            self.gas = 0;
+        }
+
+        self.memory.force_reset(&self.module);
+        self.compile_out_of_range_stub();
+    }
+
+    #[inline(always)]
+    fn pack_target(index: usize, is_first_in_basic_block: bool) -> NonZeroU32 {
+        let mut index = index as u32;
+        if is_first_in_basic_block {
+            index |= 1 << 31;
+        }
+
+        NonZeroU32::new(index).unwrap()
+    }
+
+    #[inline(always)]
+    fn unpack_target(value: NonZeroU32) -> (bool, Target) {
+        ((value.get() >> 31) == 1, ((value.get() << 1) >> 1) as usize)
+    }
+
+    fn resolve_jump<const DEBUG: bool>(&mut self, program_counter: ProgramCounter) -> Option<Target> {
+        if let Some(compiled_offset) = self.compiled_offset_for_block.get(program_counter.0) {
+            let (is_first, target) = Self::unpack_target(compiled_offset);
+            if !is_first {
+                return None;
+            }
+
+            return Some(target);
+        }
+
+        self.compile_block::<DEBUG>(program_counter)
+    }
+
+    fn resolve_arbitrary_jump<const DEBUG: bool>(&mut self, program_counter: ProgramCounter) -> Option<Target> {
+        if let Some(compiled_offset) = self.compiled_offset_for_block.get(program_counter.0) {
+            let (_, target) = Self::unpack_target(compiled_offset);
+            return Some(target);
+        }
+
+        self.compile_block::<DEBUG>(program_counter)
+    }
+
+    #[inline(never)]
+    #[cold]
+    fn compile_block<const DEBUG: bool>(&mut self, program_counter: ProgramCounter) -> Option<Target> {
+        let instructions = self.module.instructions_at(program_counter)?;
+
+        if program_counter.0 > 0
+            && !instructions
+                .clone()
+                .next_back()
+                .map_or(true, |instruction| instruction.starts_new_basic_block())
+        {
+            return None;
+        }
+
+        if program_counter.0 == self.module.code_len() {
+            return None;
+        }
+
+        let origin = self.compiled_handlers.len();
+        if DEBUG {
+            log::debug!("Compiling block:");
+        }
+
+        let mut gas_visitor = GasVisitor::default();
+        let mut charge_gas_index = None;
+        let mut is_first = true;
+        for instruction in instructions {
+            self.compiled_offset_for_block
+                .insert(instruction.offset.0, Self::pack_target(self.compiled_handlers.len(), is_first));
+
+            is_first = false;
+
+            if self.step_tracing {
+                if DEBUG {
+                    log::debug!("  [{}]: {}: step", self.compiled_handlers.len(), instruction.offset);
+                }
+                emit!(self, step(instruction.offset));
+            }
+
+            if self.module.gas_metering().is_some() {
+                if charge_gas_index.is_none() {
+                    if DEBUG {
+                        log::debug!("  [{}]: {}: charge_gas", self.compiled_handlers.len(), instruction.offset);
+                    }
+
+                    charge_gas_index = Some((instruction.offset, self.compiled_handlers.len()));
+                    emit!(self, charge_gas(instruction.offset, 0));
+                }
+                instruction.visit(&mut gas_visitor);
+            }
+
+            if DEBUG {
+                log::debug!("  [{}]: {}: {}", self.compiled_handlers.len(), instruction.offset, instruction.kind);
+            }
+
+            instruction.visit(&mut Compiler::<DEBUG, false> {
+                program_counter: instruction.offset,
+                instruction_length: instruction.length,
+                compiled_handlers: &mut self.compiled_handlers,
+                compiled_args: &mut self.compiled_args,
+                module: &self.module,
+            });
+
+            if instruction.opcode().starts_new_basic_block() {
+                break;
+            }
+        }
+
+        if let Some((program_counter, index)) = charge_gas_index {
+            let gas_cost = gas_visitor.take_block_cost().unwrap();
+            self.compiled_args[index] = Args::charge_gas(program_counter, gas_cost);
+        }
+
+        if self.compiled_handlers.len() == origin {
+            return None;
+        }
+
+        Some(origin)
+    }
+
+    fn compile_out_of_range_stub(&mut self) {
+        const DEBUG: bool = false;
+        if self.step_tracing {
+            emit!(self, step_out_of_range());
+        }
+
+        let gas_cost = if self.module.gas_metering().is_some() {
+            crate::gas::trap_cost()
+        } else {
+            0
+        };
+
+        emit!(self, out_of_range(gas_cost));
+    }
 }
 
-struct Visitor<'a, 'b, const DEBUG: bool> {
+struct Visitor<'a> {
     inner: &'a mut InterpretedInstance,
-    ctx: InterpreterContext<'b>,
 }
 
-impl<'a, 'b, const DEBUG: bool> Visitor<'a, 'b, DEBUG> {
+impl<'a> Visitor<'a> {
     #[inline(always)]
     fn get(&self, regimm: impl IntoRegImm) -> u32 {
         match regimm.into() {
-            RegImm::Reg(reg) => self.inner.regs[reg.get() as usize],
+            RegImm::Reg(reg) => self.inner.regs[reg as usize],
             RegImm::Imm(value) => value,
         }
     }
 
     #[inline(always)]
-    fn set(&mut self, dst: RawReg, value: u32) -> Result<(), ExecutionError> {
-        let dst = dst.get();
-        self.inner.regs[dst as usize] = value;
-
-        if DEBUG {
-            log::trace!("{dst} = 0x{value:x}");
-        }
-
-        if let Some(on_set_reg) = self.ctx.on_set_reg.as_mut() {
-            let result = (on_set_reg)(dst, value);
-            Ok(result.map_err(ExecutionError::Trap)?)
-        } else {
-            Ok(())
-        }
+    fn go_to_next_instruction(&mut self) -> Option<Target> {
+        Some(self.inner.compiled_offset + 1)
     }
 
     #[inline(always)]
-    fn set3(
+    fn set<const DEBUG: bool>(&mut self, dst: Reg, value: u32) {
+        if DEBUG {
+            log::trace!("  {dst} = 0x{value:x}");
+        }
+
+        self.inner.regs[dst as usize] = value;
+    }
+
+    #[inline(always)]
+    fn set3<const DEBUG: bool>(
         &mut self,
-        dst: RawReg,
+        dst: Reg,
         s1: impl IntoRegImm,
         s2: impl IntoRegImm,
         callback: impl Fn(u32, u32) -> u32,
-    ) -> Result<(), ExecutionError> {
+    ) -> Option<Target> {
         let s1 = self.get(s1);
         let s2 = self.get(s2);
-        self.set(dst, callback(s1, s2))?;
-        self.on_next_instruction();
-
-        Ok(())
+        self.set::<DEBUG>(dst, callback(s1, s2));
+        self.go_to_next_instruction()
     }
 
-    fn branch(
+    fn branch<const DEBUG: bool>(
         &mut self,
         s1: impl IntoRegImm,
         s2: impl IntoRegImm,
-        target: u32,
+        target_true: Target,
+        target_false: Target,
         callback: impl Fn(u32, u32) -> bool,
-    ) -> Result<(), ExecutionError> {
+    ) -> Option<Target> {
         let s1 = self.get(s1);
         let s2 = self.get(s2);
         if callback(s1, s2) {
-            self.inner.instruction_offset = target;
+            Some(target_true)
         } else {
-            self.on_next_instruction();
+            Some(target_false)
         }
-
-        self.inner.on_start_new_basic_block::<DEBUG>()
-    }
-
-    #[inline(always)]
-    fn on_next_instruction(&mut self) {
-        self.inner.instruction_offset += self.inner.instruction_length;
-        self.inner.compiled_offset += 1;
     }
 
     #[cfg_attr(not(debug_assertions), inline(always))]
-    fn load<T: LoadTy>(&mut self, dst: RawReg, base: Option<RawReg>, offset: u32) -> Result<(), ExecutionError> {
+    fn load<T: LoadTy, const DEBUG: bool>(
+        &mut self,
+        program_counter: ProgramCounter,
+        dst: Reg,
+        base: Option<Reg>,
+        offset: u32,
+    ) -> Option<Target> {
         assert!(core::mem::size_of::<T>() >= 1);
 
-        let address = base.map_or(0, |base| self.inner.regs[base.get() as usize]).wrapping_add(offset);
+        let address = base.map_or(0, |base| self.inner.regs[base as usize]).wrapping_add(offset);
         let length = core::mem::size_of::<T>() as u32;
         let Some(slice) = self.inner.memory.get_memory_slice(&self.inner.module, address, length) else {
             if DEBUG {
                 log::debug!(
-                    "Load of {length} bytes from 0x{address:x} failed! (pc = {pc}, cycle = {cycle})",
-                    pc = self.inner.instruction_offset,
+                    "Load of {length} bytes from 0x{address:x} failed! (pc = {program_counter}, cycle = {cycle})",
                     cycle = self.inner.cycle_counter
                 );
-
-                self.inner
-                    .module
-                    .debug_print_location(log::Level::Debug, self.inner.instruction_offset);
             }
 
-            return Err(ExecutionError::Trap(Default::default()));
+            return trap_impl::<DEBUG>(self, program_counter);
         };
 
+        let value = T::from_slice(slice);
         if DEBUG {
-            log::trace!("{dst} = {kind} [0x{address:x}]", kind = core::any::type_name::<T>());
+            log::trace!("  {dst} = {kind} [0x{address:x}] = 0x{value:x}", kind = core::any::type_name::<T>());
         }
 
-        let value = T::from_slice(slice);
-        self.set(dst, value)?;
-        self.on_next_instruction();
-
-        Ok(())
+        self.set::<false>(dst, value);
+        self.go_to_next_instruction()
     }
 
-    fn store<T: StoreTy>(&mut self, src: impl IntoRegImm, base: Option<RawReg>, offset: u32) -> Result<(), ExecutionError> {
+    fn store<T: StoreTy, const DEBUG: bool>(
+        &mut self,
+        program_counter: ProgramCounter,
+        src: impl IntoRegImm,
+        base: Option<Reg>,
+        offset: u32,
+    ) -> Option<Target> {
         assert!(core::mem::size_of::<T>() >= 1);
 
-        let address = base.map_or(0, |base| self.inner.regs[base.get() as usize]).wrapping_add(offset);
+        let address = base.map_or(0, |base| self.inner.regs[base as usize]).wrapping_add(offset);
         let value = match src.into() {
             RegImm::Reg(src) => {
-                let src = src.get();
                 let value = self.inner.regs[src as usize];
                 if DEBUG {
-                    log::trace!("{kind} [0x{address:x}] = {src} = 0x{value:x}", kind = core::any::type_name::<T>());
+                    log::trace!("  {kind} [0x{address:x}] = {src} = 0x{value:x}", kind = core::any::type_name::<T>());
                 }
 
                 value
             }
             RegImm::Imm(value) => {
                 if DEBUG {
-                    log::trace!("{kind} [0x{address:x}] = 0x{value:x}", kind = core::any::type_name::<T>());
+                    log::trace!("  {kind} [0x{address:x}] = 0x{value:x}", kind = core::any::type_name::<T>());
                 }
 
                 value
@@ -729,67 +668,50 @@ impl<'a, 'b, const DEBUG: bool> Visitor<'a, 'b, DEBUG> {
         let Some(slice) = self.inner.memory.get_memory_slice_mut(&self.inner.module, address, length) else {
             if DEBUG {
                 log::debug!(
-                    "Store of {length} bytes to 0x{address:x} failed! (pc = {pc}, cycle = {cycle})",
-                    pc = self.inner.instruction_offset,
+                    "Store of {length} bytes to 0x{address:x} failed! (pc = {program_counter}, cycle = {cycle})",
                     cycle = self.inner.cycle_counter
                 );
-
-                self.inner
-                    .module
-                    .debug_print_location(log::Level::Debug, self.inner.instruction_offset);
             }
 
-            return Err(ExecutionError::Trap(Default::default()));
+            return trap_impl::<DEBUG>(self, program_counter);
         };
 
         let value = T::into_bytes(value);
         slice.copy_from_slice(value.as_ref());
-
-        if let Some(on_store) = self.ctx.on_store.as_mut() {
-            (on_store)(address, value.as_ref()).map_err(ExecutionError::Trap)?;
-        }
-
-        self.on_next_instruction();
-        Ok(())
+        self.go_to_next_instruction()
     }
 
     #[cfg_attr(not(debug_assertions), inline(always))]
-    fn jump_indirect_impl(&mut self, call: Option<(RawReg, u32)>, base: RawReg, offset: u32) -> Result<(), ExecutionError> {
-        let base = base.get();
-        let target = self.inner.regs[base as usize].wrapping_add(offset);
-        if let Some((ra, return_address)) = call {
-            self.set(ra, return_address)?;
+    fn jump_indirect_impl<const DEBUG: bool>(&mut self, program_counter: ProgramCounter, dynamic_address: u32) -> Option<Target> {
+        if dynamic_address == VM_ADDR_RETURN_TO_HOST {
+            self.inner.program_counter = ProgramCounter(!0);
+            self.inner.program_counter_valid = false;
+            self.inner.next_program_counter = None;
+            self.inner.next_program_counter_changed = true;
+            self.inner.interrupt = InterruptKind::Finished;
+            return None;
         }
 
-        if target == VM_ADDR_RETURN_TO_HOST {
-            self.inner.return_to_host = true;
-            return Ok(());
-        }
-
-        let Some(instruction_offset) = self.inner.module.jump_table().get_by_address(target) else {
+        let Some(target) = self.inner.module.jump_table().get_by_address(dynamic_address) else {
             if DEBUG {
-                log::trace!("Indirect jump to address {target}: INVALID");
+                log::trace!("Indirect jump to dynamic address {dynamic_address}: invalid (bad jump table index)");
             }
-            return Err(ExecutionError::Trap(Default::default()));
+
+            return trap_impl::<DEBUG>(self, program_counter);
         };
 
-        if DEBUG {
-            log::trace!("Indirect jump to address {target}: {instruction_offset}");
-        }
+        if let Some(target) = self.inner.resolve_jump::<DEBUG>(target) {
+            if DEBUG {
+                log::trace!("Indirect jump to dynamic address {dynamic_address}: {target}");
+            }
 
-        self.inner.instruction_offset = instruction_offset;
-        self.inner.on_start_new_basic_block::<DEBUG>()
-    }
+            Some(target)
+        } else {
+            if DEBUG {
+                log::trace!("Indirect jump to dynamic address {dynamic_address}: invalid (bad target)");
+            }
 
-    #[inline(always)]
-    fn trace_current_instruction(&self, instruction: &Instruction) {
-        if DEBUG {
-            log::trace!(
-                "[{}]: {}..{}: {instruction}",
-                self.inner.compiled_offset,
-                self.inner.instruction_offset,
-                self.inner.instruction_offset + self.inner.instruction_length
-            );
+            trap_impl::<DEBUG>(self, program_counter)
         }
     }
 }
@@ -860,49 +782,1444 @@ impl StoreTy for u32 {
     }
 }
 
-impl<'a, 'b, const DEBUG: bool> InstructionVisitor for Visitor<'a, 'b, DEBUG> {
-    type ReturnTy = Result<(), ExecutionError>;
+#[derive(Copy, Clone, Default)]
+#[repr(C)]
+struct Args {
+    a0: u32,
+    a1: u32,
+    a2: u32,
+    a3: u32,
+}
 
-    fn trap(&mut self) -> Self::ReturnTy {
-        log::debug!("Trap at {}: explicit trap", self.inner.instruction_offset);
-        Err(ExecutionError::Trap(Default::default()))
-    }
+type Handler = for<'a, 'b> fn(visitor: &'a mut Visitor<'b>) -> Option<Target>;
 
-    fn fallthrough(&mut self) -> Self::ReturnTy {
-        self.on_next_instruction();
-        self.inner.on_start_new_basic_block::<DEBUG>()
-    }
+macro_rules! define_interpreter {
+    (@define $handler_name:ident $body:block $self:ident) => {{
+        impl Args {
+            pub fn $handler_name() -> Args {
+                Args::default()
+            }
+        }
 
-    fn sbrk(&mut self, dst: RawReg, size: RawReg) -> Self::ReturnTy {
-        let size = self.get(size);
-        let result = self.inner.sbrk(size).unwrap_or(0);
-        self.set(dst, result)?;
-        self.on_next_instruction();
+        $body
+    }};
 
-        Ok(())
-    }
+    (@define $handler_name:ident $body:block $self:ident, $a0:ident: u32) => {{
+        impl Args {
+            pub fn $handler_name(a0: u32) -> Args {
+                Args {
+                    a0,
+                    ..Args::default()
+                }
+            }
+        }
 
-    fn ecalli(&mut self, imm: u32) -> Self::ReturnTy {
-        if let Some(on_hostcall) = self.ctx.on_hostcall.as_mut() {
-            self.inner.instruction_offset += self.inner.instruction_length; // TODO: Call self.on_next_instruction().
-            self.inner.compiled_offset += 1;
+        let args = $self.inner.compiled_args[$self.inner.compiled_offset];
+        let $a0 = args.a0;
+        $body
+    }};
 
-            let access = BackendAccess::Interpreted(self.inner.access());
-            (on_hostcall)(imm, access).map_err(ExecutionError::Trap)?;
-            self.inner.check_gas()?;
-            Ok(())
-        } else {
-            log::debug!("Hostcall called without any hostcall handler set!");
-            Err(ExecutionError::Trap(Default::default()))
+    (@define $handler_name:ident $body:block $self:ident, $a0:ident: ProgramCounter) => {{
+        impl Args {
+            pub fn $handler_name(a0: ProgramCounter) -> Args {
+                Args {
+                    a0: a0.0,
+                    ..Args::default()
+                }
+            }
+        }
+
+        let args = $self.inner.compiled_args[$self.inner.compiled_offset];
+        let $a0 = ProgramCounter(args.a0);
+        $body
+    }};
+
+    (@define $handler_name:ident $body:block $self:ident, $a0:ident: ProgramCounter, $a1:ident: u32) => {{
+        impl Args {
+            pub fn $handler_name(a0: ProgramCounter, a1: u32) -> Args {
+                Args {
+                    a0: a0.0,
+                    a1,
+                    ..Args::default()
+                }
+            }
+        }
+
+        let args = $self.inner.compiled_args[$self.inner.compiled_offset];
+        let $a0 = ProgramCounter(args.a0);
+        let $a1 = args.a1;
+        $body
+    }};
+
+    (@define $handler_name:ident $body:block $self:ident, $a0:ident: ProgramCounter, $a1:ident: ProgramCounter) => {{
+        impl Args {
+            pub fn $handler_name(a0: ProgramCounter, a1: ProgramCounter) -> Args {
+                Args {
+                    a0: a0.0,
+                    a1: a1.0,
+                    ..Args::default()
+                }
+            }
+        }
+
+        let args = $self.inner.compiled_args[$self.inner.compiled_offset];
+        let $a0 = ProgramCounter(args.a0);
+        let $a1 = ProgramCounter(args.a1);
+
+        $body
+    }};
+
+    (@define $handler_name:ident $body:block $self:ident, $a0:ident: ProgramCounter, $a1:ident: u32, $a2:ident: u32) => {{
+        impl Args {
+            pub fn $handler_name(a0: ProgramCounter, a1: u32, a2: u32) -> Args {
+                Args {
+                    a0: a0.0,
+                    a1,
+                    a2,
+                    ..Args::default()
+                }
+            }
+        }
+
+        let args = $self.inner.compiled_args[$self.inner.compiled_offset];
+        let $a0 = ProgramCounter(args.a0);
+        let $a1 = args.a1;
+        let $a2 = args.a2;
+        $body
+    }};
+
+    (@define $handler_name:ident $body:block $self:ident, $a0:ident: ProgramCounter, $a1:ident: Reg, $a2:ident: u32) => {{
+        impl Args {
+            pub fn $handler_name(a0: ProgramCounter, a1: impl Into<Reg>, a2: u32) -> Args {
+                Args {
+                    a0: a0.0,
+                    a1: a1.into() as u32,
+                    a2,
+                    ..Args::default()
+                }
+            }
+        }
+
+        let args = $self.inner.compiled_args[$self.inner.compiled_offset];
+        let $a0 = ProgramCounter(args.a0);
+        let $a1 = transmute_reg(args.a1);
+        let $a2 = args.a2;
+        $body
+    }};
+
+    (@define $handler_name:ident $body:block $self:ident, $a0:ident: ProgramCounter, $a1:ident: Reg, $a2:ident: u32, $a3:ident: u32) => {{
+        impl Args {
+            #[allow(clippy::needless_update)]
+            pub fn $handler_name(a0: ProgramCounter, a1: impl Into<Reg>, a2: u32, a3: u32) -> Args {
+                Args {
+                    a0: a0.0,
+                    a1: a1.into() as u32,
+                    a2,
+                    a3,
+                    ..Args::default()
+                }
+            }
+        }
+
+        let args = $self.inner.compiled_args[$self.inner.compiled_offset];
+        let $a0 = ProgramCounter(args.a0);
+        let $a1 = transmute_reg(args.a1);
+        let $a2 = args.a2;
+        let $a3 = args.a3;
+        $body
+    }};
+
+    (@define $handler_name:ident $body:block $self:ident, $a0:ident: ProgramCounter, $a1:ident: Reg, $a2:ident: Reg, $a3:ident: u32) => {{
+        impl Args {
+            #[allow(clippy::needless_update)]
+            pub fn $handler_name(a0: ProgramCounter, a1: impl Into<Reg>, a2: impl Into<Reg>, a3: u32) -> Args {
+                Args {
+                    a0: a0.0,
+                    a1: a1.into() as u32,
+                    a2: a2.into() as u32,
+                    a3,
+                    ..Args::default()
+                }
+            }
+        }
+
+        let args = $self.inner.compiled_args[$self.inner.compiled_offset];
+        let $a0 = ProgramCounter(args.a0);
+        let $a1 = transmute_reg(args.a1);
+        let $a2 = transmute_reg(args.a2);
+        let $a3 = args.a3;
+        $body
+    }};
+
+    (@define $handler_name:ident $body:block $self:ident, $a0:ident: ProgramCounter, $a1:ident: Reg, $a2:ident: Reg, $a3:ident: u32, $a4:ident: u32) => {{
+        impl Args {
+            #[allow(clippy::needless_update)]
+            pub fn $handler_name(a0: ProgramCounter, a1: impl Into<Reg>, a2: impl Into<Reg>, a3: u32, a4: u32) -> Args {
+                Args {
+                    a0: a0.0,
+                    a1: a1.into() as u32 | ((a2.into() as u32) << 4),
+                    a2: a3,
+                    a3: a4,
+                    ..Args::default()
+                }
+            }
+        }
+
+        let args = $self.inner.compiled_args[$self.inner.compiled_offset];
+        let $a0 = ProgramCounter(args.a0);
+        let $a1 = transmute_reg(args.a1 & 0b1111);
+        let $a2 = transmute_reg(args.a1 >> 4);
+        let $a3 = args.a2;
+        let $a4 = args.a3;
+        $body
+    }};
+
+    (@define $handler_name:ident $body:block $self:ident, $a0:ident: Reg, $a1:ident: Reg) => {{
+        impl Args {
+            pub fn $handler_name(a0: impl Into<Reg>, a1: impl Into<Reg>) -> Args {
+                Args {
+                    a0: a0.into() as u32,
+                    a1: a1.into() as u32,
+                    ..Args::default()
+                }
+            }
+        }
+
+        let args = $self.inner.compiled_args[$self.inner.compiled_offset];
+        let $a0 = transmute_reg(args.a0);
+        let $a1 = transmute_reg(args.a1);
+        $body
+    }};
+
+    (@define $handler_name:ident $body:block $self:ident, $a0:ident: Reg, $a1:ident: Reg, $a2:ident: Reg) => {{
+        impl Args {
+            pub fn $handler_name(a0: impl Into<Reg>, a1: impl Into<Reg>, a2: impl Into<Reg>) -> Args {
+                Args {
+                    a0: a0.into() as u32,
+                    a1: a1.into() as u32,
+                    a2: a2.into() as u32,
+                    ..Args::default()
+                }
+            }
+        }
+
+        let args = $self.inner.compiled_args[$self.inner.compiled_offset];
+        let $a0 = transmute_reg(args.a0);
+        let $a1 = transmute_reg(args.a1);
+        let $a2 = transmute_reg(args.a2);
+        $body
+    }};
+
+    (@define $handler_name:ident $body:block $self:ident, $a0:ident: Reg, $a1:ident: Reg, $a2:ident: u32) => {{
+        impl Args {
+            pub fn $handler_name(a0: impl Into<Reg>, a1: impl Into<Reg>, a2: u32) -> Args {
+                Args {
+                    a0: a0.into() as u32,
+                    a1: a1.into() as u32,
+                    a2,
+                    ..Args::default()
+                }
+            }
+        }
+
+        let args = $self.inner.compiled_args[$self.inner.compiled_offset];
+        let $a0 = transmute_reg(args.a0);
+        let $a1 = transmute_reg(args.a1);
+        let $a2 = args.a2;
+        $body
+    }};
+
+    (@define $handler_name:ident $body:block $self:ident, $a0:ident: Reg, $a1:ident: u32) => {{
+        impl Args {
+            pub fn $handler_name(a0: impl Into<Reg>, a1: u32) -> Args {
+                Args {
+                    a0: a0.into() as u32,
+                    a1,
+                    ..Args::default()
+                }
+            }
+        }
+
+        let args = $self.inner.compiled_args[$self.inner.compiled_offset];
+        let $a0 = transmute_reg(args.a0);
+        let $a1 = args.a1;
+        $body
+    }};
+
+    (@define $handler_name:ident $body:block $self:ident, $a0:ident: Reg, $a1:ident: u32, $a2:ident: u32) => {{
+        impl Args {
+            pub fn $handler_name(a0: impl Into<Reg>, a1: u32, a2: u32) -> Args {
+                Args {
+                    a0: a0.into() as u32,
+                    a1,
+                    a2,
+                    ..Args::default()
+                }
+            }
+        }
+
+        let args = $self.inner.compiled_args[$self.inner.compiled_offset];
+        let $a0 = transmute_reg(args.a0);
+        let $a1 = args.a1;
+        let $a2 = args.a2;
+        $body
+    }};
+
+    (@define $handler_name:ident $body:block $self:ident, $a0:ident: Target) => {{
+        impl Args {
+            pub fn $handler_name(a0: Target) -> Args {
+                Args {
+                    a0: a0 as u32,
+                    ..Args::default()
+                }
+            }
+        }
+
+        let args = $self.inner.compiled_args[$self.inner.compiled_offset];
+        let $a0 = args.a0 as Target;
+        $body
+    }};
+
+    (@define $handler_name:ident $body:block $self:ident, $a0:ident: Reg, $a1:ident: Reg, $a2:ident: Target) => {{
+        impl Args {
+            pub fn $handler_name(a0: impl Into<Reg>, a1: impl Into<Reg>, a2: Target) -> Args {
+                Args {
+                    a0: a0.into() as u32,
+                    a1: a1.into() as u32,
+                    a2: a2 as u32,
+                    ..Args::default()
+                }
+            }
+        }
+
+        let args = $self.inner.compiled_args[$self.inner.compiled_offset];
+        let $a0 = transmute_reg(args.a0);
+        let $a1 = transmute_reg(args.a1);
+        let $a2 = args.a2 as Target;
+        $body
+    }};
+
+    (@define $handler_name:ident $body:block $self:ident, $a0:ident: Reg, $a1:ident: Reg, $a2:ident: Target, $a3:ident: Target) => {{
+        impl Args {
+            #[allow(clippy::needless_update)]
+            pub fn $handler_name(a0: impl Into<Reg>, a1: impl Into<Reg>, a2: Target, a3: Target) -> Args {
+                Args {
+                    a0: a0.into() as u32,
+                    a1: a1.into() as u32,
+                    a2: a2 as u32,
+                    a3: a3 as u32,
+                    ..Args::default()
+                }
+            }
+        }
+
+        let args = $self.inner.compiled_args[$self.inner.compiled_offset];
+        let $a0 = transmute_reg(args.a0);
+        let $a1 = transmute_reg(args.a1);
+        let $a2 = args.a2 as Target;
+        let $a3 = args.a3 as Target;
+        $body
+    }};
+
+    (@define $handler_name:ident $body:block $self:ident, $a0:ident: Reg, $a1:ident: u32, $a2:ident: Target, $a3:ident: Target) => {{
+        impl Args {
+            #[allow(clippy::needless_update)]
+            pub fn $handler_name(a0: impl Into<Reg>, a1: u32, a2: Target, a3: Target) -> Args {
+                Args {
+                    a0: a0.into() as u32,
+                    a1,
+                    a2: a2 as u32,
+                    a3: a3 as u32,
+                    ..Args::default()
+                }
+            }
+        }
+
+        let args = $self.inner.compiled_args[$self.inner.compiled_offset];
+        let $a0 = transmute_reg(args.a0);
+        let $a1 = args.a1;
+        let $a2 = args.a2 as Target;
+        let $a3 = args.a3 as Target;
+        $body
+    }};
+
+    (@define $handler_name:ident $body:block $self:ident, $a0:ident: Reg, $a1:ident: Reg, $a2:ident: ProgramCounter) => {{
+        impl Args {
+            pub fn $handler_name(a0: impl Into<Reg>, a1: impl Into<Reg>, a2: ProgramCounter) -> Args {
+                Args {
+                    a0: a0.into() as u32,
+                    a1: a1.into() as u32,
+                    a2: a2.0,
+                    ..Args::default()
+                }
+            }
+        }
+
+        let args = $self.inner.compiled_args[$self.inner.compiled_offset];
+        let $a0 = transmute_reg(args.a0);
+        let $a1 = transmute_reg(args.a1);
+        let $a2 = ProgramCounter(args.a2);
+        $body
+    }};
+
+    (@define $handler_name:ident $body:block $self:ident, $a0:ident: Reg, $a1:ident: Reg, $a2:ident: ProgramCounter, $a3:ident: ProgramCounter) => {{
+        impl Args {
+            #[allow(clippy::needless_update)]
+            pub fn $handler_name(a0: impl Into<Reg>, a1: impl Into<Reg>, a2: ProgramCounter, a3: ProgramCounter) -> Args {
+                Args {
+                    a0: a0.into() as u32,
+                    a1: a1.into() as u32,
+                    a2: a2.0,
+                    a3: a3.0,
+                    ..Args::default()
+                }
+            }
+        }
+
+        let args = $self.inner.compiled_args[$self.inner.compiled_offset];
+        let $a0 = transmute_reg(args.a0);
+        let $a1 = transmute_reg(args.a1);
+        let $a2 = ProgramCounter(args.a2);
+        let $a3 = ProgramCounter(args.a3);
+        $body
+    }};
+
+    (@define $handler_name:ident $body:block $self:ident, $a0:ident: Reg, $a1:ident: u32, $a2:ident: ProgramCounter, $a3:ident: ProgramCounter) => {{
+        impl Args {
+            #[allow(clippy::needless_update)]
+            pub fn $handler_name(a0: impl Into<Reg>, a1: u32, a2: ProgramCounter, a3: ProgramCounter) -> Args {
+                Args {
+                    a0: a0.into() as u32,
+                    a1,
+                    a2: a2.0,
+                    a3: a3.0,
+                    ..Args::default()
+                }
+            }
+        }
+
+        let args = $self.inner.compiled_args[$self.inner.compiled_offset];
+        let $a0 = transmute_reg(args.a0);
+        let $a1 = args.a1;
+        let $a2 = ProgramCounter(args.a2);
+        let $a3 = ProgramCounter(args.a3);
+        $body
+    }};
+
+    (@arg_names $handler_name:ident, $a0:ident: $a0_ty:ty, $a1:ident: $a1_ty:ty, $a2:ident: $a2_ty:ty) => {
+        asm::$handler_name($a0, $a1, $a2)
+    };
+
+    ($(
+        fn $handler_name:ident<const DEBUG: bool>($self:ident: &mut Visitor $($arg:tt)*) -> Option<Target> $body:block
+    )+) => {
+        mod raw_handlers {
+            use super::*;
+            $(
+                #[allow(clippy::needless_lifetimes)]
+                pub fn $handler_name<'a, 'b, const DEBUG: bool>($self: &'a mut Visitor<'b>) -> Option<Target> {
+                    define_interpreter!(@define $handler_name $body $self $($arg)*)
+                }
+            )+
+        }
+    };
+}
+
+#[inline(always)]
+fn transmute_reg(value: u32) -> Reg {
+    debug_assert!(Reg::from_raw(value).is_some());
+
+    // SAFETY: The `value` passed in here is always constructed through `reg as u32` so this is always safe.
+    unsafe { core::mem::transmute(value) }
+}
+
+fn trap_impl<const DEBUG: bool>(visitor: &mut Visitor, program_counter: ProgramCounter) -> Option<Target> {
+    visitor.inner.program_counter = program_counter;
+    visitor.inner.program_counter_valid = true;
+    visitor.inner.next_program_counter = None;
+    visitor.inner.next_program_counter_changed = true;
+    visitor.inner.interrupt = InterruptKind::Trap;
+    None
+}
+
+fn not_enough_gas_impl<const DEBUG: bool>(visitor: &mut Visitor, program_counter: ProgramCounter, new_gas: i64) -> Option<Target> {
+    match visitor.inner.module.gas_metering().unwrap() {
+        GasMeteringKind::Async => {
+            visitor.inner.gas = new_gas;
+            visitor.inner.program_counter_valid = false;
+            visitor.inner.next_program_counter = None;
+            visitor.inner.next_program_counter_changed = true;
+        }
+        GasMeteringKind::Sync => {
+            visitor.inner.program_counter = program_counter;
+            visitor.inner.program_counter_valid = true;
+            visitor.inner.next_program_counter = Some(program_counter);
+            visitor.inner.next_program_counter_changed = false;
         }
     }
 
+    visitor.inner.interrupt = InterruptKind::NotEnoughGas;
+    None
+}
+
+const TARGET_OUT_OF_RANGE: Target = 0;
+
+macro_rules! handle_unresolved_branch {
+    ($debug:expr, $visitor:ident, $s1:ident, $s2:ident, $tt:ident, $tf:ident, $name:ident) => {{
+        if DEBUG {
+            log::trace!("[{}]: jump {} if {} {} {}", $visitor.inner.compiled_offset, $tt, $s1, $debug, $s2);
+        }
+
+        let target_false = $visitor.inner.resolve_jump::<DEBUG>($tf).unwrap_or(TARGET_OUT_OF_RANGE);
+        if let Some(target_true) = $visitor.inner.resolve_jump::<DEBUG>($tt) {
+            let offset = $visitor.inner.compiled_offset;
+            $visitor.inner.compiled_handlers[offset] = raw_handlers::$name::<DEBUG> as Handler;
+            $visitor.inner.compiled_args[offset] = Args::$name($s1, $s2, target_true, target_false);
+            Some(offset)
+        } else {
+            todo!()
+        }
+    }};
+}
+
+define_interpreter! {
+    fn charge_gas<const DEBUG: bool>(visitor: &mut Visitor, program_counter: ProgramCounter, gas_cost: u32) -> Option<Target> {
+        let new_gas = visitor.inner.gas - i64::from(gas_cost);
+
+        if DEBUG {
+            log::trace!("[{}]: charge_gas: {gas_cost} ({} -> {})", visitor.inner.compiled_offset, visitor.inner.gas, new_gas);
+        }
+
+        if new_gas < 0 {
+            not_enough_gas_impl::<DEBUG>(visitor, program_counter, new_gas)
+        } else {
+            visitor.inner.gas = new_gas;
+            visitor.go_to_next_instruction()
+        }
+    }
+
+    fn out_of_range<const DEBUG: bool>(visitor: &mut Visitor, gas: u32) -> Option<Target> {
+        if DEBUG {
+            log::trace!("[{}]: trap (out of range)", visitor.inner.compiled_offset);
+        }
+
+        let program_counter = visitor.inner.program_counter;
+        let new_gas = visitor.inner.gas - i64::from(gas);
+        if new_gas < 0 {
+            not_enough_gas_impl::<DEBUG>(visitor, program_counter, new_gas)
+        } else {
+            log::debug!("Trap at {}: explicit trap", program_counter);
+
+            visitor.inner.gas = new_gas;
+            trap_impl::<DEBUG>(visitor, program_counter)
+        }
+    }
+
+    fn step<const DEBUG: bool>(visitor: &mut Visitor, program_counter: ProgramCounter) -> Option<Target> {
+        if DEBUG {
+            log::trace!("[{}]: step", visitor.inner.compiled_offset);
+        }
+
+        visitor.inner.program_counter = program_counter;
+        visitor.inner.program_counter_valid = true;
+        visitor.inner.next_program_counter = Some(program_counter);
+        visitor.inner.next_program_counter_changed = false;
+        visitor.inner.interrupt = InterruptKind::Step;
+        visitor.inner.compiled_offset += 1;
+        None
+    }
+
+    fn step_out_of_range<const DEBUG: bool>(visitor: &mut Visitor) -> Option<Target> {
+        if DEBUG {
+            log::trace!("[{}]: step (out of range)", visitor.inner.compiled_offset);
+        }
+
+        visitor.inner.program_counter_valid = true;
+        visitor.inner.next_program_counter = Some(visitor.inner.program_counter);
+        visitor.inner.next_program_counter_changed = false;
+        visitor.inner.interrupt = InterruptKind::Step;
+        visitor.inner.compiled_offset += 1;
+        None
+    }
+
+    fn fallthrough<const DEBUG: bool>(visitor: &mut Visitor) -> Option<Target> {
+        if DEBUG {
+            log::trace!("[{}]: fallthrough", visitor.inner.compiled_offset);
+        }
+
+        visitor.go_to_next_instruction()
+    }
+
+    fn trap<const DEBUG: bool>(visitor: &mut Visitor, program_counter: ProgramCounter) -> Option<Target> {
+        if DEBUG {
+            log::trace!("[{}]: trap", visitor.inner.compiled_offset);
+        }
+
+        log::debug!("Trap at {}: explicit trap", program_counter);
+        trap_impl::<DEBUG>(visitor, program_counter)
+    }
+
+    fn invalid_branch<const DEBUG: bool>(visitor: &mut Visitor, program_counter: ProgramCounter) -> Option<Target> {
+        log::debug!("Trap at {}: invalid branch", program_counter);
+        trap_impl::<DEBUG>(visitor, program_counter)
+    }
+
+    fn sbrk<const DEBUG: bool>(visitor: &mut Visitor, dst: Reg, size: Reg) -> Option<Target> {
+        let size = visitor.get(size);
+        let result = visitor.inner.sbrk(size).unwrap_or(0);
+        visitor.set::<DEBUG>(dst, result);
+        visitor.go_to_next_instruction()
+    }
+
+    fn ecalli<const DEBUG: bool>(visitor: &mut Visitor, program_counter: ProgramCounter, hostcall_number: u32) -> Option<Target> {
+        if DEBUG {
+            log::trace!("[{}]: ecalli {hostcall_number}", visitor.inner.compiled_offset);
+        }
+
+        let length = visitor.inner.module.instructions_at(program_counter).unwrap().next().unwrap().length;
+        visitor.inner.program_counter = program_counter;
+        visitor.inner.program_counter_valid = true;
+        visitor.inner.next_program_counter = Some(ProgramCounter(program_counter.0 + length));
+        visitor.inner.next_program_counter_changed = true;
+        visitor.inner.interrupt = InterruptKind::Ecalli(hostcall_number);
+        None
+    }
+
+    fn set_less_than_unsigned<const DEBUG: bool>(visitor: &mut Visitor, d: Reg, s1: Reg, s2: Reg) -> Option<Target> {
+        if DEBUG {
+            log::trace!("[{}]: {}", visitor.inner.compiled_offset, asm::set_less_than_unsigned(d, s1, s2));
+        }
+
+        visitor.set3::<DEBUG>(d, s1, s2, |s1, s2| u32::from(s1 < s2))
+    }
+
+    fn set_less_than_signed<const DEBUG: bool>(visitor: &mut Visitor, d: Reg, s1: Reg, s2: Reg) -> Option<Target> {
+        if DEBUG {
+            log::trace!("[{}]: {}", visitor.inner.compiled_offset, asm::set_less_than_signed(d, s1, s2));
+        }
+
+        visitor.set3::<DEBUG>(d, s1, s2, |s1, s2| u32::from((s1 as i32) < (s2 as i32)))
+    }
+
+    fn shift_logical_right<const DEBUG: bool>(visitor: &mut Visitor, d: Reg, s1: Reg, s2: Reg) -> Option<Target> {
+        if DEBUG {
+            log::trace!("[{}]: {}", visitor.inner.compiled_offset, asm::shift_logical_right(d, s1, s2));
+        }
+
+        visitor.set3::<DEBUG>(d, s1, s2, u32::wrapping_shr)
+    }
+
+    fn shift_arithmetic_right<const DEBUG: bool>(visitor: &mut Visitor, d: Reg, s1: Reg, s2: Reg) -> Option<Target> {
+        if DEBUG {
+            log::trace!("[{}]: {}", visitor.inner.compiled_offset, asm::shift_arithmetic_right(d, s1, s2));
+        }
+
+        visitor.set3::<DEBUG>(d, s1, s2, |s1, s2| ((s1 as i32).wrapping_shr(s2)) as u32)
+    }
+
+    fn shift_logical_left<const DEBUG: bool>(visitor: &mut Visitor, d: Reg, s1: Reg, s2: Reg) -> Option<Target> {
+        if DEBUG {
+            log::trace!("[{}]: {}", visitor.inner.compiled_offset, asm::shift_logical_left(d, s1, s2));
+        }
+
+        visitor.set3::<DEBUG>(d, s1, s2, u32::wrapping_shl)
+    }
+
+    fn xor<const DEBUG: bool>(visitor: &mut Visitor, d: Reg, s1: Reg, s2: Reg) -> Option<Target> {
+        if DEBUG {
+            log::trace!("[{}]: {}", visitor.inner.compiled_offset, asm::xor(d, s1, s2));
+        }
+
+        visitor.set3::<DEBUG>(d, s1, s2, |s1, s2| s1 ^ s2)
+    }
+
+    fn and<const DEBUG: bool>(visitor: &mut Visitor, d: Reg, s1: Reg, s2: Reg) -> Option<Target> {
+        if DEBUG {
+            log::trace!("[{}]: {}", visitor.inner.compiled_offset, asm::and(d, s1, s2));
+        }
+
+        visitor.set3::<DEBUG>(d, s1, s2, |s1, s2| s1 & s2)
+    }
+
+    fn or<const DEBUG: bool>(visitor: &mut Visitor, d: Reg, s1: Reg, s2: Reg) -> Option<Target> {
+        if DEBUG {
+            log::trace!("[{}]: {}", visitor.inner.compiled_offset, asm::or(d, s1, s2));
+        }
+
+        visitor.set3::<DEBUG>(d, s1, s2, |s1, s2| s1 | s2)
+    }
+
+    fn add<const DEBUG: bool>(visitor: &mut Visitor, d: Reg, s1: Reg, s2: Reg) -> Option<Target> {
+        if DEBUG {
+            log::trace!("[{}]: {}", visitor.inner.compiled_offset, asm::add(d, s1, s2));
+        }
+
+        visitor.set3::<DEBUG>(d, s1, s2, u32::wrapping_add)
+    }
+
+    fn sub<const DEBUG: bool>(visitor: &mut Visitor, d: Reg, s1: Reg, s2: Reg) -> Option<Target> {
+        if DEBUG {
+            log::trace!("[{}]: {}", visitor.inner.compiled_offset, asm::sub(d, s1, s2));
+        }
+
+        visitor.set3::<DEBUG>(d, s1, s2, u32::wrapping_sub)
+    }
+
+    fn negate_and_add_imm<const DEBUG: bool>(visitor: &mut Visitor, d: Reg, s1: Reg, s2: u32) -> Option<Target> {
+        if DEBUG {
+            log::trace!("[{}]: {}", visitor.inner.compiled_offset, asm::negate_and_add_imm(d, s1, s2));
+        }
+
+        visitor.set3::<DEBUG>(d, s1, s2, |s1, s2| s2.wrapping_sub(s1))
+    }
+
+    fn mul<const DEBUG: bool>(visitor: &mut Visitor, d: Reg, s1: Reg, s2: Reg) -> Option<Target> {
+        if DEBUG {
+            log::trace!("[{}]: {}", visitor.inner.compiled_offset, asm::mul(d, s1, s2));
+        }
+
+        visitor.set3::<DEBUG>(d, s1, s2, u32::wrapping_mul)
+    }
+
+    fn mul_imm<const DEBUG: bool>(visitor: &mut Visitor, d: Reg, s1: Reg, s2: u32) -> Option<Target> {
+        if DEBUG {
+            log::trace!("[{}]: {}", visitor.inner.compiled_offset, asm::mul_imm(d, s1, s2));
+        }
+
+        visitor.set3::<DEBUG>(d, s1, s2, u32::wrapping_mul)
+    }
+
+    fn mul_upper_signed_signed<const DEBUG: bool>(visitor: &mut Visitor, d: Reg, s1: Reg, s2: Reg) -> Option<Target> {
+        if DEBUG {
+            log::trace!("[{}]: {}", visitor.inner.compiled_offset, asm::mul_upper_signed_signed(d, s1, s2));
+        }
+
+        visitor.set3::<DEBUG>(d, s1, s2, |s1, s2| mulh(s1 as i32, s2 as i32) as u32)
+    }
+
+    fn mul_upper_signed_signed_imm<const DEBUG: bool>(visitor: &mut Visitor, d: Reg, s1: Reg, s2: u32) -> Option<Target> {
+        if DEBUG {
+            log::trace!("[{}]: {}", visitor.inner.compiled_offset, asm::mul_upper_signed_signed_imm(d, s1, s2));
+        }
+
+
+        visitor.set3::<DEBUG>(d, s1, s2, |s1, s2| mulh(s1 as i32, s2 as i32) as u32)
+    }
+
+    fn mul_upper_unsigned_unsigned<const DEBUG: bool>(visitor: &mut Visitor, d: Reg, s1: Reg, s2: Reg) -> Option<Target> {
+        if DEBUG {
+            log::trace!("[{}]: {}", visitor.inner.compiled_offset, asm::mul_upper_unsigned_unsigned(d, s1, s2));
+        }
+
+
+        visitor.set3::<DEBUG>(d, s1, s2, mulhu)
+    }
+
+    fn mul_upper_unsigned_unsigned_imm<const DEBUG: bool>(visitor: &mut Visitor, d: Reg, s1: Reg, s2: u32) -> Option<Target> {
+        if DEBUG {
+            log::trace!("[{}]: {}", visitor.inner.compiled_offset, asm::mul_upper_unsigned_unsigned_imm(d, s1, s2));
+        }
+
+
+        visitor.set3::<DEBUG>(d, s1, s2, mulhu)
+    }
+
+    fn mul_upper_signed_unsigned<const DEBUG: bool>(visitor: &mut Visitor, d: Reg, s1: Reg, s2: Reg) -> Option<Target> {
+        if DEBUG {
+            log::trace!("[{}]: {}", visitor.inner.compiled_offset, asm::mul_upper_signed_unsigned(d, s1, s2));
+        }
+
+
+        visitor.set3::<DEBUG>(d, s1, s2, |s1, s2| mulhsu(s1 as i32, s2) as u32)
+    }
+
+    fn div_unsigned<const DEBUG: bool>(visitor: &mut Visitor, d: Reg, s1: Reg, s2: Reg) -> Option<Target> {
+        if DEBUG {
+            log::trace!("[{}]: {}", visitor.inner.compiled_offset, asm::div_unsigned(d, s1, s2));
+        }
+
+
+        visitor.set3::<DEBUG>(d, s1, s2, divu)
+    }
+
+    fn div_signed<const DEBUG: bool>(visitor: &mut Visitor, d: Reg, s1: Reg, s2: Reg) -> Option<Target> {
+        if DEBUG {
+            log::trace!("[{}]: {}", visitor.inner.compiled_offset, asm::div_signed(d, s1, s2));
+        }
+
+        visitor.set3::<DEBUG>(d, s1, s2, |s1, s2| div(s1 as i32, s2 as i32) as u32)
+    }
+
+    fn rem_unsigned<const DEBUG: bool>(visitor: &mut Visitor, d: Reg, s1: Reg, s2: Reg) -> Option<Target> {
+        if DEBUG {
+            log::trace!("[{}]: {}", visitor.inner.compiled_offset, asm::rem_unsigned(d, s1, s2));
+        }
+
+        visitor.set3::<DEBUG>(d, s1, s2, remu)
+    }
+
+    fn rem_signed<const DEBUG: bool>(visitor: &mut Visitor, d: Reg, s1: Reg, s2: Reg) -> Option<Target> {
+        if DEBUG {
+            log::trace!("[{}]: {}", visitor.inner.compiled_offset, asm::rem_signed(d, s1, s2));
+        }
+
+        visitor.set3::<DEBUG>(d, s1, s2, |s1, s2| rem(s1 as i32, s2 as i32) as u32)
+    }
+
+    fn set_less_than_unsigned_imm<const DEBUG: bool>(visitor: &mut Visitor, d: Reg, s1: Reg, s2: u32) -> Option<Target> {
+        if DEBUG {
+            log::trace!("[{}]: {}", visitor.inner.compiled_offset, asm::set_less_than_unsigned_imm(d, s1, s2));
+        }
+
+        visitor.set3::<DEBUG>(d, s1, s2, |s1, s2| u32::from(s1 < s2))
+    }
+
+    fn set_greater_than_unsigned_imm<const DEBUG: bool>(visitor: &mut Visitor, d: Reg, s1: Reg, s2: u32) -> Option<Target> {
+        if DEBUG {
+            log::trace!("[{}]: {}", visitor.inner.compiled_offset, asm::set_greater_than_unsigned_imm(d, s1, s2));
+        }
+
+        visitor.set3::<DEBUG>(d, s1, s2, |s1, s2| u32::from(s1 > s2))
+    }
+
+    fn set_less_than_signed_imm<const DEBUG: bool>(visitor: &mut Visitor, d: Reg, s1: Reg, s2: u32) -> Option<Target> {
+        if DEBUG {
+            log::trace!("[{}]: {}", visitor.inner.compiled_offset, asm::set_less_than_signed_imm(d, s1, s2));
+        }
+
+        visitor.set3::<DEBUG>(d, s1, s2, |s1, s2| u32::from((s1 as i32) < (s2 as i32)))
+    }
+
+    fn set_greater_than_signed_imm<const DEBUG: bool>(visitor: &mut Visitor, d: Reg, s1: Reg, s2: u32) -> Option<Target> {
+        if DEBUG {
+            log::trace!("[{}]: {}", visitor.inner.compiled_offset, asm::set_greater_than_signed_imm(d, s1, s2));
+        }
+
+        visitor.set3::<DEBUG>(d, s1, s2, |s1, s2| u32::from((s1 as i32) > (s2 as i32)))
+    }
+
+    fn shift_logical_right_imm<const DEBUG: bool>(visitor: &mut Visitor, d: Reg, s1: Reg, s2: u32) -> Option<Target> {
+        if DEBUG {
+            log::trace!("[{}]: {}", visitor.inner.compiled_offset, asm::shift_logical_right_imm(d, s1, s2));
+        }
+
+        visitor.set3::<DEBUG>(d, s1, s2, u32::wrapping_shr)
+    }
+
+    fn shift_logical_right_imm_alt<const DEBUG: bool>(visitor: &mut Visitor, d: Reg, s2: Reg, s1: u32) -> Option<Target> {
+        if DEBUG {
+            log::trace!("[{}]: {}", visitor.inner.compiled_offset, asm::shift_logical_right_imm_alt(d, s2, s1));
+        }
+
+        visitor.set3::<DEBUG>(d, s1, s2, u32::wrapping_shr)
+    }
+
+    fn shift_arithmetic_right_imm<const DEBUG: bool>(visitor: &mut Visitor, d: Reg, s1: Reg, s2: u32) -> Option<Target> {
+        if DEBUG {
+            log::trace!("[{}]: {}", visitor.inner.compiled_offset, asm::shift_arithmetic_right_imm(d, s1, s2));
+        }
+
+        visitor.set3::<DEBUG>(d, s1, s2, |s1, s2| ((s1 as i32) >> s2) as u32)
+    }
+
+    fn shift_arithmetic_right_imm_alt<const DEBUG: bool>(visitor: &mut Visitor, d: Reg, s2: Reg, s1: u32) -> Option<Target> {
+        if DEBUG {
+            log::trace!("[{}]: {}", visitor.inner.compiled_offset, asm::shift_arithmetic_right_imm_alt(d, s2, s1));
+        }
+
+        visitor.set3::<DEBUG>(d, s1, s2, |s1, s2| ((s1 as i32) >> s2) as u32)
+    }
+
+    fn shift_logical_left_imm<const DEBUG: bool>(visitor: &mut Visitor, d: Reg, s1: Reg, s2: u32) -> Option<Target> {
+        if DEBUG {
+            log::trace!("[{}]: {}", visitor.inner.compiled_offset, asm::shift_logical_left_imm(d, s1, s2));
+        }
+
+        visitor.set3::<DEBUG>(d, s1, s2, u32::wrapping_shl)
+    }
+
+    fn shift_logical_left_imm_alt<const DEBUG: bool>(visitor: &mut Visitor, d: Reg, s2: Reg, s1: u32) -> Option<Target> {
+        if DEBUG {
+            log::trace!("[{}]: {}", visitor.inner.compiled_offset, asm::shift_logical_left_imm_alt(d, s2, s1));
+        }
+
+        visitor.set3::<DEBUG>(d, s1, s2, u32::wrapping_shl)
+    }
+
+    fn or_imm<const DEBUG: bool>(visitor: &mut Visitor, d: Reg, s1: Reg, s2: u32) -> Option<Target> {
+        if DEBUG {
+            log::trace!("[{}]: {}", visitor.inner.compiled_offset, asm::or_imm(d, s1, s2));
+        }
+
+        visitor.set3::<DEBUG>(d, s1, s2, |s1, s2| s1 | s2)
+    }
+
+    fn and_imm<const DEBUG: bool>(visitor: &mut Visitor, d: Reg, s1: Reg, s2: u32) -> Option<Target> {
+        if DEBUG {
+            log::trace!("[{}]: {}", visitor.inner.compiled_offset, asm::and_imm(d, s1, s2));
+        }
+
+        visitor.set3::<DEBUG>(d, s1, s2, |s1, s2| s1 & s2)
+    }
+
+    fn xor_imm<const DEBUG: bool>(visitor: &mut Visitor, d: Reg, s1: Reg, s2: u32) -> Option<Target> {
+        if DEBUG {
+            log::trace!("[{}]: {}", visitor.inner.compiled_offset, asm::xor_imm(d, s1, s2));
+        }
+
+        visitor.set3::<DEBUG>(d, s1, s2, |s1, s2| s1 ^ s2)
+    }
+
+    fn load_imm<const DEBUG: bool>(visitor: &mut Visitor, dst: Reg, imm: u32) -> Option<Target> {
+        if DEBUG {
+            log::trace!("[{}]: {}", visitor.inner.compiled_offset, asm::load_imm(dst, imm));
+        }
+
+        visitor.set::<DEBUG>(dst, imm);
+        visitor.go_to_next_instruction()
+    }
+
+    fn move_reg<const DEBUG: bool>(visitor: &mut Visitor, d: Reg, s: Reg) -> Option<Target> {
+        if DEBUG {
+            log::trace!("[{}]: {}", visitor.inner.compiled_offset, asm::move_reg(d, s));
+        }
+
+        let imm = visitor.get(s);
+        visitor.set::<DEBUG>(d, imm);
+        visitor.go_to_next_instruction()
+    }
+
+    fn cmov_if_zero<const DEBUG: bool>(visitor: &mut Visitor, d: Reg, s: Reg, c: Reg) -> Option<Target> {
+        if DEBUG {
+            log::trace!("[{}]: {}", visitor.inner.compiled_offset, asm::cmov_if_zero(d, s, c));
+        }
+
+        if visitor.get(c) == 0 {
+            let value = visitor.get(s);
+            visitor.set::<DEBUG>(d, value);
+        }
+
+        visitor.go_to_next_instruction()
+    }
+
+    fn cmov_if_zero_imm<const DEBUG: bool>(visitor: &mut Visitor, d: Reg, c: Reg, s: u32) -> Option<Target> {
+        if DEBUG {
+            log::trace!("[{}]: {}", visitor.inner.compiled_offset, asm::cmov_if_zero_imm(d, c, s));
+        }
+
+        if visitor.get(c) == 0 {
+            visitor.set::<DEBUG>(d, s);
+        }
+
+        visitor.go_to_next_instruction()
+    }
+
+    fn cmov_if_not_zero<const DEBUG: bool>(visitor: &mut Visitor, d: Reg, s: Reg, c: Reg) -> Option<Target> {
+        if DEBUG {
+            log::trace!("[{}]: {}", visitor.inner.compiled_offset, asm::cmov_if_not_zero(d, s, c));
+        }
+
+        if visitor.get(c) != 0 {
+            let value = visitor.get(s);
+            visitor.set::<DEBUG>(d, value);
+        }
+
+        visitor.go_to_next_instruction()
+    }
+
+    fn cmov_if_not_zero_imm<const DEBUG: bool>(visitor: &mut Visitor, d: Reg, c: Reg, s: u32) -> Option<Target> {
+        if DEBUG {
+            log::trace!("[{}]: {}", visitor.inner.compiled_offset, asm::cmov_if_not_zero_imm(d, c, s));
+        }
+
+        if visitor.get(c) != 0 {
+            visitor.set::<DEBUG>(d, s);
+        }
+
+        visitor.go_to_next_instruction()
+    }
+
+    fn add_imm<const DEBUG: bool>(visitor: &mut Visitor, d: Reg, s1: Reg, s2: u32) -> Option<Target> {
+        if DEBUG {
+            log::trace!("[{}]: {}", visitor.inner.compiled_offset, asm::add_imm(d, s1, s2));
+        }
+
+        visitor.set3::<DEBUG>(d, s1, s2, u32::wrapping_add)
+    }
+
+    fn store_imm_u8<const DEBUG: bool>(visitor: &mut Visitor, program_counter: ProgramCounter, offset: u32, value: u32) -> Option<Target> {
+        if DEBUG {
+            log::trace!("[{}]: {}", visitor.inner.compiled_offset, asm::store_imm_u8(offset, value));
+        }
+
+        visitor.store::<u8, DEBUG>(program_counter, value, None, offset)
+    }
+
+    fn store_imm_u16<const DEBUG: bool>(visitor: &mut Visitor, program_counter: ProgramCounter, offset: u32, value: u32) -> Option<Target> {
+        if DEBUG {
+            log::trace!("[{}]: {}", visitor.inner.compiled_offset, asm::store_imm_u16(offset, value));
+        }
+
+        visitor.store::<u16, DEBUG>(program_counter, value, None, offset)
+    }
+
+    fn store_imm_u32<const DEBUG: bool>(visitor: &mut Visitor, program_counter: ProgramCounter, offset: u32, value: u32) -> Option<Target> {
+        if DEBUG {
+            log::trace!("[{}]: {}", visitor.inner.compiled_offset, asm::store_imm_u32(offset, value));
+        }
+
+        visitor.store::<u32, DEBUG>(program_counter, value, None, offset)
+    }
+
+    fn store_imm_indirect_u8<const DEBUG: bool>(visitor: &mut Visitor, program_counter: ProgramCounter, base: Reg, offset: u32, value: u32) -> Option<Target> {
+        if DEBUG {
+            log::trace!("[{}]: {}", visitor.inner.compiled_offset, asm::store_imm_indirect_u8(base, offset, value));
+        }
+
+        visitor.store::<u8, DEBUG>(program_counter, value, Some(base), offset)
+    }
+
+    fn store_imm_indirect_u16<const DEBUG: bool>(visitor: &mut Visitor, program_counter: ProgramCounter, base: Reg, offset: u32, value: u32) -> Option<Target> {
+        if DEBUG {
+            log::trace!("[{}]: {}", visitor.inner.compiled_offset, asm::store_imm_indirect_u16(base, offset, value));
+        }
+
+        visitor.store::<u16, DEBUG>(program_counter, value, Some(base), offset)
+    }
+
+    fn store_imm_indirect_u32<const DEBUG: bool>(visitor: &mut Visitor, program_counter: ProgramCounter, base: Reg, offset: u32, value: u32) -> Option<Target> {
+        if DEBUG {
+            log::trace!("[{}]: {}", visitor.inner.compiled_offset, asm::store_imm_indirect_u32(base, offset, value));
+        }
+
+        visitor.store::<u32, DEBUG>(program_counter, value, Some(base), offset)
+    }
+
+    fn store_indirect_u8<const DEBUG: bool>(visitor: &mut Visitor, program_counter: ProgramCounter, src: Reg, base: Reg, offset: u32) -> Option<Target> {
+        if DEBUG {
+            log::trace!("[{}]: {}", visitor.inner.compiled_offset, asm::store_indirect_u8(src, base, offset));
+        }
+
+        visitor.store::<u8, DEBUG>(program_counter, src, Some(base), offset)
+    }
+
+    fn store_indirect_u16<const DEBUG: bool>(visitor: &mut Visitor, program_counter: ProgramCounter, src: Reg, base: Reg, offset: u32) -> Option<Target> {
+        if DEBUG {
+            log::trace!("[{}]: {}", visitor.inner.compiled_offset, asm::store_indirect_u16(src, base, offset));
+        }
+
+        visitor.store::<u16, DEBUG>(program_counter, src, Some(base), offset)
+    }
+
+    fn store_indirect_u32<const DEBUG: bool>(visitor: &mut Visitor, program_counter: ProgramCounter, src: Reg, base: Reg, offset: u32) -> Option<Target> {
+        if DEBUG {
+            log::trace!("[{}]: {}", visitor.inner.compiled_offset, asm::store_indirect_u32(src, base, offset));
+        }
+
+        visitor.store::<u32, DEBUG>(program_counter, src, Some(base), offset)
+    }
+
+    fn store_u8<const DEBUG: bool>(visitor: &mut Visitor, program_counter: ProgramCounter, src: Reg, offset: u32) -> Option<Target> {
+        if DEBUG {
+            log::trace!("[{}]: {}", visitor.inner.compiled_offset, asm::store_u8(src, offset));
+        }
+
+        visitor.store::<u8, DEBUG>(program_counter, src, None, offset)
+    }
+
+    fn store_u16<const DEBUG: bool>(visitor: &mut Visitor, program_counter: ProgramCounter, src: Reg, offset: u32) -> Option<Target> {
+        if DEBUG {
+            log::trace!("[{}]: {}", visitor.inner.compiled_offset, asm::store_u16(src, offset));
+        }
+
+        visitor.store::<u16, DEBUG>(program_counter, src, None, offset)
+    }
+
+    fn store_u32<const DEBUG: bool>(visitor: &mut Visitor, program_counter: ProgramCounter, src: Reg, offset: u32) -> Option<Target> {
+        if DEBUG {
+            log::trace!("[{}]: {}", visitor.inner.compiled_offset, asm::store_u32(src, offset));
+        }
+
+        visitor.store::<u32, DEBUG>(program_counter, src, None, offset)
+    }
+
+    fn load_u8<const DEBUG: bool>(visitor: &mut Visitor, program_counter: ProgramCounter, dst: Reg, offset: u32) -> Option<Target> {
+        if DEBUG {
+            log::trace!("[{}]: {}", visitor.inner.compiled_offset, asm::load_u8(dst, offset));
+        }
+
+        visitor.load::<u8, DEBUG>(program_counter, dst, None, offset)
+    }
+
+    fn load_i8<const DEBUG: bool>(visitor: &mut Visitor, program_counter: ProgramCounter, dst: Reg, offset: u32) -> Option<Target> {
+        if DEBUG {
+            log::trace!("[{}]: {}", visitor.inner.compiled_offset, asm::load_i8(dst, offset));
+        }
+
+        visitor.load::<i8, DEBUG>(program_counter, dst, None, offset)
+    }
+
+    fn load_u16<const DEBUG: bool>(visitor: &mut Visitor, program_counter: ProgramCounter, dst: Reg, offset: u32) -> Option<Target> {
+        if DEBUG {
+            log::trace!("[{}]: {}", visitor.inner.compiled_offset, asm::load_u16(dst, offset));
+        }
+
+        visitor.load::<u16, DEBUG>(program_counter, dst, None, offset)
+    }
+
+    fn load_i16<const DEBUG: bool>(visitor: &mut Visitor, program_counter: ProgramCounter, dst: Reg, offset: u32) -> Option<Target> {
+        if DEBUG {
+            log::trace!("[{}]: {}", visitor.inner.compiled_offset, asm::load_i16(dst, offset));
+        }
+
+        visitor.load::<i16, DEBUG>(program_counter, dst, None, offset)
+    }
+
+    fn load_u32<const DEBUG: bool>(visitor: &mut Visitor, program_counter: ProgramCounter, dst: Reg, offset: u32) -> Option<Target> {
+        if DEBUG {
+            log::trace!("[{}]: {}", visitor.inner.compiled_offset, asm::load_u32(dst, offset));
+        }
+
+        visitor.load::<u32, DEBUG>(program_counter, dst, None, offset)
+    }
+
+    fn load_indirect_u8<const DEBUG: bool>(visitor: &mut Visitor, program_counter: ProgramCounter, dst: Reg, base: Reg, offset: u32) -> Option<Target> {
+        if DEBUG {
+            log::trace!("[{}]: {}", visitor.inner.compiled_offset, asm::load_indirect_u8(dst, base, offset));
+        }
+
+        visitor.load::<u8, DEBUG>(program_counter, dst, Some(base), offset)
+    }
+
+    fn load_indirect_i8<const DEBUG: bool>(visitor: &mut Visitor, program_counter: ProgramCounter, dst: Reg, base: Reg, offset: u32) -> Option<Target> {
+        if DEBUG {
+            log::trace!("[{}]: {}", visitor.inner.compiled_offset, asm::load_indirect_i8(dst, base, offset));
+        }
+
+        visitor.load::<i8, DEBUG>(program_counter, dst, Some(base), offset)
+    }
+
+    fn load_indirect_u16<const DEBUG: bool>(visitor: &mut Visitor, program_counter: ProgramCounter, dst: Reg, base: Reg, offset: u32) -> Option<Target> {
+        if DEBUG {
+            log::trace!("[{}]: {}", visitor.inner.compiled_offset, asm::load_indirect_u16(dst, base, offset));
+        }
+
+        visitor.load::<u16, DEBUG>(program_counter, dst, Some(base), offset)
+    }
+
+    fn load_indirect_i16<const DEBUG: bool>(visitor: &mut Visitor, program_counter: ProgramCounter, dst: Reg, base: Reg, offset: u32) -> Option<Target> {
+        if DEBUG {
+            log::trace!("[{}]: {}", visitor.inner.compiled_offset, asm::load_indirect_i16(dst, base, offset));
+        }
+
+        visitor.load::<i16, DEBUG>(program_counter, dst, Some(base), offset)
+    }
+
+    fn load_indirect_u32<const DEBUG: bool>(visitor: &mut Visitor, program_counter: ProgramCounter, dst: Reg, base: Reg, offset: u32) -> Option<Target> {
+        if DEBUG {
+            log::trace!("[{}]: {}", visitor.inner.compiled_offset, asm::load_indirect_u32(dst, base, offset));
+        }
+
+        visitor.load::<u32, DEBUG>(program_counter, dst, Some(base), offset)
+    }
+
+    fn branch_less_unsigned<const DEBUG: bool>(visitor: &mut Visitor, s1: Reg, s2: Reg, tt: Target, tf: Target) -> Option<Target> {
+        if DEBUG {
+            log::trace!("[{}]: jump ~{tt} if {s1} <u {s2}", visitor.inner.compiled_offset);
+        }
+
+        visitor.branch::<DEBUG>(s1, s2, tt, tf, |s1, s2| s1 < s2)
+    }
+
+    fn branch_less_unsigned_imm<const DEBUG: bool>(visitor: &mut Visitor, s1: Reg, s2: u32, tt: Target, tf: Target) -> Option<Target> {
+        if DEBUG {
+            log::trace!("[{}]: jump ~{tt} if {s1} <u {s2}", visitor.inner.compiled_offset);
+        }
+
+        visitor.branch::<DEBUG>(s1, s2, tt, tf, |s1, s2| s1 < s2)
+    }
+
+    fn branch_less_signed<const DEBUG: bool>(visitor: &mut Visitor, s1: Reg, s2: Reg, tt: Target, tf: Target) -> Option<Target> {
+        if DEBUG {
+            log::trace!("[{}]: jump ~{tt} if {s1} <s {s2}", visitor.inner.compiled_offset);
+        }
+
+        visitor.branch::<DEBUG>(s1, s2, tt, tf, |s1, s2| (s1 as i32) < (s2 as i32))
+    }
+
+    fn branch_less_signed_imm<const DEBUG: bool>(visitor: &mut Visitor, s1: Reg, s2: u32, tt: Target, tf: Target) -> Option<Target> {
+        if DEBUG {
+            log::trace!("[{}]: jump ~{tt} if {s1} <s {s2}", visitor.inner.compiled_offset);
+        }
+
+        visitor.branch::<DEBUG>(s1, s2, tt, tf, |s1, s2| (s1 as i32) < (s2 as i32))
+    }
+
+    fn branch_eq<const DEBUG: bool>(visitor: &mut Visitor, s1: Reg, s2: Reg, tt: Target, tf: Target) -> Option<Target> {
+        if DEBUG {
+            log::trace!("[{}]: jump ~{tt} if {s1} == {s2}", visitor.inner.compiled_offset);
+        }
+
+        visitor.branch::<DEBUG>(s1, s2, tt, tf, |s1, s2| s1 == s2)
+    }
+
+    fn branch_eq_imm<const DEBUG: bool>(visitor: &mut Visitor, s1: Reg, s2: u32, tt: Target, tf: Target) -> Option<Target> {
+        if DEBUG {
+            log::trace!("[{}]: jump ~{tt} if {s1} == {s2}", visitor.inner.compiled_offset);
+        }
+
+        visitor.branch::<DEBUG>(s1, s2, tt, tf, |s1, s2| s1 == s2)
+    }
+
+    fn branch_not_eq<const DEBUG: bool>(visitor: &mut Visitor, s1: Reg, s2: Reg, tt: Target, tf: Target) -> Option<Target> {
+        if DEBUG {
+            log::trace!("[{}]: jump ~{tt} if {s1} != {s2}", visitor.inner.compiled_offset);
+        }
+
+        visitor.branch::<DEBUG>(s1, s2, tt, tf, |s1, s2| s1 != s2)
+    }
+
+    fn branch_not_eq_imm<const DEBUG: bool>(visitor: &mut Visitor, s1: Reg, s2: u32, tt: Target, tf: Target) -> Option<Target> {
+        if DEBUG {
+            log::trace!("[{}]: jump ~{tt} if {s1} != {s2}", visitor.inner.compiled_offset);
+        }
+
+        visitor.branch::<DEBUG>(s1, s2, tt, tf, |s1, s2| s1 != s2)
+    }
+
+    fn branch_greater_or_equal_unsigned<const DEBUG: bool>(visitor: &mut Visitor, s1: Reg, s2: Reg, tt: Target, tf: Target) -> Option<Target> {
+        if DEBUG {
+            log::trace!("[{}]: jump ~{tt} if {s1} >=u {s2}", visitor.inner.compiled_offset);
+        }
+
+        visitor.branch::<DEBUG>(s1, s2, tt, tf, |s1, s2| s1 >= s2)
+    }
+
+    fn branch_greater_or_equal_unsigned_imm<const DEBUG: bool>(visitor: &mut Visitor, s1: Reg, s2: u32, tt: Target, tf: Target) -> Option<Target> {
+        if DEBUG {
+            log::trace!("[{}]: jump ~{tt} if {s1} >=u {s2}", visitor.inner.compiled_offset);
+        }
+
+        visitor.branch::<DEBUG>(s1, s2, tt, tf, |s1, s2| s1 >= s2)
+    }
+
+    fn branch_greater_or_equal_signed<const DEBUG: bool>(visitor: &mut Visitor, s1: Reg, s2: Reg, tt: Target, tf: Target) -> Option<Target> {
+        if DEBUG {
+            log::trace!("[{}]: jump ~{tt} if {s1} >=s {s2}", visitor.inner.compiled_offset);
+        }
+
+        visitor.branch::<DEBUG>(s1, s2, tt, tf, |s1, s2| (s1 as i32) >= (s2 as i32))
+    }
+
+    fn branch_greater_or_equal_signed_imm<const DEBUG: bool>(visitor: &mut Visitor, s1: Reg, s2: u32, tt: Target, tf: Target) -> Option<Target> {
+        if DEBUG {
+            log::trace!("[{}]: jump ~{tt} if {s1} >=s {s2}", visitor.inner.compiled_offset);
+        }
+
+        visitor.branch::<DEBUG>(s1, s2, tt, tf, |s1, s2| (s1 as i32) >= (s2 as i32))
+    }
+
+    fn branch_less_or_equal_unsigned_imm<const DEBUG: bool>(visitor: &mut Visitor, s1: Reg, s2: u32, tt: Target, tf: Target) -> Option<Target> {
+        if DEBUG {
+            log::trace!("[{}]: jump ~{tt} if {s1} <=u {s2}", visitor.inner.compiled_offset);
+        }
+
+        visitor.branch::<DEBUG>(s1, s2, tt, tf, |s1, s2| s1 <= s2)
+    }
+
+    fn branch_less_or_equal_signed_imm<const DEBUG: bool>(visitor: &mut Visitor, s1: Reg, s2: u32, tt: Target, tf: Target) -> Option<Target> {
+        if DEBUG {
+            log::trace!("[{}]: jump ~{tt} if {s1} <=s {s2}", visitor.inner.compiled_offset);
+        }
+
+        visitor.branch::<DEBUG>(s1, s2, tt, tf, |s1, s2| (s1 as i32) <= (s2 as i32))
+    }
+
+    fn branch_greater_unsigned_imm<const DEBUG: bool>(visitor: &mut Visitor, s1: Reg, s2: u32, tt: Target, tf: Target) -> Option<Target> {
+        if DEBUG {
+            log::trace!("[{}]: jump ~{tt} if {s1} >u {s2}", visitor.inner.compiled_offset);
+        }
+
+        visitor.branch::<DEBUG>(s1, s2, tt, tf, |s1, s2| s1 > s2)
+    }
+
+    fn branch_greater_signed_imm<const DEBUG: bool>(visitor: &mut Visitor, s1: Reg, s2: u32, tt: Target, tf: Target) -> Option<Target> {
+        if DEBUG {
+            log::trace!("[{}]: jump ~{tt} if {s1} >s {s2}", visitor.inner.compiled_offset);
+        }
+
+        visitor.branch::<DEBUG>(s1, s2, tt, tf, |s1, s2| (s1 as i32) > (s2 as i32))
+    }
+
+    fn jump<const DEBUG: bool>(visitor: &mut Visitor, target: Target) -> Option<Target> {
+        if DEBUG {
+            log::trace!("[{}]: jump ~{target}", visitor.inner.compiled_offset);
+        }
+
+        Some(target)
+    }
+
+    fn jump_indirect<const DEBUG: bool>(visitor: &mut Visitor, program_counter: ProgramCounter, base: Reg, offset: u32) -> Option<Target> {
+        if DEBUG {
+            log::trace!("[{}]: {}", visitor.inner.compiled_offset, asm::jump_indirect(base, offset));
+        }
+
+        let dynamic_address = visitor.get(base).wrapping_add(offset);
+        visitor.jump_indirect_impl::<DEBUG>(program_counter, dynamic_address)
+    }
+
+    fn load_imm_and_jump_indirect<const DEBUG: bool>(visitor: &mut Visitor, program_counter: ProgramCounter, ra: Reg, base: Reg, value: u32, offset: u32) -> Option<Target> {
+        if DEBUG {
+            log::trace!("[{}]: {}", visitor.inner.compiled_offset, asm::load_imm_and_jump_indirect(ra, base, value, offset));
+        }
+
+        let dynamic_address = visitor.get(base).wrapping_add(offset);
+        visitor.set::<DEBUG>(ra, value);
+        visitor.jump_indirect_impl::<DEBUG>(program_counter, dynamic_address)
+    }
+
+    fn unresolved_branch_less_unsigned<const DEBUG: bool>(visitor: &mut Visitor, s1: Reg, s2: Reg, tt: ProgramCounter, tf: ProgramCounter) -> Option<Target> {
+        handle_unresolved_branch!("<u", visitor, s1, s2, tt, tf, branch_less_unsigned)
+    }
+
+    fn unresolved_branch_less_unsigned_imm<const DEBUG: bool>(visitor: &mut Visitor, s1: Reg, s2: u32, tt: ProgramCounter, tf: ProgramCounter) -> Option<Target> {
+        handle_unresolved_branch!("<u", visitor, s1, s2, tt, tf, branch_less_unsigned_imm)
+    }
+
+    fn unresolved_branch_less_signed<const DEBUG: bool>(visitor: &mut Visitor, s1: Reg, s2: Reg, tt: ProgramCounter, tf: ProgramCounter) -> Option<Target> {
+        handle_unresolved_branch!("<s", visitor, s1, s2, tt, tf, branch_less_signed)
+    }
+
+    fn unresolved_branch_less_signed_imm<const DEBUG: bool>(visitor: &mut Visitor, s1: Reg, s2: u32, tt: ProgramCounter, tf: ProgramCounter) -> Option<Target> {
+        handle_unresolved_branch!("<s", visitor, s1, s2, tt, tf, branch_less_signed_imm)
+    }
+
+    fn unresolved_branch_eq<const DEBUG: bool>(visitor: &mut Visitor, s1: Reg, s2: Reg, tt: ProgramCounter, tf: ProgramCounter) -> Option<Target> {
+        handle_unresolved_branch!("==", visitor, s1, s2, tt, tf, branch_eq)
+    }
+
+    fn unresolved_branch_eq_imm<const DEBUG: bool>(visitor: &mut Visitor, s1: Reg, s2: u32, tt: ProgramCounter, tf: ProgramCounter) -> Option<Target> {
+        handle_unresolved_branch!("==", visitor, s1, s2, tt, tf, branch_eq_imm)
+    }
+
+    fn unresolved_branch_not_eq<const DEBUG: bool>(visitor: &mut Visitor, s1: Reg, s2: Reg, tt: ProgramCounter, tf: ProgramCounter) -> Option<Target> {
+        handle_unresolved_branch!("!=", visitor, s1, s2, tt, tf, branch_not_eq)
+    }
+
+    fn unresolved_branch_not_eq_imm<const DEBUG: bool>(visitor: &mut Visitor, s1: Reg, s2: u32, tt: ProgramCounter, tf: ProgramCounter) -> Option<Target> {
+        handle_unresolved_branch!("!=", visitor, s1, s2, tt, tf, branch_not_eq_imm)
+    }
+
+    fn unresolved_branch_greater_or_equal_unsigned<const DEBUG: bool>(visitor: &mut Visitor, s1: Reg, s2: Reg, tt: ProgramCounter, tf: ProgramCounter) -> Option<Target> {
+        handle_unresolved_branch!(">=u", visitor, s1, s2, tt, tf, branch_greater_or_equal_unsigned)
+    }
+
+    fn unresolved_branch_greater_or_equal_unsigned_imm<const DEBUG: bool>(visitor: &mut Visitor, s1: Reg, s2: u32, tt: ProgramCounter, tf: ProgramCounter) -> Option<Target> {
+        handle_unresolved_branch!(">=u", visitor, s1, s2, tt, tf, branch_greater_or_equal_unsigned_imm)
+    }
+
+    fn unresolved_branch_greater_or_equal_signed<const DEBUG: bool>(visitor: &mut Visitor, s1: Reg, s2: Reg, tt: ProgramCounter, tf: ProgramCounter) -> Option<Target> {
+        handle_unresolved_branch!(">=s", visitor, s1, s2, tt, tf, branch_greater_or_equal_signed)
+    }
+
+    fn unresolved_branch_greater_or_equal_signed_imm<const DEBUG: bool>(visitor: &mut Visitor, s1: Reg, s2: u32, tt: ProgramCounter, tf: ProgramCounter) -> Option<Target> {
+        handle_unresolved_branch!(">=s", visitor, s1, s2, tt, tf, branch_greater_or_equal_signed_imm)
+    }
+
+    fn unresolved_branch_greater_unsigned_imm<const DEBUG: bool>(visitor: &mut Visitor, s1: Reg, s2: u32, tt: ProgramCounter, tf: ProgramCounter) -> Option<Target> {
+        handle_unresolved_branch!(">u", visitor, s1, s2, tt, tf, branch_greater_unsigned_imm)
+    }
+
+    fn unresolved_branch_greater_signed_imm<const DEBUG: bool>(visitor: &mut Visitor, s1: Reg, s2: u32, tt: ProgramCounter, tf: ProgramCounter) -> Option<Target> {
+        handle_unresolved_branch!(">s", visitor, s1, s2, tt, tf, branch_greater_signed_imm)
+    }
+
+    fn unresolved_branch_less_or_equal_unsigned_imm<const DEBUG: bool>(visitor: &mut Visitor, s1: Reg, s2: u32, tt: ProgramCounter, tf: ProgramCounter) -> Option<Target> {
+        handle_unresolved_branch!("<=u", visitor, s1, s2, tt, tf, branch_less_or_equal_unsigned_imm)
+    }
+
+    fn unresolved_branch_less_or_equal_signed_imm<const DEBUG: bool>(visitor: &mut Visitor, s1: Reg, s2: u32, tt: ProgramCounter, tf: ProgramCounter) -> Option<Target> {
+        handle_unresolved_branch!("<=s", visitor, s1, s2, tt, tf, branch_less_or_equal_signed_imm)
+    }
+
+    fn unresolved_jump<const DEBUG: bool>(visitor: &mut Visitor, program_counter: ProgramCounter, jump_to: ProgramCounter) -> Option<Target> {
+        if DEBUG {
+            log::trace!("[{}]: jump {jump_to}", visitor.inner.compiled_offset);
+        }
+
+        if let Some(target) = visitor.inner.resolve_jump::<DEBUG>(jump_to) {
+            let offset = visitor.inner.compiled_offset;
+            if offset + 1 == target {
+                visitor.inner.compiled_handlers[offset] = raw_handlers::fallthrough::<DEBUG> as Handler;
+                visitor.inner.compiled_args[offset] = Args::fallthrough();
+            } else {
+                visitor.inner.compiled_handlers[offset] = raw_handlers::jump::<DEBUG> as Handler;
+                visitor.inner.compiled_args[offset] = Args::jump(target);
+            }
+
+            Some(target)
+        } else {
+            trap_impl::<DEBUG>(visitor, program_counter)
+        }
+    }
+}
+
+struct Compiler<'a, const DEBUG: bool, const STEP_TRACING: bool> {
+    program_counter: ProgramCounter,
+    instruction_length: u32,
+    compiled_handlers: &'a mut Vec<Handler>,
+    compiled_args: &'a mut Vec<Args>,
+    module: &'a Module,
+}
+
+impl<'a, const DEBUG: bool, const STEP_TRACING: bool> Compiler<'a, DEBUG, STEP_TRACING> {
+    fn next_program_counter(&self) -> ProgramCounter {
+        ProgramCounter(self.program_counter.0 + self.instruction_length)
+    }
+
+    fn is_branch_valid(&mut self, target: ProgramCounter) -> bool {
+        let Some(mut instructions) = self.module.instructions_at(target) else {
+            log::debug!("  invalid branch to {target}: out of range offset");
+            return false;
+        };
+
+        if let Some(previous_instruction) = instructions.next_back() {
+            if !previous_instruction.starts_new_basic_block() {
+                log::debug!("  invalid branch to {target}: previous insruction doesn't start an new basic block");
+                return false;
+            }
+        }
+
+        true
+    }
+}
+
+impl<'a, const DEBUG: bool, const STEP_TRACING: bool> InstructionVisitor for Compiler<'a, DEBUG, STEP_TRACING> {
+    type ReturnTy = ();
+
+    fn trap(&mut self) -> Self::ReturnTy {
+        emit!(self, trap(self.program_counter));
+    }
+
+    fn fallthrough(&mut self) -> Self::ReturnTy {
+        let target = self.next_program_counter();
+        emit!(self, unresolved_jump(self.program_counter, target));
+    }
+
+    fn sbrk(&mut self, dst: RawReg, size: RawReg) -> Self::ReturnTy {
+        emit!(self, sbrk(dst, size));
+    }
+
+    fn ecalli(&mut self, imm: u32) -> Self::ReturnTy {
+        emit!(self, ecalli(self.program_counter, imm));
+    }
+
     fn set_less_than_unsigned(&mut self, d: RawReg, s1: RawReg, s2: RawReg) -> Self::ReturnTy {
-        self.set3(d, s1, s2, |s1, s2| u32::from(s1 < s2))
+        emit!(self, set_less_than_unsigned(d, s1, s2));
     }
 
     fn set_less_than_signed(&mut self, d: RawReg, s1: RawReg, s2: RawReg) -> Self::ReturnTy {
-        self.set3(d, s1, s2, |s1, s2| u32::from((s1 as i32) < (s2 as i32)))
+        emit!(self, set_less_than_signed(d, s1, s2));
     }
 
     fn set_less_than_unsigned_64(&mut self, _d: RawReg, _s1: RawReg, _s2: RawReg) -> Self::ReturnTy {
@@ -914,15 +2231,15 @@ impl<'a, 'b, const DEBUG: bool> InstructionVisitor for Visitor<'a, 'b, DEBUG> {
     }
 
     fn shift_logical_right(&mut self, d: RawReg, s1: RawReg, s2: RawReg) -> Self::ReturnTy {
-        self.set3(d, s1, s2, u32::wrapping_shr)
+        emit!(self, shift_logical_right(d, s1, s2));
     }
 
     fn shift_arithmetic_right(&mut self, d: RawReg, s1: RawReg, s2: RawReg) -> Self::ReturnTy {
-        self.set3(d, s1, s2, |s1, s2| ((s1 as i32).wrapping_shr(s2)) as u32)
+        emit!(self, shift_arithmetic_right(d, s1, s2));
     }
 
     fn shift_logical_left(&mut self, d: RawReg, s1: RawReg, s2: RawReg) -> Self::ReturnTy {
-        self.set3(d, s1, s2, u32::wrapping_shl)
+        emit!(self, shift_logical_left(d, s1, s2));
     }
 
     fn shift_logical_right_64(&mut self, _d: RawReg, _s1: RawReg, _s2: RawReg) -> Self::ReturnTy {
@@ -938,15 +2255,15 @@ impl<'a, 'b, const DEBUG: bool> InstructionVisitor for Visitor<'a, 'b, DEBUG> {
     }
 
     fn xor(&mut self, d: RawReg, s1: RawReg, s2: RawReg) -> Self::ReturnTy {
-        self.set3(d, s1, s2, |s1, s2| s1 ^ s2)
+        emit!(self, xor(d, s1, s2));
     }
 
     fn and(&mut self, d: RawReg, s1: RawReg, s2: RawReg) -> Self::ReturnTy {
-        self.set3(d, s1, s2, |s1, s2| s1 & s2)
+        emit!(self, and(d, s1, s2));
     }
 
     fn or(&mut self, d: RawReg, s1: RawReg, s2: RawReg) -> Self::ReturnTy {
-        self.set3(d, s1, s2, |s1, s2| s1 | s2)
+        emit!(self, or(d, s1, s2));
     }
 
     fn xor_64(&mut self, _d: RawReg, _s1: RawReg, _s2: RawReg) -> Self::ReturnTy {
@@ -962,7 +2279,7 @@ impl<'a, 'b, const DEBUG: bool> InstructionVisitor for Visitor<'a, 'b, DEBUG> {
     }
 
     fn add(&mut self, d: RawReg, s1: RawReg, s2: RawReg) -> Self::ReturnTy {
-        self.set3(d, s1, s2, u32::wrapping_add)
+        emit!(self, add(d, s1, s2));
     }
 
     fn add_64(&mut self, _d: RawReg, _s1: RawReg, _s2: RawReg) -> Self::ReturnTy {
@@ -970,7 +2287,7 @@ impl<'a, 'b, const DEBUG: bool> InstructionVisitor for Visitor<'a, 'b, DEBUG> {
     }
 
     fn sub(&mut self, d: RawReg, s1: RawReg, s2: RawReg) -> Self::ReturnTy {
-        self.set3(d, s1, s2, u32::wrapping_sub)
+        emit!(self, sub(d, s1, s2));
     }
 
     fn sub_64(&mut self, _d: RawReg, _s1: RawReg, _s2: RawReg) -> Self::ReturnTy {
@@ -978,11 +2295,11 @@ impl<'a, 'b, const DEBUG: bool> InstructionVisitor for Visitor<'a, 'b, DEBUG> {
     }
 
     fn negate_and_add_imm(&mut self, d: RawReg, s1: RawReg, s2: u32) -> Self::ReturnTy {
-        self.set3(d, s1, s2, |s1, s2| s2.wrapping_sub(s1))
+        emit!(self, negate_and_add_imm(d, s1, s2));
     }
 
     fn mul(&mut self, d: RawReg, s1: RawReg, s2: RawReg) -> Self::ReturnTy {
-        self.set3(d, s1, s2, u32::wrapping_mul)
+        emit!(self, mul(d, s1, s2));
     }
 
     fn mul_64(&mut self, _d: RawReg, _s1: RawReg, _s2: RawReg) -> Self::ReturnTy {
@@ -990,7 +2307,7 @@ impl<'a, 'b, const DEBUG: bool> InstructionVisitor for Visitor<'a, 'b, DEBUG> {
     }
 
     fn mul_imm(&mut self, d: RawReg, s1: RawReg, s2: u32) -> Self::ReturnTy {
-        self.set3(d, s1, s2, u32::wrapping_mul)
+        emit!(self, mul_imm(d, s1, s2));
     }
 
     fn mul_64_imm(&mut self, _d: RawReg, _s1: RawReg, _s2: u32) -> Self::ReturnTy {
@@ -1018,39 +2335,39 @@ impl<'a, 'b, const DEBUG: bool> InstructionVisitor for Visitor<'a, 'b, DEBUG> {
     }
 
     fn mul_upper_signed_signed(&mut self, d: RawReg, s1: RawReg, s2: RawReg) -> Self::ReturnTy {
-        self.set3(d, s1, s2, |s1, s2| mulh(s1 as i32, s2 as i32) as u32)
+        emit!(self, mul_upper_signed_signed(d, s1, s2));
     }
 
     fn mul_upper_signed_signed_imm(&mut self, d: RawReg, s1: RawReg, s2: u32) -> Self::ReturnTy {
-        self.set3(d, s1, s2, |s1, s2| mulh(s1 as i32, s2 as i32) as u32)
+        emit!(self, mul_upper_signed_signed_imm(d, s1, s2));
     }
 
     fn mul_upper_unsigned_unsigned(&mut self, d: RawReg, s1: RawReg, s2: RawReg) -> Self::ReturnTy {
-        self.set3(d, s1, s2, mulhu)
+        emit!(self, mul_upper_unsigned_unsigned(d, s1, s2));
     }
 
     fn mul_upper_unsigned_unsigned_imm(&mut self, d: RawReg, s1: RawReg, s2: u32) -> Self::ReturnTy {
-        self.set3(d, s1, s2, mulhu)
+        emit!(self, mul_upper_unsigned_unsigned_imm(d, s1, s2));
     }
 
     fn mul_upper_signed_unsigned(&mut self, d: RawReg, s1: RawReg, s2: RawReg) -> Self::ReturnTy {
-        self.set3(d, s1, s2, |s1, s2| mulhsu(s1 as i32, s2) as u32)
+        emit!(self, mul_upper_signed_unsigned(d, s1, s2));
     }
 
     fn div_unsigned(&mut self, d: RawReg, s1: RawReg, s2: RawReg) -> Self::ReturnTy {
-        self.set3(d, s1, s2, divu)
+        emit!(self, div_unsigned(d, s1, s2));
     }
 
     fn div_signed(&mut self, d: RawReg, s1: RawReg, s2: RawReg) -> Self::ReturnTy {
-        self.set3(d, s1, s2, |s1, s2| div(s1 as i32, s2 as i32) as u32)
+        emit!(self, div_signed(d, s1, s2));
     }
 
     fn rem_unsigned(&mut self, d: RawReg, s1: RawReg, s2: RawReg) -> Self::ReturnTy {
-        self.set3(d, s1, s2, remu)
+        emit!(self, rem_unsigned(d, s1, s2));
     }
 
     fn rem_signed(&mut self, d: RawReg, s1: RawReg, s2: RawReg) -> Self::ReturnTy {
-        self.set3(d, s1, s2, |s1, s2| rem(s1 as i32, s2 as i32) as u32)
+        emit!(self, rem_signed(d, s1, s2));
     }
 
     fn div_unsigned_64(&mut self, _d: RawReg, _s1: RawReg, _s2: RawReg) -> Self::ReturnTy {
@@ -1070,19 +2387,19 @@ impl<'a, 'b, const DEBUG: bool> InstructionVisitor for Visitor<'a, 'b, DEBUG> {
     }
 
     fn set_less_than_unsigned_imm(&mut self, d: RawReg, s1: RawReg, s2: u32) -> Self::ReturnTy {
-        self.set3(d, s1, s2, |s1, s2| u32::from(s1 < s2))
+        emit!(self, set_less_than_unsigned_imm(d, s1, s2));
     }
 
     fn set_greater_than_unsigned_imm(&mut self, d: RawReg, s1: RawReg, s2: u32) -> Self::ReturnTy {
-        self.set3(d, s1, s2, |s1, s2| u32::from(s1 > s2))
+        emit!(self, set_greater_than_unsigned_imm(d, s1, s2));
     }
 
     fn set_less_than_signed_imm(&mut self, d: RawReg, s1: RawReg, s2: u32) -> Self::ReturnTy {
-        self.set3(d, s1, s2, |s1, s2| u32::from((s1 as i32) < (s2 as i32)))
+        emit!(self, set_less_than_signed_imm(d, s1, s2));
     }
 
     fn set_greater_than_signed_imm(&mut self, d: RawReg, s1: RawReg, s2: u32) -> Self::ReturnTy {
-        self.set3(d, s1, s2, |s1, s2| u32::from((s1 as i32) > (s2 as i32)))
+        emit!(self, set_greater_than_signed_imm(d, s1, s2));
     }
 
     fn set_less_than_unsigned_64_imm(&mut self, _d: RawReg, _s1: RawReg, _s2: u32) -> Self::ReturnTy {
@@ -1102,27 +2419,27 @@ impl<'a, 'b, const DEBUG: bool> InstructionVisitor for Visitor<'a, 'b, DEBUG> {
     }
 
     fn shift_logical_right_imm(&mut self, d: RawReg, s1: RawReg, s2: u32) -> Self::ReturnTy {
-        self.set3(d, s1, s2, u32::wrapping_shr)
+        emit!(self, shift_logical_right_imm(d, s1, s2));
     }
 
     fn shift_logical_right_imm_alt(&mut self, d: RawReg, s2: RawReg, s1: u32) -> Self::ReturnTy {
-        self.set3(d, s1, s2, u32::wrapping_shr)
+        emit!(self, shift_logical_right_imm_alt(d, s2, s1));
     }
 
     fn shift_arithmetic_right_imm(&mut self, d: RawReg, s1: RawReg, s2: u32) -> Self::ReturnTy {
-        self.set3(d, s1, s2, |s1, s2| ((s1 as i32) >> s2) as u32)
+        emit!(self, shift_arithmetic_right_imm(d, s1, s2));
     }
 
     fn shift_arithmetic_right_imm_alt(&mut self, d: RawReg, s2: RawReg, s1: u32) -> Self::ReturnTy {
-        self.set3(d, s1, s2, |s1, s2| ((s1 as i32) >> s2) as u32)
+        emit!(self, shift_arithmetic_right_imm_alt(d, s2, s1));
     }
 
     fn shift_logical_left_imm(&mut self, d: RawReg, s1: RawReg, s2: u32) -> Self::ReturnTy {
-        self.set3(d, s1, s2, u32::wrapping_shl)
+        emit!(self, shift_logical_left_imm(d, s1, s2));
     }
 
     fn shift_logical_left_imm_alt(&mut self, d: RawReg, s2: RawReg, s1: u32) -> Self::ReturnTy {
-        self.set3(d, s1, s2, u32::wrapping_shl)
+        emit!(self, shift_logical_left_imm_alt(d, s2, s1));
     }
 
     fn shift_logical_right_64_imm(&mut self, _d: RawReg, _s1: RawReg, _s2: u32) -> Self::ReturnTy {
@@ -1150,15 +2467,15 @@ impl<'a, 'b, const DEBUG: bool> InstructionVisitor for Visitor<'a, 'b, DEBUG> {
     }
 
     fn or_imm(&mut self, d: RawReg, s1: RawReg, s2: u32) -> Self::ReturnTy {
-        self.set3(d, s1, s2, |s1, s2| s1 | s2)
+        emit!(self, or_imm(d, s1, s2));
     }
 
     fn and_imm(&mut self, d: RawReg, s1: RawReg, s2: u32) -> Self::ReturnTy {
-        self.set3(d, s1, s2, |s1, s2| s1 & s2)
+        emit!(self, and_imm(d, s1, s2));
     }
 
     fn xor_imm(&mut self, d: RawReg, s1: RawReg, s2: u32) -> Self::ReturnTy {
-        self.set3(d, s1, s2, |s1, s2| s1 ^ s2)
+        emit!(self, xor_imm(d, s1, s2));
     }
 
     fn or_64_imm(&mut self, _d: RawReg, _s1: RawReg, _s2: u32) -> Self::ReturnTy {
@@ -1174,56 +2491,27 @@ impl<'a, 'b, const DEBUG: bool> InstructionVisitor for Visitor<'a, 'b, DEBUG> {
     }
 
     fn load_imm(&mut self, dst: RawReg, imm: u32) -> Self::ReturnTy {
-        self.set(dst, imm)?;
-        self.on_next_instruction();
-
-        Ok(())
+        emit!(self, load_imm(dst, imm));
     }
 
     fn move_reg(&mut self, d: RawReg, s: RawReg) -> Self::ReturnTy {
-        let imm = self.get(s);
-        self.set(d, imm)?;
-        self.on_next_instruction();
-
-        Ok(())
+        emit!(self, move_reg(d, s));
     }
 
     fn cmov_if_zero(&mut self, d: RawReg, s: RawReg, c: RawReg) -> Self::ReturnTy {
-        if self.get(c) == 0 {
-            let value = self.get(s);
-            self.set(d, value)?;
-        }
-
-        self.on_next_instruction();
-        Ok(())
+        emit!(self, cmov_if_zero(d, s, c));
     }
 
     fn cmov_if_zero_imm(&mut self, d: RawReg, c: RawReg, s: u32) -> Self::ReturnTy {
-        if self.get(c) == 0 {
-            self.set(d, s)?;
-        }
-
-        self.on_next_instruction();
-        Ok(())
+        emit!(self, cmov_if_zero_imm(d, c, s));
     }
 
     fn cmov_if_not_zero(&mut self, d: RawReg, s: RawReg, c: RawReg) -> Self::ReturnTy {
-        if self.get(c) != 0 {
-            let value = self.get(s);
-            self.set(d, value)?;
-        }
-
-        self.on_next_instruction();
-        Ok(())
+        emit!(self, cmov_if_not_zero(d, s, c));
     }
 
     fn cmov_if_not_zero_imm(&mut self, d: RawReg, c: RawReg, s: u32) -> Self::ReturnTy {
-        if self.get(c) != 0 {
-            self.set(d, s)?;
-        }
-
-        self.on_next_instruction();
-        Ok(())
+        emit!(self, cmov_if_not_zero_imm(d, c, s));
     }
 
     fn add_64_imm(&mut self, _d: RawReg, _s1: RawReg, _s2: u32) -> Self::ReturnTy {
@@ -1231,19 +2519,19 @@ impl<'a, 'b, const DEBUG: bool> InstructionVisitor for Visitor<'a, 'b, DEBUG> {
     }
 
     fn add_imm(&mut self, d: RawReg, s1: RawReg, s2: u32) -> Self::ReturnTy {
-        self.set3(d, s1, s2, u32::wrapping_add)
+        emit!(self, add_imm(d, s1, s2));
     }
 
     fn store_imm_u8(&mut self, offset: u32, value: u32) -> Self::ReturnTy {
-        self.store::<u8>(value, None, offset)
+        emit!(self, store_imm_u8(self.program_counter, offset, value));
     }
 
     fn store_imm_u16(&mut self, offset: u32, value: u32) -> Self::ReturnTy {
-        self.store::<u16>(value, None, offset)
+        emit!(self, store_imm_u16(self.program_counter, offset, value));
     }
 
     fn store_imm_u32(&mut self, offset: u32, value: u32) -> Self::ReturnTy {
-        self.store::<u32>(value, None, offset)
+        emit!(self, store_imm_u32(self.program_counter, offset, value));
     }
 
     fn store_imm_u64(&mut self, _offset: u32, _value: u32) -> Self::ReturnTy {
@@ -1251,15 +2539,15 @@ impl<'a, 'b, const DEBUG: bool> InstructionVisitor for Visitor<'a, 'b, DEBUG> {
     }
 
     fn store_imm_indirect_u8(&mut self, base: RawReg, offset: u32, value: u32) -> Self::ReturnTy {
-        self.store::<u8>(value, Some(base), offset)
+        emit!(self, store_imm_indirect_u8(self.program_counter, base, offset, value));
     }
 
     fn store_imm_indirect_u16(&mut self, base: RawReg, offset: u32, value: u32) -> Self::ReturnTy {
-        self.store::<u16>(value, Some(base), offset)
+        emit!(self, store_imm_indirect_u16(self.program_counter, base, offset, value));
     }
 
     fn store_imm_indirect_u32(&mut self, base: RawReg, offset: u32, value: u32) -> Self::ReturnTy {
-        self.store::<u32>(value, Some(base), offset)
+        emit!(self, store_imm_indirect_u32(self.program_counter, base, offset, value));
     }
 
     fn store_imm_indirect_u64(&mut self, _base: RawReg, _offset: u32, _value: u32) -> Self::ReturnTy {
@@ -1267,15 +2555,15 @@ impl<'a, 'b, const DEBUG: bool> InstructionVisitor for Visitor<'a, 'b, DEBUG> {
     }
 
     fn store_indirect_u8(&mut self, src: RawReg, base: RawReg, offset: u32) -> Self::ReturnTy {
-        self.store::<u8>(src, Some(base), offset)
+        emit!(self, store_indirect_u8(self.program_counter, src, base, offset));
     }
 
     fn store_indirect_u16(&mut self, src: RawReg, base: RawReg, offset: u32) -> Self::ReturnTy {
-        self.store::<u16>(src, Some(base), offset)
+        emit!(self, store_indirect_u16(self.program_counter, src, base, offset));
     }
 
     fn store_indirect_u32(&mut self, src: RawReg, base: RawReg, offset: u32) -> Self::ReturnTy {
-        self.store::<u32>(src, Some(base), offset)
+        emit!(self, store_indirect_u32(self.program_counter, src, base, offset));
     }
 
     fn store_indirect_u64(&mut self, _src: RawReg, _base: RawReg, _offset: u32) -> Self::ReturnTy {
@@ -1283,15 +2571,15 @@ impl<'a, 'b, const DEBUG: bool> InstructionVisitor for Visitor<'a, 'b, DEBUG> {
     }
 
     fn store_u8(&mut self, src: RawReg, offset: u32) -> Self::ReturnTy {
-        self.store::<u8>(src, None, offset)
+        emit!(self, store_u8(self.program_counter, src, offset));
     }
 
     fn store_u16(&mut self, src: RawReg, offset: u32) -> Self::ReturnTy {
-        self.store::<u16>(src, None, offset)
+        emit!(self, store_u16(self.program_counter, src, offset));
     }
 
     fn store_u32(&mut self, src: RawReg, offset: u32) -> Self::ReturnTy {
-        self.store::<u32>(src, None, offset)
+        emit!(self, store_u32(self.program_counter, src, offset));
     }
 
     fn store_u64(&mut self, _src: RawReg, _offset: u32) -> Self::ReturnTy {
@@ -1299,23 +2587,23 @@ impl<'a, 'b, const DEBUG: bool> InstructionVisitor for Visitor<'a, 'b, DEBUG> {
     }
 
     fn load_u8(&mut self, dst: RawReg, offset: u32) -> Self::ReturnTy {
-        self.load::<u8>(dst, None, offset)
+        emit!(self, load_u8(self.program_counter, dst, offset));
     }
 
     fn load_i8(&mut self, dst: RawReg, offset: u32) -> Self::ReturnTy {
-        self.load::<i8>(dst, None, offset)
+        emit!(self, load_i8(self.program_counter, dst, offset));
     }
 
     fn load_u16(&mut self, dst: RawReg, offset: u32) -> Self::ReturnTy {
-        self.load::<u16>(dst, None, offset)
+        emit!(self, load_u16(self.program_counter, dst, offset));
     }
 
     fn load_i16(&mut self, dst: RawReg, offset: u32) -> Self::ReturnTy {
-        self.load::<i16>(dst, None, offset)
+        emit!(self, load_i16(self.program_counter, dst, offset));
     }
 
     fn load_u32(&mut self, dst: RawReg, offset: u32) -> Self::ReturnTy {
-        self.load::<u32>(dst, None, offset)
+        emit!(self, load_u32(self.program_counter, dst, offset));
     }
 
     fn load_i32(&mut self, _dst: RawReg, _offset: u32) -> Self::ReturnTy {
@@ -1327,23 +2615,23 @@ impl<'a, 'b, const DEBUG: bool> InstructionVisitor for Visitor<'a, 'b, DEBUG> {
     }
 
     fn load_indirect_u8(&mut self, dst: RawReg, base: RawReg, offset: u32) -> Self::ReturnTy {
-        self.load::<u8>(dst, Some(base), offset)
+        emit!(self, load_indirect_u8(self.program_counter, dst, base, offset));
     }
 
     fn load_indirect_i8(&mut self, dst: RawReg, base: RawReg, offset: u32) -> Self::ReturnTy {
-        self.load::<i8>(dst, Some(base), offset)
+        emit!(self, load_indirect_i8(self.program_counter, dst, base, offset));
     }
 
     fn load_indirect_u16(&mut self, dst: RawReg, base: RawReg, offset: u32) -> Self::ReturnTy {
-        self.load::<u16>(dst, Some(base), offset)
+        emit!(self, load_indirect_u16(self.program_counter, dst, base, offset));
     }
 
     fn load_indirect_i16(&mut self, dst: RawReg, base: RawReg, offset: u32) -> Self::ReturnTy {
-        self.load::<i16>(dst, Some(base), offset)
+        emit!(self, load_indirect_i16(self.program_counter, dst, base, offset));
     }
 
     fn load_indirect_u32(&mut self, dst: RawReg, base: RawReg, offset: u32) -> Self::ReturnTy {
-        self.load::<u32>(dst, Some(base), offset)
+        emit!(self, load_indirect_u32(self.program_counter, dst, base, offset));
     }
 
     fn load_indirect_i32(&mut self, _dst: RawReg, _base: RawReg, _offset: u32) -> Self::ReturnTy {
@@ -1355,88 +2643,83 @@ impl<'a, 'b, const DEBUG: bool> InstructionVisitor for Visitor<'a, 'b, DEBUG> {
     }
 
     fn branch_less_unsigned(&mut self, s1: RawReg, s2: RawReg, i: u32) -> Self::ReturnTy {
-        self.branch(s1, s2, i, |s1, s2| s1 < s2)
+        emit_branch!(self, unresolved_branch_less_unsigned, s1, s2, i);
     }
 
     fn branch_less_unsigned_imm(&mut self, s1: RawReg, s2: u32, i: u32) -> Self::ReturnTy {
-        self.branch(s1, s2, i, |s1, s2| s1 < s2)
+        emit_branch!(self, unresolved_branch_less_unsigned_imm, s1, s2, i);
     }
 
     fn branch_less_signed(&mut self, s1: RawReg, s2: RawReg, i: u32) -> Self::ReturnTy {
-        self.branch(s1, s2, i, |s1, s2| (s1 as i32) < (s2 as i32))
+        emit_branch!(self, unresolved_branch_less_signed, s1, s2, i);
     }
 
     fn branch_less_signed_imm(&mut self, s1: RawReg, s2: u32, i: u32) -> Self::ReturnTy {
-        self.branch(s1, s2, i, |s1, s2| (s1 as i32) < (s2 as i32))
+        emit_branch!(self, unresolved_branch_less_signed_imm, s1, s2, i);
     }
 
     fn branch_eq(&mut self, s1: RawReg, s2: RawReg, i: u32) -> Self::ReturnTy {
-        self.branch(s1, s2, i, |s1, s2| s1 == s2)
+        emit_branch!(self, unresolved_branch_eq, s1, s2, i);
     }
 
     fn branch_eq_imm(&mut self, s1: RawReg, s2: u32, i: u32) -> Self::ReturnTy {
-        self.branch(s1, s2, i, |s1, s2| s1 == s2)
+        emit_branch!(self, unresolved_branch_eq_imm, s1, s2, i);
     }
 
     fn branch_not_eq(&mut self, s1: RawReg, s2: RawReg, i: u32) -> Self::ReturnTy {
-        self.branch(s1, s2, i, |s1, s2| s1 != s2)
+        emit_branch!(self, unresolved_branch_not_eq, s1, s2, i);
     }
 
     fn branch_not_eq_imm(&mut self, s1: RawReg, s2: u32, i: u32) -> Self::ReturnTy {
-        self.branch(s1, s2, i, |s1, s2| s1 != s2)
+        emit_branch!(self, unresolved_branch_not_eq_imm, s1, s2, i);
     }
 
     fn branch_greater_or_equal_unsigned(&mut self, s1: RawReg, s2: RawReg, i: u32) -> Self::ReturnTy {
-        self.branch(s1, s2, i, |s1, s2| s1 >= s2)
+        emit_branch!(self, unresolved_branch_greater_or_equal_unsigned, s1, s2, i);
     }
 
     fn branch_greater_or_equal_unsigned_imm(&mut self, s1: RawReg, s2: u32, i: u32) -> Self::ReturnTy {
-        self.branch(s1, s2, i, |s1, s2| s1 >= s2)
+        emit_branch!(self, unresolved_branch_greater_or_equal_unsigned_imm, s1, s2, i);
     }
 
     fn branch_greater_or_equal_signed(&mut self, s1: RawReg, s2: RawReg, i: u32) -> Self::ReturnTy {
-        self.branch(s1, s2, i, |s1, s2| (s1 as i32) >= (s2 as i32))
+        emit_branch!(self, unresolved_branch_greater_or_equal_signed, s1, s2, i);
     }
 
     fn branch_greater_or_equal_signed_imm(&mut self, s1: RawReg, s2: u32, i: u32) -> Self::ReturnTy {
-        self.branch(s1, s2, i, |s1, s2| (s1 as i32) >= (s2 as i32))
+        emit_branch!(self, unresolved_branch_greater_or_equal_signed_imm, s1, s2, i);
     }
 
     fn branch_less_or_equal_unsigned_imm(&mut self, s1: RawReg, s2: u32, i: u32) -> Self::ReturnTy {
-        self.branch(s1, s2, i, |s1, s2| s1 <= s2)
+        emit_branch!(self, unresolved_branch_less_or_equal_unsigned_imm, s1, s2, i);
     }
 
     fn branch_less_or_equal_signed_imm(&mut self, s1: RawReg, s2: u32, i: u32) -> Self::ReturnTy {
-        self.branch(s1, s2, i, |s1, s2| (s1 as i32) <= (s2 as i32))
+        emit_branch!(self, unresolved_branch_less_or_equal_signed_imm, s1, s2, i);
     }
 
     fn branch_greater_unsigned_imm(&mut self, s1: RawReg, s2: u32, i: u32) -> Self::ReturnTy {
-        self.branch(s1, s2, i, |s1, s2| s1 > s2)
+        emit_branch!(self, unresolved_branch_greater_unsigned_imm, s1, s2, i);
     }
 
     fn branch_greater_signed_imm(&mut self, s1: RawReg, s2: u32, i: u32) -> Self::ReturnTy {
-        self.branch(s1, s2, i, |s1, s2| (s1 as i32) > (s2 as i32))
+        emit_branch!(self, unresolved_branch_greater_signed_imm, s1, s2, i);
     }
 
     fn jump(&mut self, target: u32) -> Self::ReturnTy {
-        if DEBUG {
-            log::trace!("Jump to: {target}");
-        }
-
-        self.inner.instruction_offset = target;
-        self.inner.on_start_new_basic_block::<DEBUG>()
+        emit!(self, unresolved_jump(self.program_counter, ProgramCounter(target)));
     }
 
     fn jump_indirect(&mut self, base: RawReg, offset: u32) -> Self::ReturnTy {
-        self.jump_indirect_impl(None, base, offset)
+        emit!(self, jump_indirect(self.program_counter, base, offset));
     }
 
-    fn load_imm_and_jump(&mut self, ra: RawReg, value: u32, target: u32) -> Self::ReturnTy {
-        self.load_imm(ra, value)?;
-        self.jump(target)
+    fn load_imm_and_jump(&mut self, dst: RawReg, imm: u32, target: u32) -> Self::ReturnTy {
+        emit!(self, load_imm(dst, imm));
+        emit!(self, unresolved_jump(self.program_counter, ProgramCounter(target)));
     }
 
     fn load_imm_and_jump_indirect(&mut self, ra: RawReg, base: RawReg, value: u32, offset: u32) -> Self::ReturnTy {
-        self.jump_indirect_impl(Some((ra, value)), base, offset)
+        emit!(self, load_imm_and_jump_indirect(self.program_counter, ra, base, value, offset));
     }
 }

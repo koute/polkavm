@@ -1,6 +1,6 @@
 #![allow(non_camel_case_types)]
 
-use crate::assembler::{FixupKind, InstBuf, Instruction, Label};
+use crate::misc::{FixupKind, InstBuf, Instruction, Label};
 
 /// The REX prefix.
 const REX: u8 = 0x40;
@@ -828,6 +828,7 @@ macro_rules! impl_inst {
                     }
                 }
 
+                #[cfg(feature = "alloc")]
                 #[cfg(test)]
                 impl super::tests::GenerateTestValues for $name {
                     fn generate_test_values(mut cb: impl FnMut(Self)) {
@@ -1057,7 +1058,7 @@ pub mod addr {
 
 pub mod inst {
     use super::*;
-    use crate::assembler::InstBuf;
+    use crate::misc::InstBuf;
 
     #[inline(always)]
     const fn new_rm(op: u8, size: Size, regmem: RegMem, reg: Option<Reg>) -> Inst {
@@ -1192,6 +1193,18 @@ pub mod inst {
             Inst::with_reg_in_op(0x50, self.0).encode(),
             None,
             (fmt.write_fmt(core::format_args!("push {}", self.0))),
+
+        push_imm(i32) =>
+            {
+                let value = self.0;
+                if value <= i32::from(i8::MAX) && value >= i32::from(i8::MIN) {
+                    Inst::new(0x6a).imm8(value as u8).rex_64b()
+                } else {
+                    Inst::new(0x68).imm32(value as u32).rex_64b()
+                }.encode()
+            },
+            None,
+            (fmt.write_fmt(core::format_args!("push 0x{:x}", i64::from(self.0)))),
 
         // https://www.felixcloutier.com/x86/pop
         pop(Reg) =>
@@ -1729,6 +1742,7 @@ impl Condition {
     }
 }
 
+#[cfg(feature = "alloc")]
 #[cfg(test)]
 impl tests::GenerateTestValues for Condition {
     fn generate_test_values(cb: impl FnMut(Self)) {
@@ -1762,6 +1776,7 @@ pub enum RegSize {
     R64,
 }
 
+#[cfg(feature = "alloc")]
 #[cfg(test)]
 impl tests::GenerateTestValues for RegSize {
     fn generate_test_values(cb: impl FnMut(Self)) {
@@ -1782,6 +1797,7 @@ pub enum LoadKind {
     I32,
 }
 
+#[cfg(feature = "alloc")]
 #[cfg(test)]
 impl tests::GenerateTestValues for LoadKind {
     fn generate_test_values(cb: impl FnMut(Self)) {
@@ -1820,6 +1836,7 @@ impl From<RegSize> for Size {
     }
 }
 
+#[cfg(feature = "alloc")]
 #[cfg(test)]
 impl tests::GenerateTestValues for Size {
     fn generate_test_values(cb: impl FnMut(Self)) {
@@ -1859,6 +1876,7 @@ impl ImmKind {
     }
 }
 
+#[cfg(feature = "alloc")]
 #[cfg(test)]
 impl tests::GenerateTestValues for ImmKind {
     fn generate_test_values(mut cb: impl FnMut(Self)) {
@@ -1870,17 +1888,13 @@ impl tests::GenerateTestValues for ImmKind {
     }
 }
 
+#[cfg(feature = "alloc")]
 #[cfg(test)]
 mod tests {
-    use alloc::format;
-    use alloc::string::String;
-
-    #[cfg(test)]
     pub trait GenerateTestValues: Copy {
         fn generate_test_values(cb: impl FnMut(Self));
     }
 
-    #[cfg(test)]
     impl GenerateTestValues for super::Reg {
         fn generate_test_values(cb: impl FnMut(Self)) {
             use super::Reg::*;
@@ -1995,7 +2009,6 @@ mod tests {
         }
     }
 
-    #[cfg(test)]
     impl<T> GenerateTestValues for Option<T>
     where
         T: GenerateTestValues,
@@ -2006,21 +2019,18 @@ mod tests {
         }
     }
 
-    #[cfg(test)]
     impl GenerateTestValues for u8 {
         fn generate_test_values(cb: impl FnMut(Self)) {
             [0, 1, 31, 0x7f, 0x80, 0x81, 0xfe, 0xff].into_iter().for_each(cb);
         }
     }
 
-    #[cfg(test)]
     impl GenerateTestValues for i8 {
         fn generate_test_values(mut cb: impl FnMut(Self)) {
             u8::generate_test_values(|value| cb(value as i8))
         }
     }
 
-    #[cfg(test)]
     impl GenerateTestValues for u16 {
         fn generate_test_values(cb: impl FnMut(Self)) {
             [
@@ -2031,14 +2041,12 @@ mod tests {
         }
     }
 
-    #[cfg(test)]
     impl GenerateTestValues for i16 {
         fn generate_test_values(mut cb: impl FnMut(Self)) {
             u16::generate_test_values(|value| cb(value as i16))
         }
     }
 
-    #[cfg(test)]
     impl GenerateTestValues for u32 {
         fn generate_test_values(cb: impl FnMut(Self)) {
             [
@@ -2050,14 +2058,12 @@ mod tests {
         }
     }
 
-    #[cfg(test)]
     impl GenerateTestValues for i32 {
         fn generate_test_values(mut cb: impl FnMut(Self)) {
             u32::generate_test_values(|value| cb(value as i32))
         }
     }
 
-    #[cfg(test)]
     impl GenerateTestValues for u64 {
         fn generate_test_values(cb: impl FnMut(Self)) {
             [
@@ -2093,6 +2099,9 @@ mod tests {
             .for_each(cb);
         }
     }
+
+    use alloc::format;
+    use alloc::string::String;
 
     fn disassemble(code: &[u8]) -> String {
         let mut output = String::new();
@@ -2246,6 +2255,7 @@ mod tests {
         or,
         pop,
         push,
+        push_imm,
         ret,
         ror_imm,
         sar_cl,

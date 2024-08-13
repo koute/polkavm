@@ -7,4 +7,4 @@ edition = "2021"
 publish = false
 
 [dependencies]
-bindgen = "0.66.1"
+bindgen = "0.69.4"

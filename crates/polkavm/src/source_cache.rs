@@ -10,6 +10,10 @@ pub struct SourceCache {
 }
 
 impl SourceCache {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
     #[allow(clippy::unused_self)]
     fn home_path_uncached(&self) -> Option<PathBuf> {
         let buffer = std::env::var("HOME").ok()?;

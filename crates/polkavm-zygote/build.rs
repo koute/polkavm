@@ -27,6 +27,7 @@ fn generate_linker_script() -> String {
             .vmctx : {{ KEEP(*(.vmctx)) }} : vmctx
 
             .address_table (INFO) : {{ KEEP(*(.address_table)) }}
+            .ext_table (INFO) : {{ KEEP(*(.ext_table)) }}
 
             /* Strip away junk we don't need. */
             /DISCARD/ : {{ *(.comment) *(.eh_frame) *(.eh_frame_hdr) }}

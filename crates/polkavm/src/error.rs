@@ -49,6 +49,16 @@ impl From<ProgramParseError> for Error {
     }
 }
 
+if_compiler_is_supported! {
+    #[cfg(target_os = "linux")]
+    impl From<polkavm_linux_raw::Error> for Error {
+        #[cold]
+        fn from(error: polkavm_linux_raw::Error) -> Self {
+            Self(ErrorKind::Owned(error.to_string()))
+        }
+    }
+}
+
 impl Error {
     #[cold]
     pub(crate) fn from_display(message: impl core::fmt::Display) -> Self {
@@ -61,26 +71,10 @@ impl Error {
     }
 
     #[cold]
-    pub(crate) fn from_execution_error<E>(error: ExecutionError<E>) -> Self
-    where
-        E: core::fmt::Display,
-    {
-        match error {
-            ExecutionError::Error(error) => Error::from_display(error),
-            ExecutionError::Trap(_) => Error::from_display("unexpected trap"),
-            ExecutionError::OutOfGas => Error::from_display("unexpected out-of-gas"),
-        }
-    }
-
-    #[cold]
     pub(crate) fn context(self, message: impl core::fmt::Display) -> Self {
         let string = match self.0 {
-            ErrorKind::Owned(mut buffer) => {
-                use core::fmt::Write;
-                let _ = write!(&mut buffer, ": {}", message);
-                buffer
-            }
-            error => format!("{}: {}", Error(error), message),
+            ErrorKind::Owned(buffer) => format!("{}: {}", message, buffer),
+            error => format!("{}: {}", message, Error(error)),
         };
 
         Error(ErrorKind::Owned(string))
@@ -101,5 +95,3 @@ impl core::fmt::Display for Error {
 
 #[cfg(feature = "std")]
 impl std::error::Error for Error {}
-
-pub type ExecutionError<T = Error> = polkavm_common::error::ExecutionError<T>;

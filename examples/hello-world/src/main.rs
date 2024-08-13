@@ -1,4 +1,4 @@
-use polkavm::{CallArgs, Config, Engine, Linker, Module, ProgramBlob, Reg, StateArgs};
+use polkavm::{Config, Engine, InterruptKind, Linker, Module, ProgramBlob, Reg};
 
 fn main() {
     env_logger::init();
@@ -9,31 +9,54 @@ fn main() {
     let config = Config::from_env().unwrap();
     let engine = Engine::new(&config).unwrap();
     let module = Module::from_blob(&engine, &Default::default(), blob).unwrap();
-    let mut linker = Linker::new(&engine);
+
+    // High-level API.
+    let mut linker: Linker = Linker::new();
 
     // Define a host function.
-    linker.func_wrap("get_third_number", || -> u32 { 100 }).unwrap();
+    linker.define_typed("get_third_number", || -> u32 { 100 }).unwrap();
 
     // Link the host functions with the module.
     let instance_pre = linker.instantiate_pre(&module).unwrap();
 
     // Instantiate the module.
-    let instance = instance_pre.instantiate().unwrap();
+    let mut instance = instance_pre.instantiate().unwrap();
 
     // Grab the function and call it.
-    println!("Calling into the guest program (simple):");
-    let result = instance.call_typed::<(u32, u32), u32>(&mut (), "add_numbers", (1, 10)).unwrap();
+    println!("Calling into the guest program (high level):");
+    let result = instance
+        .call_typed_and_get_result::<u32, (u32, u32)>(&mut (), "add_numbers", (1, 10))
+        .unwrap();
     println!("  1 + 10 + 100 = {}", result);
 
-    println!("Calling into the guest program (full):");
-    let export_index = instance.module().lookup_export("add_numbers").unwrap();
+    // Low-level API.
+    let entry_point = module.exports().find(|export| export == "add_numbers").unwrap().program_counter();
+    let mut instance = module.instantiate().unwrap();
+    instance.set_next_program_counter(entry_point);
+    instance.set_reg(Reg::A0, 1);
+    instance.set_reg(Reg::A1, 10);
+    instance.set_reg(Reg::RA, polkavm::RETURN_TO_HOST);
+    instance.set_reg(Reg::SP, module.default_sp());
 
-    #[allow(clippy::let_unit_value)]
-    let mut user_data = ();
-    let mut call_args = CallArgs::new(&mut user_data, export_index);
-    call_args.args_untyped(&[1, 10]);
+    println!("Calling into the guest program (low level):");
+    loop {
+        let interrupt_kind = instance.run().unwrap();
+        match interrupt_kind {
+            InterruptKind::Finished => break,
+            InterruptKind::Ecalli(num) => {
+                let Some(name) = module.imports().get(num) else {
+                    panic!("unexpected external call: {num}");
+                };
 
-    instance.call(StateArgs::new(), call_args).unwrap();
-    let return_value = instance.get_reg(Reg::A0);
-    println!("  1 + 10 + 100 = {}", return_value);
+                if name == "get_third_number" {
+                    instance.set_reg(Reg::A0, 100);
+                } else {
+                    panic!("unexpected external call: {name} ({num})")
+                }
+            }
+            _ => panic!("unexpected interruption: {interrupt_kind:?}"),
+        }
+    }
+
+    println!("  1 + 10 + 100 = {}", instance.reg(Reg::A0));
 }

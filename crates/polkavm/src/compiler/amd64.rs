@@ -6,8 +6,9 @@ use polkavm_assembler::amd64::RegIndex::*;
 use polkavm_assembler::amd64::{Condition, LoadKind, MemOp, RegSize, Size};
 use polkavm_assembler::{Label, NonZero, ReservedAssembler, U1, U2, U3, U4};
 
-use polkavm_common::program::{InstructionVisitor, RawReg, Reg};
+use polkavm_common::program::{RawReg, Reg};
 use polkavm_common::zygote::VM_ADDR_VMCTX;
+use polkavm_common::INVALID_PROGRAM_COUNTER;
 
 use crate::compiler::{ArchVisitor, SandboxKind};
 use crate::config::GasMeteringKind;
@@ -22,25 +23,10 @@ const GENERIC_SANDBOX_MEMORY_REG: NativeReg = r15;
 /// The register used for the linux sandbox to hold the address of the VM context.
 const LINUX_SANDBOX_VMCTX_REG: NativeReg = r15;
 
-const fn conv_reg_const(reg: Reg) -> NativeReg {
-    // NOTE: This is sorted roughly in the order of which registers are more commonly used.
-    // We try to assign registers which result in more compact code to the more common RISC-V registers.
-    match reg {
-        Reg::A0 => rdi,
-        Reg::A1 => rsi,
-        Reg::SP => rax,
-        Reg::RA => rbx,
-        Reg::A2 => rdx,
-        Reg::A3 => rbp,
-        Reg::S0 => r8,
-        Reg::S1 => r9,
-        Reg::A4 => r10,
-        Reg::A5 => r11,
-        Reg::T0 => r13,
-        Reg::T1 => r14,
-        Reg::T2 => r12,
-    }
-}
+use polkavm_common::regmap::to_native_reg as conv_reg_const;
+
+polkavm_common::static_assert!(polkavm_common::regmap::to_guest_reg(TMP_REG).is_none());
+polkavm_common::static_assert!(polkavm_common::regmap::to_guest_reg(LINUX_SANDBOX_VMCTX_REG).is_none());
 
 static REG_MAP: [NativeReg; 16] = {
     let mut output = [conv_reg_const(Reg::T2); 16];
@@ -392,16 +378,10 @@ where
     }
 
     #[cfg_attr(not(debug_assertions), inline(always))]
-    fn branch_to_label(&mut self, condition: Condition, label: Label) {
-        let asm = self.asm.reserve::<U1>();
-        branch_to_label(asm, condition, label).assert_reserved_exactly_as_needed();
-    }
-
-    #[cfg_attr(not(debug_assertions), inline(always))]
     fn branch(&mut self, s1: RawReg, s2: impl Into<RegImm>, target: u32, condition: Condition) {
         let reg_size = self.reg_size();
         let s1 = conv_reg(s1);
-        let label = self.get_or_forward_declare_label(target).unwrap_or(self.trap_label);
+        let label = self.get_or_forward_declare_label(target).unwrap_or(self.invalid_jump_label);
 
         let asm = self.asm.reserve::<U2>();
         let asm = match s2.into() {
@@ -535,8 +515,16 @@ where
         match S::KIND {
             SandboxKind::Linux => reg_indirect(RegSize::R64, LINUX_SANDBOX_VMCTX_REG + offset as i32),
             SandboxKind::Generic => {
-                let offset = crate::sandbox::generic::GUEST_MEMORY_TO_VMCTX_OFFSET as i32 + offset as i32;
-                reg_indirect(RegSize::R64, GENERIC_SANDBOX_MEMORY_REG + offset)
+                #[cfg(feature = "generic-sandbox")]
+                {
+                    let offset = crate::sandbox::generic::GUEST_MEMORY_TO_VMCTX_OFFSET as i32 + offset as i32;
+                    reg_indirect(RegSize::R64, GENERIC_SANDBOX_MEMORY_REG + offset)
+                }
+
+                #[cfg(not(feature = "generic-sandbox"))]
+                {
+                    unreachable!();
+                }
             }
         }
     }
@@ -551,56 +539,60 @@ where
     }
 
     fn save_registers_to_vmctx(&mut self) {
-        let regs_base = self.load_vmctx_field_address(S::vmctx_regs_offset());
         for (nth, reg) in Reg::ALL.iter().copied().enumerate() {
             self.push(store(
                 Size::U32,
-                reg_indirect(RegSize::R64, regs_base + nth as i32 * 4),
+                Self::vmctx_field(S::offset_table().regs + nth * 4),
                 conv_reg(reg.into()),
             ));
         }
     }
 
     fn restore_registers_from_vmctx(&mut self) {
-        let regs_base = self.load_vmctx_field_address(S::vmctx_regs_offset());
         for (nth, reg) in Reg::ALL.iter().copied().enumerate() {
             self.push(load(
                 LoadKind::U32,
                 conv_reg(reg.into()),
-                reg_indirect(RegSize::R64, regs_base + nth as i32 * 4),
+                Self::vmctx_field(S::offset_table().regs + nth * 4),
             ));
         }
     }
 
-    pub(crate) fn emit_export_trampolines(&mut self) {
-        for export in self.exports {
-            log::trace!("Emitting trampoline: export: {}", export.symbol());
+    fn save_return_address_to_vmctx(&mut self) {
+        self.push(load(LoadKind::U64, TMP_REG, reg_indirect(RegSize::R64, rsp)));
+        self.push(store(
+            Size::U64,
+            Self::vmctx_field(S::offset_table().next_native_program_counter),
+            TMP_REG,
+        ));
+    }
 
-            let trampoline_label = self.asm.create_label();
-            self.export_to_label.insert(export.target_code_offset(), trampoline_label);
+    pub(crate) fn emit_sysenter(&mut self) -> Label {
+        log::trace!("Emitting trampoline: sysenter");
+        let label = self.asm.create_label();
 
-            if matches!(S::KIND, SandboxKind::Linux) {
-                self.push(mov_imm64(LINUX_SANDBOX_VMCTX_REG, VM_ADDR_VMCTX));
-            }
-            self.restore_registers_from_vmctx();
-
-            if self.gas_metering.is_some() {
-                // Did we enter again after running out of gas? If so don't even bother running anything, just immediately trap.
-                self.push(cmp((Self::vmctx_field(S::vmctx_gas_offset()), imm64(0))));
-                self.branch_to_label(Condition::Sign, self.trap_label);
-            }
-
-            let target_label = self
-                .get_or_forward_declare_label(export.target_code_offset())
-                .unwrap_or(self.trap_label);
-            self.jump_to_label(target_label);
+        if matches!(S::KIND, SandboxKind::Linux) {
+            self.push(mov_imm64(LINUX_SANDBOX_VMCTX_REG, VM_ADDR_VMCTX));
         }
+        self.restore_registers_from_vmctx();
+        self.push(jmp(Self::vmctx_field(S::offset_table().next_native_program_counter)));
+
+        label
     }
 
     pub(crate) fn emit_sysreturn(&mut self) -> Label {
         log::trace!("Emitting trampoline: sysreturn");
         let label = self.asm.create_label();
 
+        self.push(mov_imm(
+            Self::vmctx_field(S::offset_table().program_counter),
+            imm32(INVALID_PROGRAM_COUNTER.0),
+        ));
+        self.push(mov_imm(
+            Self::vmctx_field(S::offset_table().next_program_counter),
+            imm32(INVALID_PROGRAM_COUNTER.0),
+        ));
+        self.push(mov_imm(Self::vmctx_field(S::offset_table().next_native_program_counter), imm64(0)));
         self.save_registers_to_vmctx();
         self.push(mov_imm64(TMP_REG, S::address_table().syscall_return));
         self.push(jmp(TMP_REG));
@@ -613,28 +605,21 @@ where
         let label = self.ecall_label;
         self.define_label(label);
 
-        self.push(push(TMP_REG)); // Save the ecall number.
+        self.save_return_address_to_vmctx();
         self.save_registers_to_vmctx();
         self.push(mov_imm64(TMP_REG, S::address_table().syscall_hostcall));
-        self.push(pop(rdi)); // Pop the ecall number as an argument.
-        self.push(call(TMP_REG));
-        self.restore_registers_from_vmctx();
-        self.push(ret());
+        self.push(jmp(TMP_REG));
     }
 
-    pub(crate) fn emit_trace_trampoline(&mut self) {
-        log::trace!("Emitting trampoline: trace");
-        let label = self.trace_label;
+    pub(crate) fn emit_step_trampoline(&mut self) {
+        log::trace!("Emitting trampoline: step");
+        let label = self.step_label;
         self.define_label(label);
 
-        self.push(push(TMP_REG)); // Save the instruction number.
+        self.save_return_address_to_vmctx();
         self.save_registers_to_vmctx();
-        self.push(mov_imm64(TMP_REG, S::address_table().syscall_trace));
-        self.push(pop(rdi)); // Pop the instruction number as an argument.
-        self.push(load(LoadKind::U64, rsi, reg_indirect(RegSize::R64, rsp - 8))); // Grab the return address.
-        self.push(call(TMP_REG));
-        self.restore_registers_from_vmctx();
-        self.push(ret());
+        self.push(mov_imm64(TMP_REG, S::address_table().syscall_step));
+        self.push(jmp(TMP_REG));
     }
 
     pub(crate) fn emit_trap_trampoline(&mut self) {
@@ -643,6 +628,11 @@ where
         self.define_label(label);
 
         self.save_registers_to_vmctx();
+        self.push(mov_imm(
+            Self::vmctx_field(S::offset_table().next_program_counter),
+            imm32(INVALID_PROGRAM_COUNTER.0),
+        ));
+        self.push(mov_imm(Self::vmctx_field(S::offset_table().next_native_program_counter), imm64(0)));
         self.push(mov_imm64(TMP_REG, S::address_table().syscall_trap));
         self.push(jmp(TMP_REG));
     }
@@ -663,23 +653,46 @@ where
         self.push(ret());
     }
 
-    #[inline(never)]
-    #[cold]
     pub(crate) fn trace_execution(&mut self, code_offset: u32) {
-        self.push(mov_imm(TMP_REG, imm32(code_offset)));
-        self.call_to_label(self.trace_label);
+        let step_label = self.step_label;
+        let asm = self.asm.reserve::<U3>();
+        let asm = asm.push(mov_imm(Self::vmctx_field(S::offset_table().program_counter), imm32(code_offset)));
+        let asm = asm.push(mov_imm(
+            Self::vmctx_field(S::offset_table().next_program_counter),
+            imm32(code_offset),
+        ));
+        let asm = asm.push(call_label32(step_label));
+        asm.assert_reserved_exactly_as_needed();
     }
 
+    pub const GAS_METERING_TRAP_OFFSET: u64 = 9;
+    pub const GAS_COST_OFFSET: usize = 3;
+
     pub(crate) fn emit_gas_metering_stub(&mut self, kind: GasMeteringKind) {
-        self.push(sub((Self::vmctx_field(S::vmctx_gas_offset()), imm64(i32::MAX))));
+        let origin = self.asm.len();
+
+        self.push(sub((Self::vmctx_field(S::offset_table().gas), imm64(i32::MAX))));
+        debug_assert_eq!(Self::GAS_COST_OFFSET, self.asm.len() - origin - 4); // Offset to bring us from the start of the stub to the gas cost.
+
         if matches!(kind, GasMeteringKind::Sync) {
-            self.push(cmp((Self::vmctx_field(S::vmctx_gas_offset()), imm64(0))));
-            self.branch_to_label(Condition::Sign, self.trap_label);
+            // 49833F00             cmp qword [r15],0
+            self.push(cmp((Self::vmctx_field(S::offset_table().gas), imm64(0))));
+
+            // This will jump two bytes backwards to "3f00", and 3f corresponds to the AAS instruction
+            // which is invalid in 64-bit, so it will trap with an SIGILL.
+            //
+            // Note that this is technically a forward-compatibility hazard as this opcode could arguably
+            // be reused for something in the future.
+            assert_eq!(Self::vmctx_field(S::offset_table().gas), reg_indirect(RegSize::R64, r15 + 0)); // Sanity check.
+            debug_assert!(self.asm.code_mut().ends_with(&[0x49, 0x83, 0x3F, 0x00]));
+            // Offset to bring us from where the trap will trigger to the beginning of the stub.
+            debug_assert_eq!(Self::GAS_METERING_TRAP_OFFSET, (self.asm.len() - origin - 2) as u64);
+            self.asm.push_raw(&[0x78, 0xfc]);
         }
     }
 
     pub(crate) fn emit_weight(&mut self, offset: usize, cost: u32) {
-        let length = sub((Self::vmctx_field(S::vmctx_gas_offset()), imm64(i32::MAX))).len();
+        let length = sub((Self::vmctx_field(S::offset_table().gas), imm64(i32::MAX))).len();
         let xs = cost.to_le_bytes();
         self.asm.code_mut()[offset + length - 4..offset + length].copy_from_slice(&xs);
     }
@@ -732,146 +745,152 @@ where
             }
         }
     }
-}
 
-impl<'r, 'a, S> InstructionVisitor for ArchVisitor<'r, 'a, S>
-where
-    S: Sandbox,
-{
-    type ReturnTy = ();
-
-    fn load_i32(&mut self, _: RawReg, _: u32) -> Self::ReturnTy {
+    fn load_i32(&mut self, _: RawReg, _: u32) {
         todo!()
     }
-    fn load_u64(&mut self, _: RawReg, _: u32) -> Self::ReturnTy {
+    fn load_u64(&mut self, _: RawReg, _: u32) {
         todo!()
     }
-    fn store_u64(&mut self, _: RawReg, _: u32) -> Self::ReturnTy {
+    fn store_u64(&mut self, _: RawReg, _: u32) {
         todo!()
     }
-    fn store_imm_indirect_u64(&mut self, _: RawReg, _: u32, _: u32) -> Self::ReturnTy {
+    fn store_imm_indirect_u64(&mut self, _: RawReg, _: u32, _: u32) {
         todo!()
     }
-    fn store_indirect_u64(&mut self, _: RawReg, _: RawReg, _: u32) -> Self::ReturnTy {
+    fn store_indirect_u64(&mut self, _: RawReg, _: RawReg, _: u32) {
         todo!()
     }
-    fn load_indirect_i32(&mut self, _: RawReg, _: RawReg, _: u32) -> Self::ReturnTy {
+    fn load_indirect_i32(&mut self, _: RawReg, _: RawReg, _: u32) {
         todo!()
     }
-    fn load_indirect_u64(&mut self, _: RawReg, _: RawReg, _: u32) -> Self::ReturnTy {
+    fn load_indirect_u64(&mut self, _: RawReg, _: RawReg, _: u32) {
         todo!()
     }
-    fn store_imm_u64(&mut self, _: u32, _: u32) -> Self::ReturnTy {
+    fn store_imm_u64(&mut self, _: u32, _: u32) {
         todo!()
     }
-    fn addw_imm(&mut self, _: RawReg, _: RawReg, _: u32) -> <Self as InstructionVisitor>::ReturnTy {
+    fn addw_imm(&mut self, _: RawReg, _: RawReg, _: u32) {
         todo!()
     }
-    fn andw_imm(&mut self, _: RawReg, _: RawReg, _: u32) -> <Self as InstructionVisitor>::ReturnTy {
+    fn andw_imm(&mut self, _: RawReg, _: RawReg, _: u32) {
         todo!()
     }
-    fn xorw_imm(&mut self, _: RawReg, _: RawReg, _: u32) -> <Self as InstructionVisitor>::ReturnTy {
+    fn xorw_imm(&mut self, _: RawReg, _: RawReg, _: u32) {
         todo!()
     }
-    fn orw_imm(&mut self, _: RawReg, _: RawReg, _: u32) -> <Self as InstructionVisitor>::ReturnTy {
+    fn orw_imm(&mut self, _: RawReg, _: RawReg, _: u32) {
         todo!()
     }
-    fn mulw_imm(&mut self, _: RawReg, _: RawReg, _: u32) -> <Self as InstructionVisitor>::ReturnTy {
+    fn mulw_imm(&mut self, _: RawReg, _: RawReg, _: u32) {
         todo!()
     }
-    fn set_less_than_unsigned_w_imm(&mut self, _: RawReg, _: RawReg, _: u32) -> <Self as InstructionVisitor>::ReturnTy {
+    fn set_less_than_unsigned_w_imm(&mut self, _: RawReg, _: RawReg, _: u32) {
         todo!()
     }
-    fn set_less_than_signed_w_imm(&mut self, _: RawReg, _: RawReg, _: u32) -> <Self as InstructionVisitor>::ReturnTy {
+    fn set_less_than_signed_w_imm(&mut self, _: RawReg, _: RawReg, _: u32) {
         todo!()
     }
-    fn shift_logical_left_w_imm(&mut self, _: RawReg, _: RawReg, _: u32) -> <Self as InstructionVisitor>::ReturnTy {
+    fn shift_logical_left_w_imm(&mut self, _: RawReg, _: RawReg, _: u32) {
         todo!()
     }
-    fn shift_logical_right_w_imm(&mut self, _: RawReg, _: RawReg, _: u32) -> <Self as InstructionVisitor>::ReturnTy {
+    fn shift_logical_right_w_imm(&mut self, _: RawReg, _: RawReg, _: u32) {
         todo!()
     }
-    fn shift_arithmetic_right_w_imm(&mut self, _: RawReg, _: RawReg, _: u32) -> <Self as InstructionVisitor>::ReturnTy {
+    fn shift_arithmetic_right_w_imm(&mut self, _: RawReg, _: RawReg, _: u32) {
         todo!()
     }
-    fn set_greater_than_unsigned_w_imm(&mut self, _: RawReg, _: RawReg, _: u32) -> <Self as InstructionVisitor>::ReturnTy {
+    fn set_greater_than_unsigned_w_imm(&mut self, _: RawReg, _: RawReg, _: u32) {
         todo!()
     }
-    fn set_greater_than_signed_w_imm(&mut self, _: RawReg, _: RawReg, _: u32) -> <Self as InstructionVisitor>::ReturnTy {
+    fn set_greater_than_signed_w_imm(&mut self, _: RawReg, _: RawReg, _: u32) {
         todo!()
     }
-    fn shift_logical_right_w_imm_alt(&mut self, _: RawReg, _: RawReg, _: u32) -> <Self as InstructionVisitor>::ReturnTy {
+    fn shift_logical_right_w_imm_alt(&mut self, _: RawReg, _: RawReg, _: u32) {
         todo!()
     }
-    fn shift_arithmetic_right_w_imm_alt(&mut self, _: RawReg, _: RawReg, _: u32) -> <Self as InstructionVisitor>::ReturnTy {
+    fn shift_arithmetic_right_w_imm_alt(&mut self, _: RawReg, _: RawReg, _: u32) {
         todo!()
     }
-    fn shift_logical_left_w_imm_alt(&mut self, _: RawReg, _: RawReg, _: u32) -> <Self as InstructionVisitor>::ReturnTy {
+    fn shift_logical_left_w_imm_alt(&mut self, _: RawReg, _: RawReg, _: u32) {
         todo!()
     }
-    fn addw(&mut self, _: RawReg, _: RawReg, _: RawReg) -> <Self as InstructionVisitor>::ReturnTy {
+    fn addw(&mut self, _: RawReg, _: RawReg, _: RawReg) {
         todo!()
     }
-    fn subw(&mut self, _: RawReg, _: RawReg, _: RawReg) -> <Self as InstructionVisitor>::ReturnTy {
+    fn subw(&mut self, _: RawReg, _: RawReg, _: RawReg) {
         todo!()
     }
-    fn andw(&mut self, _: RawReg, _: RawReg, _: RawReg) -> <Self as InstructionVisitor>::ReturnTy {
+    fn andw(&mut self, _: RawReg, _: RawReg, _: RawReg) {
         todo!()
     }
-    fn xorw(&mut self, _: RawReg, _: RawReg, _: RawReg) -> <Self as InstructionVisitor>::ReturnTy {
+    fn xorw(&mut self, _: RawReg, _: RawReg, _: RawReg) {
         todo!()
     }
-    fn orw(&mut self, _: RawReg, _: RawReg, _: RawReg) -> <Self as InstructionVisitor>::ReturnTy {
+    fn orw(&mut self, _: RawReg, _: RawReg, _: RawReg) {
         todo!()
     }
-    fn mulw(&mut self, _: RawReg, _: RawReg, _: RawReg) -> <Self as InstructionVisitor>::ReturnTy {
+    fn mulw(&mut self, _: RawReg, _: RawReg, _: RawReg) {
         todo!()
     }
-    fn set_less_than_unsigned_w(&mut self, _: RawReg, _: RawReg, _: RawReg) -> <Self as InstructionVisitor>::ReturnTy {
+    fn set_less_than_unsigned_w(&mut self, _: RawReg, _: RawReg, _: RawReg) {
         todo!()
     }
-    fn set_less_than_signed_w(&mut self, _: RawReg, _: RawReg, _: RawReg) -> <Self as InstructionVisitor>::ReturnTy {
+    fn set_less_than_signed_w(&mut self, _: RawReg, _: RawReg, _: RawReg) {
         todo!()
     }
-    fn shift_logical_left_w(&mut self, _: RawReg, _: RawReg, _: RawReg) -> <Self as InstructionVisitor>::ReturnTy {
+    fn shift_logical_left_w(&mut self, _: RawReg, _: RawReg, _: RawReg) {
         todo!()
     }
-    fn shift_logical_right_w(&mut self, _: RawReg, _: RawReg, _: RawReg) -> <Self as InstructionVisitor>::ReturnTy {
+    fn shift_logical_right_w(&mut self, _: RawReg, _: RawReg, _: RawReg) {
         todo!()
     }
-    fn shift_arithmetic_right_w(&mut self, _: RawReg, _: RawReg, _: RawReg) -> <Self as InstructionVisitor>::ReturnTy {
+    fn shift_arithmetic_right_w(&mut self, _: RawReg, _: RawReg, _: RawReg) {
         todo!()
     }
-    fn div_unsigned_w(&mut self, _: RawReg, _: RawReg, _: RawReg) -> <Self as InstructionVisitor>::ReturnTy {
+    fn div_unsigned_w(&mut self, _: RawReg, _: RawReg, _: RawReg) {
         todo!()
     }
-    fn div_signed_w(&mut self, _: RawReg, _: RawReg, _: RawReg) -> <Self as InstructionVisitor>::ReturnTy {
+    fn div_signed_w(&mut self, _: RawReg, _: RawReg, _: RawReg) {
         todo!()
     }
-    fn rem_unsigned_w(&mut self, _: RawReg, _: RawReg, _: RawReg) -> <Self as InstructionVisitor>::ReturnTy {
+    fn rem_unsigned_w(&mut self, _: RawReg, _: RawReg, _: RawReg) {
         todo!()
     }
-    fn rem_signed_w(&mut self, _: RawReg, _: RawReg, _: RawReg) -> <Self as InstructionVisitor>::ReturnTy {
+    fn rem_signed_w(&mut self, _: RawReg, _: RawReg, _: RawReg) {
         todo!()
     }
 
     #[inline(always)]
-    fn trap(&mut self) -> Self::ReturnTy {
-        self.jump_to_label(self.trap_label);
+    pub fn trap(&mut self, code_offset: u32) {
+        let trap_label = self.trap_label;
+        let asm = self.asm.reserve::<U2>();
+        let asm = asm.push(mov_imm(Self::vmctx_field(S::offset_table().program_counter), imm32(code_offset)));
+        let asm = asm.push(call_label32(trap_label));
+        asm.assert_reserved_exactly_as_needed();
+    }
+
+    #[inline(always)]
+    pub fn trap_without_modifying_program_counter(&mut self) {
+        let trap_label = self.trap_label;
+        let asm = self.asm.reserve::<U1>();
+        let asm = asm.push(call_label32(trap_label));
+        asm.assert_reserved_exactly_as_needed();
     }
 
     #[inline(always)]
     #[cold]
-    fn invalid(&mut self) -> Self::ReturnTy {
+    pub fn invalid(&mut self, code_offset: u32) {
         log::debug!("Encountered invalid instruction");
-        self.trap()
+        self.trap(code_offset)
     }
 
+    #[allow(clippy::unused_self)]
     #[inline(always)]
-    fn fallthrough(&mut self) -> Self::ReturnTy {}
+    pub fn fallthrough(&mut self) {}
 
     #[inline(always)]
-    fn sbrk(&mut self, dst: RawReg, size: RawReg) -> Self::ReturnTy {
+    pub fn sbrk(&mut self, dst: RawReg, size: RawReg) {
         let label_bump_only = self.asm.forward_declare_label();
         let label_continue = self.asm.forward_declare_label();
         let sbrk_label = self.sbrk_label;
@@ -882,7 +901,7 @@ where
             self.push(mov(RegSize::R32, dst, size));
         }
 
-        let offset = S::vmctx_heap_info_offset();
+        let offset = S::offset_table().heap_info;
         let heap_info_base = self.load_vmctx_field_address(offset);
 
         // Calculate new top-of-the-heap pointer.
@@ -908,76 +927,81 @@ where
     }
 
     #[inline(always)]
-    fn ecalli(&mut self, imm: u32) -> Self::ReturnTy {
+    pub fn ecalli(&mut self, code_offset: u32, args_length: u32, imm: u32) {
         let ecall_label = self.ecall_label;
-        let asm = self.asm.reserve::<U2>();
-        let asm = asm.push(mov_imm(TMP_REG, imm32(imm)));
+        let asm = self.asm.reserve::<U4>();
+        let asm = asm.push(mov_imm(Self::vmctx_field(S::offset_table().arg), imm32(imm)));
+        let asm = asm.push(mov_imm(Self::vmctx_field(S::offset_table().program_counter), imm32(code_offset)));
+        let asm = asm.push(mov_imm(
+            Self::vmctx_field(S::offset_table().next_program_counter),
+            imm32(code_offset + args_length + 1),
+        ));
         let asm = asm.push(call_label32(ecall_label));
         asm.assert_reserved_exactly_as_needed();
     }
 
     #[inline(always)]
-    fn set_less_than_unsigned(&mut self, d: RawReg, s1: RawReg, s2: RawReg) -> Self::ReturnTy {
+    pub fn set_less_than_unsigned(&mut self, d: RawReg, s1: RawReg, s2: RawReg) {
         self.compare_reg_reg(d, s1, s2, Condition::Below);
     }
 
     #[inline(always)]
-    fn set_less_than_unsigned_imm(&mut self, d: RawReg, s1: RawReg, s2: u32) -> Self::ReturnTy {
+    pub fn set_less_than_unsigned_imm(&mut self, d: RawReg, s1: RawReg, s2: u32) {
         self.compare_reg_imm(d, s1, s2, Condition::Below);
     }
 
     #[inline(always)]
-    fn set_greater_than_unsigned_imm(&mut self, d: RawReg, s1: RawReg, s2: u32) -> Self::ReturnTy {
+    pub fn set_greater_than_unsigned_imm(&mut self, d: RawReg, s1: RawReg, s2: u32) {
         self.compare_reg_imm(d, s1, s2, Condition::Above);
     }
 
     #[inline(always)]
-    fn set_less_than_signed(&mut self, d: RawReg, s1: RawReg, s2: RawReg) -> Self::ReturnTy {
+    pub fn set_less_than_signed(&mut self, d: RawReg, s1: RawReg, s2: RawReg) {
         self.compare_reg_reg(d, s1, s2, Condition::Less);
     }
 
     #[inline(always)]
-    fn set_less_than_signed_imm(&mut self, d: RawReg, s1: RawReg, s2: u32) -> Self::ReturnTy {
+    pub fn set_less_than_signed_imm(&mut self, d: RawReg, s1: RawReg, s2: u32) {
         self.compare_reg_imm(d, s1, s2, Condition::Less);
     }
 
     #[inline(always)]
-    fn set_greater_than_signed_imm(&mut self, d: RawReg, s1: RawReg, s2: u32) -> Self::ReturnTy {
+    pub fn set_greater_than_signed_imm(&mut self, d: RawReg, s1: RawReg, s2: u32) {
         self.compare_reg_imm(d, s1, s2, Condition::Greater);
     }
 
     #[inline(always)]
-    fn shift_logical_right(&mut self, d: RawReg, s1: RawReg, s2: RawReg) -> Self::ReturnTy {
+    pub fn shift_logical_right(&mut self, d: RawReg, s1: RawReg, s2: RawReg) {
         self.shift(d, s1, s2, ShiftKind::LogicalRight);
     }
 
     #[inline(always)]
-    fn shift_arithmetic_right(&mut self, d: RawReg, s1: RawReg, s2: RawReg) -> Self::ReturnTy {
+    pub fn shift_arithmetic_right(&mut self, d: RawReg, s1: RawReg, s2: RawReg) {
         self.shift(d, s1, s2, ShiftKind::ArithmeticRight);
     }
 
     #[inline(always)]
-    fn shift_logical_left(&mut self, d: RawReg, s1: RawReg, s2: RawReg) -> Self::ReturnTy {
+    pub fn shift_logical_left(&mut self, d: RawReg, s1: RawReg, s2: RawReg) {
         self.shift(d, s1, s2, ShiftKind::LogicalLeft);
     }
 
     #[inline(always)]
-    fn shift_logical_right_imm_alt(&mut self, d: RawReg, s2: RawReg, s1: u32) -> Self::ReturnTy {
+    pub fn shift_logical_right_imm_alt(&mut self, d: RawReg, s2: RawReg, s1: u32) {
         self.shift(d, s1, s2, ShiftKind::LogicalRight);
     }
 
     #[inline(always)]
-    fn shift_arithmetic_right_imm_alt(&mut self, d: RawReg, s2: RawReg, s1: u32) -> Self::ReturnTy {
+    pub fn shift_arithmetic_right_imm_alt(&mut self, d: RawReg, s2: RawReg, s1: u32) {
         self.shift(d, s1, s2, ShiftKind::ArithmeticRight);
     }
 
     #[inline(always)]
-    fn shift_logical_left_imm_alt(&mut self, d: RawReg, s2: RawReg, s1: u32) -> Self::ReturnTy {
+    pub fn shift_logical_left_imm_alt(&mut self, d: RawReg, s2: RawReg, s1: u32) {
         self.shift(d, s1, s2, ShiftKind::LogicalLeft);
     }
 
     #[inline(always)]
-    fn xor(&mut self, d: RawReg, s1: RawReg, s2: RawReg) -> Self::ReturnTy {
+    pub fn xor(&mut self, d: RawReg, s1: RawReg, s2: RawReg) {
         let reg_size = self.reg_size();
         let d = conv_reg(d);
         let s1 = conv_reg(s1);
@@ -999,7 +1023,7 @@ where
     }
 
     #[inline(always)]
-    fn and(&mut self, d: RawReg, s1: RawReg, s2: RawReg) -> Self::ReturnTy {
+    pub fn and(&mut self, d: RawReg, s1: RawReg, s2: RawReg) {
         let reg_size = self.reg_size();
         let d = conv_reg(d);
         let s1 = conv_reg(s1);
@@ -1021,7 +1045,7 @@ where
     }
 
     #[inline(always)]
-    fn or(&mut self, d: RawReg, s1: RawReg, s2: RawReg) -> Self::ReturnTy {
+    pub fn or(&mut self, d: RawReg, s1: RawReg, s2: RawReg) {
         let reg_size = self.reg_size();
         let d = conv_reg(d);
         let s1 = conv_reg(s1);
@@ -1043,7 +1067,7 @@ where
     }
 
     #[inline(always)]
-    fn add(&mut self, d: RawReg, s1: RawReg, s2: RawReg) -> Self::ReturnTy {
+    pub fn add(&mut self, d: RawReg, s1: RawReg, s2: RawReg) {
         let reg_size = self.reg_size();
         let d = conv_reg(d);
         let s1 = conv_reg(s1);
@@ -1065,7 +1089,7 @@ where
     }
 
     #[inline(always)]
-    fn sub(&mut self, d: RawReg, s1: RawReg, s2: RawReg) -> Self::ReturnTy {
+    pub fn sub(&mut self, d: RawReg, s1: RawReg, s2: RawReg) {
         let reg_size = self.reg_size();
         let d = conv_reg(d);
         let s1 = conv_reg(s1);
@@ -1090,7 +1114,7 @@ where
     }
 
     #[inline(always)]
-    fn negate_and_add_imm(&mut self, d: RawReg, s1: RawReg, s2: u32) -> Self::ReturnTy {
+    pub fn negate_and_add_imm(&mut self, d: RawReg, s1: RawReg, s2: u32) {
         let reg_size = self.reg_size();
         let d = conv_reg(d);
         let s1 = conv_reg(s1);
@@ -1118,7 +1142,7 @@ where
     }
 
     #[inline(always)]
-    fn mul(&mut self, d: RawReg, s1: RawReg, s2: RawReg) -> Self::ReturnTy {
+    pub fn mul(&mut self, d: RawReg, s1: RawReg, s2: RawReg) {
         let reg_size = self.reg_size();
         let d = conv_reg(d);
         let s1 = conv_reg(s1);
@@ -1140,12 +1164,12 @@ where
     }
 
     #[inline(always)]
-    fn mul_imm(&mut self, d: RawReg, s1: RawReg, s2: u32) -> Self::ReturnTy {
+    pub fn mul_imm(&mut self, d: RawReg, s1: RawReg, s2: u32) {
         self.push(imul_imm(RegSize::R32, conv_reg(d), conv_reg(s1), s2 as i32));
     }
 
     #[inline(always)]
-    fn mul_upper_signed_signed(&mut self, d: RawReg, s1: RawReg, s2: RawReg) -> Self::ReturnTy {
+    pub fn mul_upper_signed_signed(&mut self, d: RawReg, s1: RawReg, s2: RawReg) {
         let asm = self.asm.reserve::<U4>();
         let asm = asm.push(movsxd_32_to_64(TMP_REG, conv_reg(s2)));
         let asm = asm.push(movsxd_32_to_64(conv_reg(d), conv_reg(s1)));
@@ -1155,7 +1179,7 @@ where
     }
 
     #[inline(always)]
-    fn mul_upper_signed_signed_imm(&mut self, d: RawReg, s1: RawReg, s2: u32) -> Self::ReturnTy {
+    pub fn mul_upper_signed_signed_imm(&mut self, d: RawReg, s1: RawReg, s2: u32) {
         let asm = self.asm.reserve::<U4>();
         let asm = asm.push(mov_imm(TMP_REG, imm64(s2 as i32)));
         let asm = asm.push(movsxd_32_to_64(conv_reg(d), conv_reg(s1)));
@@ -1165,7 +1189,7 @@ where
     }
 
     #[inline(always)]
-    fn mul_upper_unsigned_unsigned(&mut self, d: RawReg, s1: RawReg, s2: RawReg) -> Self::ReturnTy {
+    pub fn mul_upper_unsigned_unsigned(&mut self, d: RawReg, s1: RawReg, s2: RawReg) {
         let asm = self.asm.reserve::<U3>();
         let asm = if d == s1 {
             // d = d * s2
@@ -1184,7 +1208,7 @@ where
     }
 
     #[inline(always)]
-    fn mul_upper_unsigned_unsigned_imm(&mut self, d: RawReg, s1: RawReg, s2: u32) -> Self::ReturnTy {
+    pub fn mul_upper_unsigned_unsigned_imm(&mut self, d: RawReg, s1: RawReg, s2: u32) {
         let asm = self.asm.reserve::<U4>();
         let asm = asm.push(mov_imm(TMP_REG, imm32(s2)));
         let asm = asm.push_if(d != s1, mov(RegSize::R32, conv_reg(d), conv_reg(s1)));
@@ -1194,7 +1218,7 @@ where
     }
 
     #[inline(always)]
-    fn mul_upper_signed_unsigned(&mut self, d: RawReg, s1: RawReg, s2: RawReg) -> Self::ReturnTy {
+    pub fn mul_upper_signed_unsigned(&mut self, d: RawReg, s1: RawReg, s2: RawReg) {
         // This instruction is equivalent to:
         //   let s1: i32;
         //   let s2: u32;
@@ -1226,42 +1250,42 @@ where
     }
 
     #[inline(always)]
-    fn div_unsigned(&mut self, d: RawReg, s1: RawReg, s2: RawReg) -> Self::ReturnTy {
+    pub fn div_unsigned(&mut self, d: RawReg, s1: RawReg, s2: RawReg) {
         self.div_rem(d, s1, s2, DivRem::Div, Signedness::Unsigned);
     }
 
     #[inline(always)]
-    fn div_signed(&mut self, d: RawReg, s1: RawReg, s2: RawReg) -> Self::ReturnTy {
+    pub fn div_signed(&mut self, d: RawReg, s1: RawReg, s2: RawReg) {
         self.div_rem(d, s1, s2, DivRem::Div, Signedness::Signed);
     }
 
     #[inline(always)]
-    fn rem_unsigned(&mut self, d: RawReg, s1: RawReg, s2: RawReg) -> Self::ReturnTy {
+    pub fn rem_unsigned(&mut self, d: RawReg, s1: RawReg, s2: RawReg) {
         self.div_rem(d, s1, s2, DivRem::Rem, Signedness::Unsigned);
     }
 
     #[inline(always)]
-    fn rem_signed(&mut self, d: RawReg, s1: RawReg, s2: RawReg) -> Self::ReturnTy {
+    pub fn rem_signed(&mut self, d: RawReg, s1: RawReg, s2: RawReg) {
         self.div_rem(d, s1, s2, DivRem::Rem, Signedness::Signed);
     }
 
     #[inline(always)]
-    fn shift_logical_right_imm(&mut self, d: RawReg, s1: RawReg, s2: u32) -> Self::ReturnTy {
+    pub fn shift_logical_right_imm(&mut self, d: RawReg, s1: RawReg, s2: u32) {
         self.shift_imm(d, s1, s2, ShiftKind::LogicalRight);
     }
 
     #[inline(always)]
-    fn shift_arithmetic_right_imm(&mut self, d: RawReg, s1: RawReg, s2: u32) -> Self::ReturnTy {
+    pub fn shift_arithmetic_right_imm(&mut self, d: RawReg, s1: RawReg, s2: u32) {
         self.shift_imm(d, s1, s2, ShiftKind::ArithmeticRight);
     }
 
     #[inline(always)]
-    fn shift_logical_left_imm(&mut self, d: RawReg, s1: RawReg, s2: u32) -> Self::ReturnTy {
+    pub fn shift_logical_left_imm(&mut self, d: RawReg, s1: RawReg, s2: u32) {
         self.shift_imm(d, s1, s2, ShiftKind::LogicalLeft);
     }
 
     #[inline(always)]
-    fn or_imm(&mut self, d: RawReg, s1: RawReg, s2: u32) -> Self::ReturnTy {
+    pub fn or_imm(&mut self, d: RawReg, s1: RawReg, s2: u32) {
         let reg_size = self.reg_size();
         let d = conv_reg(d);
         let s1 = conv_reg(s1);
@@ -1275,7 +1299,7 @@ where
     }
 
     #[inline(always)]
-    fn and_imm(&mut self, d: RawReg, s1: RawReg, s2: u32) -> Self::ReturnTy {
+    pub fn and_imm(&mut self, d: RawReg, s1: RawReg, s2: u32) {
         let reg_size = self.reg_size();
         let d = conv_reg(d);
         let s1 = conv_reg(s1);
@@ -1289,7 +1313,7 @@ where
     }
 
     #[inline(always)]
-    fn xor_imm(&mut self, d: RawReg, s1: RawReg, s2: u32) -> Self::ReturnTy {
+    pub fn xor_imm(&mut self, d: RawReg, s1: RawReg, s2: u32) {
         let reg_size = self.reg_size();
         let d = conv_reg(d);
         let s1 = conv_reg(s1);
@@ -1307,37 +1331,37 @@ where
     }
 
     #[inline(always)]
-    fn load_imm(&mut self, dst: RawReg, s2: u32) -> Self::ReturnTy {
+    pub fn load_imm(&mut self, dst: RawReg, s2: u32) {
         self.load_immediate(dst, s2);
     }
 
     #[inline(always)]
-    fn move_reg(&mut self, d: RawReg, s: RawReg) -> Self::ReturnTy {
+    pub fn move_reg(&mut self, d: RawReg, s: RawReg) {
         self.mov(d, s);
     }
 
     #[inline(always)]
-    fn cmov_if_zero(&mut self, d: RawReg, s: RawReg, c: RawReg) -> Self::ReturnTy {
+    pub fn cmov_if_zero(&mut self, d: RawReg, s: RawReg, c: RawReg) {
         self.cmov(d, s, c, Condition::Equal);
     }
 
     #[inline(always)]
-    fn cmov_if_not_zero(&mut self, d: RawReg, s: RawReg, c: RawReg) -> Self::ReturnTy {
+    pub fn cmov_if_not_zero(&mut self, d: RawReg, s: RawReg, c: RawReg) {
         self.cmov(d, s, c, Condition::NotEqual);
     }
 
     #[inline(always)]
-    fn cmov_if_zero_imm(&mut self, d: RawReg, c: RawReg, s: u32) -> Self::ReturnTy {
+    pub fn cmov_if_zero_imm(&mut self, d: RawReg, c: RawReg, s: u32) {
         self.cmov_imm(d, s, c, Condition::Equal);
     }
 
     #[inline(always)]
-    fn cmov_if_not_zero_imm(&mut self, d: RawReg, c: RawReg, s: u32) -> Self::ReturnTy {
+    pub fn cmov_if_not_zero_imm(&mut self, d: RawReg, c: RawReg, s: u32) {
         self.cmov_imm(d, s, c, Condition::NotEqual);
     }
 
     #[inline(always)]
-    fn add_imm(&mut self, d: RawReg, s1: RawReg, s2: u32) -> Self::ReturnTy {
+    pub fn add_imm(&mut self, d: RawReg, s1: RawReg, s2: u32) {
         let reg_size = self.reg_size();
         let d = conv_reg(d);
         let s1 = conv_reg(s1);
@@ -1356,204 +1380,204 @@ where
     }
 
     #[inline(always)]
-    fn store_u8(&mut self, src: RawReg, offset: u32) -> Self::ReturnTy {
+    pub fn store_u8(&mut self, src: RawReg, offset: u32) {
         self.store(src, None, offset, Size::U8);
     }
 
     #[inline(always)]
-    fn store_u16(&mut self, src: RawReg, offset: u32) -> Self::ReturnTy {
+    pub fn store_u16(&mut self, src: RawReg, offset: u32) {
         self.store(src, None, offset, Size::U16);
     }
 
     #[inline(always)]
-    fn store_u32(&mut self, src: RawReg, offset: u32) -> Self::ReturnTy {
+    pub fn store_u32(&mut self, src: RawReg, offset: u32) {
         self.store(src, None, offset, Size::U32);
     }
 
     #[inline(always)]
-    fn store_indirect_u8(&mut self, src: RawReg, base: RawReg, offset: u32) -> Self::ReturnTy {
+    pub fn store_indirect_u8(&mut self, src: RawReg, base: RawReg, offset: u32) {
         self.store(src, Some(base), offset, Size::U8);
     }
 
     #[inline(always)]
-    fn store_indirect_u16(&mut self, src: RawReg, base: RawReg, offset: u32) -> Self::ReturnTy {
+    pub fn store_indirect_u16(&mut self, src: RawReg, base: RawReg, offset: u32) {
         self.store(src, Some(base), offset, Size::U16);
     }
 
     #[inline(always)]
-    fn store_indirect_u32(&mut self, src: RawReg, base: RawReg, offset: u32) -> Self::ReturnTy {
+    pub fn store_indirect_u32(&mut self, src: RawReg, base: RawReg, offset: u32) {
         self.store(src, Some(base), offset, Size::U32);
     }
 
     #[inline(always)]
-    fn store_imm_indirect_u8(&mut self, base: RawReg, offset: u32, value: u32) -> Self::ReturnTy {
+    pub fn store_imm_indirect_u8(&mut self, base: RawReg, offset: u32, value: u32) {
         self.store(value, Some(base), offset, Size::U8);
     }
 
     #[inline(always)]
-    fn store_imm_indirect_u16(&mut self, base: RawReg, offset: u32, value: u32) -> Self::ReturnTy {
+    pub fn store_imm_indirect_u16(&mut self, base: RawReg, offset: u32, value: u32) {
         self.store(value, Some(base), offset, Size::U16);
     }
 
     #[inline(always)]
-    fn store_imm_indirect_u32(&mut self, base: RawReg, offset: u32, value: u32) -> Self::ReturnTy {
+    pub fn store_imm_indirect_u32(&mut self, base: RawReg, offset: u32, value: u32) {
         self.store(value, Some(base), offset, Size::U32);
     }
 
     #[inline(always)]
-    fn store_imm_u8(&mut self, offset: u32, value: u32) -> Self::ReturnTy {
+    pub fn store_imm_u8(&mut self, offset: u32, value: u32) {
         self.store(value, None, offset, Size::U8);
     }
 
     #[inline(always)]
-    fn store_imm_u16(&mut self, offset: u32, value: u32) -> Self::ReturnTy {
+    pub fn store_imm_u16(&mut self, offset: u32, value: u32) {
         self.store(value, None, offset, Size::U16);
     }
 
     #[inline(always)]
-    fn store_imm_u32(&mut self, offset: u32, value: u32) -> Self::ReturnTy {
+    pub fn store_imm_u32(&mut self, offset: u32, value: u32) {
         self.store(value, None, offset, Size::U32);
     }
 
     #[inline(always)]
-    fn load_indirect_u8(&mut self, dst: RawReg, base: RawReg, offset: u32) -> Self::ReturnTy {
+    pub fn load_indirect_u8(&mut self, dst: RawReg, base: RawReg, offset: u32) {
         self.load(dst, Some(base), offset, LoadKind::U8);
     }
 
     #[inline(always)]
-    fn load_indirect_i8(&mut self, dst: RawReg, base: RawReg, offset: u32) -> Self::ReturnTy {
+    pub fn load_indirect_i8(&mut self, dst: RawReg, base: RawReg, offset: u32) {
         self.load(dst, Some(base), offset, LoadKind::I8);
     }
 
     #[inline(always)]
-    fn load_indirect_u16(&mut self, dst: RawReg, base: RawReg, offset: u32) -> Self::ReturnTy {
+    pub fn load_indirect_u16(&mut self, dst: RawReg, base: RawReg, offset: u32) {
         self.load(dst, Some(base), offset, LoadKind::U16);
     }
 
     #[inline(always)]
-    fn load_indirect_i16(&mut self, dst: RawReg, base: RawReg, offset: u32) -> Self::ReturnTy {
+    pub fn load_indirect_i16(&mut self, dst: RawReg, base: RawReg, offset: u32) {
         self.load(dst, Some(base), offset, LoadKind::I16);
     }
 
     #[inline(always)]
-    fn load_indirect_u32(&mut self, dst: RawReg, base: RawReg, offset: u32) -> Self::ReturnTy {
+    pub fn load_indirect_u32(&mut self, dst: RawReg, base: RawReg, offset: u32) {
         self.load(dst, Some(base), offset, LoadKind::U32);
     }
 
     #[inline(always)]
-    fn load_u8(&mut self, dst: RawReg, offset: u32) -> Self::ReturnTy {
+    pub fn load_u8(&mut self, dst: RawReg, offset: u32) {
         self.load(dst, None, offset, LoadKind::U8);
     }
 
     #[inline(always)]
-    fn load_i8(&mut self, dst: RawReg, offset: u32) -> Self::ReturnTy {
+    pub fn load_i8(&mut self, dst: RawReg, offset: u32) {
         self.load(dst, None, offset, LoadKind::I8);
     }
 
     #[inline(always)]
-    fn load_u16(&mut self, dst: RawReg, offset: u32) -> Self::ReturnTy {
+    pub fn load_u16(&mut self, dst: RawReg, offset: u32) {
         self.load(dst, None, offset, LoadKind::U16);
     }
 
     #[inline(always)]
-    fn load_i16(&mut self, dst: RawReg, offset: u32) -> Self::ReturnTy {
+    pub fn load_i16(&mut self, dst: RawReg, offset: u32) {
         self.load(dst, None, offset, LoadKind::I16);
     }
 
     #[inline(always)]
-    fn load_u32(&mut self, dst: RawReg, offset: u32) -> Self::ReturnTy {
+    pub fn load_u32(&mut self, dst: RawReg, offset: u32) {
         self.load(dst, None, offset, LoadKind::U32);
     }
 
     #[inline(always)]
-    fn branch_less_unsigned(&mut self, s1: RawReg, s2: RawReg, target: u32) -> Self::ReturnTy {
+    pub fn branch_less_unsigned(&mut self, s1: RawReg, s2: RawReg, target: u32) {
         self.branch(s1, s2, target, Condition::Below);
     }
 
     #[inline(always)]
-    fn branch_less_signed(&mut self, s1: RawReg, s2: RawReg, target: u32) -> Self::ReturnTy {
+    pub fn branch_less_signed(&mut self, s1: RawReg, s2: RawReg, target: u32) {
         self.branch(s1, s2, target, Condition::Less);
     }
 
     #[inline(always)]
-    fn branch_greater_or_equal_unsigned(&mut self, s1: RawReg, s2: RawReg, target: u32) -> Self::ReturnTy {
+    pub fn branch_greater_or_equal_unsigned(&mut self, s1: RawReg, s2: RawReg, target: u32) {
         self.branch(s1, s2, target, Condition::AboveOrEqual);
     }
 
     #[inline(always)]
-    fn branch_greater_or_equal_signed(&mut self, s1: RawReg, s2: RawReg, target: u32) -> Self::ReturnTy {
+    pub fn branch_greater_or_equal_signed(&mut self, s1: RawReg, s2: RawReg, target: u32) {
         self.branch(s1, s2, target, Condition::GreaterOrEqual);
     }
 
     #[inline(always)]
-    fn branch_eq(&mut self, s1: RawReg, s2: RawReg, target: u32) -> Self::ReturnTy {
+    pub fn branch_eq(&mut self, s1: RawReg, s2: RawReg, target: u32) {
         self.branch(s1, s2, target, Condition::Equal);
     }
 
     #[inline(always)]
-    fn branch_not_eq(&mut self, s1: RawReg, s2: RawReg, target: u32) -> Self::ReturnTy {
+    pub fn branch_not_eq(&mut self, s1: RawReg, s2: RawReg, target: u32) {
         self.branch(s1, s2, target, Condition::NotEqual);
     }
 
     #[inline(always)]
-    fn branch_eq_imm(&mut self, s1: RawReg, s2: u32, target: u32) -> Self::ReturnTy {
+    pub fn branch_eq_imm(&mut self, s1: RawReg, s2: u32, target: u32) {
         self.branch(s1, s2, target, Condition::Equal);
     }
 
     #[inline(always)]
-    fn branch_not_eq_imm(&mut self, s1: RawReg, s2: u32, target: u32) -> Self::ReturnTy {
+    pub fn branch_not_eq_imm(&mut self, s1: RawReg, s2: u32, target: u32) {
         self.branch(s1, s2, target, Condition::NotEqual);
     }
 
     #[inline(always)]
-    fn branch_less_unsigned_imm(&mut self, s1: RawReg, s2: u32, target: u32) -> Self::ReturnTy {
+    pub fn branch_less_unsigned_imm(&mut self, s1: RawReg, s2: u32, target: u32) {
         self.branch(s1, s2, target, Condition::Below);
     }
 
     #[inline(always)]
-    fn branch_less_signed_imm(&mut self, s1: RawReg, s2: u32, target: u32) -> Self::ReturnTy {
+    pub fn branch_less_signed_imm(&mut self, s1: RawReg, s2: u32, target: u32) {
         self.branch(s1, s2, target, Condition::Less);
     }
 
     #[inline(always)]
-    fn branch_greater_or_equal_unsigned_imm(&mut self, s1: RawReg, s2: u32, target: u32) -> Self::ReturnTy {
+    pub fn branch_greater_or_equal_unsigned_imm(&mut self, s1: RawReg, s2: u32, target: u32) {
         self.branch(s1, s2, target, Condition::AboveOrEqual);
     }
 
     #[inline(always)]
-    fn branch_greater_or_equal_signed_imm(&mut self, s1: RawReg, s2: u32, target: u32) -> Self::ReturnTy {
+    pub fn branch_greater_or_equal_signed_imm(&mut self, s1: RawReg, s2: u32, target: u32) {
         self.branch(s1, s2, target, Condition::GreaterOrEqual);
     }
 
     #[inline(always)]
-    fn branch_less_or_equal_unsigned_imm(&mut self, s1: RawReg, s2: u32, target: u32) -> Self::ReturnTy {
+    pub fn branch_less_or_equal_unsigned_imm(&mut self, s1: RawReg, s2: u32, target: u32) {
         self.branch(s1, s2, target, Condition::BelowOrEqual);
     }
 
     #[inline(always)]
-    fn branch_less_or_equal_signed_imm(&mut self, s1: RawReg, s2: u32, target: u32) -> Self::ReturnTy {
+    pub fn branch_less_or_equal_signed_imm(&mut self, s1: RawReg, s2: u32, target: u32) {
         self.branch(s1, s2, target, Condition::LessOrEqual);
     }
 
     #[inline(always)]
-    fn branch_greater_unsigned_imm(&mut self, s1: RawReg, s2: u32, target: u32) -> Self::ReturnTy {
+    pub fn branch_greater_unsigned_imm(&mut self, s1: RawReg, s2: u32, target: u32) {
         self.branch(s1, s2, target, Condition::Above);
     }
 
     #[inline(always)]
-    fn branch_greater_signed_imm(&mut self, s1: RawReg, s2: u32, target: u32) -> Self::ReturnTy {
+    pub fn branch_greater_signed_imm(&mut self, s1: RawReg, s2: u32, target: u32) {
         self.branch(s1, s2, target, Condition::Greater);
     }
 
     #[inline(always)]
-    fn jump(&mut self, target: u32) -> Self::ReturnTy {
-        let label = self.get_or_forward_declare_label(target).unwrap_or(self.trap_label);
+    pub fn jump(&mut self, target: u32) {
+        let label = self.get_or_forward_declare_label(target).unwrap_or(self.invalid_jump_label);
         self.jump_to_label(label);
     }
 
     #[inline(always)]
-    fn load_imm_and_jump(&mut self, ra: RawReg, value: u32, target: u32) -> Self::ReturnTy {
-        let label = self.get_or_forward_declare_label(target).unwrap_or(self.trap_label);
+    pub fn load_imm_and_jump(&mut self, ra: RawReg, value: u32, target: u32) {
+        let label = self.get_or_forward_declare_label(target).unwrap_or(self.invalid_jump_label);
         let asm = self.asm.reserve::<U2>();
         let asm = asm.push(mov_imm(conv_reg(ra), imm32(value)));
         let asm = jump_to_label(asm, label);
@@ -1561,12 +1585,12 @@ where
     }
 
     #[inline(always)]
-    fn jump_indirect(&mut self, base: RawReg, offset: u32) -> Self::ReturnTy {
+    pub fn jump_indirect(&mut self, base: RawReg, offset: u32) {
         self.jump_indirect_impl(None, base, offset)
     }
 
     #[inline(always)]
-    fn load_imm_and_jump_indirect(&mut self, ra: RawReg, base: RawReg, value: u32, offset: u32) -> Self::ReturnTy {
+    pub fn load_imm_and_jump_indirect(&mut self, ra: RawReg, base: RawReg, value: u32, offset: u32) {
         self.jump_indirect_impl(Some((ra, value)), base, offset)
     }
 }
