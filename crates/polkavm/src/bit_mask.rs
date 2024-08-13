@@ -87,8 +87,9 @@ pub struct BitMask<Primary, Secondary, const SECONDARY_LENGTH: usize> where Prim
 }
 
 // TODO: Remove this once this is fixed: https://github.com/rust-lang/rust/issues/60551
+#[doc(hidden)]
 #[macro_export]
-macro_rules! bitmask_type {
+macro_rules! _bitmask_type {
     ($primary:ty, $secondary:ty, $bits:expr) => {
         $crate::bit_mask::BitMask<$primary, $secondary, {
             let bits_per_item = ::core::mem::size_of::<$secondary>() * 8;
@@ -102,7 +103,7 @@ macro_rules! bitmask_type {
     }
 }
 
-pub use bitmask_type;
+pub use _bitmask_type as bitmask_type;
 
 #[test]
 fn test_bitmask_basic() {
