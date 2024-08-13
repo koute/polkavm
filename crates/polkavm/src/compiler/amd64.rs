@@ -8,7 +8,6 @@ use polkavm_assembler::{ReservedAssembler, Label, U1, U2, U3, U4, NonZero};
 
 use polkavm_common::program::{Reg, RawReg};
 use polkavm_common::zygote::VM_ADDR_VMCTX;
-use polkavm_common::INVALID_PROGRAM_COUNTER;
 
 use crate::config::GasMeteringKind;
 use crate::compiler::{ArchVisitor, SandboxKind};
@@ -570,8 +569,6 @@ impl<'r, 'a, S> ArchVisitor<'r, 'a, S> where S: Sandbox {
         log::trace!("Emitting trampoline: sysreturn");
         let label = self.asm.create_label();
 
-        self.push(mov_imm(Self::vmctx_field(S::offset_table().program_counter), imm32(INVALID_PROGRAM_COUNTER.0)));
-        self.push(mov_imm(Self::vmctx_field(S::offset_table().next_program_counter), imm32(INVALID_PROGRAM_COUNTER.0)));
         self.push(mov_imm(Self::vmctx_field(S::offset_table().next_native_program_counter), imm64(0)));
         self.save_registers_to_vmctx();
         self.push(mov_imm64(TMP_REG, S::address_table().syscall_return));
@@ -608,7 +605,6 @@ impl<'r, 'a, S> ArchVisitor<'r, 'a, S> where S: Sandbox {
         self.define_label(label);
 
         self.save_registers_to_vmctx();
-        self.push(mov_imm(Self::vmctx_field(S::offset_table().next_program_counter), imm32(INVALID_PROGRAM_COUNTER.0)));
         self.push(mov_imm(Self::vmctx_field(S::offset_table().next_native_program_counter), imm64(0)));
         self.push(mov_imm64(TMP_REG, S::address_table().syscall_trap));
         self.push(jmp(TMP_REG));
