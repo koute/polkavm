@@ -109,7 +109,7 @@ pub use crate::error::Error;
 pub use crate::linker::{CallError, Caller, Instance, InstancePre, Linker};
 #[cfg(feature = "std")]
 pub use crate::source_cache::SourceCache;
-pub use crate::utils::{InterruptKind, Segfault, Trap};
+pub use crate::utils::{InterruptKind, Segfault};
 
 pub const RETURN_TO_HOST: u32 = polkavm_common::abi::VM_ADDR_RETURN_TO_HOST;
 
