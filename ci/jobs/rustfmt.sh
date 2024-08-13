@@ -6,6 +6,8 @@ cd ../..
 
 echo ">> cargo fmt"
 cargo fmt --check --all
+# https://github.com/rust-lang/rustfmt/issues/3253
+cargo fmt --check -- $(find crates/polkavm -name *.rs)
 
 echo ">> cargo fmt (zygote)"
 cd crates/polkavm-zygote
