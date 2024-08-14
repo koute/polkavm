@@ -3349,46 +3349,32 @@ impl OperationKind {
         use polkavm_common::operation::*;
         #[allow(clippy::unnecessary_cast)]
         match self {
-            // TODO
-            Self::Add | Self::Add64 => lhs.wrapping_add(rhs),
-            Self::Sub | Self::Sub64 => lhs.wrapping_sub(rhs),
-            Self::And | Self::And64 => lhs & rhs,
-            Self::Or | Self::Or64 => lhs | rhs,
-            Self::Xor | Self::Xor64 => lhs ^ rhs,
-            Self::SetLessThanUnsigned | Self::SetLessThanUnsigned64 => i32::from((lhs as u32) < (rhs as u32)),
-            Self::SetLessThanSigned | Self::SetLessThanSigned64 => i32::from((lhs as i32) < (rhs as i32)),
+            Self::Add => lhs.wrapping_add(rhs),
+            Self::Sub => lhs.wrapping_sub(rhs),
+            Self::And => lhs & rhs,
+            Self::Or => lhs | rhs,
+            Self::Xor => lhs ^ rhs,
+            Self::SetLessThanUnsigned => i32::from((lhs as u32) < (rhs as u32)),
+            Self::SetLessThanSigned => i32::from((lhs as i32) < (rhs as i32)),
             Self::ShiftLogicalLeft => ((lhs as u32).wrapping_shl(rhs as u32)) as i32,
-            Self::ShiftLogicalLeft64 => ((lhs as u32).wrapping_shl(rhs as u32)) as i32,
             Self::ShiftLogicalRight => ((lhs as u32).wrapping_shr(rhs as u32)) as i32,
-            Self::ShiftLogicalRight64 => ((lhs as u32).wrapping_shr(rhs as u32)) as i32,
             Self::ShiftArithmeticRight => (lhs as i32).wrapping_shr(rhs as u32),
-            Self::ShiftArithmeticRight64 => (lhs as i32).wrapping_shr(rhs as u32),
 
             Self::Mul => (lhs as i32).wrapping_mul(rhs as i32),
-            // TODO
-            Self::Mul64 => (lhs as i32).wrapping_mul(rhs as i32),
             Self::MulUpperSignedSigned => mulh(lhs, rhs),
-            Self::MulUpperSignedSigned64 => mulh(lhs, rhs),
             Self::MulUpperSignedUnsigned => mulhsu(lhs, rhs as u32),
-            Self::MulUpperSignedUnsigned64 => mulhsu(lhs, rhs as u32),
             Self::MulUpperUnsignedUnsigned => mulhu(lhs as u32, rhs as u32) as i32,
-            Self::MulUpperUnsignedUnsigned64 => mulhu(lhs as u32, rhs as u32) as i32,
             Self::Div => div(lhs, rhs),
-            // TODO
-            Self::Div64 => div(lhs, rhs),
             Self::DivUnsigned => divu(lhs as u32, rhs as u32) as i32,
-            Self::DivUnsigned64 => divu(lhs as u32, rhs as u32) as i32,
             Self::Rem => rem(lhs, rhs),
-            // TODO
-            Self::Rem64 => rem(lhs, rhs),
             Self::RemUnsigned => remu(lhs as u32, rhs as u32) as i32,
-            // TODO
-            Self::RemUnsigned64 => remu(lhs as u32, rhs as u32) as i32,
 
             Self::Eq => i32::from(lhs == rhs),
             Self::NotEq => i32::from(lhs != rhs),
             Self::SetGreaterOrEqualUnsigned => i32::from((lhs as u32) >= (rhs as u32)),
             Self::SetGreaterOrEqualSigned => i32::from((lhs as i32) >= (rhs as i32)),
+
+            _ => todo!("64bit support"),
         }
     }
 
