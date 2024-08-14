@@ -1525,6 +1525,7 @@ mod test_decode_compressed {
     #[test]
     fn illegal_instruction() {
         assert_eq!(Inst::decode_compressed(1 << 16, false), Some(Inst::Unimplemented));
+        assert_eq!(Inst::decode_compressed(1 << 16, true), Some(Inst::Unimplemented));
     }
 
     #[test]
@@ -1547,9 +1548,20 @@ mod test_decode_compressed {
             })
         );
 
+        assert_eq!(
+            Inst::decode_compressed(op, true),
+            Some(Inst::RegImm {
+                kind: RegImmKind::Add64,
+                dst: Reg::decode_compressed(0b111),
+                src: Reg::SP,
+                imm: 0b1010100100
+            })
+        );
+
         let op = 0b000_00000000_111_00;
         // RES, nzuimm=0
         assert_eq!(Inst::decode_compressed(op, false), None);
+        assert_eq!(Inst::decode_compressed(op, true), None);
     }
 
     #[test]
@@ -1665,9 +1677,20 @@ mod test_decode_compressed {
             })
         );
 
+        assert_eq!(
+            Inst::decode_compressed(op, true),
+            Some(Inst::RegImm {
+                kind: RegImmKind::Add64,
+                dst: Reg::S0,
+                src: Reg::S0,
+                imm: -5
+            })
+        );
+
         let op = 0b000_0_01000_00000_01;
         // HINT, nzimm=0
         assert_eq!(Inst::decode_compressed(op, false), None);
+        assert_eq!(Inst::decode_compressed(op, true), None);
     }
 
     #[test]
@@ -1701,14 +1724,13 @@ mod test_decode_compressed {
     #[test]
     fn c_j() {
         let op = 0b101_01010101010_01;
+        let insn = Some(Inst::JumpAndLink {
+            dst: Reg::Zero,
+            target: bits_imm_c_jump(op),
+        });
 
-        assert_eq!(
-            Inst::decode_compressed(op, false),
-            Some(Inst::JumpAndLink {
-                dst: Reg::Zero,
-                target: bits_imm_c_jump(op)
-            })
-        );
+        assert_eq!(Inst::decode_compressed(op, false), insn);
+        assert_eq!(Inst::decode_compressed(op, true), insn);
     }
 
     #[test]
@@ -1725,14 +1747,26 @@ mod test_decode_compressed {
             })
         );
 
+        assert_eq!(
+            Inst::decode_compressed(op, true),
+            Some(Inst::RegImm {
+                kind: RegImmKind::Add64,
+                dst: Reg::decode(0b01000),
+                src: Reg::Zero,
+                imm: -11
+            })
+        );
+
         let op = 0b010_0_00000_10101_01;
         // HINT, rd=0
         assert_eq!(Inst::decode_compressed(op, false), None);
+        assert_eq!(Inst::decode_compressed(op, true), None);
     }
 
     #[test]
     fn c_addi16sp() {
         let op = 0b011_1_00010_01010_01;
+        let imm = 0b11111111_11111111_11111110_11000000u32 as i32;
 
         assert_eq!(
             Inst::decode_compressed(op, false),
@@ -1740,34 +1774,50 @@ mod test_decode_compressed {
                 kind: RegImmKind::Add,
                 dst: Reg::SP,
                 src: Reg::SP,
-                imm: 0b11111111_11111111_11111110_11000000u32 as i32
+                imm,
+            })
+        );
+
+        assert_eq!(
+            Inst::decode_compressed(op, true),
+            Some(Inst::RegImm {
+                kind: RegImmKind::Add64,
+                dst: Reg::SP,
+                src: Reg::SP,
+                imm,
             })
         );
 
         let op = 0b011_0_00010_00000_01;
         // RES, nzimm=0
         assert_eq!(Inst::decode(op, false), None);
+        assert_eq!(Inst::decode(op, true), None);
     }
 
     #[test]
     fn c_lui() {
         let op = 0b011_1_01100_10101_01;
+        let value = 0b11111111_11111111_01010000_00000000;
 
         assert_eq!(
             Inst::decode_compressed(op, false),
-            Some(Inst::LoadUpperImmediate {
-                dst: Reg::A2,
-                value: 0b11111111_11111111_01010000_00000000
-            })
+            Some(Inst::LoadUpperImmediate { dst: Reg::A2, value })
+        );
+
+        assert_eq!(
+            Inst::decode_compressed(op, true),
+            Some(Inst::LoadUpperImmediate { dst: Reg::A2, value })
         );
 
         let op = 0b011_0_01100_00000_01;
         // RES, nzimm=0
         assert_eq!(Inst::decode(op, false), None);
+        assert_eq!(Inst::decode(op, true), None);
 
         let op = 0b011_1_00000_10101_01;
         // HINT, rd=0
         assert_eq!(Inst::decode(op, false), None);
+        assert_eq!(Inst::decode(op, true), None);
     }
 
     #[test]
@@ -1784,13 +1834,25 @@ mod test_decode_compressed {
             })
         );
 
+        assert_eq!(
+            Inst::decode_compressed(op, true),
+            Some(Inst::RegImm {
+                kind: RegImmKind::ShiftLogicalRight64,
+                dst: Reg::A2,
+                src: Reg::A2,
+                imm: 0b10000
+            })
+        );
+
         let op = 0b100_1_00_100_10000_01;
         // RV32 NSE, nzuimm[5]=1
         assert_eq!(Inst::decode_compressed(op, false), None);
+        assert_eq!(Inst::decode_compressed(op, true), None);
 
         let op = 0b100_0_00_100_00000_01;
         // non-zero imm
         assert_eq!(Inst::decode_compressed(op, false), None);
+        assert_eq!(Inst::decode_compressed(op, true), None);
     }
 
     #[test]
@@ -1807,13 +1869,25 @@ mod test_decode_compressed {
             })
         );
 
+        assert_eq!(
+            Inst::decode_compressed(op, true),
+            Some(Inst::RegImm {
+                kind: RegImmKind::ShiftArithmeticRight64,
+                dst: Reg::A2,
+                src: Reg::A2,
+                imm: 0b10000
+            })
+        );
+
         let op = 0b100_1_01_100_10000_01;
         // RV32 NSE, nzuimm[5]=1
         assert_eq!(Inst::decode_compressed(op, false), None);
+        assert_eq!(Inst::decode_compressed(op, true), None);
 
         let op = 0b100_0_01_100_00000_01;
         // non-zero imm
         assert_eq!(Inst::decode_compressed(op, false), None);
+        assert_eq!(Inst::decode_compressed(op, true), None);
     }
 
     #[test]
@@ -1828,7 +1902,17 @@ mod test_decode_compressed {
                 src: Reg::A2,
                 imm: -11
             })
-        )
+        );
+
+        assert_eq!(
+            Inst::decode_compressed(op, true),
+            Some(Inst::RegImm {
+                kind: RegImmKind::And64,
+                dst: Reg::A2,
+                src: Reg::A2,
+                imm: -11
+            })
+        );
     }
 
     #[test]
@@ -1843,7 +1927,17 @@ mod test_decode_compressed {
                 src1: Reg::A5,
                 src2: Reg::A2
             })
-        )
+        );
+
+        assert_eq!(
+            Inst::decode_compressed(op, true),
+            Some(Inst::RegReg {
+                kind: RegRegKind::Sub64,
+                dst: Reg::A5,
+                src1: Reg::A5,
+                src2: Reg::A2
+            })
+        );
     }
 
     #[test]
@@ -1858,7 +1952,17 @@ mod test_decode_compressed {
                 src1: Reg::A5,
                 src2: Reg::A2
             })
-        )
+        );
+
+        assert_eq!(
+            Inst::decode_compressed(op, true),
+            Some(Inst::RegReg {
+                kind: RegRegKind::Xor64,
+                dst: Reg::A5,
+                src1: Reg::A5,
+                src2: Reg::A2
+            })
+        );
     }
 
     #[test]
@@ -1873,7 +1977,17 @@ mod test_decode_compressed {
                 src1: Reg::A5,
                 src2: Reg::A2
             })
-        )
+        );
+
+        assert_eq!(
+            Inst::decode_compressed(op, true),
+            Some(Inst::RegReg {
+                kind: RegRegKind::Or64,
+                dst: Reg::A5,
+                src1: Reg::A5,
+                src2: Reg::A2
+            })
+        );
     }
 
     #[test]
@@ -1888,7 +2002,17 @@ mod test_decode_compressed {
                 src1: Reg::A5,
                 src2: Reg::A2
             })
-        )
+        );
+
+        assert_eq!(
+            Inst::decode_compressed(op, true),
+            Some(Inst::RegReg {
+                kind: RegRegKind::And64,
+                dst: Reg::A5,
+                src1: Reg::A5,
+                src2: Reg::A2
+            })
+        );
     }
 
     #[test]
@@ -1935,17 +2059,30 @@ mod test_decode_compressed {
             })
         );
 
+        assert_eq!(
+            Inst::decode_compressed(op, true),
+            Some(Inst::RegImm {
+                kind: RegImmKind::ShiftLogicalLeft64,
+                dst: Reg::A2,
+                src: Reg::A2,
+                imm: 0b10101
+            })
+        );
+
         let op = 0b000_0_00000_10101_10;
         // HINT, rd=0
         assert_eq!(Inst::decode_compressed(op, false), None);
+        assert_eq!(Inst::decode_compressed(op, true), None);
 
         let op = 0b000_1_01100_10101_10;
         // RV32 NSE, nzuimm[5]=1
         assert_eq!(Inst::decode_compressed(op, false), None);
+        assert_eq!(Inst::decode_compressed(op, true), None);
 
         let op = 0b000_0_01100_00000_10;
         // non-zero shamt
         assert_eq!(Inst::decode_compressed(op, false), None);
+        assert_eq!(Inst::decode_compressed(op, true), None);
     }
 
     #[test]
@@ -2020,9 +2157,20 @@ mod test_decode_compressed {
             })
         );
 
+        assert_eq!(
+            Inst::decode_compressed(op, true),
+            Some(Inst::RegReg {
+                kind: RegRegKind::Add64,
+                dst: Reg::A2,
+                src1: Reg::Zero,
+                src2: Reg::A3
+            })
+        );
+
         let op = 0b100_0_00000_01101_10;
         // HINT, rd=0
         assert_eq!(Inst::decode_compressed(op, false), None);
+        assert_eq!(Inst::decode_compressed(op, true), None);
     }
 
     #[test]
@@ -2030,6 +2178,7 @@ mod test_decode_compressed {
         let op = 0b100_1_00000_00000_10;
         // ebreak is not supported
         assert_eq!(Inst::decode_compressed(op, false), None);
+        assert_eq!(Inst::decode_compressed(op, true), None);
     }
 
     #[test]
@@ -2038,6 +2187,15 @@ mod test_decode_compressed {
 
         assert_eq!(
             Inst::decode_compressed(op, false),
+            Some(Inst::JumpAndLinkRegister {
+                dst: Reg::RA,
+                base: Reg::A2,
+                value: 0
+            })
+        );
+
+        assert_eq!(
+            Inst::decode_compressed(op, true),
             Some(Inst::JumpAndLinkRegister {
                 dst: Reg::RA,
                 base: Reg::A2,
@@ -2060,9 +2218,20 @@ mod test_decode_compressed {
             })
         );
 
+        assert_eq!(
+            Inst::decode_compressed(op, true),
+            Some(Inst::RegReg {
+                kind: RegRegKind::Add64,
+                dst: Reg::A2,
+                src1: Reg::A2,
+                src2: Reg::A3
+            })
+        );
+
         let op = 0b100_1_00000_01101_10;
         // HINT, rd=0
         assert_eq!(Inst::decode_compressed(op, false), None);
+        assert_eq!(Inst::decode_compressed(op, true), None);
     }
 
     #[test]
