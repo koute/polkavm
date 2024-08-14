@@ -7,6 +7,7 @@ use crate::common::{is_cfg, is_doc, is_path_eq, is_rustfmt};
 mod kw {
     syn::custom_keyword!(symbol);
     syn::custom_keyword!(abi);
+    syn::custom_keyword!(index);
 }
 
 fn ident_from_pattern_strict(syn::PatType { attrs, pat, .. }: &syn::PatType) -> Result<Option<syn::Ident>, syn::Error> {
@@ -86,6 +87,7 @@ impl syn::parse::Parse for ImportBlockAttributes {
 
 enum ImportAttribute {
     Symbol(syn::LitByteStr),
+    Index(u32),
 }
 
 impl syn::parse::Parse for ImportAttribute {
@@ -129,6 +131,12 @@ impl syn::parse::Parse for ImportAttribute {
             } else {
                 Err(lookahead.error())
             }
+        } else if lookahead.peek(kw::index) {
+            input.parse::<kw::index>()?;
+            let _: Token![=] = input.parse()?;
+            let value: syn::LitInt = input.parse()?;
+            let value = value.base10_parse::<u32>().map_err(|err| syn::Error::new(value.span(), err))?;
+            Ok(ImportAttribute::Index(value))
         } else {
             Err(lookahead.error())
         }
@@ -173,6 +181,8 @@ pub fn polkavm_import(attributes: ImportBlockAttributes, input: syn::ItemForeign
                 let mut inner_cfg_attributes = Vec::new();
                 let mut inner_doc_attributes = Vec::new();
                 let mut symbol = None;
+                let mut index = None;
+
                 for attr in attrs {
                     if is_rustfmt(&attr) {
                         continue;
@@ -193,6 +203,9 @@ pub fn polkavm_import(attributes: ImportBlockAttributes, input: syn::ItemForeign
                             match attribute {
                                 ImportAttribute::Symbol(bytes) => {
                                     symbol = Some(bytes);
+                                }
+                                ImportAttribute::Index(value) => {
+                                    index = Some(value);
                                 }
                             }
                         }
@@ -267,6 +280,8 @@ pub fn polkavm_import(attributes: ImportBlockAttributes, input: syn::ItemForeign
                     ident.span(),
                 );
 
+                let (has_index, index) = index.map_or((false, 0), |index| (true, index));
+
                 tokens.push(quote! {
                     #(#outer_cfg_attributes)*
                     #(#inner_cfg_attributes)*
@@ -285,13 +300,15 @@ pub fn polkavm_import(attributes: ImportBlockAttributes, input: syn::ItemForeign
                         static METADATA_SYMBOL: &[u8] = #symbol;
 
                         #[link_section = ".polkavm_metadata"]
-                        static METADATA: #abi_path::private::ExternMetadata = #abi_path::private::ExternMetadata {
-                            version: 1,
+                        static METADATA: #abi_path::private::ExternMetadataV2 = #abi_path::private::ExternMetadataV2 {
+                            version: 2,
                             flags: 0,
                             symbol_length: METADATA_SYMBOL.len() as u32,
                             symbol: #abi_path::private::MetadataPointer(METADATA_SYMBOL.as_ptr()),
                             input_regs: <#args_joined_regs_ty as #abi_path::private::CountTuple>::COUNT,
                             output_regs: <<#return_ty as #abi_path::FromHost>::Regs as #abi_path::private::CountTuple>::COUNT,
+                            has_index: #has_index,
+                            index: #index,
                         };
 
                         struct Sym;
