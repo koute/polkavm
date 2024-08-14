@@ -61,9 +61,6 @@ pub(crate) fn get_native_page_size() -> usize {
     page_size
 }
 
-#[derive(Copy, Clone, PartialEq, Eq, Debug)]
-pub(crate) struct NotEnoughGas;
-
 pub trait SandboxConfig: Default {
     fn enable_logger(&mut self, value: bool);
 }

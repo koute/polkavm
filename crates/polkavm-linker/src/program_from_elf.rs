@@ -1295,8 +1295,8 @@ where
     let _ = b.read(target.offset as usize)?;
 
     let version = b.read_byte()?;
-    if version != 1 {
-        return Err(format!("unsupported extern metadata version: '{version}' (expected '1')"));
+    if version != 1 && version != 2 {
+        return Err(format!("unsupported extern metadata version: '{version}' (expected '1' or '2')"));
     }
 
     let flags = b.read_u32()?;
@@ -1337,12 +1337,24 @@ where
         return Err(format!("too many output registers: {output_regs}"));
     }
 
+    let index = if version >= 2 {
+        let has_index = b.read_byte()?;
+        let index = b.read_u32()?;
+        if has_index > 0 {
+            Some(index)
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+
     if flags != 0 {
         return Err(format!("found unsupported flags: 0x{flags:x}"));
     }
 
     Ok(ExternMetadata {
-        index: None,
+        index,
         symbol: symbol.to_owned(),
         input_regs,
         output_regs,
@@ -1361,7 +1373,7 @@ where
         .map_err(|error| ProgramFromElfError::other(format!("failed to parse extern metadata: {}", error)))
 }
 
-fn check_imports_and_assign_indexes(imports: &mut [Import], used_imports: &HashSet<usize>) -> Result<(), ProgramFromElfError> {
+fn check_imports_and_assign_indexes(imports: &mut Vec<Import>, used_imports: &HashSet<usize>) -> Result<(), ProgramFromElfError> {
     let mut import_by_symbol: HashMap<Vec<u8>, usize> = HashMap::new();
     for (nth_import, import) in imports.iter().enumerate() {
         if let Some(&old_nth_import) = import_by_symbol.get(&import.metadata.symbol) {
@@ -1379,11 +1391,52 @@ fn check_imports_and_assign_indexes(imports: &mut [Import], used_imports: &HashS
         import_by_symbol.insert(import.metadata.symbol.clone(), nth_import);
     }
 
-    let mut ordered: Vec<_> = used_imports.iter().copied().collect();
-    ordered.sort_by(|&a, &b| imports[a].metadata.symbol.cmp(&imports[b].metadata.symbol));
+    if imports.iter().any(|import| import.metadata.index.is_some()) {
+        let mut import_by_index: HashMap<u32, ExternMetadata> = HashMap::new();
+        let mut max_index = 0;
+        for import in &*imports {
+            if let Some(index) = import.index {
+                if let Some(old_metadata) = import_by_index.get(&index) {
+                    if *old_metadata != import.metadata {
+                        return Err(ProgramFromElfError::other(format!(
+                            "duplicate imports with the same index yet different prototypes: {}, {}",
+                            ProgramSymbol::new(&*old_metadata.symbol),
+                            ProgramSymbol::new(&*import.metadata.symbol)
+                        )));
+                    }
+                } else {
+                    import_by_index.insert(index, import.metadata.clone());
+                }
 
-    for (assigned_index, &nth_import) in ordered.iter().enumerate() {
-        imports[nth_import].metadata.index = Some(assigned_index as u32);
+                max_index = core::cmp::max(max_index, index);
+            } else {
+                return Err(ProgramFromElfError::other(format!(
+                    "import without a specified index: {}",
+                    ProgramSymbol::new(&*import.metadata.symbol)
+                )));
+            }
+        }
+
+        // If there are any holes in the indexes then insert dummy imports.
+        for index in 0..max_index {
+            if !import_by_index.contains_key(&index) {
+                imports.push(Import {
+                    metadata: ExternMetadata {
+                        index: Some(index),
+                        symbol: Vec::new(),
+                        input_regs: 0,
+                        output_regs: 0,
+                    },
+                })
+            }
+        }
+    } else {
+        let mut ordered: Vec<_> = used_imports.iter().copied().collect();
+        ordered.sort_by(|&a, &b| imports[a].metadata.symbol.cmp(&imports[b].metadata.symbol));
+
+        for (assigned_index, &nth_import) in ordered.iter().enumerate() {
+            imports[nth_import].metadata.index = Some(assigned_index as u32);
+        }
     }
 
     for import in imports {

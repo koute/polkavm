@@ -140,7 +140,7 @@ impl Engine {
         }
 
         if config.dynamic_paging() && !config.allow_experimental {
-            bail!("cannot enable dynamic paging: this is not production ready nor even finished; you can enabled `set_allow_experimental`/`POLKAVM_ALLOW_EXPERIMENTAL` to be able to use it anyway");
+            bail!("cannot enable dynamic paging: this is not production ready nor even finished; you can enable `set_allow_experimental`/`POLKAVM_ALLOW_EXPERIMENTAL` to be able to use it anyway");
         }
 
         Ok(Engine {
