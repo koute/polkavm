@@ -58,6 +58,9 @@ serde = { version = "1.0.203", features = ["derive"] }
 serde_json = { version = "1.0.117" }
 syn = "2.0.25"
 
+[workspace.lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(kani)', 'cfg(polkavm_dev_debug_zygote)'] }
+
 [workspace.lints.clippy]
 # This also triggers on cases like `.or_insert_with(Vec::new)`.
 unwrap_or_default = "allow"
