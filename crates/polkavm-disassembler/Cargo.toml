@@ -6,8 +6,7 @@ license.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 repository.workspace = true
-
-# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+description = "Disassembler for PolkaVM"
 
 [dependencies]
 clap = { workspace = true, features = ["derive"] }
