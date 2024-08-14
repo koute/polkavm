@@ -396,11 +396,23 @@ pub struct MetadataPointer(pub *const u8);
 unsafe impl Sync for MetadataPointer {}
 
 #[repr(packed)]
-pub struct ExternMetadata {
+pub struct ExternMetadataV1 {
     pub version: u8,
     pub flags: u32,
     pub symbol_length: u32,
     pub symbol: MetadataPointer,
     pub input_regs: u8,
     pub output_regs: u8,
+}
+
+#[repr(packed)]
+pub struct ExternMetadataV2 {
+    pub version: u8,
+    pub flags: u32,
+    pub symbol_length: u32,
+    pub symbol: MetadataPointer,
+    pub input_regs: u8,
+    pub output_regs: u8,
+    pub has_index: bool,
+    pub index: u32,
 }
