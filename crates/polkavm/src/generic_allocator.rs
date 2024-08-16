@@ -71,7 +71,10 @@ pub struct AllocatorBinConfig {
 }
 
 #[doc(hidden)]
-pub const fn calculate_optimal_bin_config<PrimaryMask, SecondaryMask>(max_allocation_size: u32, mut requested_max_bins: u32) -> AllocatorBinConfig {
+pub const fn calculate_optimal_bin_config<PrimaryMask, SecondaryMask>(
+    max_allocation_size: u32,
+    mut requested_max_bins: u32,
+) -> AllocatorBinConfig {
     let true_max_bins = (core::mem::size_of::<PrimaryMask>() * 8 * ::core::mem::size_of::<SecondaryMask>() * 8) as u32;
     if true_max_bins < requested_max_bins {
         requested_max_bins = true_max_bins
@@ -148,14 +151,22 @@ trait BitMaskT: Default {
     fn find_first(&mut self, min_index: Self::Index) -> Option<Self::Index>;
 }
 
-impl<Primary, Secondary> BitIndexT for crate::bit_mask::BitIndex<Primary, Secondary> where Primary: Copy, Secondary: Copy {
+impl<Primary, Secondary> BitIndexT for crate::bit_mask::BitIndex<Primary, Secondary>
+where
+    Primary: Copy,
+    Secondary: Copy,
+{
     #[inline]
     fn index(&self) -> usize {
         Self::index(self)
     }
 }
 
-impl<Primary, Secondary, const SECONDARY_LENGTH: usize> BitMaskT for crate::bit_mask::BitMask<Primary, Secondary, SECONDARY_LENGTH> where Primary: crate::bit_mask::RawMask, Secondary: crate::bit_mask::RawMask {
+impl<Primary, Secondary, const SECONDARY_LENGTH: usize> BitMaskT for crate::bit_mask::BitMask<Primary, Secondary, SECONDARY_LENGTH>
+where
+    Primary: crate::bit_mask::RawMask,
+    Secondary: crate::bit_mask::RawMask,
+{
     type Index = crate::bit_mask::BitIndex<Primary, Secondary>;
 
     #[inline]
@@ -196,8 +207,9 @@ pub trait AllocatorConfig {
 }
 
 // TODO: Remove this once this is fixed: https://github.com/rust-lang/rust/issues/60551
+#[doc(hidden)]
 #[macro_export]
-macro_rules! allocator_config {
+macro_rules! _allocator_config {
     (
         impl AllocatorConfig for $type:ty {
             const MAX_ALLOCATION_SIZE: u32 = $max_allocation_size:expr;
@@ -206,18 +218,24 @@ macro_rules! allocator_config {
     ) => {
         impl $crate::generic_allocator::AllocatorConfig for $type {
             const MAX_ALLOCATION_SIZE: u32 = $max_allocation_size;
-            type BitMask = $crate::bit_mask::bitmask_type!(usize, usize, $crate::generic_allocator::calculate_optimal_bin_config::<usize, usize>($max_allocation_size, $max_bins).bin_count as usize);
-            type BinArray = [u32; $crate::generic_allocator::calculate_optimal_bin_config::<usize, usize>($max_allocation_size, $max_bins).bin_count as usize];
+            type BitMask = $crate::bit_mask::bitmask_type!(
+                usize,
+                usize,
+                $crate::generic_allocator::calculate_optimal_bin_config::<usize, usize>($max_allocation_size, $max_bins).bin_count as usize
+            );
+            type BinArray = [u32; $crate::generic_allocator::calculate_optimal_bin_config::<usize, usize>($max_allocation_size, $max_bins)
+                .bin_count as usize];
 
             fn to_bin_index<const ROUND_UP: bool>(size: u32) -> u32 {
-                const MANTISSA_BITS: u32 = $crate::generic_allocator::calculate_optimal_bin_config::<usize, usize>($max_allocation_size, $max_bins).mantissa_bits;
+                const MANTISSA_BITS: u32 =
+                    $crate::generic_allocator::calculate_optimal_bin_config::<usize, usize>($max_allocation_size, $max_bins).mantissa_bits;
                 $crate::generic_allocator::to_bin_index::<MANTISSA_BITS, ROUND_UP>(size)
             }
         }
-    }
+    };
 }
 
-pub use allocator_config;
+pub use _allocator_config as allocator_config;
 
 const EMPTY: u32 = u32::MAX;
 
@@ -267,7 +285,10 @@ impl GenericAllocation {
     }
 }
 
-impl<C> GenericAllocator<C> where C: AllocatorConfig {
+impl<C> GenericAllocator<C>
+where
+    C: AllocatorConfig,
+{
     pub fn new(total_space: u32) -> Self {
         let mut mutable = GenericAllocator {
             bins_with_free_space: C::BitMask::default(),
@@ -393,11 +414,7 @@ impl<C> GenericAllocator<C> where C: AllocatorConfig {
             self.nodes[new_free_node as usize].next_by_address = next_by_address;
         }
 
-        Some(GenericAllocation {
-            node,
-            offset,
-            size
-        })
+        Some(GenericAllocation { node, offset, size })
     }
 
     pub fn free(&mut self, alloc: GenericAllocation) {
@@ -405,7 +422,11 @@ impl<C> GenericAllocator<C> where C: AllocatorConfig {
             return;
         }
 
-        let GenericAllocation { node, mut offset, mut size } = alloc;
+        let GenericAllocation {
+            node,
+            mut offset,
+            mut size,
+        } = alloc;
 
         // Check if there's a free node before this node with which we can merge.
         {

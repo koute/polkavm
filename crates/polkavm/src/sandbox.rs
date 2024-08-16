@@ -1,19 +1,15 @@
 use alloc::sync::Arc;
 use core::sync::atomic::{AtomicUsize, Ordering};
 
-use polkavm_common::{
-    zygote::{
-        AddressTable,
-    },
-};
+use polkavm_common::zygote::AddressTable;
 
-use crate::{Gas, InterruptKind, Reg, RegValue, MemoryAccessError, AsUninitSliceMut, ProgramCounter};
 use crate::api::{EngineState, Module};
 use crate::compiler::CompiledModule;
 use crate::config::{Config, SandboxKind};
+use crate::error::Error;
 use crate::mutex::Mutex;
 use crate::utils::GuestInit;
-use crate::error::Error;
+use crate::{AsUninitSliceMut, Gas, InterruptKind, MemoryAccessError, ProgramCounter, Reg, RegValue};
 
 macro_rules! get_field_offset {
     ($struct:expr, |$struct_ident:ident| $get_field:expr) => {{
@@ -23,7 +19,7 @@ macro_rules! get_field_offset {
         let struct_addr = struct_ref as usize;
         let field_addr = field_ptr as usize;
         field_addr - struct_addr
-    }}
+    }};
 }
 
 #[cfg(feature = "generic-sandbox")]
@@ -65,9 +61,6 @@ pub(crate) fn get_native_page_size() -> usize {
     page_size
 }
 
-#[derive(Copy, Clone, PartialEq, Eq, Debug)]
-pub(crate) struct NotEnoughGas;
-
 pub trait SandboxConfig: Default {
     fn enable_logger(&mut self, value: bool);
 }
@@ -107,7 +100,11 @@ pub(crate) trait Sandbox: Sized {
     fn allocate_jump_table(global: &Self::GlobalState, count: usize) -> Result<Self::JumpTable, Self::Error>;
 
     fn reserve_address_space() -> Result<Self::AddressSpace, Self::Error>;
-    fn prepare_program(global: &Self::GlobalState, init: SandboxInit<Self>, address_space: Self::AddressSpace) -> Result<Self::Program, Self::Error>;
+    fn prepare_program(
+        global: &Self::GlobalState,
+        init: SandboxInit<Self>,
+        address_space: Self::AddressSpace,
+    ) -> Result<Self::Program, Self::Error>;
     fn spawn(global: &Self::GlobalState, config: &Self::Config) -> Result<Self, Self::Error>;
     fn load_module(&mut self, global: &Self::GlobalState, module: &Module) -> Result<(), Self::Error>;
     fn recycle(&mut self, global: &Self::GlobalState) -> Result<(), Self::Error>;
@@ -125,7 +122,9 @@ pub(crate) trait Sandbox: Sized {
     fn next_native_program_counter(&self) -> Option<usize>;
     fn set_next_program_counter(&mut self, pc: ProgramCounter);
     fn reset_memory(&mut self) -> Result<(), Self::Error>;
-    fn read_memory_into<'slice, B>(&self, address: u32, buffer: &'slice mut B) -> Result<&'slice mut [u8], MemoryAccessError> where B: ?Sized + AsUninitSliceMut;
+    fn read_memory_into<'slice, B>(&self, address: u32, buffer: &'slice mut B) -> Result<&'slice mut [u8], MemoryAccessError>
+    where
+        B: ?Sized + AsUninitSliceMut;
     fn write_memory(&mut self, address: u32, data: &[u8]) -> Result<(), MemoryAccessError>;
     fn zero_memory(&mut self, address: u32, length: u32) -> Result<(), MemoryAccessError>;
     fn free_pages(&mut self, address: u32, length: u32) -> Result<(), Self::Error>;
@@ -135,7 +134,10 @@ pub(crate) trait Sandbox: Sized {
 }
 
 #[derive(Copy, Clone, Default)]
-pub struct SandboxInit<'a, S> where S: Sandbox {
+pub struct SandboxInit<'a, S>
+where
+    S: Sandbox,
+{
     pub guest_init: GuestInit<'a>,
     pub code: &'a [u8],
     pub jump_table: S::JumpTable,
@@ -143,12 +145,18 @@ pub struct SandboxInit<'a, S> where S: Sandbox {
     pub sysreturn_address: u64,
 }
 
-pub(crate) struct SandboxInstance<S> where S: Sandbox {
+pub(crate) struct SandboxInstance<S>
+where
+    S: Sandbox,
+{
     engine_state: Arc<EngineState>,
-    sandbox: Option<S>
+    sandbox: Option<S>,
 }
 
-impl<S> SandboxInstance<S> where S: Sandbox {
+impl<S> SandboxInstance<S>
+where
+    S: Sandbox,
+{
     pub fn spawn_and_load_module(engine_state: Arc<EngineState>, module: &Module) -> Result<Self, Error> {
         use crate::sandbox::SandboxConfig;
 
@@ -156,7 +164,11 @@ impl<S> SandboxInstance<S> where S: Sandbox {
         sandbox_config.enable_logger(is_sandbox_logging_enabled());
 
         let global = S::downcast_global_state(engine_state.sandbox_global.as_ref().unwrap());
-        let mut sandbox = if let Some(sandbox) = engine_state.sandbox_cache.as_ref().and_then(|cache| S::downcast_worker_cache(cache).reuse_sandbox()) {
+        let mut sandbox = if let Some(sandbox) = engine_state
+            .sandbox_cache
+            .as_ref()
+            .and_then(|cache| S::downcast_worker_cache(cache).reuse_sandbox())
+        {
             sandbox
         } else {
             S::spawn(global, &sandbox_config)
@@ -164,8 +176,8 @@ impl<S> SandboxInstance<S> where S: Sandbox {
                 .map_err(|error| error.context("instantiation failed: failed to create a sandbox"))?
         };
 
-
-        sandbox.load_module(global, module)
+        sandbox
+            .load_module(global, module)
             .map_err(Error::from_display)
             .map_err(|error| error.context("instantiation failed: failed to upload the program into the sandbox"))?;
 
@@ -184,7 +196,10 @@ impl<S> SandboxInstance<S> where S: Sandbox {
     }
 }
 
-impl<S> Drop for SandboxInstance<S> where S: Sandbox {
+impl<S> Drop for SandboxInstance<S>
+where
+    S: Sandbox,
+{
     fn drop(&mut self) {
         if let Some(cache) = self.engine_state.sandbox_cache.as_ref() {
             let cache = S::downcast_worker_cache(cache);
@@ -215,18 +230,24 @@ impl GlobalStateKind {
             SandboxKind::Linux => {
                 #[cfg(target_os = "linux")]
                 {
-                    Ok(Self::Linux(crate::sandbox::linux::GlobalState::new(config).map_err(|error| format!("failed to initialize Linux sandbox: {error}"))?))
+                    Ok(Self::Linux(
+                        crate::sandbox::linux::GlobalState::new(config)
+                            .map_err(|error| format!("failed to initialize Linux sandbox: {error}"))?,
+                    ))
                 }
 
                 #[cfg(not(target_os = "linux"))]
                 {
                     unreachable!()
                 }
-            },
+            }
             SandboxKind::Generic => {
                 #[cfg(feature = "generic-sandbox")]
                 {
-                    Ok(Self::Generic(crate::sandbox::generic::GlobalState::new(config).map_err(|error| format!("failed to initialize generic sandbox: {error}"))?))
+                    Ok(Self::Generic(
+                        crate::sandbox::generic::GlobalState::new(config)
+                            .map_err(|error| format!("failed to initialize generic sandbox: {error}"))?,
+                    ))
                 }
 
                 #[cfg(not(feature = "generic-sandbox"))]
@@ -258,7 +279,7 @@ impl WorkerCacheKind {
                 {
                     unreachable!()
                 }
-            },
+            }
             SandboxKind::Generic => {
                 #[cfg(feature = "generic-sandbox")]
                 {
@@ -276,9 +297,7 @@ impl WorkerCacheKind {
     pub(crate) fn spawn(&self, global: &GlobalStateKind) -> Result<(), Error> {
         match self {
             #[cfg(target_os = "linux")]
-            WorkerCacheKind::Linux(ref cache) => {
-                cache.spawn(crate::sandbox::linux::Sandbox::downcast_global_state(global))
-            },
+            WorkerCacheKind::Linux(ref cache) => cache.spawn(crate::sandbox::linux::Sandbox::downcast_global_state(global)),
             #[cfg(feature = "generic-sandbox")]
             WorkerCacheKind::Generic(ref cache) => cache.spawn(crate::sandbox::generic::Sandbox::downcast_global_state(global)),
         }
@@ -291,7 +310,10 @@ pub(crate) struct WorkerCache<S> {
     worker_limit: usize,
 }
 
-impl<S> WorkerCache<S> where S: Sandbox {
+impl<S> WorkerCache<S>
+where
+    S: Sandbox,
+{
     pub(crate) fn new(config: &Config) -> Self {
         WorkerCache {
             sandboxes: Mutex::new(Vec::new()),
@@ -306,7 +328,12 @@ impl<S> WorkerCache<S> where S: Sandbox {
 
         let sandbox = S::spawn(global, &sandbox_config)
             .map_err(crate::Error::from_display)
-            .map_err(|error| error.context(format!("failed to create a worker process ({} already exist)", self.available_workers.load(Ordering::Relaxed))))?;
+            .map_err(|error| {
+                error.context(format!(
+                    "failed to create a worker process ({} already exist)",
+                    self.available_workers.load(Ordering::Relaxed)
+                ))
+            })?;
 
         let mut sandboxes = self.sandboxes.lock();
         sandboxes.push(sandbox);
@@ -343,7 +370,10 @@ impl<S> WorkerCache<S> where S: Sandbox {
         }
 
         loop {
-            if let Err(new_count) = self.available_workers.compare_exchange(count, count + 1, Ordering::Relaxed, Ordering::Relaxed) {
+            if let Err(new_count) = self
+                .available_workers
+                .compare_exchange(count, count + 1, Ordering::Relaxed, Ordering::Relaxed)
+            {
                 if new_count >= self.worker_limit {
                     return;
                 }

@@ -10,4 +10,4 @@ mod riscv;
 mod utils;
 
 pub use crate::program_from_elf::{program_from_elf, Config, ProgramFromElfError};
-pub use polkavm_common::program::{ProgramBlob, ProgramParseError};
+pub use polkavm_common::program::{ProgramBlob, ProgramParseError, ProgramParts};

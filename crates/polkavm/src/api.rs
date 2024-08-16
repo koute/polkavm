@@ -140,7 +140,7 @@ impl Engine {
         }
 
         if config.dynamic_paging() && !config.allow_experimental {
-            bail!("cannot enable dynamic paging: this is not production ready nor even finished; you can enabled `set_allow_experimental`/`POLKAVM_ALLOW_EXPERIMENTAL` to be able to use it anyway");
+            bail!("cannot enable dynamic paging: this is not production ready nor even finished; you can enable `set_allow_experimental`/`POLKAVM_ALLOW_EXPERIMENTAL` to be able to use it anyway");
         }
 
         Ok(Engine {
@@ -502,7 +502,7 @@ impl Module {
     }
 
     /// Returns the module's exports.
-    pub fn exports(&self) -> impl Iterator<Item = crate::ProgramExport<&[u8]>> + Clone {
+    pub fn exports(&self) -> impl Iterator<Item = crate::program::ProgramExport<&[u8]>> + Clone {
         self.0.blob.exports()
     }
 

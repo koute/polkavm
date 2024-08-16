@@ -1,21 +1,19 @@
+use core::marker::PhantomData;
 use std::collections::HashMap;
 use std::sync::Arc;
-use core::marker::PhantomData;
 
 use polkavm_assembler::{Assembler, Label};
-use polkavm_common::program::{ParsedInstruction, ProgramExport, ProgramCounter, Instructions, JumpTable, RawReg, InstructionVisitor};
-use polkavm_common::zygote::{
-    VM_COMPILER_MAXIMUM_INSTRUCTION_LENGTH,
-};
 use polkavm_common::abi::VM_CODE_ADDRESS_ALIGNMENT;
+use polkavm_common::program::{InstructionVisitor, Instructions, JumpTable, ParsedInstruction, ProgramCounter, ProgramExport, RawReg};
+use polkavm_common::zygote::VM_COMPILER_MAXIMUM_INSTRUCTION_LENGTH;
 
 use crate::error::Error;
 
-use crate::sandbox::{Sandbox, SandboxProgram, SandboxInit};
 use crate::config::{GasMeteringKind, ModuleConfig, SandboxKind};
-use crate::utils::{FlatMap, GuestInit};
 use crate::gas::GasVisitor;
 use crate::mutex::Mutex;
+use crate::sandbox::{Sandbox, SandboxInit, SandboxProgram};
+use crate::utils::{FlatMap, GuestInit};
 
 #[cfg(target_arch = "x86_64")]
 mod amd64;
@@ -60,7 +58,10 @@ struct Cache {
 #[derive(Clone, Default)]
 pub(crate) struct CompilerCache(Arc<Mutex<Cache>>);
 
-pub(crate) struct CompilerVisitor<'a, S> where S: Sandbox {
+pub(crate) struct CompilerVisitor<'a, S>
+where
+    S: Sandbox,
+{
     init: GuestInit<'a>,
     jump_table: JumpTable<'a>,
     code: &'a [u8],
@@ -88,22 +89,33 @@ pub(crate) struct CompilerVisitor<'a, S> where S: Sandbox {
 }
 
 #[repr(transparent)]
-pub(crate) struct ArchVisitor<'r, 'a, S>(pub &'r mut CompilerVisitor<'a, S>) where S: Sandbox;
+pub(crate) struct ArchVisitor<'r, 'a, S>(pub &'r mut CompilerVisitor<'a, S>)
+where
+    S: Sandbox;
 
-impl<'r, 'a, S> core::ops::Deref for ArchVisitor<'r, 'a, S> where S: Sandbox {
+impl<'r, 'a, S> core::ops::Deref for ArchVisitor<'r, 'a, S>
+where
+    S: Sandbox,
+{
     type Target = CompilerVisitor<'a, S>;
     fn deref(&self) -> &Self::Target {
         self.0
     }
 }
 
-impl<'r, 'a, S> core::ops::DerefMut for ArchVisitor<'r, 'a, S> where S: Sandbox {
+impl<'r, 'a, S> core::ops::DerefMut for ArchVisitor<'r, 'a, S>
+where
+    S: Sandbox,
+{
     fn deref_mut(&mut self) -> &mut Self::Target {
         self.0
     }
 }
 
-impl<'a, S> CompilerVisitor<'a, S> where S: Sandbox {
+impl<'a, S> CompilerVisitor<'a, S>
+where
+    S: Sandbox,
+{
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
         cache: &CompilerCache,
@@ -115,10 +127,17 @@ impl<'a, S> CompilerVisitor<'a, S> where S: Sandbox {
         step_tracing: bool,
         code_length: u32,
         init: GuestInit<'a>,
-    ) -> Result<(Self, S::AddressSpace), Error> where S: Sandbox {
+    ) -> Result<(Self, S::AddressSpace), Error>
+    where
+        S: Sandbox,
+    {
         let native_page_size = crate::sandbox::get_native_page_size();
         if native_page_size > config.page_size as usize || config.page_size as usize % native_page_size != 0 {
-            return Err(format!("configured page size of {} is incompatible with the native page size of {}", config.page_size, native_page_size).into());
+            return Err(format!(
+                "configured page size of {} is incompatible with the native page size of {}",
+                config.page_size, native_page_size
+            )
+            .into());
         }
 
         let address_space = S::reserve_address_space().map_err(Error::from_display)?;
@@ -210,14 +229,29 @@ impl<'a, S> CompilerVisitor<'a, S> where S: Sandbox {
         }
 
         log::trace!("Emitting code...");
-        visitor.program_counter_to_machine_code_offset_list.push((ProgramCounter(0), visitor.asm.len() as u32));
+        visitor
+            .program_counter_to_machine_code_offset_list
+            .push((ProgramCounter(0), visitor.asm.len() as u32));
         visitor.force_start_new_basic_block(0);
 
         Ok((visitor, address_space))
     }
 
-    pub(crate) fn finish_compilation(mut self, global: &S::GlobalState, cache: &CompilerCache, address_space: S::AddressSpace) -> Result<CompiledModule<S>, Error> where S: Sandbox {
-        if self.program_counter_to_label.get(self.code_length).and_then(|label| self.asm.get_label_origin_offset(label)).is_none() {
+    pub(crate) fn finish_compilation(
+        mut self,
+        global: &S::GlobalState,
+        cache: &CompilerCache,
+        address_space: S::AddressSpace,
+    ) -> Result<CompiledModule<S>, Error>
+    where
+        S: Sandbox,
+    {
+        if self
+            .program_counter_to_label
+            .get(self.code_length)
+            .and_then(|label| self.asm.get_label_origin_offset(label))
+            .is_none()
+        {
             // Finish with a trap in case the code doesn't end with a basic block terminator.
             log::trace!("Adding an implicit trap to the last block...");
             use polkavm_common::program::ParsingVisitor;
@@ -265,14 +299,23 @@ impl<'a, S> CompilerVisitor<'a, S> where S: Sandbox {
 
         assert!(self.program_counter_to_machine_code_offset_map.is_empty());
         for export in self.exports {
-            let native_offset = if let Ok(index) = self.program_counter_to_machine_code_offset_list.binary_search_by_key(&export.program_counter(), |&(code_offset, _)| code_offset) {
+            let native_offset = if let Ok(index) = self
+                .program_counter_to_machine_code_offset_list
+                .binary_search_by_key(&export.program_counter(), |&(code_offset, _)| code_offset)
+            {
                 self.program_counter_to_machine_code_offset_list[index].1
             } else {
                 self.program_counter_to_machine_code_offset_list.last().unwrap().1
             };
 
-            log::trace!("Export at {}: {} => 0x{:08x}", export.program_counter(), export.symbol(), native_code_origin + u64::from(native_offset));
-            self.program_counter_to_machine_code_offset_map.insert(export.program_counter(), native_offset);
+            log::trace!(
+                "Export at {}: {} => 0x{:08x}",
+                export.program_counter(),
+                export.symbol(),
+                native_code_origin + u64::from(native_offset)
+            );
+            self.program_counter_to_machine_code_offset_map
+                .insert(export.program_counter(), native_offset);
         }
 
         let sysenter_address = native_code_origin
@@ -284,7 +327,7 @@ impl<'a, S> CompilerVisitor<'a, S> where S: Sandbox {
             .expect("overflow");
 
         match S::KIND {
-            SandboxKind::Linux => {},
+            SandboxKind::Linux => {}
             SandboxKind::Generic => {
                 let native_page_size = crate::sandbox::get_native_page_size();
                 let padded_length = polkavm_common::utils::align_to_next_page_usize(native_page_size, self.asm.len()).unwrap();
@@ -373,7 +416,8 @@ impl<'a, S> CompilerVisitor<'a, S> where S: Sandbox {
         }
 
         let next_program_counter = program_counter + args_length + 1;
-        self.program_counter_to_machine_code_offset_list.push((ProgramCounter(next_program_counter), self.asm.len() as u32));
+        self.program_counter_to_machine_code_offset_list
+            .push((ProgramCounter(next_program_counter), self.asm.len() as u32));
 
         if IS_BASIC_BLOCK_TERMINATOR {
             if self.gas_metering.is_some() {
@@ -457,7 +501,10 @@ impl<'a, S> CompilerVisitor<'a, S> where S: Sandbox {
     }
 }
 
-impl<'a, S> polkavm_common::program::ParsingVisitor for CompilerVisitor<'a, S> where S: Sandbox {
+impl<'a, S> polkavm_common::program::ParsingVisitor for CompilerVisitor<'a, S>
+where
+    S: Sandbox,
+{
     type ReturnTy = ();
 
     #[inline(always)]
@@ -1085,7 +1132,14 @@ impl<'a, S> polkavm_common::program::ParsingVisitor for CompilerVisitor<'a, S> w
     }
 
     #[inline(always)]
-    fn branch_greater_or_equal_unsigned_imm(&mut self, code_offset: u32, args_length: u32, s1: RawReg, s2: u32, imm: u32) -> Self::ReturnTy {
+    fn branch_greater_or_equal_unsigned_imm(
+        &mut self,
+        code_offset: u32,
+        args_length: u32,
+        s1: RawReg,
+        s2: u32,
+        imm: u32,
+    ) -> Self::ReturnTy {
         self.before_instruction(code_offset);
         self.gas_visitor.branch_greater_or_equal_unsigned_imm(s1, s2, imm);
         ArchVisitor(self).branch_greater_or_equal_unsigned_imm(s1, s2, imm);
@@ -1149,7 +1203,15 @@ impl<'a, S> polkavm_common::program::ParsingVisitor for CompilerVisitor<'a, S> w
     }
 
     #[inline(always)]
-    fn load_imm_and_jump_indirect(&mut self, code_offset: u32, args_length: u32, ra: RawReg, base: RawReg, value: u32, offset: u32) -> Self::ReturnTy {
+    fn load_imm_and_jump_indirect(
+        &mut self,
+        code_offset: u32,
+        args_length: u32,
+        ra: RawReg,
+        base: RawReg,
+        value: u32,
+        offset: u32,
+    ) -> Self::ReturnTy {
         self.before_instruction(code_offset);
         self.gas_visitor.load_imm_and_jump_indirect(ra, base, value, offset);
         ArchVisitor(self).load_imm_and_jump_indirect(ra, base, value, offset);
@@ -1173,7 +1235,10 @@ impl<'a, S> polkavm_common::program::ParsingVisitor for CompilerVisitor<'a, S> w
     }
 }
 
-pub(crate) struct CompiledModule<S> where S: Sandbox {
+pub(crate) struct CompiledModule<S>
+where
+    S: Sandbox,
+{
     pub(crate) sandbox_program: S::Program,
     pub(crate) native_code_origin: u64,
     // A sorted list which maps guest code offsets to native code offsets.
@@ -1185,7 +1250,10 @@ pub(crate) struct CompiledModule<S> where S: Sandbox {
     pub(crate) invalid_code_offset_address: u64,
 }
 
-impl<S> CompiledModule<S> where S: Sandbox {
+impl<S> CompiledModule<S>
+where
+    S: Sandbox,
+{
     pub fn machine_code(&self) -> &[u8] {
         self.sandbox_program.machine_code()
     }
@@ -1195,15 +1263,25 @@ impl<S> CompiledModule<S> where S: Sandbox {
     }
 
     pub fn lookup_native_code_address(&self, program_counter: ProgramCounter) -> Option<u64> {
-        self.program_counter_to_machine_code_offset_map.get(&program_counter).copied().or_else(|| {
-            let index = self.program_counter_to_machine_code_offset_list.binary_search_by_key(&program_counter, |&(pc, _)| pc).ok()?;
-            Some(self.program_counter_to_machine_code_offset_list[index].1)
-        }).map(|native_offset| self.native_code_origin + u64::from(native_offset))
+        self.program_counter_to_machine_code_offset_map
+            .get(&program_counter)
+            .copied()
+            .or_else(|| {
+                let index = self
+                    .program_counter_to_machine_code_offset_list
+                    .binary_search_by_key(&program_counter, |&(pc, _)| pc)
+                    .ok()?;
+                Some(self.program_counter_to_machine_code_offset_list[index].1)
+            })
+            .map(|native_offset| self.native_code_origin + u64::from(native_offset))
     }
 
     pub fn program_counter_by_native_code_address(&self, address: u64, strict: bool) -> Option<ProgramCounter> {
         let offset = address - self.native_code_origin;
-        let index = match self.program_counter_to_machine_code_offset_list.binary_search_by_key(&offset, |&(_, native_offset)| u64::from(native_offset)) {
+        let index = match self
+            .program_counter_to_machine_code_offset_list
+            .binary_search_by_key(&offset, |&(_, native_offset)| u64::from(native_offset))
+        {
             Ok(index) => index,
             Err(index) => {
                 if !strict && index > 0 && index < self.program_counter_to_machine_code_offset_list.len() {
@@ -1211,14 +1289,17 @@ impl<S> CompiledModule<S> where S: Sandbox {
                 } else {
                     return None;
                 }
-            },
+            }
         };
 
         Some(self.program_counter_to_machine_code_offset_list[index].0)
     }
 }
 
-impl<S> Drop for CompiledModule<S> where S: Sandbox {
+impl<S> Drop for CompiledModule<S>
+where
+    S: Sandbox,
+{
     fn drop(&mut self) {
         let mut program_counter_to_machine_code_offset_list = core::mem::take(&mut self.program_counter_to_machine_code_offset_list);
         let mut program_counter_to_machine_code_offset_map = core::mem::take(&mut self.program_counter_to_machine_code_offset_map);

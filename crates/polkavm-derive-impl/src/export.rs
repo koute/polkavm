@@ -189,7 +189,7 @@ pub fn polkavm_export(attributes: ExportBlockAttributes, input: syn::ItemFn) -> 
                 static METADATA_SYMBOL: &str = #symbol;
 
                 #[link_section = ".polkavm_metadata"]
-                static METADATA: #abi_path::private::ExternMetadata = #abi_path::private::ExternMetadata {
+                static METADATA: #abi_path::private::ExternMetadataV1 = #abi_path::private::ExternMetadataV1 {
                     version: 1,
                     flags: 0,
                     symbol_length: METADATA_SYMBOL.len() as u32,
