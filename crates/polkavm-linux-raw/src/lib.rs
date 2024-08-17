@@ -209,6 +209,7 @@ pub use crate::arch_bindings::{
     ETOOMANYREFS,
     ETXTBSY,
     EXDEV,
+    ERESTARTSYS,
     F_ADD_SEALS,
     F_DUPFD,
     F_GETFD,
@@ -1310,6 +1311,7 @@ impl Error {
             ERANGE => Some("ERANGE"),
             EOPNOTSUPP => Some("EOPNOTSUPP"),
             ETOOMANYREFS => Some("ETOOMANYREFS"),
+            ERESTARTSYS => Some("ERESTARTSYS"),
             _ => None,
         };
 

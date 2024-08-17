@@ -1199,6 +1199,7 @@ pub const ERANGE: u32 = 34;
 pub const EOPNOTSUPP: u32 = 95;
 pub const ETOOMANYREFS: u32 = 109;
 pub const ETIMEDOUT: u32 = 110;
+pub const ERESTARTSYS: u32 = 512;
 pub const FUTEX_WAIT: u32 = 0;
 pub const FUTEX_WAKE: u32 = 1;
 pub const FUTEX_FD: u32 = 2;
