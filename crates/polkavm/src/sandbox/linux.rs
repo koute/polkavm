@@ -1156,7 +1156,7 @@ impl super::Sandbox for Sandbox {
         })))
     }
 
-    fn spawn(global: &Self::GlobalState, config: &SandboxConfig) -> Result<Self, Error> {
+    fn spawn(global: &Self::GlobalState, _config: &SandboxConfig) -> Result<Self, Error> {
         let sigset = Sigmask::block_all_signals()?;
         let (vmctx_memfd, vmctx_mmap) = prepare_vmctx()?;
         let (socket, child_socket) = linux_raw::sys_socketpair(linux_raw::AF_UNIX, linux_raw::SOCK_SEQPACKET | linux_raw::SOCK_CLOEXEC, 0)?;
