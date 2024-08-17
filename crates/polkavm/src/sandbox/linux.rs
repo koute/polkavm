@@ -646,7 +646,7 @@ fn prepare_memory() -> Result<(Fd, Mmap), Error> {
     Ok((memfd, vmctx))
 }
 
-unsafe fn child_main(zygote_memfd: Fd, child_socket: Fd, uid_map: &str, gid_map: &str, logging_pipe: Option<Fd>) -> Result<(), Error> {
+unsafe fn child_main(zygote_memfd: Fd, child_socket: Fd, uid_map: &str, gid_map: &str, logging_pipe: Fd) -> Result<(), Error> {
     // Change the name of the process.
     linux_raw::sys_prctl_set_name(b"polkavm-sandbox\0")?;
 
@@ -675,10 +675,7 @@ unsafe fn child_main(zygote_memfd: Fd, child_socket: Fd, uid_map: &str, gid_map:
 
     // This should never happen in practice, but can in theory if the user closes stdin or stderr manually.
     // TODO: Actually support this?
-    for fd in [zygote_memfd.raw(), child_socket.raw()]
-        .into_iter()
-        .chain(logging_pipe.as_ref().map(|fd| fd.raw()))
-    {
+    for fd in [zygote_memfd.raw(), child_socket.raw(), logging_pipe.raw()] {
         if fd == STDIN_FILENO {
             return Err(Error::from_str("internal error: fd overlaps with stdin"));
         }
@@ -697,12 +694,10 @@ unsafe fn child_main(zygote_memfd: Fd, child_socket: Fd, uid_map: &str, gid_map:
     let fds_to_keep = {
         let mut count = 1;
         fds_to_keep[0] = STDIN_FILENO;
-        if let Some(logging_pipe) = logging_pipe {
-            linux_raw::sys_dup3(logging_pipe.raw(), STDERR_FILENO, 0)?;
-            logging_pipe.close()?;
-            fds_to_keep[count] = STDERR_FILENO;
-            count += 1;
-        }
+        linux_raw::sys_dup3(logging_pipe.raw(), STDERR_FILENO, 0)?;
+        logging_pipe.close()?;
+        fds_to_keep[count] = STDERR_FILENO;
+        count += 1;
 
         fds_to_keep[count] = zygote_memfd.raw();
         count += 1;
@@ -1199,12 +1194,7 @@ impl super::Sandbox for Sandbox {
         let uid_map = format!("0 {} 1\n", uid);
         let gid_map = format!("0 {} 1\n", gid);
 
-        let (logger_rx, logger_tx) = if config.enable_logger {
-            let (rx, tx) = linux_raw::sys_pipe2(linux_raw::O_CLOEXEC)?;
-            (Some(rx), Some(tx))
-        } else {
-            (None, None)
-        };
+        let (logger_rx, logger_tx) = linux_raw::sys_pipe2(linux_raw::O_CLOEXEC)?;
 
         // Fork a new process.
         let mut child_pid =
@@ -1250,46 +1240,44 @@ impl super::Sandbox for Sandbox {
             }
         }
 
-        if let Some(logger_rx) = logger_rx {
-            // Hook up the child process' STDERR to our logger.
-            std::thread::Builder::new()
-                .name("polkavm-logger".into())
-                .spawn(move || {
-                    let mut tmp = [0; 4096];
-                    let mut buffer = Vec::new();
-                    loop {
-                        if buffer.len() > 8192 {
-                            // Make sure the child can't exhaust our memory by spamming logs.
-                            buffer.clear();
+        // Hook up the child process' STDERR to our logger.
+        std::thread::Builder::new()
+            .name("polkavm-logger".into())
+            .spawn(move || {
+                let mut tmp = [0; 4096];
+                let mut buffer = Vec::new();
+                loop {
+                    if buffer.len() > 8192 {
+                        // Make sure the child can't exhaust our memory by spamming logs.
+                        buffer.clear();
+                    }
+
+                    match linux_raw::sys_read(logger_rx.borrow(), &mut tmp) {
+                        Err(error) if error.errno() == linux_raw::EINTR => continue,
+                        Err(error) => {
+                            log::warn!("Failed to read from logger: {}", error);
+                            break;
                         }
+                        Ok(0) => break,
+                        Ok(count) => {
+                            let mut tmp = &tmp[..count];
+                            while !tmp.is_empty() {
+                                if let Some(index) = tmp.iter().position(|&byte| byte == b'\n') {
+                                    buffer.extend_from_slice(&tmp[..index]);
+                                    tmp = &tmp[index + 1..];
 
-                        match linux_raw::sys_read(logger_rx.borrow(), &mut tmp) {
-                            Err(error) if error.errno() == linux_raw::EINTR => continue,
-                            Err(error) => {
-                                log::warn!("Failed to read from logger: {}", error);
-                                break;
-                            }
-                            Ok(0) => break,
-                            Ok(count) => {
-                                let mut tmp = &tmp[..count];
-                                while !tmp.is_empty() {
-                                    if let Some(index) = tmp.iter().position(|&byte| byte == b'\n') {
-                                        buffer.extend_from_slice(&tmp[..index]);
-                                        tmp = &tmp[index + 1..];
-
-                                        log::trace!(target: "polkavm::zygote", "Child #{}: {}", child_pid, String::from_utf8_lossy(&buffer));
-                                        buffer.clear();
-                                    } else {
-                                        buffer.extend_from_slice(tmp);
-                                        break;
-                                    }
+                                    log::trace!(target: "polkavm::zygote", "Child #{}: {}", child_pid, String::from_utf8_lossy(&buffer));
+                                    buffer.clear();
+                                } else {
+                                    buffer.extend_from_slice(tmp);
+                                    break;
                                 }
                             }
                         }
                     }
-                })
-                .map_err(|error| Error::from_os_error("failed to spawn logger thread", error))?;
-        }
+                }
+            })
+            .map_err(|error| Error::from_os_error("failed to spawn logger thread", error))?;
 
         let mut child = ChildProcess {
             pid: child_pid as c_int,
