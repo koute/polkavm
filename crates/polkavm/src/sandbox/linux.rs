@@ -2163,9 +2163,12 @@ impl Sandbox {
                     if job.user_data == IO_URING_JOB_FUTEX_WAIT {
                         self.iouring_futex_wait_queued = false;
                     } else if job.user_data == IO_URING_JOB_USERFAULTFD_READ {
+                        self.iouring_uffd_read_queued = false;
+                        if job.res == -(linux_raw::ERESTARTSYS as i32) {
+                            continue 'outer;
+                        }
                         job.to_result()?;
 
-                        self.iouring_uffd_read_queued = false;
                         let msg = unsafe { &mut *self.uffd_msg.0.get() };
                         let event = u32::from(core::mem::replace(&mut msg.event, 0));
                         if event == linux_raw::UFFD_EVENT_PAGEFAULT {
