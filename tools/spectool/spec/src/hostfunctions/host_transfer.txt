@@ -1,0 +1,10 @@
+pub @main:
+    a0 = 0x2a
+    a1 = 0x1234
+    a2 = 0x5678
+    a3 = 0x0123
+    a4 = 0x4567
+    a5 = 0x4000
+    transfer
+    trap
+

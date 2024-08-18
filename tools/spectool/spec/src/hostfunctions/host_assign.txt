@@ -1,0 +1,6 @@
+pub @main:
+    a0 = 0x1
+    a1 = 0x4000
+    assign
+    trap
+

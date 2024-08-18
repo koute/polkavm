@@ -309,6 +309,76 @@ pub fn assemble(code: &str) -> Result<Vec<u8>, String> {
             emit_and_continue!(Instruction::fallthrough);
         }
 
+        if line == "egas" {
+            emit_and_continue!(Instruction::egas);
+        }
+        if line == "lookup" {
+            emit_and_continue!(Instruction::lookup);
+        }
+        if line == "read" {
+            emit_and_continue!(Instruction::read);
+        }
+        if line == "write" {
+            emit_and_continue!(Instruction::write);
+        }
+        if line == "info" {
+            emit_and_continue!(Instruction::info);
+        }
+        if line == "empower" {
+            emit_and_continue!(Instruction::empower);
+        }
+        if line == "designate" {
+            emit_and_continue!(Instruction::designate);
+        }
+        if line == "checkpoint" {
+            emit_and_continue!(Instruction::checkpoint);
+        }
+        if line == "upgrade" {
+            emit_and_continue!(Instruction::upgrade);
+        }
+        if line == "transfer" {
+            emit_and_continue!(Instruction::transfer);
+        }
+        if line == "quit" {
+            emit_and_continue!(Instruction::quit);
+        }
+        if line == "solicit" {
+            emit_and_continue!(Instruction::solicit);
+        }
+        if line == "forget" {
+            emit_and_continue!(Instruction::forget);
+        }
+        if line == "historical_lookup" {
+            emit_and_continue!(Instruction::historical_lookup);
+        }
+        if line == "import" {
+            emit_and_continue!(Instruction::import);
+        }
+        if line == "export" {
+            emit_and_continue!(Instruction::export);
+        }
+        if line == "machine" {
+            emit_and_continue!(Instruction::machine);
+        }
+        if line == "peek" {
+            emit_and_continue!(Instruction::peek);
+        }
+        if line == "poke" {
+            emit_and_continue!(Instruction::poke);
+        }
+        if line == "invoke" {
+            emit_and_continue!(Instruction::invoke);
+        }
+        if line == "expunge" {
+            emit_and_continue!(Instruction::expunge);
+        }
+        if line == "assign" {
+            emit_and_continue!(Instruction::assign);
+        }
+        if line == "new" {
+            emit_and_continue!(Instruction::new);
+        }
+
         if line == "ret" {
             emit_and_continue!(Instruction::jump_indirect(Reg::RA.into(), 0));
         }

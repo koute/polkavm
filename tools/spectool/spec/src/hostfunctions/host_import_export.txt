@@ -1,0 +1,14 @@
+pub @main:
+    a0 = 0
+    a1 = 0x3000
+    a2 = 4
+    import
+
+    a3 = u32 [0x3000]
+    a4 = a3 * a3
+    a0 = 0x7000
+    a1 = 4
+    export
+    
+    trap
+

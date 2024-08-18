@@ -760,6 +760,75 @@ where
     #[allow(clippy::unused_self)]
     #[inline(always)]
     pub fn fallthrough(&mut self) {}
+#[inline(always)]
+pub fn egas(&mut self) {
+}
+#[inline(always)]
+pub fn lookup(&mut self) {
+}
+#[inline(always)]
+pub fn read(&mut self){
+}
+#[inline(always)]
+pub fn write(&mut self) {
+}
+#[inline(always)]
+pub fn info(&mut self) {
+}
+#[inline(always)]
+pub fn empower(&mut self) {
+}
+#[inline(always)]
+pub fn designate(&mut self) {
+}
+#[inline(always)]
+pub fn checkpoint(&mut self) {
+}
+#[inline(always)]
+pub fn upgrade(&mut self) {
+}
+#[inline(always)]
+pub fn transfer(&mut self) {
+}
+#[inline(always)]
+pub fn quit(&mut self) {
+}
+#[inline(always)]
+pub fn solicit(&mut self) {
+}
+#[inline(always)]
+pub fn forget(&mut self) {
+}
+#[inline(always)]
+pub fn historical_lookup(&mut self) {
+}
+#[inline(always)]
+pub fn import(&mut self) {
+}
+#[inline(always)]
+pub fn export(&mut self) {
+}
+#[inline(always)]
+pub fn machine(&mut self) {
+}
+#[inline(always)]
+pub fn peek(&mut self) {
+}
+#[inline(always)]
+pub fn poke(&mut self) {
+}
+#[inline(always)]
+pub fn invoke(&mut self) {
+}
+#[inline(always)]
+pub fn expunge(&mut self) {
+}
+#[inline(always)]
+pub fn assign(&mut self) {
+}
+#[inline(always)]
+pub fn new(&mut self) {
+}
 
     #[inline(always)]
     pub fn sbrk(&mut self, dst: RawReg, size: RawReg) {

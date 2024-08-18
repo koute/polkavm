@@ -1,0 +1,8 @@
+pub @main:
+    a0 = 0x2a
+    a1 = 0x4000
+    a2 = 0x3000
+    a3 = 4
+    poke
+    trap
+

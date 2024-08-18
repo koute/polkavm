@@ -2206,6 +2206,30 @@ impl<'a, const DEBUG: bool, const STEP_TRACING: bool> InstructionVisitor for Com
         emit!(self, unresolved_jump(self.program_counter, target));
     }
 
+    fn egas(&mut self) -> Self::ReturnTy {}
+    fn lookup(&mut self) -> Self::ReturnTy {}
+    fn read(&mut self) -> Self::ReturnTy {}
+    fn write(&mut self) -> Self::ReturnTy {}
+    fn info(&mut self) -> Self::ReturnTy {}
+    fn empower(&mut self) -> Self::ReturnTy {}
+    fn designate(&mut self) -> Self::ReturnTy {}
+    fn checkpoint(&mut self) -> Self::ReturnTy {}
+    fn upgrade(&mut self) -> Self::ReturnTy {}
+    fn transfer(&mut self) -> Self::ReturnTy {}
+    fn quit(&mut self) -> Self::ReturnTy {}
+    fn solicit(&mut self) -> Self::ReturnTy {}
+    fn forget(&mut self) -> Self::ReturnTy {}
+    fn historical_lookup(&mut self) -> Self::ReturnTy {}
+    fn import(&mut self) -> Self::ReturnTy {}
+    fn export(&mut self) -> Self::ReturnTy {}
+    fn machine(&mut self) -> Self::ReturnTy {}
+    fn peek(&mut self) -> Self::ReturnTy {}
+    fn poke(&mut self) -> Self::ReturnTy {}
+    fn invoke(&mut self) -> Self::ReturnTy {}
+    fn expunge(&mut self) -> Self::ReturnTy {}
+    fn assign(&mut self) -> Self::ReturnTy {}
+    fn new(&mut self) -> Self::ReturnTy {}
+
     fn sbrk(&mut self, dst: RawReg, size: RawReg) -> Self::ReturnTy {
         emit!(self, sbrk(dst, size));
     }

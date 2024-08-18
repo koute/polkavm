@@ -34,6 +34,98 @@ impl InstructionVisitor for GasVisitor {
         self.cost += 1;
         self.start_new_basic_block();
     }
+    #[inline(always)]
+    fn egas(&mut self) -> Self::ReturnTy {
+        self.cost += 1;
+    }
+    #[inline(always)]
+    fn lookup(&mut self) -> Self::ReturnTy {
+        self.cost += 1;
+    }
+    #[inline(always)]
+    fn read(&mut self) -> Self::ReturnTy {
+        self.cost += 1;
+    }
+    #[inline(always)]
+    fn write(&mut self) -> Self::ReturnTy {
+        self.cost += 1;
+    }
+    #[inline(always)]
+    fn info(&mut self) -> Self::ReturnTy {
+        self.cost += 1;
+    }
+    #[inline(always)]
+    fn empower(&mut self) -> Self::ReturnTy {
+        self.cost += 1;
+    }
+    #[inline(always)]
+    fn designate(&mut self) -> Self::ReturnTy {
+        self.cost += 1;
+    }
+    #[inline(always)]
+    fn checkpoint(&mut self) -> Self::ReturnTy {
+        self.cost += 1;
+    }
+    #[inline(always)]
+    fn upgrade(&mut self) -> Self::ReturnTy {
+        self.cost += 1;
+    }
+    #[inline(always)]
+    fn transfer(&mut self) -> Self::ReturnTy {
+        self.cost += 1;
+    }
+    #[inline(always)]
+    fn quit(&mut self) -> Self::ReturnTy {
+        self.cost += 1;
+    }
+    #[inline(always)]
+    fn solicit(&mut self) -> Self::ReturnTy {
+        self.cost += 1;
+    }
+    #[inline(always)]
+    fn forget(&mut self) -> Self::ReturnTy {
+        self.cost += 1;
+    }
+    #[inline(always)]
+    fn historical_lookup(&mut self) -> Self::ReturnTy {
+        self.cost += 1;
+    }
+    #[inline(always)]
+    fn import(&mut self) -> Self::ReturnTy {
+        self.cost += 1;
+    }
+    #[inline(always)]
+    fn export(&mut self) -> Self::ReturnTy {
+        self.cost += 1;
+    }
+    #[inline(always)]
+    fn machine(&mut self) -> Self::ReturnTy {
+        self.cost += 1;
+    }
+    #[inline(always)]
+    fn peek(&mut self) -> Self::ReturnTy {
+        self.cost += 1;
+    }
+    #[inline(always)]
+    fn poke(&mut self) -> Self::ReturnTy {
+        self.cost += 1;
+    }
+    #[inline(always)]
+    fn invoke(&mut self) -> Self::ReturnTy {
+        self.cost += 1;
+    }
+    #[inline(always)]
+    fn expunge(&mut self) -> Self::ReturnTy {
+        self.cost += 1;
+    }
+    #[inline(always)]
+    fn assign(&mut self) -> Self::ReturnTy {
+        self.cost += 1;
+    }
+    #[inline(always)]
+    fn new(&mut self) -> Self::ReturnTy {
+        self.cost += 1;
+    }
 
     #[inline(always)]
     fn sbrk(&mut self, _d: RawReg, _s: RawReg) -> Self::ReturnTy {

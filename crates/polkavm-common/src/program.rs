@@ -1311,6 +1311,31 @@ define_opcodes! {
     [
         trap                                     = 0,
         fallthrough                              = 17,
+        // 23 host functions: 128 + the GP number in Appendix B
+        egas = 128,
+        lookup                            = 129,
+        read                              = 130,
+        write                             = 131,
+        info = 132,
+        empower = 133,
+        designate = 134,
+        checkpoint = 135,
+        upgrade = 136,
+        transfer = 137,
+        quit = 138,
+        solicit                           = 139,
+        forget                            = 140,
+        historical_lookup                 = 141,
+        import                            = 142,
+        export                            = 143,
+        machine                           = 144,
+        peek = 145,
+        poke = 146,
+        invoke = 147,
+        expunge = 148,
+        // no number specified in GP below has assign=21, new=22
+        assign = 149,
+        new = 150,
     ]
 
     // Instructions with args: reg, imm
@@ -1635,7 +1660,75 @@ impl<'a, 'b> InstructionVisitor for InstructionFormatter<'a, 'b> {
     fn fallthrough(&mut self) -> Self::ReturnTy {
         write!(self, "fallthrough")
     }
-
+    fn egas(&mut self) -> Self::ReturnTy {
+        write!(self, "egas")
+    }
+    fn lookup(&mut self) -> Self::ReturnTy {
+        write!(self, "lookup")
+    }
+    fn read(&mut self) -> Self::ReturnTy {
+        write!(self, "read")
+    }
+    fn write(&mut self) -> Self::ReturnTy {
+        write!(self, "write")
+    }
+    fn info(&mut self) -> Self::ReturnTy {
+        write!(self, "info")
+    }
+    fn empower(&mut self) -> Self::ReturnTy {
+        write!(self, "empower")
+    }
+    fn designate(&mut self) -> Self::ReturnTy {
+        write!(self, "designate")
+    }
+    fn checkpoint(&mut self) -> Self::ReturnTy {
+        write!(self, "checkpoint")
+    }
+    fn upgrade(&mut self) -> Self::ReturnTy {
+        write!(self, "upgrade")
+    }
+    fn transfer(&mut self) -> Self::ReturnTy {
+        write!(self, "transfer")
+    }
+    fn quit(&mut self) -> Self::ReturnTy {
+        write!(self, "quit")
+    }
+    fn solicit(&mut self) -> Self::ReturnTy {
+        write!(self, "solicit")
+    }
+    fn forget(&mut self) -> Self::ReturnTy {
+        write!(self, "forget")
+    }
+    fn historical_lookup(&mut self) -> Self::ReturnTy {
+        write!(self, "historical_lookup")
+    }
+    fn import(&mut self) -> Self::ReturnTy {
+        write!(self, "import")
+    }
+    fn export(&mut self) -> Self::ReturnTy {
+        write!(self, "export")
+    }
+    fn machine(&mut self) -> Self::ReturnTy {
+        write!(self, "machine")
+    }
+    fn peek(&mut self) -> Self::ReturnTy {
+        write!(self, "peek")
+    }
+    fn poke(&mut self) -> Self::ReturnTy {
+        write!(self, "poke")
+    }
+    fn invoke(&mut self) -> Self::ReturnTy {
+        write!(self, "invoke")
+    }
+    fn expunge(&mut self) -> Self::ReturnTy {
+        write!(self, "expunge")
+    }
+    fn assign(&mut self) -> Self::ReturnTy {
+        write!(self, "assign")
+    }
+    fn new(&mut self) -> Self::ReturnTy {
+        write!(self, "new")
+    }
     fn sbrk(&mut self, d: RawReg, s: RawReg) -> Self::ReturnTy {
         let d = self.format_reg(d);
         let s = self.format_reg(s);

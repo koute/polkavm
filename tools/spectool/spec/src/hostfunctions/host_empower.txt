@@ -1,0 +1,7 @@
+pub @main:
+    a0 = 0x12345678
+    a1 = 0x87654321
+    a2 = 0x00000100
+    empower
+    trap
+

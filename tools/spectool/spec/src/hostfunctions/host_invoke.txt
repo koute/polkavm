@@ -1,0 +1,6 @@
+pub @main:
+    a0 = 0x0000002b
+    a1 = 0x4000
+    invoke
+    trap
+

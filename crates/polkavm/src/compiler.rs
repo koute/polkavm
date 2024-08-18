@@ -532,6 +532,171 @@ where
     }
 
     #[inline(always)]
+    fn egas(&mut self, code_offset: u32, args_length: u32) -> Self::ReturnTy {
+        self.before_instruction(code_offset);
+        self.gas_visitor.egas();
+        ArchVisitor(self).egas();
+        self.after_instruction::<true>(code_offset, args_length);
+    }
+    
+    #[inline(always)]
+    fn lookup(&mut self, code_offset: u32, args_length: u32) -> Self::ReturnTy {
+        self.before_instruction(code_offset);
+        self.gas_visitor.lookup();
+        ArchVisitor(self).lookup();
+        self.after_instruction::<true>(code_offset, args_length);
+    }
+    #[inline(always)]
+    fn read(&mut self, code_offset: u32, args_length: u32) -> Self::ReturnTy {
+        self.before_instruction(code_offset);
+        self.gas_visitor.read();
+        ArchVisitor(self).read();
+        self.after_instruction::<true>(code_offset, args_length);
+    }
+    #[inline(always)]
+    fn write(&mut self, code_offset: u32, args_length: u32) -> Self::ReturnTy {
+        self.before_instruction(code_offset);
+        self.gas_visitor.write();
+        ArchVisitor(self).write();
+        self.after_instruction::<true>(code_offset, args_length);
+    }
+    #[inline(always)]
+    fn info(&mut self, code_offset: u32, args_length: u32) -> Self::ReturnTy {
+        self.before_instruction(code_offset);
+        self.gas_visitor.info();
+        ArchVisitor(self).info();
+        self.after_instruction::<true>(code_offset, args_length);
+    }
+    #[inline(always)]
+    fn empower(&mut self, code_offset: u32, args_length: u32) -> Self::ReturnTy {
+        self.before_instruction(code_offset);
+        self.gas_visitor.empower();
+        ArchVisitor(self).empower();
+        self.after_instruction::<true>(code_offset, args_length);
+    }
+    #[inline(always)]
+    fn designate(&mut self, code_offset: u32, args_length: u32) -> Self::ReturnTy {
+        self.before_instruction(code_offset);
+        self.gas_visitor.designate();
+        ArchVisitor(self).designate();
+        self.after_instruction::<true>(code_offset, args_length);
+        
+    }
+    #[inline(always)]
+    fn checkpoint(&mut self, code_offset: u32, args_length: u32) -> Self::ReturnTy {
+        self.before_instruction(code_offset);
+        self.gas_visitor.checkpoint();
+        ArchVisitor(self).checkpoint();
+        self.after_instruction::<true>(code_offset, args_length);
+        
+    }
+    #[inline(always)]
+    fn upgrade(&mut self, code_offset: u32, args_length: u32) -> Self::ReturnTy {
+        self.before_instruction(code_offset);
+        self.gas_visitor.upgrade();
+        ArchVisitor(self).upgrade();
+        self.after_instruction::<true>(code_offset, args_length);
+        
+    }
+    #[inline(always)]
+    fn transfer(&mut self, code_offset: u32, args_length: u32) -> Self::ReturnTy {
+        self.before_instruction(code_offset);
+        self.gas_visitor.transfer();
+        ArchVisitor(self).transfer();
+        self.after_instruction::<true>(code_offset, args_length);
+    }
+    #[inline(always)]
+    fn quit(&mut self, code_offset: u32, args_length: u32) -> Self::ReturnTy {
+        self.before_instruction(code_offset);
+        self.gas_visitor.quit();
+        ArchVisitor(self).quit();
+        self.after_instruction::<true>(code_offset, args_length);
+    }
+    #[inline(always)]
+    fn solicit(&mut self, code_offset: u32, args_length: u32) -> Self::ReturnTy {
+        self.before_instruction(code_offset);
+        self.gas_visitor.solicit();
+        ArchVisitor(self).solicit();
+        self.after_instruction::<true>(code_offset, args_length);
+    }
+    #[inline(always)]
+    fn forget(&mut self, code_offset: u32, args_length: u32) -> Self::ReturnTy {
+        self.before_instruction(code_offset);
+        self.gas_visitor.forget();
+        ArchVisitor(self).forget();
+        self.after_instruction::<true>(code_offset, args_length);
+    }
+    #[inline(always)]
+    fn historical_lookup(&mut self, code_offset: u32, args_length: u32) -> Self::ReturnTy {
+        self.before_instruction(code_offset);
+        self.gas_visitor.historical_lookup();
+        ArchVisitor(self).historical_lookup();
+        self.after_instruction::<true>(code_offset, args_length);
+    }
+    #[inline(always)]
+    fn import(&mut self, code_offset: u32, args_length: u32) -> Self::ReturnTy {
+        self.before_instruction(code_offset);
+        self.gas_visitor.import();
+        ArchVisitor(self).import();
+        self.after_instruction::<true>(code_offset, args_length);
+    }
+    #[inline(always)]
+    fn export(&mut self, code_offset: u32, args_length: u32) -> Self::ReturnTy {
+        self.before_instruction(code_offset);
+        self.gas_visitor.export();
+        ArchVisitor(self).export();
+        self.after_instruction::<true>(code_offset, args_length);
+    }
+    #[inline(always)]
+    fn machine(&mut self, code_offset: u32, args_length: u32) -> Self::ReturnTy {
+        self.before_instruction(code_offset);
+        self.gas_visitor.machine();
+        ArchVisitor(self).machine();
+        self.after_instruction::<true>(code_offset, args_length);
+    }
+    #[inline(always)]
+    fn peek(&mut self, code_offset: u32, args_length: u32) -> Self::ReturnTy {
+        self.before_instruction(code_offset);
+        self.gas_visitor.peek();
+        ArchVisitor(self).peek();
+        self.after_instruction::<true>(code_offset, args_length);
+    }
+    #[inline(always)]
+    fn poke(&mut self, code_offset: u32, args_length: u32) -> Self::ReturnTy {
+        self.before_instruction(code_offset);
+        self.gas_visitor.poke();
+        ArchVisitor(self).poke();
+        self.after_instruction::<true>(code_offset, args_length);
+    }
+    #[inline(always)]
+    fn invoke(&mut self, code_offset: u32, args_length: u32) -> Self::ReturnTy {
+        self.before_instruction(code_offset);
+        self.gas_visitor.invoke();
+        ArchVisitor(self).invoke();
+        self.after_instruction::<true>(code_offset, args_length);
+    }
+    #[inline(always)]
+    fn expunge(&mut self, code_offset: u32, args_length: u32) -> Self::ReturnTy {
+        self.before_instruction(code_offset);
+        self.gas_visitor.expunge();
+        ArchVisitor(self).expunge();
+        self.after_instruction::<true>(code_offset, args_length);
+    }
+    #[inline(always)]
+    fn assign(&mut self, code_offset: u32, args_length: u32) -> Self::ReturnTy {
+        self.before_instruction(code_offset);
+        self.gas_visitor.assign();
+        ArchVisitor(self).assign();
+        self.after_instruction::<true>(code_offset, args_length);
+    }
+    #[inline(always)]
+    fn new(&mut self, code_offset: u32, args_length: u32) -> Self::ReturnTy {
+        self.before_instruction(code_offset);
+        self.gas_visitor.new();
+        ArchVisitor(self).new();
+        self.after_instruction::<true>(code_offset, args_length);
+    }
+    #[inline(always)]
     fn sbrk(&mut self, code_offset: u32, args_length: u32, d: RawReg, s: RawReg) -> Self::ReturnTy {
         self.before_instruction(code_offset);
         self.gas_visitor.sbrk(d, s);

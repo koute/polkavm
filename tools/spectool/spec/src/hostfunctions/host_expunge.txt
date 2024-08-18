@@ -1,0 +1,5 @@
+pub @main:
+    a0 = 0x2b
+    expunge
+    trap
+
