@@ -7,7 +7,7 @@ use polkavm_common::{
     program::Reg,
     utils::{align_to_next_page_usize, slice_assume_init_mut, AsUninitSliceMut},
     zygote::{
-        AddressTable, AddressTablePacked, ExtTable, ExtTablePacked, VmCtx, VmMap, VMCTX_FUTEX_BUSY, VMCTX_FUTEX_GUEST_ECALLI,
+        AddressTable, AddressTablePacked, ExtTable, ExtTablePacked, VmCtx, VmFd, VmMap, VMCTX_FUTEX_BUSY, VMCTX_FUTEX_GUEST_ECALLI,
         VMCTX_FUTEX_GUEST_SIGNAL, VMCTX_FUTEX_GUEST_STEP, VMCTX_FUTEX_GUEST_TRAP, VMCTX_FUTEX_IDLE, VM_ADDR_NATIVE_CODE,
     },
 };
@@ -33,7 +33,7 @@ use crate::{Gas, InterruptKind, ProgramCounter, RegValue, Segfault};
 
 pub struct GlobalState {
     shared_memory: ShmAllocator,
-    uffd_enabled: bool,
+    uffd_available: bool,
     zygote_memfd: Fd,
 }
 
@@ -42,8 +42,8 @@ const UFFD_REQUIRED_FEATURES: u64 =
 
 impl GlobalState {
     pub fn new(config: &Config) -> Result<Self, Error> {
-        let uffd_enabled = config.dynamic_paging;
-        if uffd_enabled {
+        let uffd_available = config.allow_dynamic_paging;
+        if uffd_available {
             let userfaultfd = linux_raw::sys_userfaultfd(linux_raw::O_CLOEXEC).map_err(|error| {
                 if error.errno() == linux_raw::EPERM
                     && std::fs::read("/proc/sys/vm/unprivileged_userfaultfd")
@@ -78,7 +78,7 @@ impl GlobalState {
         let zygote_memfd = prepare_zygote()?;
         Ok(GlobalState {
             shared_memory: ShmAllocator::new()?,
-            uffd_enabled,
+            uffd_available,
             zygote_memfd,
         })
     }
@@ -960,6 +960,8 @@ pub struct Sandbox {
     next_program_counter: Option<ProgramCounter>,
     pending_pagefault: Option<Pagefault>,
     page_set: PageSet,
+    dynamic_paging_enabled: bool,
+    idle_regs: linux_raw::user_regs_struct,
 }
 
 impl Drop for Sandbox {
@@ -1457,14 +1459,14 @@ impl super::Sandbox for Sandbox {
             }
         }
 
-        vmctx.init.uffd_enabled.store(global.uffd_enabled, Ordering::Relaxed);
+        vmctx.init.uffd_available.store(global.uffd_available, Ordering::Relaxed);
         vmctx.init.sandbox_disabled.store(cfg!(polkavm_dev_debug_zygote), Ordering::Relaxed);
 
         // Wake the child so that it finishes initialization.
         vmctx.futex.store(VMCTX_FUTEX_BUSY, Ordering::Release);
         linux_raw::sys_futex_wake_one(&vmctx.futex)?;
 
-        let (iouring, memory_mmap, userfaultfd) = if global.uffd_enabled {
+        let (iouring, memory_mmap, userfaultfd) = if global.uffd_available {
             let iouring = linux_raw::IoUring::new(3)?;
             let (memory_memfd, memory_mmap) = prepare_memory()?;
             linux_raw::sendfd(socket.borrow(), memory_memfd.borrow())?;
@@ -1487,19 +1489,6 @@ impl super::Sandbox for Sandbox {
             linux_raw::sys_uffdio_api(userfaultfd.borrow(), &mut api)
                 .map_err(|error| Error::from(format!("failed to initialize the userfaultfd API: {error}")))?;
 
-            linux_raw::sys_uffdio_register(
-                userfaultfd.borrow(),
-                &mut linux_raw::uffdio_register {
-                    range: linux_raw::uffdio_range {
-                        start: 0x10000,
-                        len: u64::from(u32::MAX) + 1 - 0x20000,
-                    },
-                    mode: linux_raw::UFFDIO_REGISTER_MODE_MISSING | linux_raw::UFFDIO_REGISTER_MODE_WP,
-                    ..linux_raw::uffdio_register::default()
-                },
-            )
-            .map_err(|error| Error::from(format!("failed to register the guest memory with userfaultfd: {error}")))?;
-
             linux_raw::sys_ptrace_seize(child.pid)?;
 
             (Some(iouring), memory_mmap, userfaultfd)
@@ -1512,6 +1501,39 @@ impl super::Sandbox for Sandbox {
 
         // Wait for the child to finish initialization.
         wait_for_futex(vmctx, &mut child, VMCTX_FUTEX_BUSY, VMCTX_FUTEX_IDLE)?;
+
+        let mut idle_regs = linux_raw::user_regs_struct::default();
+        if global.uffd_available {
+            // We need to be able to return to idle from a pending segfault,
+            // so let's grab the registers which will allow us to do that.
+
+            // First grab all of the general-purpose registers.
+            linux_raw::sys_ptrace_interrupt(child.pid)?;
+            let status = child.check_status(false)?;
+            if !status.is_trapped() {
+                log::error!("Child #{}: expected child to trap, found: {status}", child.pid);
+                return Err(Error::from_str("internal error: unexpected child status"));
+            }
+
+            idle_regs = linux_raw::sys_ptrace_getregs(child.pid)?;
+            linux_raw::sys_ptrace_continue(child.pid, None)?;
+
+            // Then grab the worker's idle longjmp registers.
+            vmctx.jump_into.store(ZYGOTE_TABLES.1.ext_fetch_idle_regs, Ordering::Relaxed);
+            vmctx.futex.store(VMCTX_FUTEX_BUSY, Ordering::Release);
+            linux_raw::sys_futex_wake_one(&vmctx.futex)?;
+            wait_for_futex(vmctx, &mut child, VMCTX_FUTEX_BUSY, VMCTX_FUTEX_IDLE)?;
+
+            idle_regs.rax = 1;
+            idle_regs.rip = vmctx.init.idle_regs.rip.load(Ordering::Relaxed);
+            idle_regs.rbx = vmctx.init.idle_regs.rbx.load(Ordering::Relaxed);
+            idle_regs.sp = vmctx.init.idle_regs.rsp.load(Ordering::Relaxed);
+            idle_regs.rbp = vmctx.init.idle_regs.rbp.load(Ordering::Relaxed);
+            idle_regs.r12 = vmctx.init.idle_regs.r12.load(Ordering::Relaxed);
+            idle_regs.r13 = vmctx.init.idle_regs.r13.load(Ordering::Relaxed);
+            idle_regs.r14 = vmctx.init.idle_regs.r14.load(Ordering::Relaxed);
+            idle_regs.r15 = vmctx.init.idle_regs.r15.load(Ordering::Relaxed);
+        }
 
         Ok(Sandbox {
             _lifetime_pipe: lifetime_pipe_host,
@@ -1537,6 +1559,8 @@ impl super::Sandbox for Sandbox {
             next_program_counter: None,
             pending_pagefault: None,
             page_set: PageSet::new(),
+            dynamic_paging_enabled: false,
+            idle_regs,
         })
     }
 
@@ -1545,50 +1569,89 @@ impl super::Sandbox for Sandbox {
             return Err(Error::from("module already loaded"));
         }
 
-        if self.iouring.is_some() && get_native_page_size() != module.memory_map().page_size() as usize {
+        if module.is_dynamic_paging() && get_native_page_size() != module.memory_map().page_size() as usize {
             return Err(Error::from(
                 "dynamic paging is currently unsupported if the module's page size doesn't match the native page size",
             ));
         }
 
-        log::debug!("Loading module into sandbox #{}...", self.child.pid);
+        log::debug!(
+            "Loading module into sandbox #{}... (dynamic paging = {})",
+            self.child.pid,
+            module.is_dynamic_paging()
+        );
 
         let compiled_module = Self::downcast_module(module);
         let program = &compiled_module.sandbox_program.0;
 
-        let Some(memory_map) = global.shared_memory.alloc(core::mem::size_of::<VmMap>() * program.memory_map.len()) else {
-            return Err(Error::from_str("out of shared memory"));
-        };
+        let memory_map = if !module.is_dynamic_paging() {
+            let Some(memory_map) = global.shared_memory.alloc(core::mem::size_of::<VmMap>() * program.memory_map.len()) else {
+                return Err(Error::from_str("out of shared memory"));
+            };
 
-        unsafe {
-            if !global.uffd_enabled {
-                for (chunk, vm_map) in program.memory_map.iter().zip(memory_map.as_typed_slice_mut::<VmMap>().iter_mut()) {
-                    *vm_map = VmMap {
-                        address: chunk.address,
-                        length: chunk.length,
-                        shm_offset: chunk.initialize_with.as_ref().map_or(u64::MAX, |alloc| alloc.offset() as u64),
-                        is_writable: chunk.is_writable,
-                    };
-                }
-
-                *self.vmctx().shm_memory_map_offset.get() = memory_map.offset() as u64;
-                *self.vmctx().shm_memory_map_count.get() = program.memory_map.len() as u64;
-            } else {
-                *self.vmctx().shm_memory_map_count.get() = 0;
+            let vm_maps = unsafe { memory_map.as_typed_slice_mut::<VmMap>() };
+            for (chunk, vm_map) in program.memory_map.iter().zip(vm_maps.iter_mut()) {
+                *vm_map = VmMap {
+                    address: chunk.address,
+                    length: chunk.length,
+                    protection: linux_raw::PROT_READ | if chunk.is_writable { linux_raw::PROT_WRITE } else { 0 },
+                    flags: if chunk.initialize_with.is_some() {
+                        linux_raw::MAP_FIXED | linux_raw::MAP_PRIVATE
+                    } else {
+                        linux_raw::MAP_FIXED | linux_raw::MAP_PRIVATE | linux_raw::MAP_ANONYMOUS
+                    },
+                    fd: if chunk.initialize_with.is_some() { VmFd::Shm } else { VmFd::None },
+                    fd_offset: chunk.initialize_with.as_ref().map_or(0, |alloc| alloc.offset() as u64),
+                };
             }
 
+            self.vmctx()
+                .shm_memory_map_count
+                .store(program.memory_map.len() as u64, Ordering::Relaxed);
+            memory_map
+        } else {
+            let Some(memory_map) = global.shared_memory.alloc(core::mem::size_of::<VmMap>()) else {
+                return Err(Error::from_str("out of shared memory"));
+            };
+
+            let vm_maps = unsafe { memory_map.as_typed_slice_mut::<VmMap>() };
+            vm_maps[0] = VmMap {
+                address: 0x10000,
+                length: u64::from(u32::MAX) + 1 - 0x10000,
+                protection: linux_raw::PROT_READ | linux_raw::PROT_WRITE,
+                flags: linux_raw::MAP_FIXED | linux_raw::MAP_SHARED,
+                fd: VmFd::Mem,
+                fd_offset: 0x10000,
+            };
+
+            self.vmctx().shm_memory_map_count.store(1, Ordering::Relaxed);
+            memory_map
+        };
+
+        self.vmctx()
+            .shm_memory_map_offset
+            .store(memory_map.offset() as u64, Ordering::Relaxed);
+
+        unsafe {
             *self.vmctx().heap_info.heap_top.get() = u64::from(module.memory_map().heap_base());
             *self.vmctx().heap_info.heap_threshold.get() = u64::from(module.memory_map().rw_data_range().end);
             *self.vmctx().heap_base.get() = module.memory_map().heap_base();
             *self.vmctx().heap_initial_threshold.get() = module.memory_map().rw_data_range().end;
             *self.vmctx().heap_max_size.get() = module.memory_map().max_heap_size();
             *self.vmctx().page_size.get() = module.memory_map().page_size();
-            *self.vmctx().shm_code_offset.get() = program.shm_code.offset() as u64;
-            *self.vmctx().shm_code_length.get() = program.shm_code.len() as u64;
-            *self.vmctx().shm_jump_table_offset.get() = program.shm_jump_table.offset() as u64;
-            *self.vmctx().shm_jump_table_length.get() = program.shm_jump_table.len() as u64;
-            *self.vmctx().sysreturn_address.get() = program.sysreturn_address;
         }
+
+        self.vmctx()
+            .shm_code_offset
+            .store(program.shm_code.offset() as u64, Ordering::Relaxed);
+        self.vmctx().shm_code_length.store(program.shm_code.len() as u64, Ordering::Relaxed);
+        self.vmctx()
+            .shm_jump_table_offset
+            .store(program.shm_jump_table.offset() as u64, Ordering::Relaxed);
+        self.vmctx()
+            .shm_jump_table_length
+            .store(program.shm_jump_table.len() as u64, Ordering::Relaxed);
+        self.vmctx().sysreturn_address.store(program.sysreturn_address, Ordering::Relaxed);
 
         self.vmctx().program_counter.store(0, Ordering::Relaxed);
         self.vmctx().next_program_counter.store(0, Ordering::Relaxed);
@@ -1599,21 +1662,44 @@ impl super::Sandbox for Sandbox {
             reg.store(0, Ordering::Relaxed);
         }
 
+        self.dynamic_paging_enabled = module.is_dynamic_paging();
         self.is_program_counter_valid = false;
         self.gas_metering = module.gas_metering();
         self.module = Some(module.clone());
         self.wake_oneshot_and_expect_idle()?;
         core::mem::drop(memory_map);
 
+        if module.is_dynamic_paging() {
+            linux_raw::sys_uffdio_register(
+                self.userfaultfd.borrow(),
+                &mut linux_raw::uffdio_register {
+                    range: linux_raw::uffdio_range {
+                        start: 0x10000,
+                        len: u64::from(u32::MAX) + 1 - 0x20000,
+                    },
+                    mode: linux_raw::UFFDIO_REGISTER_MODE_MISSING | linux_raw::UFFDIO_REGISTER_MODE_WP,
+                    ..linux_raw::uffdio_register::default()
+                },
+            )
+            .map_err(|error| Error::from(format!("failed to register the guest memory with userfaultfd: {error}")))?;
+        }
+
         Ok(())
     }
 
     fn recycle(&mut self, _global: &Self::GlobalState) -> Result<(), Self::Error> {
-        if self.pending_pagefault.is_some() {
-            Err(Error::from_str("TODO: sandbox recycling is currently unimplemented"))
+        log::trace!("Recycling sandbox #{}", self.child.pid);
+        if self.dynamic_paging_enabled {
+            self.free_pages(0x10000, 0xffff0000)?;
+        }
+
+        self.module = None;
+        self.page_set.clear();
+
+        if self.pending_pagefault.take().is_some() {
+            self.cancel_pagefault()?;
+            Ok(())
         } else {
-            self.module = None;
-            self.page_set.clear();
             self.vmctx().jump_into.store(ZYGOTE_TABLES.1.ext_recycle, Ordering::Relaxed);
             self.wake_oneshot_and_expect_idle()
         }
@@ -1624,12 +1710,12 @@ impl super::Sandbox for Sandbox {
             return Err(Error::from_str("no module loaded into the sandbox"));
         };
 
-        let compiled_module = Self::downcast_module(self.module.as_ref().unwrap());
         if let Some(pc) = self.next_program_counter.take() {
             if self.pending_pagefault.take().is_some() {
-                todo!();
+                self.cancel_pagefault()?;
             }
 
+            let compiled_module = Self::downcast_module(self.module.as_ref().unwrap());
             let Some(address) = compiled_module.lookup_native_code_address(pc) else {
                 log::debug!("Tried to call into {pc} which doesn't have any native code associated with it");
                 self.is_program_counter_valid = true;
@@ -1670,6 +1756,7 @@ impl super::Sandbox for Sandbox {
             );
             linux_raw::sys_ptrace_continue(self.child.pid, None)?;
         } else {
+            let compiled_module = Self::downcast_module(self.module.as_ref().unwrap());
             debug_assert_eq!(self.vmctx().futex.load(Ordering::Relaxed) & 1, VMCTX_FUTEX_IDLE);
             self.vmctx()
                 .jump_into
@@ -1768,7 +1855,7 @@ impl super::Sandbox for Sandbox {
             return Err(Error::from_str("no module loaded into the sandbox"));
         };
 
-        if self.iouring.is_none() {
+        if !self.dynamic_paging_enabled {
             self.vmctx().jump_into.store(ZYGOTE_TABLES.1.ext_reset_memory, Ordering::Relaxed);
             self.wake_oneshot_and_expect_idle()
         } else {
@@ -1788,7 +1875,7 @@ impl super::Sandbox for Sandbox {
             slice.len()
         );
 
-        if self.iouring.is_none() {
+        if !self.dynamic_paging_enabled {
             let length = slice.len();
             match linux_raw::vm_read_memory(self.child.pid, [slice], [(address as usize, length)]) {
                 Ok(actual_length) if actual_length == length => unsafe { Ok(slice_assume_init_mut(slice)) },
@@ -1834,9 +1921,7 @@ impl super::Sandbox for Sandbox {
             return Ok(());
         }
 
-        self.vmctx().is_memory_dirty.store(true, Ordering::Relaxed);
-
-        if self.iouring.is_none() {
+        if !self.dynamic_paging_enabled {
             let length = data.len();
             match linux_raw::vm_write_memory(self.child.pid, [data], [(address as usize, length)]) {
                 Ok(actual_length) if actual_length == length => Ok(()),
@@ -1869,9 +1954,7 @@ impl super::Sandbox for Sandbox {
             length
         );
 
-        self.vmctx().is_memory_dirty.store(true, Ordering::Relaxed);
-
-        if self.iouring.is_none() {
+        if !self.dynamic_paging_enabled {
             self.vmctx().arg.store(address, Ordering::Relaxed);
             self.vmctx().arg2.store(length, Ordering::Relaxed);
             self.vmctx()
@@ -1888,7 +1971,10 @@ impl super::Sandbox for Sandbox {
             let module = self.module.as_ref().unwrap();
             let page_start = module.address_to_page(module.round_to_page_size_down(address));
             let page_end = module.address_to_page(module.round_to_page_size_down(address + length));
-            if self.page_set.is_whole_region_empty((page_start, page_end)) {
+            if module.is_multiple_of_page_size(address)
+                && module.is_multiple_of_page_size(length)
+                && self.page_set.is_whole_region_empty((page_start, page_end))
+            {
                 let mut arg: linux_raw::uffdio_zeropage = Default::default();
                 arg.range.start = u64::from(address);
                 arg.range.len = u64::from(length);
@@ -1918,7 +2004,7 @@ impl super::Sandbox for Sandbox {
     }
 
     fn free_pages(&mut self, address: u32, length: u32) -> Result<(), Self::Error> {
-        if self.iouring.is_none() {
+        if !self.dynamic_paging_enabled {
             todo!();
         } else {
             unsafe {
@@ -2121,7 +2207,9 @@ impl Sandbox {
                 return Err(Error::from_str("internal error: unexpected worker process state"));
             }
 
-            if let Some(ref mut iouring) = self.iouring {
+            if self.dynamic_paging_enabled {
+                let iouring = self.iouring.as_mut().unwrap();
+
                 const IO_URING_JOB_FUTEX_WAIT: u64 = 1;
                 const IO_URING_JOB_USERFAULTFD_READ: u64 = 2;
                 const IO_URING_JOB_TIMEOUT: u64 = 3;
@@ -2340,5 +2428,20 @@ impl Sandbox {
         linux_raw::sys_ptrace_setregs(self.child.pid, &regs)?;
 
         Ok(())
+    }
+
+    fn cancel_pagefault(&mut self) -> Result<(), Error> {
+        log::trace!("Cancelling pending page fault...");
+
+        // This will cancel *our own* `futex_wait` which we've queued up with iouring.
+        linux_raw::sys_futex_wake_one(&self.vmctx().futex)?;
+
+        // Forcibly return the worker to the idle state.
+        //
+        // The worker's currently stuck in a page fault somewhere inside guest code,
+        // so it can't do this by itself.
+        self.vmctx().futex.store(VMCTX_FUTEX_IDLE, Ordering::Release);
+        linux_raw::sys_ptrace_setregs(self.child.pid, &self.idle_regs)?;
+        linux_raw::sys_ptrace_continue(self.child.pid, None)
     }
 }
