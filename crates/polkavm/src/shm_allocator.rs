@@ -1,10 +1,10 @@
 #![allow(clippy::undocumented_unsafe_blocks)]
 
-use alloc::sync::Arc;
-use polkavm_linux_raw as linux_raw;
-use linux_raw::{cstr, Fd, Error};
 use crate::mutex::Mutex;
 use crate::sandbox::get_native_page_size;
+use alloc::sync::Arc;
+use linux_raw::{cstr, Error, Fd};
+use polkavm_linux_raw as linux_raw;
 
 use crate::generic_allocator::{GenericAllocation, GenericAllocator};
 
@@ -39,10 +39,7 @@ impl ShmAllocation {
     ///
     /// The allocation must not be already mutably borrowed.
     pub unsafe fn as_slice(&self) -> &[u8] {
-        core::slice::from_raw_parts(
-            self.as_ptr(),
-            self.len()
-        )
+        core::slice::from_raw_parts(self.as_ptr(), self.len())
     }
 
     /// Accesses the allocation as a mutable slice.
@@ -52,10 +49,7 @@ impl ShmAllocation {
     /// The allocation must not be already immutably or mutably borrowed.
     #[allow(clippy::mut_from_ref)]
     pub unsafe fn as_slice_mut(&self) -> &mut [u8] {
-        core::slice::from_raw_parts_mut(
-            self.as_mut_ptr(),
-            self.len()
-        )
+        core::slice::from_raw_parts_mut(self.as_mut_ptr(), self.len())
     }
 
     /// Accesses the allocation as a mutable slice of a given type.
@@ -68,10 +62,7 @@ impl ShmAllocation {
     ///   or `T` cannot have any niches.
     #[allow(clippy::mut_from_ref)]
     pub unsafe fn as_typed_slice_mut<T>(&self) -> &mut [T] {
-        core::slice::from_raw_parts_mut(
-            self.as_mut_ptr().cast(),
-            self.len() / core::mem::size_of::<T>()
-        )
+        core::slice::from_raw_parts_mut(self.as_mut_ptr().cast(), self.len() / core::mem::size_of::<T>())
     }
 
     pub fn offset(&self) -> usize {
@@ -80,13 +71,23 @@ impl ShmAllocation {
 
     pub fn as_ptr(&self) -> *const u8 {
         unsafe {
-            self.allocator.0.mmap.as_ptr().cast::<u8>().add((self.allocation.offset() << self.allocator.0.page_shift) as usize)
+            self.allocator
+                .0
+                .mmap
+                .as_ptr()
+                .cast::<u8>()
+                .add((self.allocation.offset() << self.allocator.0.page_shift) as usize)
         }
     }
 
     pub fn as_mut_ptr(&self) -> *mut u8 {
         unsafe {
-            self.allocator.0.mmap.as_mut_ptr().cast::<u8>().add((self.allocation.offset() << self.allocator.0.page_shift) as usize)
+            self.allocator
+                .0
+                .mmap
+                .as_mut_ptr()
+                .cast::<u8>()
+                .add((self.allocation.offset() << self.allocator.0.page_shift) as usize)
         }
     }
 
@@ -119,14 +120,16 @@ impl ShmAllocator {
         let fd = linux_raw::sys_memfd_create(cstr!("global"), linux_raw::MFD_CLOEXEC | linux_raw::MFD_ALLOW_SEALING)?;
         linux_raw::sys_ftruncate(fd.borrow(), linux_raw::c_ulong::from(u32::MAX))?;
 
-        let mmap = unsafe { linux_raw::Mmap::map(
-            core::ptr::null_mut(),
-            u32::MAX as usize,
-            linux_raw::PROT_READ | linux_raw::PROT_WRITE,
-            linux_raw::MAP_SHARED,
-            Some(fd.borrow()),
-            0,
-        )? };
+        let mmap = unsafe {
+            linux_raw::Mmap::map(
+                core::ptr::null_mut(),
+                u32::MAX as usize,
+                linux_raw::PROT_READ | linux_raw::PROT_WRITE,
+                linux_raw::MAP_SHARED,
+                Some(fd.borrow()),
+                0,
+            )?
+        };
 
         linux_raw::sys_fcntl(
             fd.borrow(),
@@ -138,7 +141,7 @@ impl ShmAllocator {
             page_shift,
             mmap,
             fd,
-            mutable: Mutex::new(GenericAllocator::<Config>::new(u32::MAX >> page_shift))
+            mutable: Mutex::new(GenericAllocator::<Config>::new(u32::MAX >> page_shift)),
         })))
     }
 
@@ -170,6 +173,7 @@ impl ShmAllocator {
 
 #[test]
 fn test_shm_allocator() {
+    crate::sandbox::init_native_page_size();
     let page_size = get_native_page_size();
     let shm = ShmAllocator::new().unwrap();
     let allocation = shm.alloc(1).unwrap();

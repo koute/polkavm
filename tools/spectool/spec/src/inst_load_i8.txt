@@ -1,0 +1,5 @@
+%rw_data_size = 1
+%rw_data = 81
+
+pub @main:
+    a0 = i8 [0x20000]

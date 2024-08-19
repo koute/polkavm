@@ -1,0 +1,3 @@
+pub @main:
+pub @expected_exit:
+    a0 = u8 [0x20000]

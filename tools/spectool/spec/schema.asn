@@ -1,0 +1,78 @@
+PVMTestSuite DEFINITIONS ::= BEGIN
+
+-- a 64-bit signed integer
+I64 ::= INTEGER(-9223372036854775808..9223372036854775807)
+
+-- a 32-bit unsigned integer
+U32 ::= INTEGER(0..4294967295)
+
+-- an 8-bit unsigned integer (a byte)
+U8 ::= INTEGER(0..255)
+
+-- a blob of bytes at a given memory address
+MemoryChunk ::= SEQUENCE OF SEQUENCE {
+    address U32,
+    contents SEQUENCE OF U8
+}
+
+Testcase ::= SEQUENCE {
+    -- a unique identifier for the test
+    name UTF8String,
+
+    -- (the "ω" from the paper)
+    -- the initial value of each of the 13 registers; these need to be set *before* the test program is executed
+    initial-regs SEQUENCE (SIZE(13..13)) OF U32,
+
+    -- (the "ı" from the paper)
+    -- the initial program counter from which to start the execution
+    initial-pc U32,
+
+    -- (part of the "µ" from the paper)
+    -- lists regions of memory which should be accessible, initialized with zeros by default; any address not on this list should be inaccessible
+    initial-page-map SEQUENCE OF SEQUENCE {
+        address U32,
+        length U32,
+        is-writable BOOLEAN
+    },
+
+    -- (part of the "µ" from the paper)
+    -- lists all non-zero values to put in memory before execution
+    initial-memory MemoryChunk,
+
+    -- (the "ξ" from the paper)
+    -- the initial amount of gas
+    initial-gas I64,
+
+    -- (the bold "p" from the paper)
+    -- the program blob to be executed as part of the test
+    program SEQUENCE OF U8,
+
+    -- (the "ζ" from the paper)
+    -- the status code of the execution, i.e. the way the program is supposed to end
+    expected-status ENUMERATED {
+        -- (called "panic" in the Graypaper)
+        -- the execution ended with a trap (the `trap` instruction was executed, the execution went "out of bounds", an invalid jump was made, or an invalid instruction was executed)
+        trap,
+
+        -- the execution finished gracefully (a dynamic jump to address `0xffff0000` was made)
+        halt
+    },
+
+    -- (the "ω′" from the paper)
+    -- the expected values of each of the 13 registers *after* the test program is executed
+    expected-regs SEQUENCE (SIZE(13..13)) OF U32,
+
+    -- (the "ı′" from the paper)
+    -- the final value of the program counter, after the execution finishes
+    expected-pc U32,
+
+    -- (part of the "µ′" from the paper)
+    -- lists all non-zero values after the execution finishes; all accessible addresses not on this list must be filled with zeroes
+    expected-memory MemoryChunk,
+
+    -- (the "ξ′" from the paper)
+    -- the final amount of gas remaining after the execution finishes
+    expected-gas I64
+}
+
+END

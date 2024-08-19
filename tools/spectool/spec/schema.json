@@ -1,0 +1,90 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "object",
+  "properties": {
+    "name": {
+      "type": "string"
+    },
+    "initial-regs": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/u32" },
+      "minItems": 13,
+      "maxItems": 13
+    },
+    "initial-pc": { "$ref": "#/$defs/u32" },
+    "initial-page-map": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "properties": {
+          "address": { "$ref": "#/$defs/u32" },
+          "length": { "$ref": "#/$defs/u32" },
+          "is-writable": { "type": "boolean" }
+        },
+        "required": ["address", "length", "is-writable"],
+        "additionalProperties": false
+      }
+    },
+    "initial-memory": {
+      "$ref": "#/$defs/memory-chunk"
+    },
+    "initial-gas": {
+      "$ref": "#/$defs/i64"
+    },
+    "program": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/u8" }
+    },
+    "expected-status": {
+      "type": "string",
+      "enum": ["trap", "halt"]
+    },
+    "expected-regs": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/u32" },
+      "minItems": 13,
+      "maxItems": 13
+    },
+    "expected-pc": { "$ref": "#/$defs/u32" },
+    "expected-memory": {
+        "$ref": "#/$defs/memory-chunk"
+    },
+    "expected-gas": {
+      "$ref": "#/$defs/i64"
+    }
+  },
+  "required": ["name", "initial-regs", "initial-pc", "initial-page-map", "initial-memory", "initial-gas", "program", "expected-status", "expected-regs", "expected-pc", "expected-memory", "expected-gas"],
+  "additionalProperties": false,
+  "$defs": {
+    "u8": {
+      "type": "integer",
+      "minimum": 0,
+      "maximum": 255
+    },
+    "u32": {
+      "type": "integer",
+      "minimum": 0,
+      "maximum": 4294967295
+    },
+    "i64": {
+      "type": "integer",
+      "minimum": -9223372036854775808,
+      "maximum": 9223372036854775807
+    },
+    "memory-chunk": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "properties": {
+          "address": { "$ref": "#/$defs/u32" },
+          "contents": {
+            "type": "array",
+            "items": { "$ref": "#/$defs/u8" }
+          }
+        },
+        "required": ["address", "contents"],
+        "additionalProperties": false
+      }
+    }
+  }
+}

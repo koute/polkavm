@@ -4,35 +4,30 @@
 
 use core::ptr::addr_of_mut;
 use core::sync::atomic::Ordering;
-use core::sync::atomic::{AtomicBool, AtomicI32, AtomicUsize};
+use core::sync::atomic::{AtomicBool, AtomicI32, AtomicU64, AtomicUsize};
 
 #[rustfmt::skip]
 use polkavm_common::{
     utils::align_to_next_page_usize,
     zygote::{
-        AddressTableRaw, VmCtx as VmCtxInner,
-        VmMap,
-        SANDBOX_EMPTY_NATIVE_PROGRAM_COUNTER,
-        SANDBOX_EMPTY_NTH_INSTRUCTION,
+        AddressTableRaw, ExtTableRaw, VmCtx as VmCtxInner,
+        VmMap, VmFd, JmpBuf,
         VM_ADDR_JUMP_TABLE_RETURN_TO_HOST,
         VM_ADDR_JUMP_TABLE,
         VM_ADDR_NATIVE_CODE,
         VM_ADDR_SHARED_MEMORY,
         VM_ADDR_SIGSTACK,
-        VM_RPC_FLAG_RECONFIGURE,
         VM_SANDBOX_MAXIMUM_JUMP_TABLE_SIZE,
         VM_SANDBOX_MAXIMUM_JUMP_TABLE_VIRTUAL_SIZE,
         VM_SANDBOX_MAXIMUM_NATIVE_CODE_SIZE,
         VM_SHARED_MEMORY_SIZE,
         VMCTX_FUTEX_BUSY,
-        VMCTX_FUTEX_HOSTCALL,
+        VMCTX_FUTEX_GUEST_ECALLI,
+        VMCTX_FUTEX_GUEST_STEP,
+        VMCTX_FUTEX_GUEST_TRAP,
+        VMCTX_FUTEX_GUEST_SIGNAL,
         VMCTX_FUTEX_IDLE,
-        VMCTX_FUTEX_INIT,
-        VMCTX_FUTEX_TRAP,
     },
-    VM_RPC_FLAG_CLEAR_PROGRAM_AFTER_EXECUTION,
-    VM_RPC_FLAG_RESET_MEMORY_AFTER_EXECUTION,
-    VM_RPC_FLAG_RESET_MEMORY_BEFORE_EXECUTION,
 };
 use polkavm_linux_raw as linux_raw;
 
@@ -93,6 +88,19 @@ impl DisplayLite for u32 {
 impl DisplayLite for u64 {
     fn fmt_lite(&self, mut write_str: impl FnMut(&str)) {
         write_number_base10(*self, &mut write_str)
+    }
+}
+
+impl DisplayLite for i64 {
+    fn fmt_lite(&self, mut write_str: impl FnMut(&str)) {
+        let value = if *self > 0 {
+            *self as u64
+        } else {
+            write_str("-");
+            (*self * -1) as u64
+        };
+
+        write_number_base10(value, &mut write_str)
     }
 }
 
@@ -158,6 +166,18 @@ pub static VMCTX: VmCtx = VmCtx(VmCtxInner::zeroed());
 #[panic_handler]
 fn panic(_: &core::panic::PanicInfo) -> ! {
     abort_with_message("panic triggered in zygote");
+}
+
+#[no_mangle]
+unsafe fn memset(dst: *mut u8, value: u32, size: usize) -> *mut u8 {
+    let mut p = dst;
+    let end = dst.add(size);
+    while p < end {
+        *p = value as u8;
+        p = p.add(1);
+    }
+
+    dst
 }
 
 #[no_mangle]
@@ -247,7 +267,6 @@ fn shm_fd() -> linux_raw::FdRef<'static> {
     linux_raw::FdRef::from_raw_unchecked(SHM_FD.load(Ordering::Relaxed))
 }
 
-#[allow(dead_code)] // TODO: Use this.
 #[inline]
 fn memory_fd() -> linux_raw::FdRef<'static> {
     linux_raw::FdRef::from_raw_unchecked(MEMORY_FD.load(Ordering::Relaxed))
@@ -255,7 +274,6 @@ fn memory_fd() -> linux_raw::FdRef<'static> {
 
 static IN_SIGNAL_HANDLER: AtomicBool = AtomicBool::new(false);
 static NATIVE_PAGE_SIZE: AtomicUsize = AtomicUsize::new(!0);
-static IS_PROGRAM_DIRTY: AtomicBool = AtomicBool::new(false);
 
 unsafe extern "C" fn signal_handler(signal: u32, _info: &linux_raw::siginfo_t, context: &linux_raw::ucontext) {
     if IN_SIGNAL_HANDLER.load(Ordering::Relaxed) || signal == linux_raw::SIGIO {
@@ -263,16 +281,13 @@ unsafe extern "C" fn signal_handler(signal: u32, _info: &linux_raw::siginfo_t, c
     }
 
     IN_SIGNAL_HANDLER.store(true, Ordering::Relaxed);
-
     let rip = context.uc_mcontext.rip;
-    *VMCTX.rip().get() = rip;
 
     trace!(
-        "signal triggered from ",
-        Hex(rip),
-        " (signal = ",
+        "Signal received: ",
         signal,
-        ")",
+        ", rip = ",
+        Hex(rip),
         ", rax = ",
         Hex(context.uc_mcontext.rax),
         ", rcx = ",
@@ -307,43 +322,48 @@ unsafe extern "C" fn signal_handler(signal: u32, _info: &linux_raw::siginfo_t, c
         Hex(context.uc_mcontext.r15)
     );
 
-    let user_code = VM_ADDR_NATIVE_CODE;
-
-    #[allow(clippy::needless_borrow)]
-    if rip >= user_code && rip < user_code + *VMCTX.shm_code_length.get() {
-        signal_host(VMCTX_FUTEX_TRAP, SignalHostKind::Normal)
-            .unwrap_or_else(|error| abort_with_error("failed to wait for the host process (trap)", error));
-
-        *VMCTX.rip().get() = SANDBOX_EMPTY_NATIVE_PROGRAM_COUNTER;
-        longjmp(addr_of_mut!(RESUME_IDLE_LOOP_JMPBUF), 1);
-    } else {
+    if rip < VM_ADDR_NATIVE_CODE || rip > VM_ADDR_NATIVE_CODE + VMCTX.shm_code_length.load(Ordering::Relaxed) {
         abort_with_message("segmentation fault")
     }
+
+    use polkavm_common::regmap::NativeReg::*;
+    for reg in polkavm_common::program::Reg::ALL {
+        #[deny(unreachable_patterns)]
+        let value = match polkavm_common::regmap::to_native_reg(reg) {
+            rax => context.uc_mcontext.rax,
+            rcx => context.uc_mcontext.rcx,
+            rdx => context.uc_mcontext.rdx,
+            rbx => context.uc_mcontext.rbx,
+            rbp => context.uc_mcontext.rbp,
+            rsi => context.uc_mcontext.rsi,
+            rdi => context.uc_mcontext.rdi,
+            r8 => context.uc_mcontext.r8,
+            r9 => context.uc_mcontext.r9,
+            r10 => context.uc_mcontext.r10,
+            r11 => context.uc_mcontext.r11,
+            r12 => context.uc_mcontext.r12,
+            r13 => context.uc_mcontext.r13,
+            r14 => context.uc_mcontext.r14,
+            r15 => context.uc_mcontext.r15,
+        };
+
+        VMCTX.regs[reg as usize].store(value as u32, Ordering::Relaxed);
+    }
+
+    VMCTX.next_native_program_counter.store(rip, Ordering::Relaxed);
+
+    signal_host_and_longjmp(VMCTX_FUTEX_GUEST_SIGNAL);
 }
 
-#[repr(C)]
-struct JmpBuf {
-    return_address: u64,
-    rbx: u64,
-    rsp: u64,
-    rbp: u64,
-    r12: u64,
-    r13: u64,
-    r14: u64,
-    r15: u64,
-    return_value: u64,
-}
-
-static mut RESUME_IDLE_LOOP_JMPBUF: JmpBuf = JmpBuf {
-    return_address: 0,
-    rbx: 0,
-    rsp: 0,
-    rbp: 0,
-    r12: 0,
-    r13: 0,
-    r14: 0,
-    r15: 0,
-    return_value: 0,
+static mut RESUME_MAIN_LOOP_JMPBUF: JmpBuf = JmpBuf {
+    rip: AtomicU64::new(0),
+    rbx: AtomicU64::new(0),
+    rsp: AtomicU64::new(0),
+    rbp: AtomicU64::new(0),
+    r12: AtomicU64::new(0),
+    r13: AtomicU64::new(0),
+    r14: AtomicU64::new(0),
+    r15: AtomicU64::new(0),
 };
 
 extern "C" {
@@ -375,7 +395,7 @@ unsafe fn initialize(mut stack: *mut usize) {
     */
     let argc = *stack;
     stack = stack.add(1);
-    let argv = stack.cast::<*mut u8>();
+    let argv = stack.cast::<*mut *mut u8>();
     let envp = argv.add(argc + 1);
     let auxv = {
         let mut p = envp;
@@ -477,18 +497,9 @@ unsafe fn initialize(mut stack: *mut usize) {
     // Stash the shared memory FD.
     SHM_FD.store(shm_fd.leak(), Ordering::Relaxed);
 
-    // Stash the guest memory FD.
-    let memory_fd = linux_raw::recvfd(socket.borrow()).unwrap_or_else(|error| abort_with_error("failed to read memory fd", error));
-    MEMORY_FD.store(memory_fd.leak(), Ordering::Relaxed);
-
-    // Close the socket; we don't need it anymore.
-    socket
-        .close()
-        .unwrap_or_else(|error| abort_with_error("failed to close the socket", error));
-
     // Wait for the host to fill out vmctx.
-    signal_host(VMCTX_FUTEX_INIT, SignalHostKind::Normal)
-        .unwrap_or_else(|error| abort_with_error("failed to wait for the host process (init)", error));
+    VMCTX.futex.store(VMCTX_FUTEX_IDLE, Ordering::Release);
+    futex_wait_until(VMCTX_FUTEX_BUSY);
 
     // Unmap the original stack.
     linux_raw::sys_munmap(
@@ -525,6 +536,28 @@ unsafe fn initialize(mut stack: *mut usize) {
             .unwrap_or_else(|| abort_with_message("overflow")),
     )
     .unwrap_or_else(|error| abort_with_error("failed to make sure the jump table address space is unmapped", error));
+
+    if VMCTX.init.uffd_available.load(Ordering::Relaxed) {
+        let memory_fd = linux_raw::recvfd(socket.borrow()).unwrap_or_else(|error| abort_with_error("failed to read memory fd", error));
+
+        MEMORY_FD.store(memory_fd.leak(), Ordering::Relaxed);
+
+        // Set up and send the userfaultfd to the host.
+        let userfaultfd = linux_raw::sys_userfaultfd(linux_raw::O_CLOEXEC)
+            .unwrap_or_else(|error| abort_with_error("failed to create an userfaultfd", error));
+
+        linux_raw::sendfd(socket.borrow(), userfaultfd.borrow())
+            .unwrap_or_else(|error| abort_with_error("failed to send the userfaultfd to the host", error));
+
+        userfaultfd
+            .close()
+            .unwrap_or_else(|error| abort_with_error("failed to close the userfaultfd", error));
+    }
+
+    // Close the socket; we don't need it anymore.
+    socket
+        .close()
+        .unwrap_or_else(|error| abort_with_error("failed to close the socket", error));
 
     // Set up our signal handler.
     let minsigstksz = align_to_next_page_usize(page_size, minsigstksz).unwrap_or_else(|| abort_with_message("overflow"));
@@ -596,118 +629,109 @@ unsafe fn initialize(mut stack: *mut usize) {
             .unwrap_or_else(|error| abort_with_error("failed to set the %gs register", error));
     }
 
-    // Change the name of the process.
-    linux_raw::sys_prctl_set_name(b"polkavm-sandbox\0").unwrap_or_else(|error| abort_with_error("failed to set the process name", error));
+    if !VMCTX.init.sandbox_disabled.load(Ordering::Relaxed) {
+        linux_raw::sys_setrlimit(linux_raw::RLIMIT_NOFILE, &linux_raw::rlimit { rlim_cur: 0, rlim_max: 0 })
+            .unwrap_or_else(|error| abort_with_error("failed to set RLIMIT_NOFILE", error));
 
-    // Unmount the filesystem.
-    //
-    // Previously we did this before `execveat`ing into the zygote but for some
-    // ungodly unexplicable reason on *some* Linux distributions (but not all of them!)
-    // the `pivot_root` makes the `execveat` fail with an ENOENT error, even if we
-    // physically copy the zygote binary into the newly created filesystem and open
-    // it immediately before `execveat`ing with an `open`, and even if we also have
-    // /proc mounted in the new namespace.
-    linux_raw::sys_pivot_root(linux_raw::cstr!("."), linux_raw::cstr!("."))
-        .unwrap_or_else(|error| abort_with_error("failed to sandbox the filesystem", error));
-    linux_raw::sys_umount2(linux_raw::cstr!("."), linux_raw::MNT_DETACH)
-        .unwrap_or_else(|error| abort_with_error("failed to sandbox the filesystem", error));
+        // Change the name of the process.
+        linux_raw::sys_prctl_set_name(b"polkavm-sandbox\0")
+            .unwrap_or_else(|error| abort_with_error("failed to set the process name", error));
 
-    linux_raw::sys_prctl_set_securebits(
-        // Make UID == 0 have no special privileges.
-        linux_raw::SECBIT_NOROOT |
-        linux_raw::SECBIT_NOROOT_LOCKED |
-        // Calling 'setuid' from/to UID == 0 doesn't change any privileges.
-        linux_raw::SECBIT_NO_SETUID_FIXUP |
-        linux_raw::SECBIT_NO_SETUID_FIXUP_LOCKED |
-        // The process cannot add capabilities to its ambient set.
-        linux_raw::SECBIT_NO_CAP_AMBIENT_RAISE |
-        linux_raw::SECBIT_NO_CAP_AMBIENT_RAISE_LOCKED,
-    )
-    .unwrap_or_else(|error| abort_with_error("failed to sandbox the zygote", error));
+        // Unmount the filesystem.
+        //
+        // Previously we did this before `execveat`ing into the zygote but for some
+        // ungodly unexplicable reason on *some* Linux distributions (but not all of them!)
+        // the `pivot_root` makes the `execveat` fail with an ENOENT error, even if we
+        // physically copy the zygote binary into the newly created filesystem and open
+        // it immediately before `execveat`ing with an `open`, and even if we also have
+        // /proc mounted in the new namespace.
+        linux_raw::sys_pivot_root(linux_raw::cstr!("."), linux_raw::cstr!("."))
+            .unwrap_or_else(|error| abort_with_error("failed to sandbox the filesystem", error));
+        linux_raw::sys_umount2(linux_raw::cstr!("."), linux_raw::MNT_DETACH)
+            .unwrap_or_else(|error| abort_with_error("failed to sandbox the filesystem", error));
 
-    // Finally, drop all capabilities.
-    linux_raw::sys_capset_drop_all().unwrap_or_else(|error| abort_with_error("failed to sandbox the zygote", error));
+        linux_raw::sys_prctl_set_securebits(
+            // Make UID == 0 have no special privileges.
+            linux_raw::SECBIT_NOROOT |
+            linux_raw::SECBIT_NOROOT_LOCKED |
+            // Calling 'setuid' from/to UID == 0 doesn't change any privileges.
+            linux_raw::SECBIT_NO_SETUID_FIXUP |
+            linux_raw::SECBIT_NO_SETUID_FIXUP_LOCKED |
+            // The process cannot add capabilities to its ambient set.
+            linux_raw::SECBIT_NO_CAP_AMBIENT_RAISE |
+            linux_raw::SECBIT_NO_CAP_AMBIENT_RAISE_LOCKED,
+        )
+        .unwrap_or_else(|error| abort_with_error("failed to sandbox the zygote", error));
 
-    const SECCOMP_FILTER: &[linux_raw::sock_filter] = &linux_raw::bpf! {
-        (a = syscall_nr),
-        (if a == linux_raw::SYS_futex => jump @1),
-        (if a == linux_raw::SYS_mmap => jump @5),
-        (if a == linux_raw::SYS_munmap => jump @1),
-        (if a == linux_raw::SYS_madvise => jump @4),
-        (if a == linux_raw::SYS_close => jump @1),
-        (if a == linux_raw::SYS_write => jump @3),
-        (if a == linux_raw::SYS_recvmsg => jump @2),
-        (if a == linux_raw::SYS_rt_sigreturn => jump @1),
-        (if a == linux_raw::SYS_sched_yield => jump @1),
-        (if a == linux_raw::SYS_exit => jump @1),
-        (seccomp_kill_thread),
+        // Finally, drop all capabilities.
+        linux_raw::sys_capset_drop_all().unwrap_or_else(|error| abort_with_error("failed to sandbox the zygote", error));
 
-        // SYS_recvmsg
-        ([2]: a = syscall_arg[0]),
-        (if a != HOST_SOCKET_FILENO => jump @0),
-        (seccomp_allow),
+        const SECCOMP_FILTER: &[linux_raw::sock_filter] = &linux_raw::bpf! {
+            (a = syscall_nr),
+            (if a == linux_raw::SYS_futex => jump @1),
+            (if a == linux_raw::SYS_mmap => jump @5),
+            (if a == linux_raw::SYS_munmap => jump @1),
+            (if a == linux_raw::SYS_madvise => jump @4),
+            (if a == linux_raw::SYS_close => jump @1),
+            (if a == linux_raw::SYS_write => jump @3),
+            (if a == linux_raw::SYS_rt_sigreturn => jump @1),
+            (if a == linux_raw::SYS_sched_yield => jump @1),
+            (if a == linux_raw::SYS_exit => jump @1),
+            (seccomp_kill_thread),
 
-        // SYS_write
-        ([3]: a = syscall_arg[0]),
-        (if a != linux_raw::STDERR_FILENO => jump @0),
-        (seccomp_allow),
+            // SYS_write
+            ([3]: a = syscall_arg[0]),
+            (if a != linux_raw::STDERR_FILENO => jump @0),
+            (seccomp_allow),
 
-        // SYS_madvise
-        ([4]: a = syscall_arg[2]),
-        (if a != linux_raw::MADV_DONTNEED => jump @0),
-        (seccomp_allow),
+            // SYS_madvise
+            ([4]: a = syscall_arg[2]),
+            (if a != linux_raw::MADV_DONTNEED => jump @0),
+            (seccomp_allow),
 
-        // SYS_mmap
-        ([5]: a = syscall_arg[2]),
-        (a &= linux_raw::PROT_EXEC),
-        (if a != 0 => jump @6),
-        (seccomp_allow),
+            // SYS_mmap
+            ([5]: a = syscall_arg[2]),
+            (a &= linux_raw::PROT_EXEC),
+            (if a != 0 => jump @6),
+            (seccomp_allow),
 
-        // SYS_mmap + PROT_EXEC
-        ([6]: a = syscall_arg[2]),
-        (if a != linux_raw::PROT_EXEC => jump @0),
-        (seccomp_allow),
+            // SYS_mmap + PROT_EXEC
+            ([6]: a = syscall_arg[2]),
+            (if a != linux_raw::PROT_EXEC => jump @0),
+            (seccomp_allow),
 
-        ([0]: seccomp_kill_thread),
-        ([1]: seccomp_allow),
-    };
+            ([0]: seccomp_kill_thread),
+            ([1]: seccomp_allow),
+        };
 
-    linux_raw::sys_seccomp_set_mode_filter(SECCOMP_FILTER).unwrap_or_else(|error| abort_with_error("failed to set seccomp filter", error));
+        linux_raw::sys_seccomp_set_mode_filter(SECCOMP_FILTER)
+            .unwrap_or_else(|error| abort_with_error("failed to set seccomp filter", error));
+    }
 
     VMCTX.futex.store(VMCTX_FUTEX_IDLE, Ordering::Release);
     linux_raw::sys_futex_wake_one(&VMCTX.futex)
         .unwrap_or_else(|error| abort_with_error("failed to wake up the host process on initialization", error));
 }
 
-#[link_section = ".text_hot"]
-#[inline(never)]
-unsafe fn main_loop() -> ! {
-    if setjmp(addr_of_mut!(RESUME_IDLE_LOOP_JMPBUF)) != 0 {
-        IN_SIGNAL_HANDLER.store(false, Ordering::Relaxed);
-
-        trace!("returning to idle...");
-
-        let rpc_flags = *VMCTX.rpc_flags.get();
-        if rpc_flags & VM_RPC_FLAG_CLEAR_PROGRAM_AFTER_EXECUTION != 0 {
-            clear_program();
-        } else if rpc_flags & VM_RPC_FLAG_RESET_MEMORY_AFTER_EXECUTION != 0 {
-            reset_memory();
+#[inline]
+fn futex_wait_until(target_state: u32) {
+    let mut state = VMCTX.futex.load(Ordering::Relaxed);
+    'main_loop: loop {
+        if state == target_state {
+            break;
         }
 
-        VMCTX.futex.store(VMCTX_FUTEX_IDLE, Ordering::Release);
-        linux_raw::sys_futex_wake_one(&VMCTX.futex).unwrap_or_else(|error| abort_with_error("failed to wake up the host process", error));
-    }
-
-    'wait_loop: while VMCTX.futex.load(Ordering::Relaxed) == VMCTX_FUTEX_IDLE {
         // Use a `black_box` to prevent loop unrolling.
         for _ in 0..core::hint::black_box(20) {
             let _ = linux_raw::sys_sched_yield();
-            if VMCTX.futex.load(Ordering::Relaxed) != VMCTX_FUTEX_IDLE {
-                break 'wait_loop;
+
+            state = VMCTX.futex.load(Ordering::Relaxed);
+            if state == target_state {
+                break 'main_loop;
             }
         }
 
-        match linux_raw::sys_futex_wait(&VMCTX.futex, VMCTX_FUTEX_IDLE, None) {
+        match linux_raw::sys_futex_wait(&VMCTX.futex, state, None) {
             Ok(()) => continue,
             Err(error) if error.errno() == linux_raw::EAGAIN || error.errno() == linux_raw::EINTR => continue,
             Err(error) => {
@@ -717,45 +741,39 @@ unsafe fn main_loop() -> ! {
     }
 
     core::sync::atomic::fence(Ordering::Acquire);
-    trace!("work received...");
-
-    let rpc_flags = *VMCTX.rpc_flags.get();
-    let rpc_address = *VMCTX.rpc_address.get().cast::<Option<extern "C" fn() -> !>>();
-    let rpc_sbrk = *VMCTX.rpc_sbrk.get();
-
-    if rpc_flags & VM_RPC_FLAG_RECONFIGURE != 0 {
-        load_program();
-    } else if rpc_flags & VM_RPC_FLAG_RESET_MEMORY_BEFORE_EXECUTION != 0 {
-        reset_memory();
-    }
-
-    if rpc_sbrk > 0 {
-        let new_heap_top = *VMCTX.heap_info.heap_top.get() + rpc_sbrk as u64;
-        if syscall_sbrk(new_heap_top) == 0 {
-            abort_with_message("sbrk failed");
-        }
-    }
-
-    if let Some(rpc_address) = rpc_address {
-        trace!("jumping to: ", Hex(rpc_address as usize));
-
-        VMCTX.is_memory_dirty.store(true, Ordering::Relaxed);
-        rpc_address();
-    } else {
-        longjmp(addr_of_mut!(RESUME_IDLE_LOOP_JMPBUF), 1);
-    }
 }
 
-#[link_section = ".text_hot"]
-unsafe fn reset_memory() {
-    if !VMCTX.is_memory_dirty.load(Ordering::Relaxed) {
-        return;
+#[inline(never)]
+unsafe fn main_loop() -> ! {
+    if setjmp(addr_of_mut!(RESUME_MAIN_LOOP_JMPBUF)) != 0 {
+        IN_SIGNAL_HANDLER.store(false, Ordering::Relaxed);
     }
 
-    trace!("resetting memory...");
+    futex_wait_until(VMCTX_FUTEX_BUSY);
+
+    let address = VMCTX.jump_into.load(Ordering::Relaxed);
+    trace!("Jumping into: ", Hex(address as usize));
+
+    let callback: extern "C" fn() -> ! = core::mem::transmute(address);
+    callback();
+}
+
+pub unsafe extern "C" fn ext_sbrk() -> ! {
+    trace!("Entry point: ext_sbrk");
+
+    let new_heap_top = *VMCTX.heap_info.heap_top.get() + VMCTX.arg.load(Ordering::Relaxed) as u64;
+    let result = syscall_sbrk(new_heap_top);
+    VMCTX.arg.store(result, Ordering::Relaxed);
+
+    signal_host_and_longjmp(VMCTX_FUTEX_IDLE);
+}
+
+pub unsafe extern "C" fn ext_reset_memory() -> ! {
+    trace!("Entry point: ext_reset_memory");
+
     let memory_map = memory_map();
     for map in memory_map {
-        if !map.is_writable {
+        if (map.protection & linux_raw::PROT_WRITE) == 0 {
             continue;
         }
 
@@ -777,66 +795,46 @@ unsafe fn reset_memory() {
     *VMCTX.heap_info.heap_top.get() = heap_base;
     *VMCTX.heap_info.heap_threshold.get() = heap_initial_threshold;
 
-    VMCTX.is_memory_dirty.store(false, Ordering::Relaxed);
+    signal_host_and_longjmp(VMCTX_FUTEX_IDLE);
+}
+
+pub unsafe extern "C" fn ext_zero_memory_chunk() -> ! {
+    trace!("Entry point: ext_zero_memory_chunk");
+
+    let address = VMCTX.arg.load(Ordering::Relaxed);
+    let length = VMCTX.arg2.load(Ordering::Relaxed);
+    core::ptr::write_bytes(address as *mut u8, 0, length as usize);
+
+    signal_host_and_longjmp(VMCTX_FUTEX_IDLE);
 }
 
 #[inline(never)]
 #[no_mangle]
-pub unsafe extern "C" fn syscall_hostcall(hostcall: u32) {
+pub unsafe extern "C" fn syscall_hostcall() -> ! {
     trace!("syscall: hostcall triggered");
-
-    *VMCTX.hostcall().get() = hostcall;
-
-    loop {
-        signal_host(VMCTX_FUTEX_HOSTCALL, SignalHostKind::Normal)
-            .unwrap_or_else(|error| abort_with_error("failed to wait for the host process (hostcall)", error));
-
-        match *VMCTX.hostcall().get() {
-            polkavm_common::zygote::HOSTCALL_ABORT_EXECUTION => longjmp(addr_of_mut!(RESUME_IDLE_LOOP_JMPBUF), 1),
-            polkavm_common::zygote::HOSTCALL_SBRK => {
-                let new_heap_top = *VMCTX.heap_info.heap_top.get() + *VMCTX.rpc_sbrk.get() as u64;
-                *VMCTX.rpc_sbrk.get() = syscall_sbrk(new_heap_top);
-                *VMCTX.hostcall().get() = hostcall;
-            }
-            _ => break,
-        }
-    }
+    signal_host_and_longjmp(VMCTX_FUTEX_GUEST_ECALLI);
 }
 
 #[inline(never)]
 #[no_mangle]
 pub unsafe extern "C" fn syscall_trap() -> ! {
     trace!("syscall: trap triggered");
-    signal_host(VMCTX_FUTEX_TRAP, SignalHostKind::Normal)
-        .unwrap_or_else(|error| abort_with_error("failed to wait for the host process (trap)", error));
-
-    longjmp(addr_of_mut!(RESUME_IDLE_LOOP_JMPBUF), 1);
+    signal_host_and_longjmp(VMCTX_FUTEX_GUEST_TRAP);
 }
 
 #[inline(never)]
 #[no_mangle]
 pub unsafe extern "C" fn syscall_return() -> ! {
     trace!("syscall: return triggered");
-    longjmp(addr_of_mut!(RESUME_IDLE_LOOP_JMPBUF), 1);
+    signal_host_and_longjmp(VMCTX_FUTEX_IDLE);
 }
 
 // Just for debugging. Normally should never be used.
 #[inline(never)]
 #[no_mangle]
-pub unsafe extern "C" fn syscall_trace(nth_instruction: u32, rip: u64) {
-    *VMCTX.hostcall().get() = polkavm_common::HOSTCALL_TRACE;
-    *VMCTX.nth_instruction().get() = nth_instruction;
-    *VMCTX.rip().get() = rip;
-
-    signal_host(VMCTX_FUTEX_HOSTCALL, SignalHostKind::Trace)
-        .unwrap_or_else(|error| abort_with_error("failed to wait for the host process (trace)", error));
-
-    *VMCTX.nth_instruction().get() = SANDBOX_EMPTY_NTH_INSTRUCTION;
-    *VMCTX.rip().get() = SANDBOX_EMPTY_NATIVE_PROGRAM_COUNTER;
-
-    if *VMCTX.hostcall().get() == polkavm_common::zygote::HOSTCALL_ABORT_EXECUTION {
-        longjmp(addr_of_mut!(RESUME_IDLE_LOOP_JMPBUF), 1);
-    }
+pub unsafe extern "C" fn syscall_step() -> ! {
+    // TODO: Add a fast path for this.
+    signal_host_and_longjmp(VMCTX_FUTEX_GUEST_STEP);
 }
 
 #[inline(never)]
@@ -855,6 +853,7 @@ pub unsafe extern "C" fn syscall_sbrk(pending_heap_top: u64) -> u32 {
     let heap_base = *VMCTX.heap_base.get();
     let heap_max_size = *VMCTX.heap_max_size.get();
     if pending_heap_top > u64::from(heap_base + heap_max_size) {
+        trace!("sbrk: heap size overflow; ignoring request");
         return 0;
     }
 
@@ -888,78 +887,43 @@ pub unsafe extern "C" fn syscall_sbrk(pending_heap_top: u64) -> u32 {
     pending_heap_top as u32
 }
 
+// A table for functions which can be called from *within* the VM (by the guest program).
 #[link_section = ".address_table"]
 #[no_mangle]
 pub static ADDRESS_TABLE: AddressTableRaw = AddressTableRaw {
     syscall_hostcall,
     syscall_trap,
     syscall_return,
-    syscall_trace,
+    syscall_step,
     syscall_sbrk,
 };
 
-enum SignalHostKind {
-    Normal,
-    Trace,
-}
+// A table for functions which can be called from *outside* the VM (by the host).
+#[link_section = ".ext_table"]
+#[no_mangle]
+pub static EXT_TABLE: ExtTableRaw = ExtTableRaw {
+    ext_sbrk,
+    ext_reset_memory,
+    ext_zero_memory_chunk,
+    ext_load_program,
+    ext_recycle,
+    ext_fetch_idle_regs,
+};
 
-fn signal_host(futex_value_to_set: u32, kind: SignalHostKind) -> Result<(), linux_raw::Error> {
+#[inline(always)]
+fn signal_host_and_longjmp(futex_value_to_set: u32) -> ! {
     VMCTX.futex.store(futex_value_to_set, Ordering::Release);
     linux_raw::sys_futex_wake_one(&VMCTX.futex).unwrap_or_else(|error| abort_with_error("failed to wake up the host process", error));
-
-    let spin_target = match kind {
-        SignalHostKind::Normal => 64,
-        SignalHostKind::Trace => 512,
-    };
-
-    'outer: loop {
-        unsafe {
-            *VMCTX.counters.syscall_wait_loop_start.get() += 1;
-        }
-
-        let new_futex_value = VMCTX.futex.load(Ordering::Relaxed);
-        if new_futex_value == VMCTX_FUTEX_BUSY {
-            break;
-        }
-
-        if new_futex_value != futex_value_to_set {
-            abort_with_message("unexpected futex value while waiting for the host");
-        }
-
-        for _ in 0..spin_target {
-            core::hint::spin_loop();
-            if VMCTX.futex.load(Ordering::Relaxed) == VMCTX_FUTEX_BUSY {
-                break 'outer;
-            }
-        }
-
-        unsafe {
-            *VMCTX.counters.syscall_futex_wait.get() += 1;
-        }
-
-        let result = linux_raw::sys_futex_wait(&VMCTX.futex, futex_value_to_set, None);
-        match result {
-            Ok(()) => {
-                continue;
-            }
-            Err(error) if error.errno() == linux_raw::EAGAIN || error.errno() == linux_raw::EINTR => {
-                continue;
-            }
-            Err(error) => {
-                return Err(error);
-            }
-        }
+    unsafe {
+        longjmp(addr_of_mut!(RESUME_MAIN_LOOP_JMPBUF), 1);
     }
-
-    core::sync::atomic::fence(Ordering::Acquire);
-    Ok(())
 }
 
 fn memory_map() -> &'static [VmMap] {
     unsafe {
-        let shm_memory_map_count = *VMCTX.shm_memory_map_count.get();
+        let shm_memory_map_count = VMCTX.shm_memory_map_count.load(Ordering::Relaxed);
         if shm_memory_map_count > 0 {
-            let shm_memory_map_offset = *VMCTX.shm_memory_map_offset.get();
+            let shm_memory_map_offset = VMCTX.shm_memory_map_offset.load(Ordering::Relaxed);
             core::slice::from_raw_parts(
                 (VM_ADDR_SHARED_MEMORY as *const u8)
                     .add(shm_memory_map_offset as usize)
@@ -974,69 +938,61 @@ fn memory_map() -> &'static [VmMap] {
 
 #[cold]
 #[inline(never)]
-unsafe fn load_program() {
-    trace!("reconfiguring...");
+pub unsafe extern "C" fn ext_load_program() -> ! {
+    trace!("Entry point: ext_load_program");
     if NATIVE_PAGE_SIZE.load(Ordering::Relaxed) == 0 {
         abort_with_message("assertion failed: native page size is zero");
     }
 
-    clear_program();
-    IS_PROGRAM_DIRTY.store(true, Ordering::Relaxed);
+    recycle();
 
     let shm_fd = shm_fd();
+    let memory_fd = memory_fd();
     let memory_map = memory_map();
+
     for map in memory_map {
-        let mut protection = linux_raw::PROT_READ;
-        if map.is_writable {
-            protection |= linux_raw::PROT_WRITE;
-        }
+        linux_raw::sys_mmap(
+            map.address as *mut core::ffi::c_void,
+            map.length as usize,
+            map.protection,
+            map.flags,
+            match map.fd {
+                VmFd::None => None,
+                VmFd::Shm => Some(shm_fd),
+                VmFd::Mem => Some(memory_fd),
+            },
+            map.fd_offset,
+        )
+        .unwrap_or_else(|error| abort_with_error("failed to mmap memory", error));
 
-        if map.shm_offset == u64::MAX {
-            linux_raw::sys_mmap(
-                map.address as *mut core::ffi::c_void,
-                map.length as usize,
-                protection,
-                linux_raw::MAP_FIXED | linux_raw::MAP_PRIVATE | linux_raw::MAP_ANONYMOUS,
-                None,
-                0,
-            )
-            .unwrap_or_else(|error| abort_with_error("failed to mmap anonymous memory", error));
-
-            trace!(
-                "mapped anonymous: ",
-                Hex(map.address),
-                "-",
-                Hex(map.address + map.length),
-                " (",
-                Hex(map.length),
-                ")"
-            );
-        } else {
-            linux_raw::sys_mmap(
-                map.address as *mut core::ffi::c_void,
-                map.length as usize,
-                protection,
-                linux_raw::MAP_FIXED | linux_raw::MAP_PRIVATE,
-                Some(shm_fd),
-                map.shm_offset,
-            )
-            .unwrap_or_else(|error| abort_with_error("failed to mmap from shared memory", error));
-
-            trace!(
-                "mapped from shared memory: ",
-                Hex(map.address),
-                "-",
-                Hex(map.address + map.length),
-                " (",
-                Hex(map.length),
-                ")"
-            );
-        }
+        trace!(
+            "Mapped memory (",
+            if map.protection == linux_raw::PROT_READ {
+                "RO"
+            } else if map.protection == linux_raw::PROT_READ | linux_raw::PROT_WRITE {
+                "RW"
+            } else {
+                "??"
+            },
+            ", ",
+            match map.fd {
+                VmFd::None => "anon",
+                VmFd::Shm => "shm",
+                VmFd::Mem => "mem",
+            },
+            "): ",
+            Hex(map.address),
+            "-",
+            Hex(map.address + map.length),
+            " (",
+            Hex(map.length),
+            ")"
+        );
     }
 
-    let shm_code_length = *VMCTX.shm_code_length.get();
+    let shm_code_length = VMCTX.shm_code_length.load(Ordering::Relaxed);
     if shm_code_length > 0 {
-        let shm_code_offset = *VMCTX.shm_code_offset.get();
+        let shm_code_offset = VMCTX.shm_code_offset.load(Ordering::Relaxed);
         linux_raw::sys_mmap(
             VM_ADDR_NATIVE_CODE as *mut core::ffi::c_void,
             shm_code_length as usize,
@@ -1058,9 +1014,9 @@ unsafe fn load_program() {
         );
     }
 
-    let shm_jump_table_length = *VMCTX.shm_jump_table_length.get();
+    let shm_jump_table_length = VMCTX.shm_jump_table_length.load(Ordering::Relaxed);
     if shm_jump_table_length > 0 {
-        let shm_jump_table_offset = *VMCTX.shm_jump_table_offset.get();
+        let shm_jump_table_offset = VMCTX.shm_jump_table_offset.load(Ordering::Relaxed);
         linux_raw::sys_mmap(
             VM_ADDR_JUMP_TABLE as *mut core::ffi::c_void,
             shm_jump_table_length as usize,
@@ -1082,7 +1038,7 @@ unsafe fn load_program() {
         );
     }
 
-    let sysreturn_address = *VMCTX.sysreturn_address.get();
+    let sysreturn_address = VMCTX.sysreturn_address.load(Ordering::Relaxed);
     trace!(
         "new sysreturn address: ",
         Hex(sysreturn_address),
@@ -1091,15 +1047,11 @@ unsafe fn load_program() {
         ")"
     );
     *(VM_ADDR_JUMP_TABLE_RETURN_TO_HOST as *mut u64) = sysreturn_address;
-    VMCTX.is_memory_dirty.store(false, Ordering::Relaxed);
+
+    signal_host_and_longjmp(VMCTX_FUTEX_IDLE);
 }
 
-#[inline(never)]
-unsafe fn clear_program() {
-    if !IS_PROGRAM_DIRTY.load(Ordering::Relaxed) {
-        return;
-    }
-
+unsafe fn recycle() {
     polkavm_common::static_assert!(VM_ADDR_NATIVE_CODE + (VM_SANDBOX_MAXIMUM_NATIVE_CODE_SIZE as u64) < 0x200000000);
 
     linux_raw::sys_munmap(core::ptr::null_mut(), 0x200000000)
@@ -1112,6 +1064,37 @@ unsafe fn clear_program() {
     .unwrap_or_else(|error| abort_with_error("failed to unmap jump table", error));
 
     *(VM_ADDR_JUMP_TABLE_RETURN_TO_HOST as *mut u64) = 0;
-    VMCTX.is_memory_dirty.store(false, Ordering::Relaxed);
-    IS_PROGRAM_DIRTY.store(false, Ordering::Relaxed);
+}
+
+#[inline(never)]
+pub unsafe extern "C" fn ext_recycle() -> ! {
+    trace!("Entry point: ext_recycle");
+    recycle();
+    signal_host_and_longjmp(VMCTX_FUTEX_IDLE);
+}
+
+#[inline(never)]
+pub unsafe extern "C" fn ext_fetch_idle_regs() -> ! {
+    trace!("Entry point: ext_fetch_idle_regs");
+
+    macro_rules! copy_regs {
+        ($($name:ident),+) => {
+            $(
+                VMCTX.init.idle_regs.$name.store(RESUME_MAIN_LOOP_JMPBUF.$name.load(Ordering::Relaxed), Ordering::Relaxed);
+            )+
+        }
+    }
+
+    copy_regs! {
+        rip,
+        rbp,
+        rsp,
+        rbp,
+        r12,
+        r13,
+        r14,
+        r15
+    }
+
+    signal_host_and_longjmp(VMCTX_FUTEX_IDLE);
 }

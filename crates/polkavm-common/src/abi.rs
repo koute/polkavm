@@ -35,8 +35,7 @@ pub const VM_MAXIMUM_JUMP_TABLE_ENTRIES: u32 = 16 * 1024 * 1024;
 pub const VM_MAXIMUM_IMPORT_COUNT: u32 = 1024;
 
 /// The minimum required alignment of runtime code pointers.
-// TODO: Support the C extension in the linker and lower this to 2.
-pub const VM_CODE_ADDRESS_ALIGNMENT: u32 = 4;
+pub const VM_CODE_ADDRESS_ALIGNMENT: u32 = 2;
 
 /// The memory map of a given guest program.
 #[derive(Clone)]

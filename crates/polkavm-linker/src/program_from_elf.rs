@@ -1,5 +1,5 @@
 use polkavm_common::abi::{MemoryMap, VM_CODE_ADDRESS_ALIGNMENT, VM_MAX_PAGE_SIZE, VM_MIN_PAGE_SIZE};
-use polkavm_common::program::{self, FrameKind, Instruction, LineProgramOp, ProgramBlob, ProgramSymbol};
+use polkavm_common::program::{self, FrameKind, Instruction, LineProgramOp, ProgramBlob, ProgramCounter, ProgramSymbol};
 use polkavm_common::utils::{align_to_next_page_u32, align_to_next_page_u64};
 use polkavm_common::varint;
 use polkavm_common::writer::{ProgramBlobBuilder, Writer};
@@ -229,7 +229,7 @@ impl Source {
 
     fn iter(&'_ self) -> impl Iterator<Item = SectionTarget> + '_ {
         (self.offset_range.start..self.offset_range.end)
-            .step_by(4)
+            .step_by(2)
             .map(|offset| SectionTarget {
                 section_index: self.section_index,
                 offset,
@@ -1277,8 +1277,8 @@ fn parse_extern_metadata_impl(
     let _ = b.read(target.offset as usize)?;
 
     let version = b.read_byte()?;
-    if version != 1 {
-        return Err(format!("unsupported extern metadata version: '{version}' (expected '1')"));
+    if version != 1 && version != 2 {
+        return Err(format!("unsupported extern metadata version: '{version}' (expected '1' or '2')"));
     }
 
     let flags = b.read_u32()?;
@@ -1319,12 +1319,24 @@ fn parse_extern_metadata_impl(
         return Err(format!("too many output registers: {output_regs}"));
     }
 
+    let index = if version >= 2 {
+        let has_index = b.read_byte()?;
+        let index = b.read_u32()?;
+        if has_index > 0 {
+            Some(index)
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+
     if flags != 0 {
         return Err(format!("found unsupported flags: 0x{flags:x}"));
     }
 
     Ok(ExternMetadata {
-        index: None,
+        index,
         symbol: symbol.to_owned(),
         input_regs,
         output_regs,
@@ -1340,7 +1352,7 @@ fn parse_extern_metadata(
         .map_err(|error| ProgramFromElfError::other(format!("failed to parse extern metadata: {}", error)))
 }
 
-fn check_imports_and_assign_indexes(imports: &mut [Import], used_imports: &HashSet<usize>) -> Result<(), ProgramFromElfError> {
+fn check_imports_and_assign_indexes(imports: &mut Vec<Import>, used_imports: &HashSet<usize>) -> Result<(), ProgramFromElfError> {
     let mut import_by_symbol: HashMap<Vec<u8>, usize> = HashMap::new();
     for (nth_import, import) in imports.iter().enumerate() {
         if let Some(&old_nth_import) = import_by_symbol.get(&import.metadata.symbol) {
@@ -1358,11 +1370,52 @@ fn check_imports_and_assign_indexes(imports: &mut [Import], used_imports: &HashS
         import_by_symbol.insert(import.metadata.symbol.clone(), nth_import);
     }
 
-    let mut ordered: Vec<_> = used_imports.iter().copied().collect();
-    ordered.sort_by(|&a, &b| imports[a].metadata.symbol.cmp(&imports[b].metadata.symbol));
+    if imports.iter().any(|import| import.metadata.index.is_some()) {
+        let mut import_by_index: HashMap<u32, ExternMetadata> = HashMap::new();
+        let mut max_index = 0;
+        for import in &*imports {
+            if let Some(index) = import.index {
+                if let Some(old_metadata) = import_by_index.get(&index) {
+                    if *old_metadata != import.metadata {
+                        return Err(ProgramFromElfError::other(format!(
+                            "duplicate imports with the same index yet different prototypes: {}, {}",
+                            ProgramSymbol::new(&*old_metadata.symbol),
+                            ProgramSymbol::new(&*import.metadata.symbol)
+                        )));
+                    }
+                } else {
+                    import_by_index.insert(index, import.metadata.clone());
+                }
 
-    for (assigned_index, &nth_import) in ordered.iter().enumerate() {
-        imports[nth_import].metadata.index = Some(assigned_index as u32);
+                max_index = core::cmp::max(max_index, index);
+            } else {
+                return Err(ProgramFromElfError::other(format!(
+                    "import without a specified index: {}",
+                    ProgramSymbol::new(&*import.metadata.symbol)
+                )));
+            }
+        }
+
+        // If there are any holes in the indexes then insert dummy imports.
+        for index in 0..max_index {
+            if !import_by_index.contains_key(&index) {
+                imports.push(Import {
+                    metadata: ExternMetadata {
+                        index: Some(index),
+                        symbol: Vec::new(),
+                        input_regs: 0,
+                        output_regs: 0,
+                    },
+                })
+            }
+        }
+    } else {
+        let mut ordered: Vec<_> = used_imports.iter().copied().collect();
+        ordered.sort_by(|&a, &b| imports[a].metadata.symbol.cmp(&imports[b].metadata.symbol));
+
+        for (assigned_index, &nth_import) in ordered.iter().enumerate() {
+            imports[nth_import].metadata.index = Some(assigned_index as u32);
+        }
     }
 
     for import in imports {
@@ -1482,6 +1535,7 @@ fn convert_instruction(
     section: &Section,
     current_location: SectionTarget,
     instruction: Inst,
+    instruction_size: u64,
     mut emit: impl FnMut(InstExt<SectionTarget, SectionTarget>),
 ) -> Result<(), ProgramFromElfError> {
     match instruction {
@@ -1501,7 +1555,7 @@ fn convert_instruction(
             }
 
             let next = if let Some(dst) = cast_reg_non_zero(dst)? {
-                let target_return = current_location.add(4);
+                let target_return = current_location.add(instruction_size);
                 ControlInst::Call {
                     ra: dst,
                     target,
@@ -1527,7 +1581,7 @@ fn convert_instruction(
                 return Err(ProgramFromElfError::other("out of range unrelocated branch"));
             }
 
-            let target_false = current_location.add(4);
+            let target_false = current_location.add(instruction_size);
             emit(InstExt::Control(ControlInst::Branch {
                 kind,
                 src1,
@@ -1543,7 +1597,7 @@ fn convert_instruction(
             };
 
             let next = if let Some(dst) = cast_reg_non_zero(dst)? {
-                let target_return = current_location.add(4);
+                let target_return = current_location.add(instruction_size);
                 ControlInst::CallIndirect {
                     ra: dst,
                     base,
@@ -1569,15 +1623,16 @@ fn convert_instruction(
             Ok(())
         }
         Inst::Load { kind, dst, base, offset } => {
-            let Some(dst) = cast_reg_non_zero(dst)? else {
-                return Err(ProgramFromElfError::other("found a load with a zero register as the destination"));
-            };
-
             let Some(base) = cast_reg_non_zero(base)? else {
                 return Err(ProgramFromElfError::other("found an unrelocated absolute load"));
             };
 
-            emit(InstExt::Basic(BasicInst::LoadIndirect { kind, dst, base, offset }));
+            // LLVM riscv-enable-dead-defs pass may rewrite dst to the zero register.
+            match cast_reg_non_zero(dst)? {
+                Some(dst) => emit(InstExt::Basic(BasicInst::LoadIndirect { kind, dst, base, offset })),
+                None => emit(InstExt::Basic(BasicInst::Nop)),
+            }
+
             Ok(())
         }
         Inst::Store { kind, src, base, offset } => {
@@ -1847,6 +1902,37 @@ fn convert_instruction(
     }
 }
 
+/// Read `n` bytes in `text` at `relative_offset` where `n` is
+/// the length of the instruction at `relative_offset`.
+///
+/// # Panics
+/// - Valid RISC-V instructions can be 2 or 4 bytes. Misaligned
+///   `relative_offset` are considered an internal error.
+/// - `relative_offset` is expected to be inbounds.
+///
+/// # Returns
+/// The instruction length and the raw instruction.
+fn read_instruction_bytes(text: &[u8], relative_offset: usize) -> (u64, u32) {
+    assert!(
+        relative_offset % VM_CODE_ADDRESS_ALIGNMENT as usize == 0,
+        "internal error: misaligned instruction read: 0x{relative_offset:08x}"
+    );
+
+    if Inst::is_compressed(text[relative_offset]) {
+        (2, u32::from(u16::from_le_bytes([text[relative_offset], text[relative_offset + 1]])))
+    } else {
+        (
+            4,
+            u32::from_le_bytes([
+                text[relative_offset],
+                text[relative_offset + 1],
+                text[relative_offset + 2],
+                text[relative_offset + 3],
+            ]),
+        )
+    }
+}
+
 fn parse_code_section(
     elf: &Elf,
     section: &Section,
@@ -1859,9 +1945,9 @@ fn parse_code_section(
     let section_name = section.name();
     let text = &section.data();
 
-    if text.len() % 4 != 0 {
+    if text.len() % VM_CODE_ADDRESS_ALIGNMENT as usize != 0 {
         return Err(ProgramFromElfError::other(format!(
-            "size of section '{section_name}' is not divisible by 4"
+            "size of section '{section_name}' is not divisible by 2"
         )));
     }
 
@@ -1873,19 +1959,16 @@ fn parse_code_section(
             offset: relative_offset.try_into().expect("overflow"),
         };
 
-        let raw_inst = u32::from_le_bytes([
-            text[relative_offset],
-            text[relative_offset + 1],
-            text[relative_offset + 2],
-            text[relative_offset + 3],
-        ]);
+        let (inst_size, raw_inst) = read_instruction_bytes(text, relative_offset);
 
         const FUNC3_ECALLI: u32 = 0b000;
         const FUNC3_SBRK: u32 = 0b001;
 
         if crate::riscv::R(raw_inst).unpack() == (crate::riscv::OPCODE_CUSTOM_0, FUNC3_ECALLI, 0, RReg::Zero, RReg::Zero, RReg::Zero) {
             let initial_offset = relative_offset as u64;
-            if relative_offset + 12 > text.len() {
+
+            // `ret` can be 2 bytes long, so 4 + 4 + 2 = 10
+            if relative_offset + 10 > text.len() {
                 return Err(ProgramFromElfError::other("truncated ecalli instruction"));
             }
 
@@ -1926,12 +2009,7 @@ fn parse_code_section(
                 value: 0,
             };
 
-            let next_raw_inst = u32::from_le_bytes([
-                text[relative_offset],
-                text[relative_offset + 1],
-                text[relative_offset + 2],
-                text[relative_offset + 3],
-            ]);
+            let (next_inst_size, next_raw_inst) = read_instruction_bytes(text, relative_offset);
 
             if Inst::decode(next_raw_inst) != Some(INST_RET) {
                 return Err(ProgramFromElfError::other("external call shim doesn't end with a 'ret'"));
@@ -1940,12 +2018,12 @@ fn parse_code_section(
             output.push((
                 Source {
                     section_index,
-                    offset_range: AddressRange::from(relative_offset as u64..relative_offset as u64 + 4),
+                    offset_range: AddressRange::from(relative_offset as u64..relative_offset as u64 + next_inst_size),
                 },
                 InstExt::Control(ControlInst::JumpIndirect { base: Reg::RA, offset: 0 }),
             ));
 
-            relative_offset += 4;
+            relative_offset += next_inst_size as usize;
             continue;
         }
 
@@ -1965,21 +2043,21 @@ fn parse_code_section(
             output.push((
                 Source {
                     section_index,
-                    offset_range: (relative_offset as u64..relative_offset as u64 + 4).into(),
+                    offset_range: (relative_offset as u64..relative_offset as u64 + inst_size).into(),
                 },
                 InstExt::Basic(BasicInst::Sbrk { dst, size }),
             ));
 
-            relative_offset += 4;
+            relative_offset += inst_size as usize;
             continue;
         }
 
         let source = Source {
             section_index,
-            offset_range: AddressRange::from(relative_offset as u64..relative_offset as u64 + 4),
+            offset_range: AddressRange::from(relative_offset as u64..relative_offset as u64 + inst_size),
         };
 
-        relative_offset += 4;
+        relative_offset += inst_size as usize;
 
         let Some(original_inst) = Inst::decode(raw_inst) else {
             return Err(ProgramFromElfErrorKind::UnsupportedInstruction {
@@ -2001,17 +2079,15 @@ fn parse_code_section(
             } = original_inst
             {
                 if relative_offset < text.len() {
-                    let next_inst = Inst::decode(u32::from_le_bytes([
-                        text[relative_offset],
-                        text[relative_offset + 1],
-                        text[relative_offset + 2],
-                        text[relative_offset + 3],
-                    ]));
+                    let (next_inst_size, next_inst) = read_instruction_bytes(text, relative_offset);
+                    let next_inst = Inst::decode(next_inst);
 
                     if let Some(Inst::JumpAndLinkRegister { dst: ra_dst, base, value }) = next_inst {
                         if base == ra_dst && base == base_upper {
                             if let Some(ra) = cast_reg_non_zero(ra_dst)? {
-                                let offset = (relative_offset as i32 - 4).wrapping_add(value).wrapping_add(value_upper as i32);
+                                let offset = (relative_offset as i32 - next_inst_size as i32)
+                                    .wrapping_add(value)
+                                    .wrapping_add(value_upper as i32);
                                 if offset >= 0 && offset < section.data().len() as i32 {
                                     output.push((
                                         source,
@@ -2021,11 +2097,11 @@ fn parse_code_section(
                                                 section_index,
                                                 offset: u64::from(offset as u32),
                                             },
-                                            target_return: current_location.add(8),
+                                            target_return: current_location.add(inst_size + next_inst_size),
                                         }),
                                     ));
 
-                                    relative_offset += 4;
+                                    relative_offset += inst_size as usize;
                                     continue;
                                 }
                             }
@@ -2035,7 +2111,7 @@ fn parse_code_section(
             }
 
             let original_length = output.len();
-            convert_instruction(section, current_location, original_inst, |inst| {
+            convert_instruction(section, current_location, original_inst, inst_size, |inst| {
                 output.push((source, inst));
             })?;
 
@@ -2077,7 +2153,7 @@ fn split_code_into_basic_blocks(
         let (block_section, block_start) = if !is_jump_target {
             // Make sure nothing wants to jump into the middle of this instruction.
             assert!((source.offset_range.start..source.offset_range.end)
-                .step_by(4)
+                .step_by(2)
                 .skip(1)
                 .all(|offset| !jump_targets.contains(&SectionTarget {
                     section_index: source.section_index,
@@ -5584,6 +5660,7 @@ pub(crate) enum RelocationSize {
 #[derive(Copy, Clone, Debug)]
 pub(crate) enum SizeRelocationSize {
     SixBits,
+    Uleb128,
     Generic(RelocationSize),
 }
 
@@ -5643,6 +5720,9 @@ fn harvest_data_relocations(
 
         Set6 { target: SectionTarget },
         Sub6 { target: SectionTarget },
+
+        SetUleb128 { target: SectionTarget },
+        SubUleb128 { target: SectionTarget },
     }
 
     if elf.relocations(section).next().is_none() {
@@ -5667,8 +5747,10 @@ fn harvest_data_relocations(
             continue;
         };
 
-        let (relocation_name, kind) = match relocation.kind() {
-            object::RelocationKind::Absolute if relocation.encoding() == object::RelocationEncoding::Generic && relocation.size() == 32 => {
+        let (relocation_name, kind) = match (relocation.kind(), relocation.flags()) {
+            (object::RelocationKind::Absolute, _)
+                if relocation.encoding() == object::RelocationEncoding::Generic && relocation.size() == 32 =>
+            {
                 (
                     "R_RISCV_32",
                     Kind::Set(RelocationKind::Abs {
@@ -5677,7 +5759,7 @@ fn harvest_data_relocations(
                     }),
                 )
             }
-            object::RelocationKind::Elf(reloc_kind) => match reloc_kind {
+            (_, object::RelocationFlags::Elf { r_type: reloc_kind }) => match reloc_kind {
                 object::elf::R_RISCV_SET6 => ("R_RISCV_SET6", Kind::Set6 { target }),
                 object::elf::R_RISCV_SUB6 => ("R_RISCV_SUB6", Kind::Sub6 { target }),
                 object::elf::R_RISCV_SET8 => (
@@ -5700,6 +5782,8 @@ fn harvest_data_relocations(
                 object::elf::R_RISCV_SUB16 => ("R_RISCV_SUB16", Kind::Mut(MutOp::Sub, RelocationSize::U16, target)),
                 object::elf::R_RISCV_ADD32 => ("R_RISCV_ADD32", Kind::Mut(MutOp::Add, RelocationSize::U32, target)),
                 object::elf::R_RISCV_SUB32 => ("R_RISCV_SUB32", Kind::Mut(MutOp::Sub, RelocationSize::U32, target)),
+                object::elf::R_RISCV_SET_ULEB128 => ("R_RISCV_SET_ULEB128", Kind::SetUleb128 { target }),
+                object::elf::R_RISCV_SUB_ULEB128 => ("R_RISCV_SUB_ULEB128", Kind::SubUleb128 { target }),
                 _ => {
                     return Err(ProgramFromElfError::other(format!(
                         "unsupported relocation in data section '{section_name}': {relocation:?}"
@@ -5777,6 +5861,19 @@ fn harvest_data_relocations(
                 );
                 continue;
             }
+            [(_, Kind::SetUleb128 { target: target_1 }), (_, Kind::SubUleb128 { target: target_2 })]
+                if target_1.section_index == target_2.section_index && target_1.offset >= target_2.offset =>
+            {
+                relocations.insert(
+                    current_location,
+                    RelocationKind::Size {
+                        section_index: target_1.section_index,
+                        range: (target_2.offset..target_1.offset).into(),
+                        size: SizeRelocationSize::Uleb128,
+                    },
+                );
+                continue;
+            }
             [(_, Kind::Mut(MutOp::Add, size_1, target_1)), (_, Kind::Mut(MutOp::Sub, size_2, target_2))]
                 if size_1 == size_2
                     && *size_1 == RelocationSize::U32
@@ -5813,10 +5910,56 @@ fn read_u32(data: &[u8], relative_address: u64) -> Result<u32, ProgramFromElfErr
     Ok(u32::from_le_bytes([value[0], value[1], value[2], value[3]]))
 }
 
+fn read_u16(data: &[u8], relative_address: u64) -> Result<u16, ProgramFromElfError> {
+    let target_range = relative_address as usize..relative_address as usize + 2;
+    let value = data
+        .get(target_range)
+        .ok_or(ProgramFromElfError::other("out of range relocation"))?;
+    Ok(u16::from_le_bytes([value[0], value[1]]))
+}
+
 fn read_u8(data: &[u8], relative_address: u64) -> Result<u8, ProgramFromElfError> {
     data.get(relative_address as usize)
         .ok_or(ProgramFromElfError::other("out of range relocation"))
         .copied()
+}
+
+/// ULEB128 encode `value` and overwrite the existing value at `data_offset`, keeping the length.
+///
+/// See the [ELF ABI spec] and [LLD implementation] for reference.
+///
+/// [ELF ABI spec]: https://github.com/riscv-non-isa/riscv-elf-psabi-doc/blob/fbf3cbbac00ef1860ae60302a9afedb98fd31109/riscv-elf.adoc#uleb128-note
+/// [LLD implementation]: https://github.com/llvm/llvm-project/blob/release/18.x/lld/ELF/Target.h#L310
+fn overwrite_uleb128(data: &mut [u8], mut data_offset: usize, mut value: u64) -> Result<(), ProgramFromElfError> {
+    loop {
+        let Some(byte) = data.get_mut(data_offset) else {
+            return Err(ProgramFromElfError::other("ULEB128 relocation target offset out of bounds"));
+        };
+        data_offset += 1;
+
+        if *byte & 0x80 != 0 {
+            *byte = 0x80 | (value as u8 & 0x7f);
+            value >>= 7;
+        } else {
+            *byte = value as u8;
+            return if value > 0x80 {
+                Err(ProgramFromElfError::other("ULEB128 relocation overflow"))
+            } else {
+                Ok(())
+            };
+        }
+    }
+}
+
+#[test]
+fn test_overwrite_uleb128() {
+    let value = 624485;
+    let encoded_value = vec![0xE5u8, 0x8E, 0x26];
+    let mut data = vec![0x80, 0x80, 0x00];
+
+    overwrite_uleb128(&mut data, 0, value).unwrap();
+
+    assert_eq!(data, encoded_value);
 }
 
 fn write_u32(data: &mut [u8], relative_address: u64, value: u32) -> Result<(), ProgramFromElfError> {
@@ -5902,8 +6045,10 @@ fn harvest_code_relocations(
             continue;
         };
 
-        match relocation.kind() {
-            object::RelocationKind::Absolute if relocation.encoding() == object::RelocationEncoding::Generic && relocation.size() == 32 => {
+        match (relocation.kind(), relocation.flags()) {
+            (object::RelocationKind::Absolute, _)
+                if relocation.encoding() == object::RelocationEncoding::Generic && relocation.size() == 32 =>
+            {
                 data_relocations.insert(
                     current_location,
                     RelocationKind::Abs {
@@ -5912,7 +6057,7 @@ fn harvest_code_relocations(
                     },
                 );
             }
-            object::RelocationKind::Elf(reloc_kind) => {
+            (_, object::RelocationFlags::Elf { r_type: reloc_kind }) => {
                 // https://github.com/riscv-non-isa/riscv-elf-psabi-doc/releases
                 match reloc_kind {
                     object::elf::R_RISCV_CALL_PLT => {
@@ -6192,6 +6337,61 @@ fn harvest_code_relocations(
                             target
                         );
                     }
+                    object::elf::R_RISCV_RVC_JUMP => {
+                        let inst_raw = read_u16(section_data, relative_address)?;
+                        let Some(inst) = Inst::decode(inst_raw.into()) else {
+                            return Err(ProgramFromElfError::other(format!(
+                                "R_RISCV_RVC_JUMP for an unsupported instruction: 0x{inst_raw:04}"
+                            )));
+                        };
+
+                        let (Inst::JumpAndLink { dst, .. } | Inst::JumpAndLinkRegister { dst, .. }) = inst else {
+                            return Err(ProgramFromElfError::other(format!(
+                                "R_RISCV_RVC_JUMP for an unsupported instruction: 0x{inst_raw:04} ({inst:?})"
+                            )));
+                        };
+
+                        let target_return = current_location.add(2);
+                        instruction_overrides.insert(current_location, InstExt::Control(jump_or_call(dst, target, target_return)?));
+
+                        log::trace!(
+                            "  R_RISCV_RVC_JUMP: {}[0x{relative_address:x}] (0x{absolute_address:x} -> {}",
+                            section.name(),
+                            target
+                        );
+                    }
+                    object::elf::R_RISCV_RVC_BRANCH => {
+                        let inst_raw = read_u16(section_data, relative_address)?;
+                        let Some(inst) = Inst::decode_compressed(inst_raw.into()) else {
+                            return Err(ProgramFromElfError::other(format!(
+                                "R_RISCV_RVC_BRANCH for an unsupported instruction: 0x{inst_raw:04}"
+                            )));
+                        };
+
+                        let Inst::Branch { kind, src1, src2, .. } = inst else {
+                            return Err(ProgramFromElfError::other(format!(
+                                "R_RISCV_BRANCH for an unsupported instruction: 0x{inst_raw:04} ({inst:?})"
+                            )));
+                        };
+
+                        let target_false = current_location.add(2);
+                        instruction_overrides.insert(
+                            current_location,
+                            InstExt::Control(ControlInst::Branch {
+                                kind,
+                                src1: cast_reg_any(src1)?,
+                                src2: cast_reg_any(src2)?,
+                                target_true: target,
+                                target_false,
+                            }),
+                        );
+
+                        log::trace!(
+                            "  R_RISCV_RVC_BRANCH: {}[0x{relative_address:x}] (0x{absolute_address:x} -> {}",
+                            section.name(),
+                            target
+                        );
+                    }
                     object::elf::R_RISCV_RELAX => {}
                     _ => {
                         return Err(ProgramFromElfError::other(format!(
@@ -6255,7 +6455,9 @@ fn harvest_code_relocations(
                     ..
                 } => {
                     let Some(dst) = cast_reg_non_zero(dst)? else {
-                        return Err(ProgramFromElfError::other("{lo_rel_name} with a zero destination register"));
+                        return Err(ProgramFromElfError::other(format!(
+                            "{lo_rel_name} with a zero destination register: 0x{lo_inst_raw:08x} in {section_name}[0x{relative_lo:08x}]"
+                        )));
                     };
 
                     (base, InstExt::Basic(BasicInst::LoadAddressIndirect { dst, target }))
@@ -6275,14 +6477,17 @@ fn harvest_code_relocations(
                     ..
                 } => {
                     let Some(dst) = cast_reg_non_zero(dst)? else {
-                        return Err(ProgramFromElfError::other("{lo_rel_name} with a zero destination register"));
+                        return Err(ProgramFromElfError::other(format!(
+                            "{lo_rel_name} with a zero destination register: 0x{lo_inst_raw:08x} in {section_name}[0x{relative_lo:08x}]"
+                        )));
                     };
 
                     (src, InstExt::Basic(BasicInst::LoadAddress { dst, target }))
                 }
                 Inst::Load { kind, base, dst, .. } => {
                     let Some(dst) = cast_reg_non_zero(dst)? else {
-                        return Err(ProgramFromElfError::other("{lo_rel_name} with a zero destination register"));
+                        // The instruction will be translated to a NOP.
+                        continue;
                     };
 
                     (base, InstExt::Basic(BasicInst::LoadAbsolute { kind, dst, target }))
@@ -6433,6 +6638,7 @@ pub fn program_from_elf(config: Config, data: &[u8]) -> Result<Vec<u8>, ProgramF
             || name == ".data.rel.ro"
             || name.starts_with(".data.rel.ro.")
             || name == ".got"
+            || name == ".relro_padding"
         {
             if name == ".rodata" && is_writable {
                 return Err(ProgramFromElfError::other(format!(
@@ -6829,6 +7035,9 @@ pub fn program_from_elf(config: Config, data: &[u8]) -> Result<Vec<u8>, ProgramF
                 let data = elf.section_data_mut(relocation_target.section_index);
                 let value = range.end - range.start;
                 match size {
+                    SizeRelocationSize::Uleb128 => {
+                        overwrite_uleb128(data, relocation_target.offset as usize, value)?;
+                    }
                     SizeRelocationSize::SixBits => {
                         let mask = 0b00111111;
                         if value > mask {
@@ -7047,7 +7256,7 @@ pub fn program_from_elf(config: Config, data: &[u8]) -> Result<Vec<u8>, ProgramF
             // TODO: Use a smallvec.
             let mut list = Vec::new();
             for source in source_stack.as_slice() {
-                for offset in (source.offset_range.start..source.offset_range.end).step_by(4) {
+                for offset in (source.offset_range.start..source.offset_range.end).step_by(2) {
                     let target = SectionTarget {
                         section_index: source.section_index,
                         offset,
@@ -7101,20 +7310,28 @@ pub fn program_from_elf(config: Config, data: &[u8]) -> Result<Vec<u8>, ProgramF
 
     builder.set_code(&raw_code, &jump_table);
 
+    let mut offsets = Vec::new();
     if !config.strip {
-        emit_debug_info(&mut builder, &locations_for_instruction);
+        let blob = ProgramBlob::parse(builder.to_vec().into())?;
+        offsets = blob
+            .instructions()
+            .map(|instruction| (instruction.offset, instruction.next_offset()))
+            .collect();
+        assert_eq!(offsets.len(), locations_for_instruction.len());
+
+        emit_debug_info(&mut builder, &locations_for_instruction, &offsets);
     }
 
-    let raw_blob = builder.into_vec();
+    let raw_blob = builder.to_vec();
 
     log::debug!("Built a program of {} bytes", raw_blob.len());
     let blob = ProgramBlob::parse(raw_blob[..].into())?;
 
     // Sanity check that our debug info was properly emitted and can be parsed.
     if cfg!(debug_assertions) && !config.strip {
-        'outer: for (instruction_position, locations) in locations_for_instruction.iter().enumerate() {
-            let instruction_position = instruction_position as u32;
-            let line_program = blob.get_debug_line_program_at(instruction_position).unwrap();
+        'outer: for (nth_instruction, locations) in locations_for_instruction.iter().enumerate() {
+            let (program_counter, _) = offsets[nth_instruction];
+            let line_program = blob.get_debug_line_program_at(program_counter).unwrap();
             let Some(locations) = locations else {
                 assert!(line_program.is_none());
                 continue;
@@ -7122,7 +7339,7 @@ pub fn program_from_elf(config: Config, data: &[u8]) -> Result<Vec<u8>, ProgramF
 
             let mut line_program = line_program.unwrap();
             while let Some(region_info) = line_program.run().unwrap() {
-                if !region_info.instruction_range().contains(&instruction_position) {
+                if !region_info.instruction_range().contains(&program_counter) {
                     continue;
                 }
 
@@ -7177,7 +7394,11 @@ fn simplify_path(path: &str) -> Cow<str> {
     path.into()
 }
 
-fn emit_debug_info(builder: &mut ProgramBlobBuilder, locations_for_instruction: &[Option<Arc<[Location]>>]) {
+fn emit_debug_info(
+    builder: &mut ProgramBlobBuilder,
+    locations_for_instruction: &[Option<Arc<[Location]>>],
+    offsets: &[(ProgramCounter, ProgramCounter)],
+) {
     #[derive(Default)]
     struct DebugStringsBuilder<'a> {
         map: HashMap<Cow<'a, str>, u32>,
@@ -7217,6 +7438,8 @@ fn emit_debug_info(builder: &mut ProgramBlobBuilder, locations_for_instruction: 
         path: Option<Cow<'a, str>>,
         instruction_position: usize,
         instruction_count: usize,
+        program_counter_start: ProgramCounter,
+        program_counter_end: ProgramCounter,
     }
 
     impl<'a> Group<'a> {
@@ -7249,6 +7472,8 @@ fn emit_debug_info(builder: &mut ProgramBlobBuilder, locations_for_instruction: 
                 path: location.source_code_location.as_ref().map(|target| simplify_path(target.path())),
                 instruction_position,
                 instruction_count: 1,
+                program_counter_start: offsets[instruction_position].0,
+                program_counter_end: offsets[instruction_position].1,
             }
         } else {
             Group {
@@ -7257,6 +7482,8 @@ fn emit_debug_info(builder: &mut ProgramBlobBuilder, locations_for_instruction: 
                 path: None,
                 instruction_position,
                 instruction_count: 1,
+                program_counter_start: offsets[instruction_position].0,
+                program_counter_end: offsets[instruction_position].1,
             }
         };
 
@@ -7264,6 +7491,7 @@ fn emit_debug_info(builder: &mut ProgramBlobBuilder, locations_for_instruction: 
             if last_group.key() == group.key() {
                 assert_eq!(last_group.instruction_position + last_group.instruction_count, instruction_position);
                 last_group.instruction_count += 1;
+                last_group.program_counter_end = group.program_counter_end;
                 continue;
             }
         }
@@ -7351,8 +7579,8 @@ fn emit_debug_info(builder: &mut ProgramBlobBuilder, locations_for_instruction: 
                     self.stack_depth = depth;
                 }
 
-                fn finish_instruction(&mut self, writer: &mut Writer, next_depth: usize) {
-                    self.queued_count += 1;
+                fn finish_instruction(&mut self, writer: &mut Writer, next_depth: usize, instruction_length: u32) {
+                    self.queued_count += instruction_length;
 
                     enum Direction {
                         GoDown,
@@ -7501,7 +7729,7 @@ fn emit_debug_info(builder: &mut ProgramBlobBuilder, locations_for_instruction: 
                     .get(nth_instruction + 1)
                     .and_then(|next_locations| next_locations.as_ref().map(|xs| xs.len()))
                     .unwrap_or(0);
-                state.finish_instruction(writer, next_depth);
+                state.finish_instruction(writer, next_depth, (offsets[nth_instruction].1).0 - (offsets[nth_instruction].0).0);
             }
 
             state.flush_if_any_are_queued(writer);
@@ -7515,8 +7743,8 @@ fn emit_debug_info(builder: &mut ProgramBlobBuilder, locations_for_instruction: 
     {
         let mut writer = Writer::new(&mut section_line_program_ranges);
         for (group, info_offset) in groups.iter().zip(info_offsets.into_iter()) {
-            writer.push_u32(group.instruction_position.try_into().expect("overflow"));
-            writer.push_u32((group.instruction_position + group.instruction_count).try_into().expect("overflow"));
+            writer.push_u32(group.program_counter_start.0);
+            writer.push_u32(group.program_counter_end.0);
             writer.push_u32(info_offset);
         }
     }

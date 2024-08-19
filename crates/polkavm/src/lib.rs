@@ -7,7 +7,10 @@
 #[cfg(all(
     not(miri),
     target_arch = "x86_64",
-    any(target_os = "linux", target_os = "macos", target_os = "freebsd"),
+    any(
+        target_os = "linux",
+        all(feature = "generic-sandbox", any(target_os = "macos", target_os = "freebsd"))
+    ),
     feature = "std",
 ))]
 macro_rules! if_compiler_is_supported {
@@ -27,7 +30,10 @@ macro_rules! if_compiler_is_supported {
 #[cfg(not(all(
     not(miri),
     target_arch = "x86_64",
-    any(target_os = "linux", target_os = "macos", target_os = "freebsd"),
+    any(
+        target_os = "linux",
+        all(feature = "generic-sandbox", any(target_os = "macos", target_os = "freebsd"))
+    ),
     feature = "std",
 )))]
 macro_rules! if_compiler_is_supported {
@@ -47,13 +53,13 @@ extern crate alloc;
 mod error;
 
 mod api;
-mod caller;
 mod config;
 mod gas;
 mod interpreter;
+mod linker;
+mod page_set;
 #[cfg(feature = "std")]
 mod source_cache;
-mod tracer;
 mod utils;
 
 #[cfg(feature = "std")]
@@ -68,6 +74,15 @@ mod mutex_no_std;
 #[cfg(not(feature = "std"))]
 pub(crate) use mutex_no_std as mutex;
 
+impl<T> Default for crate::mutex::Mutex<T>
+where
+    T: Default,
+{
+    fn default() -> Self {
+        Self::new(Default::default())
+    }
+}
+
 if_compiler_is_supported! {
     mod bit_mask;
     mod compiler;
@@ -80,17 +95,49 @@ if_compiler_is_supported! {
     mod shm_allocator;
 }
 
+// These are needed due to: https://github.com/rust-lang/rustfmt/issues/3253
+#[cfg(rustfmt)]
+mod bit_mask;
+#[cfg(rustfmt)]
+mod compiler;
+#[cfg(rustfmt)]
+mod generic_allocator;
+#[cfg(rustfmt)]
+mod sandbox;
+#[cfg(rustfmt)]
+mod shm_allocator;
+
 pub use polkavm_common::{
     abi::MemoryMap,
-    error::{ExecutionError, Trap},
-    program::{ProgramBlob, ProgramParseError, Reg},
-    utils::{ArcBytes, AsUninitSliceMut, Gas},
+    program::{ProgramBlob, ProgramCounter, ProgramParts, Reg},
+    utils::{ArcBytes, AsUninitSliceMut},
 };
 
-pub use crate::api::{CallArgs, Engine, ExportIndex, Instance, InstancePre, Linker, Module, StateArgs};
-pub use crate::caller::{Caller, CallerRef};
+/// Miscellaneous types related to debug info.
+pub mod debug_info {
+    pub use polkavm_common::program::{FrameInfo, FrameKind, LineProgram, RegionInfo, SourceLocation};
+
+    #[cfg(feature = "std")]
+    pub use crate::source_cache::SourceCache;
+}
+
+/// Miscellaneous types related to program blobs.
+pub mod program {
+    pub use polkavm_common::program::{
+        Imports, ImportsIter, Instruction, Instructions, JumpTable, JumpTableIter, Opcode, ProgramExport, ProgramParseError, ProgramSymbol,
+        RawReg,
+    };
+}
+
+pub type Gas = i64;
+
+pub use crate::api::{Engine, MemoryAccessError, Module, RawInstance, RegValue};
 pub use crate::config::{BackendKind, Config, GasMeteringKind, ModuleConfig, SandboxKind};
 pub use crate::error::Error;
+pub use crate::linker::{CallError, Caller, Instance, InstancePre, Linker};
+pub use crate::utils::{InterruptKind, Segfault};
+
+pub const RETURN_TO_HOST: u32 = polkavm_common::abi::VM_ADDR_RETURN_TO_HOST;
 
 #[cfg(test)]
 mod tests;

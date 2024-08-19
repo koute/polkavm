@@ -1,0 +1,7 @@
+pub @main:
+    a0 = @target
+pub @expected_exit:
+    jump [a0 + 1]
+    trap
+@target:
+    a1 = 0xdeadbeef

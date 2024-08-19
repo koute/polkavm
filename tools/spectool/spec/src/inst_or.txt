@@ -1,0 +1,5 @@
+pre: a0 = 0b101
+pre: a1 = 0b011
+
+pub @main:
+    a2 = a0 | a1

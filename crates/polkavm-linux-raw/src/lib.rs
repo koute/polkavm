@@ -29,10 +29,13 @@ pub mod arch_amd64_syscall;
 #[allow(non_snake_case)]
 #[allow(clippy::ptr_as_ptr)]
 #[allow(clippy::used_underscore_binding)]
+#[allow(clippy::transmute_ptr_to_ptr)]
 mod arch_amd64_bindings;
 
+mod io_uring;
 mod mmap;
 
+pub use io_uring::IoUring;
 pub use mmap::Mmap;
 
 #[cfg(target_arch = "x86_64")]
@@ -69,8 +72,10 @@ pub const SIG_IGN: usize = 1;
 // so let's define it manually.
 pub const HWCAP2_FSGSBASE: usize = 1 << 1;
 
+pub(crate) use crate::arch_amd64_bindings as arch_bindings;
+
 #[rustfmt::skip]
-pub use crate::arch_amd64_bindings::{
+pub use crate::arch_bindings::{
     __kernel_gid_t as gid_t,
     __kernel_pid_t as pid_t,
     __kernel_uid_t as uid_t,
@@ -94,6 +99,10 @@ pub use crate::arch_amd64_bindings::{
     __NR_getgid as SYS_getgid,
     __NR_getpid as SYS_getpid,
     __NR_getuid as SYS_getuid,
+    __NR_io_uring_enter as SYS_io_uring_enter,
+    __NR_io_uring_register as SYS_io_uring_register,
+    __NR_io_uring_setup as SYS_io_uring_setup,
+    __NR_ioctl as SYS_ioctl,
     __NR_kill as SYS_kill,
     __NR_lseek as SYS_lseek,
     __NR_madvise as SYS_madvise,
@@ -127,7 +136,9 @@ pub use crate::arch_amd64_bindings::{
     __NR_sigaltstack as SYS_sigaltstack,
     __NR_socketpair as SYS_socketpair,
     __NR_umount2 as SYS_umount2,
+    __NR_uname as SYS_uname,
     __NR_unshare as SYS_unshare,
+    __NR_userfaultfd as SYS_userfaultfd,
     __NR_waitid as SYS_waitid,
     __NR_write as SYS_write,
     __NR_writev as SYS_writev,
@@ -195,15 +206,20 @@ pub use crate::arch_amd64_bindings::{
     ESPIPE,
     ESRCH,
     ETIMEDOUT,
+    ETOOMANYREFS,
     ETXTBSY,
     EXDEV,
+    ERESTARTSYS,
     F_ADD_SEALS,
+    F_DUPFD,
+    F_GETFD,
     F_SEAL_EXEC,
     F_SEAL_FUTURE_WRITE,
     F_SEAL_GROW,
     F_SEAL_SEAL,
     F_SEAL_SHRINK,
     F_SEAL_WRITE,
+    F_SETFD,
     F_SETFL,
     F_SETOWN,
     F_SETSIG,
@@ -214,8 +230,218 @@ pub use crate::arch_amd64_bindings::{
     FALLOC_FL_PUNCH_HOLE,
     FALLOC_FL_UNSHARE_RANGE,
     FALLOC_FL_ZERO_RANGE,
+    FUTEX_BITSET_MATCH_ANY,
     FUTEX_WAIT,
     FUTEX_WAKE,
+    FUTEX2_SIZE_U32,
+    io_cqring_offsets,
+    io_sqring_offsets,
+    io_uring_buf_reg,
+    io_uring_buf_ring,
+    io_uring_buf_status,
+    io_uring_buf,
+    io_uring_cqe,
+    io_uring_file_index_range,
+    io_uring_files_update,
+    io_uring_getevents_arg,
+    io_uring_napi,
+    io_uring_op_IORING_OP_ACCEPT,
+    io_uring_op_IORING_OP_ASYNC_CANCEL,
+    io_uring_op_IORING_OP_CLOSE,
+    io_uring_op_IORING_OP_CONNECT,
+    io_uring_op_IORING_OP_EPOLL_CTL,
+    io_uring_op_IORING_OP_FADVISE,
+    io_uring_op_IORING_OP_FALLOCATE,
+    io_uring_op_IORING_OP_FGETXATTR,
+    io_uring_op_IORING_OP_FILES_UPDATE,
+    io_uring_op_IORING_OP_FIXED_FD_INSTALL,
+    io_uring_op_IORING_OP_FSETXATTR,
+    io_uring_op_IORING_OP_FSYNC,
+    io_uring_op_IORING_OP_FTRUNCATE,
+    io_uring_op_IORING_OP_FUTEX_WAIT,
+    io_uring_op_IORING_OP_FUTEX_WAITV,
+    io_uring_op_IORING_OP_FUTEX_WAKE,
+    io_uring_op_IORING_OP_GETXATTR,
+    io_uring_op_IORING_OP_LAST,
+    io_uring_op_IORING_OP_LINK_TIMEOUT,
+    io_uring_op_IORING_OP_LINKAT,
+    io_uring_op_IORING_OP_MADVISE,
+    io_uring_op_IORING_OP_MKDIRAT,
+    io_uring_op_IORING_OP_MSG_RING,
+    io_uring_op_IORING_OP_NOP,
+    io_uring_op_IORING_OP_OPENAT,
+    io_uring_op_IORING_OP_OPENAT2,
+    io_uring_op_IORING_OP_POLL_ADD,
+    io_uring_op_IORING_OP_POLL_REMOVE,
+    io_uring_op_IORING_OP_PROVIDE_BUFFERS,
+    io_uring_op_IORING_OP_READ_FIXED,
+    io_uring_op_IORING_OP_READ_MULTISHOT,
+    io_uring_op_IORING_OP_READ,
+    io_uring_op_IORING_OP_READV,
+    io_uring_op_IORING_OP_RECV,
+    io_uring_op_IORING_OP_RECVMSG,
+    io_uring_op_IORING_OP_REMOVE_BUFFERS,
+    io_uring_op_IORING_OP_RENAMEAT,
+    io_uring_op_IORING_OP_SEND_ZC,
+    io_uring_op_IORING_OP_SEND,
+    io_uring_op_IORING_OP_SENDMSG_ZC,
+    io_uring_op_IORING_OP_SENDMSG,
+    io_uring_op_IORING_OP_SETXATTR,
+    io_uring_op_IORING_OP_SHUTDOWN,
+    io_uring_op_IORING_OP_SOCKET,
+    io_uring_op_IORING_OP_SPLICE,
+    io_uring_op_IORING_OP_STATX,
+    io_uring_op_IORING_OP_SYMLINKAT,
+    io_uring_op_IORING_OP_SYNC_FILE_RANGE,
+    io_uring_op_IORING_OP_TEE,
+    io_uring_op_IORING_OP_TIMEOUT_REMOVE,
+    io_uring_op_IORING_OP_TIMEOUT,
+    io_uring_op_IORING_OP_UNLINKAT,
+    io_uring_op_IORING_OP_URING_CMD,
+    io_uring_op_IORING_OP_WAITID,
+    io_uring_op_IORING_OP_WRITE_FIXED,
+    io_uring_op_IORING_OP_WRITE,
+    io_uring_op_IORING_OP_WRITEV,
+    io_uring_params,
+    io_uring_probe_op,
+    io_uring_probe,
+    io_uring_recvmsg_out,
+    io_uring_restriction,
+    io_uring_rsrc_register,
+    io_uring_rsrc_update,
+    io_uring_rsrc_update2,
+    io_uring_sqe,
+    io_uring_sync_cancel_reg,
+    IORING_ACCEPT_MULTISHOT,
+    IORING_ASYNC_CANCEL_ALL,
+    IORING_ASYNC_CANCEL_ANY,
+    IORING_ASYNC_CANCEL_FD_FIXED,
+    IORING_ASYNC_CANCEL_FD,
+    IORING_ASYNC_CANCEL_OP,
+    IORING_ASYNC_CANCEL_USERDATA,
+    IORING_CQ_EVENTFD_DISABLED,
+    IORING_CQE_BUFFER_SHIFT,
+    IORING_CQE_F_BUFFER,
+    IORING_CQE_F_MORE,
+    IORING_CQE_F_NOTIF,
+    IORING_CQE_F_SOCK_NONEMPTY,
+    IORING_ENTER_EXT_ARG,
+    IORING_ENTER_GETEVENTS,
+    IORING_ENTER_REGISTERED_RING,
+    IORING_ENTER_SQ_WAIT,
+    IORING_ENTER_SQ_WAKEUP,
+    IORING_FEAT_CQE_SKIP,
+    IORING_FEAT_CUR_PERSONALITY,
+    IORING_FEAT_EXT_ARG,
+    IORING_FEAT_FAST_POLL,
+    IORING_FEAT_LINKED_FILE,
+    IORING_FEAT_NATIVE_WORKERS,
+    IORING_FEAT_NODROP,
+    IORING_FEAT_POLL_32BITS,
+    IORING_FEAT_REG_REG_RING,
+    IORING_FEAT_RSRC_TAGS,
+    IORING_FEAT_RW_CUR_POS,
+    IORING_FEAT_SINGLE_MMAP,
+    IORING_FEAT_SQPOLL_NONFIXED,
+    IORING_FEAT_SUBMIT_STABLE,
+    IORING_FILE_INDEX_ALLOC,
+    IORING_FIXED_FD_NO_CLOEXEC,
+    IORING_FSYNC_DATASYNC,
+    IORING_LINK_TIMEOUT_UPDATE,
+    IORING_MSG_DATA,
+    IORING_MSG_RING_CQE_SKIP,
+    IORING_MSG_RING_FLAGS_PASS,
+    IORING_MSG_SEND_FD,
+    IORING_NOTIF_USAGE_ZC_COPIED,
+    IORING_OFF_CQ_RING,
+    IORING_OFF_MMAP_MASK,
+    IORING_OFF_PBUF_RING,
+    IORING_OFF_PBUF_SHIFT,
+    IORING_OFF_SQ_RING,
+    IORING_OFF_SQES,
+    IORING_POLL_ADD_LEVEL,
+    IORING_POLL_ADD_MULTI,
+    IORING_POLL_UPDATE_EVENTS,
+    IORING_POLL_UPDATE_USER_DATA,
+    IORING_RECV_MULTISHOT,
+    IORING_RECVSEND_FIXED_BUF,
+    IORING_RECVSEND_POLL_FIRST,
+    IORING_REGISTER_BUFFERS_UPDATE,
+    IORING_REGISTER_BUFFERS,
+    IORING_REGISTER_BUFFERS2,
+    IORING_REGISTER_ENABLE_RINGS,
+    IORING_REGISTER_EVENTFD_ASYNC,
+    IORING_REGISTER_EVENTFD,
+    IORING_REGISTER_FILE_ALLOC_RANGE,
+    IORING_REGISTER_FILES_SKIP,
+    IORING_REGISTER_FILES_UPDATE,
+    IORING_REGISTER_FILES_UPDATE2,
+    IORING_REGISTER_FILES,
+    IORING_REGISTER_FILES2,
+    IORING_REGISTER_IOWQ_AFF,
+    IORING_REGISTER_IOWQ_MAX_WORKERS,
+    IORING_REGISTER_LAST,
+    IORING_REGISTER_NAPI,
+    IORING_REGISTER_PBUF_RING,
+    IORING_REGISTER_PBUF_STATUS,
+    IORING_REGISTER_PERSONALITY,
+    IORING_REGISTER_PROBE,
+    IORING_REGISTER_RESTRICTIONS,
+    IORING_REGISTER_RING_FDS,
+    IORING_REGISTER_SYNC_CANCEL,
+    IORING_REGISTER_USE_REGISTERED_RING,
+    IORING_RESTRICTION_LAST,
+    IORING_RESTRICTION_REGISTER_OP,
+    IORING_RESTRICTION_SQE_FLAGS_ALLOWED,
+    IORING_RESTRICTION_SQE_FLAGS_REQUIRED,
+    IORING_RESTRICTION_SQE_OP,
+    IORING_RSRC_REGISTER_SPARSE,
+    IORING_SEND_ZC_REPORT_USAGE,
+    IORING_SETUP_ATTACH_WQ,
+    IORING_SETUP_CLAMP,
+    IORING_SETUP_COOP_TASKRUN,
+    IORING_SETUP_CQE32,
+    IORING_SETUP_CQSIZE,
+    IORING_SETUP_DEFER_TASKRUN,
+    IORING_SETUP_IOPOLL,
+    IORING_SETUP_NO_MMAP,
+    IORING_SETUP_NO_SQARRAY,
+    IORING_SETUP_R_DISABLED,
+    IORING_SETUP_REGISTERED_FD_ONLY,
+    IORING_SETUP_SINGLE_ISSUER,
+    IORING_SETUP_SQ_AFF,
+    IORING_SETUP_SQE128,
+    IORING_SETUP_SQPOLL,
+    IORING_SETUP_SUBMIT_ALL,
+    IORING_SETUP_TASKRUN_FLAG,
+    IORING_SQ_CQ_OVERFLOW,
+    IORING_SQ_NEED_WAKEUP,
+    IORING_SQ_TASKRUN,
+    IORING_TIMEOUT_ABS,
+    IORING_TIMEOUT_BOOTTIME,
+    IORING_TIMEOUT_CLOCK_MASK,
+    IORING_TIMEOUT_ETIME_SUCCESS,
+    IORING_TIMEOUT_MULTISHOT,
+    IORING_TIMEOUT_REALTIME,
+    IORING_TIMEOUT_UPDATE_MASK,
+    IORING_TIMEOUT_UPDATE,
+    IORING_UNREGISTER_BUFFERS,
+    IORING_UNREGISTER_EVENTFD,
+    IORING_UNREGISTER_FILES,
+    IORING_UNREGISTER_IOWQ_AFF,
+    IORING_UNREGISTER_NAPI,
+    IORING_UNREGISTER_PBUF_RING,
+    IORING_UNREGISTER_PERSONALITY,
+    IORING_UNREGISTER_RING_FDS,
+    IORING_URING_CMD_FIXED,
+    IORING_URING_CMD_MASK,
+    IOSQE_ASYNC_BIT,
+    IOSQE_BUFFER_SELECT_BIT,
+    IOSQE_CQE_SKIP_SUCCESS_BIT,
+    IOSQE_FIXED_FILE_BIT,
+    IOSQE_IO_DRAIN_BIT,
+    IOSQE_IO_HARDLINK_BIT,
+    IOSQE_IO_LINK_BIT,
     iovec,
     linux_dirent64,
     MADV_COLD,
@@ -260,6 +486,7 @@ pub use crate::arch_amd64_bindings::{
     MS_PRIVATE,
     MS_RDONLY,
     MS_REC,
+    new_utsname,
     O_CLOEXEC,
     O_DIRECTORY,
     O_NONBLOCK,
@@ -314,9 +541,158 @@ pub use crate::arch_amd64_bindings::{
     SIGTERM,
     SIGTRAP,
     timespec,
+    UFFD_EVENT_FORK,
+    UFFD_EVENT_PAGEFAULT,
+    UFFD_EVENT_REMAP,
+    UFFD_EVENT_REMOVE,
+    UFFD_EVENT_UNMAP,
+    UFFD_FEATURE_EVENT_FORK,
+    UFFD_FEATURE_EVENT_REMAP,
+    UFFD_FEATURE_EVENT_REMOVE,
+    UFFD_FEATURE_EVENT_UNMAP,
+    UFFD_FEATURE_EXACT_ADDRESS,
+    UFFD_FEATURE_MINOR_HUGETLBFS,
+    UFFD_FEATURE_MINOR_SHMEM,
+    UFFD_FEATURE_MISSING_HUGETLBFS,
+    UFFD_FEATURE_MISSING_SHMEM,
+    UFFD_FEATURE_MOVE,
+    UFFD_FEATURE_PAGEFAULT_FLAG_WP,
+    UFFD_FEATURE_POISON,
+    UFFD_FEATURE_SIGBUS,
+    UFFD_FEATURE_THREAD_ID,
+    UFFD_FEATURE_WP_ASYNC,
+    UFFD_FEATURE_WP_HUGETLBFS_SHMEM,
+    UFFD_FEATURE_WP_UNPOPULATED,
+    uffd_msg,
+    UFFD_PAGEFAULT_FLAG_MINOR,
+    UFFD_PAGEFAULT_FLAG_WP,
+    UFFD_PAGEFAULT_FLAG_WRITE,
+    UFFD_USER_MODE_ONLY,
+    uffdio_api,
+    uffdio_continue,
+    uffdio_copy,
+    uffdio_move,
+    uffdio_poison,
+    uffdio_range,
+    uffdio_register,
+    uffdio_writeprotect,
+    uffdio_zeropage,
     WEXITED,
     WNOHANG,
 };
+
+// For some reason bindgen just refuses to emit these.
+pub const UFFD_API: u64 = 0xaa;
+pub const UFFDIO_REGISTER_MODE_MISSING: u64 = 1 << 0;
+pub const UFFDIO_REGISTER_MODE_WP: u64 = 1 << 1;
+pub const UFFDIO_REGISTER_MODE_MINOR: u64 = 1 << 2;
+pub const UFFDIO_COPY_MODE_DONTWAKE: u64 = 1 << 0;
+pub const UFFDIO_COPY_MODE_WP: u64 = 1 << 1;
+pub const UFFDIO_ZEROPAGE_MODE_DONTWAKE: u64 = 1 << 0;
+pub const UFFDIO_WRITEPROTECT_MODE_WP: u64 = 1 << 0;
+pub const UFFDIO_WRITEPROTECT_MODE_DONTWAKE: u64 = 1 << 1;
+pub const UFFDIO_CONTINUE_MODE_DONTWAKE: u64 = 1 << 0;
+pub const UFFDIO_CONTINUE_MODE_WP: u64 = 1 << 1;
+
+macro_rules! ioc {
+    ($dir:expr, $type:expr, $nr:expr, $size:expr) => {
+        ($dir << $crate::arch_bindings::_IOC_DIRSHIFT)
+            | ($type << $crate::arch_bindings::_IOC_TYPESHIFT)
+            | ($nr << $crate::arch_bindings::_IOC_NRSHIFT)
+            | ($size << $crate::arch_bindings::_IOC_SIZESHIFT)
+    };
+}
+
+macro_rules! ior {
+    ($type:expr, $nr:expr, $size:ty) => {
+        ioc!(
+            $crate::arch_bindings::_IOC_READ,
+            $type,
+            $nr,
+            core::mem::size_of::<$size>() as $crate::c_uint
+        )
+    };
+}
+
+macro_rules! iowr {
+    ($type:expr, $nr:expr, $size:ty) => {
+        ioc!(
+            $crate::arch_bindings::_IOC_READ | $crate::arch_bindings::_IOC_WRITE,
+            $type,
+            $nr,
+            core::mem::size_of::<$size>() as $crate::c_uint
+        )
+    };
+}
+
+use crate::arch_bindings::UFFDIO;
+
+const UFFDIO_API: c_uint = iowr!(UFFDIO, crate::arch_bindings::_UFFDIO_API, uffdio_api);
+const UFFDIO_REGISTER: c_uint = iowr!(UFFDIO, crate::arch_bindings::_UFFDIO_REGISTER, uffdio_register);
+const UFFDIO_UNREGISTER: c_uint = ior!(UFFDIO, crate::arch_bindings::_UFFDIO_UNREGISTER, uffdio_range);
+const UFFDIO_WAKE: c_uint = ior!(UFFDIO, crate::arch_bindings::_UFFDIO_WAKE, uffdio_range);
+const UFFDIO_COPY: c_uint = iowr!(UFFDIO, crate::arch_bindings::_UFFDIO_COPY, uffdio_copy);
+const UFFDIO_ZEROPAGE: c_uint = iowr!(UFFDIO, crate::arch_bindings::_UFFDIO_ZEROPAGE, uffdio_zeropage);
+const UFFDIO_MOVE: c_uint = iowr!(UFFDIO, crate::arch_bindings::_UFFDIO_MOVE, uffdio_move);
+const UFFDIO_WRITEPROTECT: c_uint = iowr!(UFFDIO, crate::arch_bindings::_UFFDIO_WRITEPROTECT, uffdio_writeprotect);
+const UFFDIO_CONTINUE: c_uint = iowr!(UFFDIO, crate::arch_bindings::_UFFDIO_CONTINUE, uffdio_continue);
+const UFFDIO_POISON: c_uint = iowr!(UFFDIO, crate::arch_bindings::_UFFDIO_POISON, uffdio_poison);
+
+macro_rules! ioctl_wrapper {
+    ($(
+        ($name:ident, $command:ident, $struct:ident),
+    )*) => {
+        $(
+            pub fn $name(fd: FdRef, arg: &mut $struct) -> Result<(), Error> {
+                sys_ioctl(fd, $command, arg as *mut _ as c_ulong)?;
+                Ok(())
+            }
+        )*
+    }
+}
+
+ioctl_wrapper! {
+    (sys_uffdio_api, UFFDIO_API, uffdio_api),
+    (sys_uffdio_register, UFFDIO_REGISTER, uffdio_register),
+    (sys_uffdio_unregister, UFFDIO_UNREGISTER, uffdio_range),
+    (sys_uffdio_wake, UFFDIO_WAKE, uffdio_range),
+    (sys_uffdio_copy, UFFDIO_COPY, uffdio_copy),
+    (sys_uffdio_zeropage, UFFDIO_ZEROPAGE, uffdio_zeropage),
+    (sys_uffdio_move, UFFDIO_MOVE, uffdio_move),
+    (sys_uffdio_writeprotect, UFFDIO_WRITEPROTECT, uffdio_writeprotect),
+    (sys_uffdio_continue, UFFDIO_CONTINUE, uffdio_continue),
+    (sys_uffdio_poison, UFFDIO_POISON, uffdio_poison),
+}
+
+macro_rules! unsafe_impl_zeroed_default {
+    ($(
+        $name:ident,
+    )*) => {
+        $(
+            impl Default for $name {
+                #[inline]
+                fn default() -> Self {
+                    unsafe { core::mem::zeroed() }
+                }
+            }
+        )*
+    }
+}
+
+unsafe_impl_zeroed_default! {
+    uffdio_api,
+    uffdio_register,
+    uffdio_range,
+    uffdio_copy,
+    uffdio_zeropage,
+    uffdio_move,
+    uffdio_writeprotect,
+    uffdio_continue,
+    uffdio_poison,
+    uffd_msg,
+    io_uring_params,
+    io_uring_sqe,
+}
 
 impl siginfo_t {
     pub unsafe fn si_signo(&self) -> c_int {
@@ -934,6 +1310,8 @@ impl Error {
             EDOM => Some("EDOM"),
             ERANGE => Some("ERANGE"),
             EOPNOTSUPP => Some("EOPNOTSUPP"),
+            ETOOMANYREFS => Some("ETOOMANYREFS"),
+            ERESTARTSYS => Some("ERESTARTSYS"),
             _ => None,
         };
 
@@ -1123,6 +1501,50 @@ impl<'a> core::fmt::Write for FdRef<'a> {
     }
 }
 
+pub fn sys_uname() -> Result<new_utsname, Error> {
+    let mut out: new_utsname = unsafe { core::mem::zeroed() };
+    let result = unsafe { syscall!(SYS_uname, core::ptr::addr_of_mut!(out)) };
+    Error::from_syscall("uname", result)?;
+    Ok(out)
+}
+
+pub fn sys_io_uring_setup(entries: u32, params: &mut io_uring_params) -> Result<Fd, Error> {
+    let fd = unsafe { syscall!(SYS_io_uring_setup, entries, params as *mut io_uring_params) };
+    Error::from_syscall("io_uring_setup", fd)?;
+    Ok(Fd::from_raw_unchecked(fd as c_int))
+}
+
+pub fn sys_io_uring_register(fd: FdRef, opcode: u32, arg: *const c_void, arg_count: u32) -> Result<(), Error> {
+    let result = unsafe { syscall!(SYS_io_uring_register, fd, opcode, arg, arg_count) };
+    Error::from_syscall("io_uring_register", result)?;
+    Ok(())
+}
+
+pub unsafe fn sys_io_uring_enter(
+    fd: FdRef,
+    to_submit: u32,
+    min_complete: u32,
+    flags: u32,
+    arg: *const c_void,
+    argsz: usize,
+) -> Result<u32, Error> {
+    let result = unsafe { syscall!(SYS_io_uring_enter, fd, to_submit, min_complete, flags, arg, argsz) };
+    Error::from_syscall("io_uring_enter", result)?;
+    Ok(result as u32)
+}
+
+pub fn sys_ioctl(fd: FdRef, cmd: c_uint, arg: c_ulong) -> Result<c_int, Error> {
+    let result = unsafe { syscall!(SYS_ioctl, fd, cmd, arg) };
+    Error::from_syscall("ioctl", result)?;
+    Ok(result as c_int)
+}
+
+pub fn sys_userfaultfd(flags: c_uint) -> Result<Fd, Error> {
+    let fd = unsafe { syscall_readonly!(SYS_userfaultfd, flags) };
+    Error::from_syscall("userfaultfd", fd)?;
+    Ok(Fd::from_raw_unchecked(fd as c_int))
+}
+
 fn sys_getdents64(fd: FdRef, buffer: &mut [u8]) -> Result<Option<usize>, Error> {
     let length = buffer.len();
     let bytes_read = unsafe { syscall!(SYS_getdents64, fd.raw(), buffer, length) };
@@ -1181,10 +1603,15 @@ pub fn sys_memfd_create(name: &CStr, flags: c_uint) -> Result<Fd, Error> {
     Ok(Fd(fd as c_int))
 }
 
-pub fn sys_fcntl(fd: FdRef, cmd: u32, arg: u32) -> Result<(), Error> {
+pub fn sys_fcntl(fd: FdRef, cmd: u32, arg: u32) -> Result<i32, Error> {
     let result = unsafe { syscall_readonly!(SYS_fcntl, fd, cmd, arg) };
     Error::from_syscall("fcntl", result)?;
-    Ok(())
+    Ok(result as i32)
+}
+
+pub fn sys_fcntl_dupfd(fd: FdRef, arg: u32) -> Result<Fd, Error> {
+    let fd = sys_fcntl(fd, F_DUPFD, arg)?;
+    Ok(Fd::from_raw_unchecked(fd))
 }
 
 pub fn sys_close_range(first_fd: c_int, last_fd: c_int, flags: c_uint) -> Result<(), Error> {
@@ -1378,6 +1805,84 @@ pub fn sys_ptrace_traceme() -> Result<(), Error> {
     Ok(())
 }
 
+pub fn sys_ptrace_interrupt(pid: pid_t) -> Result<(), Error> {
+    let result = unsafe { syscall_readonly!(SYS_ptrace, crate::arch_bindings::PTRACE_INTERRUPT, pid, 0, 0) };
+    Error::from_syscall("ptrace (PTRACE_INTERRUPT)", result)?;
+    Ok(())
+}
+
+pub fn sys_ptrace_attach(pid: pid_t) -> Result<(), Error> {
+    let result = unsafe { syscall_readonly!(SYS_ptrace, crate::arch_bindings::PTRACE_ATTACH, pid, 0, 0) };
+    Error::from_syscall("ptrace (PTRACE_ATTACH)", result)?;
+    Ok(())
+}
+
+pub fn sys_ptrace_seize(pid: pid_t) -> Result<(), Error> {
+    let result = unsafe { syscall_readonly!(SYS_ptrace, crate::arch_bindings::PTRACE_SEIZE, pid, 0, 0) };
+    Error::from_syscall("ptrace (PTRACE_SEIZE)", result)?;
+    Ok(())
+}
+
+pub fn sys_ptrace_continue(pid: pid_t, signal: Option<u32>) -> Result<(), Error> {
+    let result = unsafe { syscall_readonly!(SYS_ptrace, crate::arch_bindings::PTRACE_CONT, pid, 0, signal.unwrap_or(0)) };
+    Error::from_syscall("ptrace (PTRACE_CONT)", result)?;
+    Ok(())
+}
+
+pub fn sys_ptrace_detach(pid: pid_t) -> Result<(), Error> {
+    let result = unsafe { syscall_readonly!(SYS_ptrace, crate::arch_bindings::PTRACE_DETACH, pid, 0, 0) };
+    Error::from_syscall("ptrace (PTRACE_DETACH)", result)?;
+    Ok(())
+}
+
+#[cfg(target_arch = "x86_64")]
+#[repr(C)]
+#[derive(Default, Debug)]
+pub struct user_regs_struct {
+    pub r15: c_ulong,
+    pub r14: c_ulong,
+    pub r13: c_ulong,
+    pub r12: c_ulong,
+    pub rbp: c_ulong,
+    pub rbx: c_ulong,
+    pub r11: c_ulong,
+    pub r10: c_ulong,
+    pub r9: c_ulong,
+    pub r8: c_ulong,
+    pub rax: c_ulong,
+    pub rcx: c_ulong,
+    pub rdx: c_ulong,
+    pub rsi: c_ulong,
+    pub rdi: c_ulong,
+    pub orig_rax: c_ulong,
+    pub rip: c_ulong,
+    pub cs: c_ulong,
+    pub flags: c_ulong,
+    pub sp: c_ulong,
+    pub ss: c_ulong,
+    pub fs_base: c_ulong,
+    pub gs_base: c_ulong,
+    pub ds: c_ulong,
+    pub es: c_ulong,
+    pub fs: c_ulong,
+    pub gs: c_ulong,
+}
+
+pub fn sys_ptrace_getregs(pid: pid_t) -> Result<user_regs_struct, Error> {
+    let mut output: MaybeUninit<user_regs_struct> = MaybeUninit::uninit();
+    let result = unsafe { syscall!(SYS_ptrace, crate::arch_bindings::PTRACE_GETREGS, pid, 0, output.as_mut_ptr()) };
+    Error::from_syscall("ptrace (PTRACE_GETREGS)", result)?;
+
+    unsafe { Ok(output.assume_init()) }
+}
+
+pub fn sys_ptrace_setregs(pid: pid_t, regs: &user_regs_struct) -> Result<(), Error> {
+    let regs: *const user_regs_struct = regs;
+    let result = unsafe { syscall_readonly!(SYS_ptrace, crate::arch_bindings::PTRACE_SETREGS, pid, 0, regs) };
+    Error::from_syscall("ptrace (PTRACE_SETREGS)", result)?;
+    Ok(())
+}
+
 pub fn sys_prctl_set_no_new_privs() -> Result<(), Error> {
     const PR_SET_NO_NEW_PRIVS: usize = 38;
     let result = unsafe { syscall_readonly!(SYS_prctl, PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) };
@@ -1401,6 +1906,24 @@ pub fn sys_prctl_set_name(name: &[u8; 16]) -> Result<(), Error> {
     const PR_SET_NAME: usize = 15;
     let result = unsafe { syscall_readonly!(SYS_prctl, PR_SET_NAME, name.as_ptr(), 0, 0, 0) };
     Error::from_syscall("prctl(PR_SET_NAME)", result)
+}
+
+pub fn sys_prctl_set_dumpable(value: bool) -> Result<(), Error> {
+    const PR_SET_DUMPABLE: usize = 4;
+    let value = usize::from(value);
+    let result = unsafe { syscall_readonly!(SYS_prctl, PR_SET_DUMPABLE, value, 0, 0, 0) };
+    Error::from_syscall("prctl(PR_SET_DUMPABLE)", result)
+}
+
+pub fn sys_prctl_get_dumpable() -> Result<bool, Error> {
+    const PR_GET_DUMPABLE: usize = 3;
+    let result = unsafe { syscall_readonly!(SYS_prctl, PR_GET_DUMPABLE, 0, 0, 0, 0) };
+    Error::from_syscall("prctl(PR_GET_DUMPABLE)", result)?;
+    if result == 0 {
+        Ok(false)
+    } else {
+        Ok(true)
+    }
 }
 
 pub fn sys_capset(header: &__user_cap_header_struct, data: &[__user_cap_data_struct; 2]) -> Result<(), Error> {
@@ -1754,6 +2277,10 @@ pub fn recvfd(socket: FdRef) -> Result<Fd, Error> {
     };
 
     let count = sys_recvmsg(socket, &mut header, 0)?;
+    if count == 0 {
+        return Err(Error::from_str("recvfd failed: received zero bytes"));
+    }
+
     if count != core::mem::size_of::<c_int>() {
         return Err(Error::from_str("recvfd failed: received unexpected number of bytes"));
     }

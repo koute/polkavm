@@ -1,0 +1,6 @@
+pre: a0 = 0x20EFE
+
+%rw_data_size = 2
+
+pub @main:
+    u16 [a0 + 256] = 0x1234

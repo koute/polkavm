@@ -1,15 +1,16 @@
 #![allow(clippy::same_name_method)]
 
-pub trait RawMask: Copy +
-    core::ops::BitOrAssign<Self> +
-    core::ops::BitAndAssign<Self> +
-    core::ops::Shl<u32, Output = Self> +
-    core::ops::Sub<Output = Self> +
-    core::ops::BitAnd<Output = Self> +
-    core::ops::Not<Output = Self> +
-    PartialEq +
-    Eq +
-    core::fmt::Debug
+pub trait RawMask:
+    Copy
+    + core::ops::BitOrAssign<Self>
+    + core::ops::BitAndAssign<Self>
+    + core::ops::Shl<u32, Output = Self>
+    + core::ops::Sub<Output = Self>
+    + core::ops::BitAnd<Output = Self>
+    + core::ops::Not<Output = Self>
+    + PartialEq
+    + Eq
+    + core::fmt::Debug
 {
     const ZERO: Self;
     const ONE: Self;
@@ -78,7 +79,11 @@ impl<Primary, Secondary> BitIndex<Primary, Secondary> {
 
 /// A constant-length two-level bitmask.
 #[derive(Debug)]
-pub struct BitMask<Primary, Secondary, const SECONDARY_LENGTH: usize> where Primary: RawMask, Secondary: RawMask {
+pub struct BitMask<Primary, Secondary, const SECONDARY_LENGTH: usize>
+where
+    Primary: RawMask,
+    Secondary: RawMask,
+{
     /// The primary mask. This mask is used to mark which secondary masks are non-empty.
     primary_mask: Primary,
 
@@ -87,8 +92,9 @@ pub struct BitMask<Primary, Secondary, const SECONDARY_LENGTH: usize> where Prim
 }
 
 // TODO: Remove this once this is fixed: https://github.com/rust-lang/rust/issues/60551
+#[doc(hidden)]
 #[macro_export]
-macro_rules! bitmask_type {
+macro_rules! _bitmask_type {
     ($primary:ty, $secondary:ty, $bits:expr) => {
         $crate::bit_mask::BitMask<$primary, $secondary, {
             let bits_per_item = ::core::mem::size_of::<$secondary>() * 8;
@@ -102,7 +108,7 @@ macro_rules! bitmask_type {
     }
 }
 
-pub use bitmask_type;
+pub use _bitmask_type as bitmask_type;
 
 #[test]
 fn test_bitmask_basic() {
@@ -151,14 +157,22 @@ fn test_bitmask_out_of_range() {
     mask.set(Mask16::index(16));
 }
 
-impl<Primary, Secondary, const SECONDARY_LENGTH: usize> Default for BitMask<Primary, Secondary, SECONDARY_LENGTH> where Primary: RawMask, Secondary: RawMask {
+impl<Primary, Secondary, const SECONDARY_LENGTH: usize> Default for BitMask<Primary, Secondary, SECONDARY_LENGTH>
+where
+    Primary: RawMask,
+    Secondary: RawMask,
+{
     #[inline]
     fn default() -> Self {
         Self::new()
     }
 }
 
-impl<Primary, Secondary, const SECONDARY_LENGTH: usize> BitMask<Primary, Secondary, SECONDARY_LENGTH> where Primary: RawMask, Secondary: RawMask {
+impl<Primary, Secondary, const SECONDARY_LENGTH: usize> BitMask<Primary, Secondary, SECONDARY_LENGTH>
+where
+    Primary: RawMask,
+    Secondary: RawMask,
+{
     const PRIMARY_BIN_SHIFT: u32 = (core::mem::size_of::<Secondary>() * 8).ilog2();
     const SECONDARY_BIN_MASK: u32 = (1 << Self::PRIMARY_BIN_SHIFT) - 1;
 

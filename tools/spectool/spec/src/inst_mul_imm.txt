@@ -1,0 +1,4 @@
+pre: a0 = 3
+
+pub @main:
+    a2 = a0 * 7

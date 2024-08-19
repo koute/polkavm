@@ -1,4 +1,4 @@
-use polkavm_common::program::{Instructions, RawReg};
+use polkavm_common::program::{InstructionVisitor, Instructions, RawReg};
 
 // TODO: Come up with a better cost model.
 #[derive(Default)]
@@ -20,7 +20,7 @@ impl GasVisitor {
     }
 }
 
-impl polkavm_common::program::InstructionVisitor for GasVisitor {
+impl InstructionVisitor for GasVisitor {
     type ReturnTy = ();
 
     #[inline(always)]
@@ -486,13 +486,27 @@ impl polkavm_common::program::InstructionVisitor for GasVisitor {
     }
 }
 
-pub fn calculate_for_block(mut instructions: Instructions) -> u32 {
+pub fn calculate_for_block(mut instructions: Instructions) -> (u32, bool) {
     let mut visitor = GasVisitor::default();
     while instructions.visit(&mut visitor).is_some() {
         if let Some(cost) = visitor.last_block_cost {
-            return cost;
+            return (cost, false);
         }
     }
 
-    visitor.last_block_cost.unwrap_or(0)
+    if let Some(cost) = visitor.last_block_cost {
+        (cost, false)
+    } else {
+        let started_out_of_bounds = visitor.cost == 0;
+
+        // We've ended out of bounds, so assume there's an implicit trap there.
+        visitor.trap();
+        (visitor.last_block_cost.unwrap(), started_out_of_bounds)
+    }
+}
+
+pub fn trap_cost() -> u32 {
+    let mut gas_visitor = GasVisitor::default();
+    gas_visitor.trap();
+    gas_visitor.take_block_cost().unwrap()
 }

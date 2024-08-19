@@ -1,0 +1,2 @@
+pub @main:
+    a0 = 0xdeadbeef

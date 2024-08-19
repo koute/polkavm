@@ -1,0 +1,16 @@
+[package]
+name = "spectool"
+publish = false
+edition = "2021"
+
+[dependencies]
+clap = { workspace = true, features = ["derive"] }
+env_logger = { workspace = true }
+polkavm = { workspace = true }
+polkavm-common = { workspace = true }
+polkavm-disassembler = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+
+[lints]
+workspace = true

@@ -18,5 +18,8 @@ rustc-demangle = { workspace = true }
 hashbrown = { workspace = true, features = ["raw"] }
 regalloc2 = "0.9.3"
 
+[dev-dependencies]
+proptest = { workspace = true }
+
 [lints]
 workspace = true

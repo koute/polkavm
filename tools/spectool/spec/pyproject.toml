@@ -1,0 +1,11 @@
+[project]
+dependencies = [
+    "asn1tools>=0.166.0",
+]
+
+requires-python = "== 3.11.8"
+
+[tool.rye]
+managed = true
+virtual = true
+dev-dependencies = []
