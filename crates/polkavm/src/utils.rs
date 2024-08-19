@@ -115,7 +115,7 @@ pub enum InterruptKind {
     /// This happens when a program accesses a memory page that is not mapped,
     /// or tries to write to a read-only page.
     ///
-    /// Requires dynamic paging to be enabled with [`Config::set_dynamic_paging`](crate::Config::set_dynamic_paging), otherwise is never emitted.
+    /// Requires dynamic paging to be enabled with [`ModuleConfig::set_dynamic_paging`](crate::ModuleConfig::set_dynamic_paging), otherwise is never emitted.
     Segfault(Segfault),
 
     /// The execution ran out of gas.
