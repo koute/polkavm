@@ -44,7 +44,7 @@ const UFFD_REQUIRED_FEATURES: u64 =
 impl GlobalState {
     pub fn new(config: &Config) -> Result<Self, Error> {
         let is_sandboxing_enabled = GlobalState::is_sandboxing_supported()?;
-        if !config.allow_insecure && !is_sandboxing_enabled  {
+        if !is_sandboxing_enabled  {
             return Err(Error::from_str("Sandboxing is not supported on your system. You can enable set_allow_insecure/POLKAVM_ALLOW_INSECURE to run with reduced sandboxing, if you know what you're doing"));
         }
 
@@ -1248,7 +1248,7 @@ impl super::Sandbox for Sandbox {
 
         let mut pidfd: c_int = -1;
         let args = CloneArgs {
-            flags: linux_raw::CLONE_CLEAR_SIGHAND | u64::from(linux_raw::CLONE_PIDFD) | u64::from(sandbox_flags),
+            flags: linux_raw::CLONE_CLEAR_SIGHAND | u64::from(linux_raw::CLONE_PIDFD) | sandbox_flags,
             pidfd: &mut pidfd,
             child_tid: 0,
             parent_tid: 0,
