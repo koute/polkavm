@@ -2165,6 +2165,7 @@ impl Sandbox {
                     } else if job.user_data == IO_URING_JOB_USERFAULTFD_READ {
                         self.iouring_uffd_read_queued = false;
                         if job.res == -(linux_raw::ERESTARTSYS as i32) {
+                            log::trace!("Child #{}: ERESTARTSYS", self.child.pid);
                             continue 'outer;
                         }
                         job.to_result()?;
