@@ -66,6 +66,7 @@ pub struct Engine {
     interpreter_enabled: bool,
     crosscheck: bool,
     state: Arc<EngineState>,
+    allow_dynamic_paging: bool,
 }
 
 impl Engine {
@@ -135,11 +136,11 @@ impl Engine {
             }
         };
 
-        if (crosscheck || selected_backend == BackendKind::Interpreter) && config.dynamic_paging() {
+        if (crosscheck || selected_backend == BackendKind::Interpreter) && config.allow_dynamic_paging() {
             bail!("dynamic paging is currently not supported by the interpreter");
         }
 
-        if config.dynamic_paging() && !config.allow_experimental {
+        if config.allow_dynamic_paging() && !config.allow_experimental {
             bail!("cannot enable dynamic paging: this is not production ready nor even finished; you can enable `set_allow_experimental`/`POLKAVM_ALLOW_EXPERIMENTAL` to be able to use it anyway");
         }
 
@@ -149,6 +150,7 @@ impl Engine {
             interpreter_enabled: crosscheck || selected_backend == BackendKind::Interpreter,
             crosscheck,
             state,
+            allow_dynamic_paging: config.allow_dynamic_paging(),
         })
     }
 }
@@ -186,6 +188,7 @@ struct ModulePrivate {
     gas_metering: Option<GasMeteringKind>,
     is_strict: bool,
     step_tracing: bool,
+    dynamic_paging: bool,
     page_size_mask: u32,
     page_shift: u32,
 }
@@ -201,6 +204,10 @@ impl Module {
 
     pub(crate) fn is_step_tracing(&self) -> bool {
         self.0.step_tracing
+    }
+
+    pub(crate) fn is_dynamic_paging(&self) -> bool {
+        self.0.dynamic_paging
     }
 
     pub(crate) fn compiled_module(&self) -> &CompiledModuleKind {
@@ -235,7 +242,7 @@ impl Module {
         self.0.gas_metering
     }
 
-    fn is_multiple_of_page_size(&self, value: u32) -> bool {
+    pub(crate) fn is_multiple_of_page_size(&self, value: u32) -> bool {
         (value & self.0.page_size_mask) == 0
     }
 
@@ -261,6 +268,10 @@ impl Module {
 
     /// Creates a new module from a deserialized program `blob`.
     pub fn from_blob(engine: &Engine, config: &ModuleConfig, blob: ProgramBlob) -> Result<Self, Error> {
+        if config.dynamic_paging() && !engine.allow_dynamic_paging {
+            bail!("dynamic paging was not enabled; use `Config::set_allow_dynamic_paging` to enable it");
+        }
+
         // Do an early check for memory config validity.
         MemoryMap::new(config.page_size, blob.ro_data_size(), blob.rw_data_size(), blob.stack_size()).map_err(Error::from_static_str)?;
 
@@ -438,6 +449,7 @@ impl Module {
             gas_metering: config.gas_metering,
             is_strict: config.is_strict,
             step_tracing: config.step_tracing,
+            dynamic_paging: config.dynamic_paging,
             crosscheck: engine.crosscheck,
             page_size_mask,
             page_shift,

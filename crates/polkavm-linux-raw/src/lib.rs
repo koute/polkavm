@@ -1837,6 +1837,7 @@ pub fn sys_ptrace_detach(pid: pid_t) -> Result<(), Error> {
 
 #[cfg(target_arch = "x86_64")]
 #[repr(C)]
+#[derive(Default, Debug)]
 pub struct user_regs_struct {
     pub r15: c_ulong,
     pub r14: c_ulong,
