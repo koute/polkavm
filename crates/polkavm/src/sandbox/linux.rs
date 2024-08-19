@@ -40,7 +40,7 @@ pub struct GlobalState {
 
 impl GlobalState {
     pub fn new(config: &Config) -> Result<Self, Error> {
-        let is_sandboxing_enabled = GlobalState::is_sandboxing_supported();
+        let is_sandboxing_enabled = GlobalState::is_sandboxing_supported()?;
         if !config.allow_insecure && !is_sandboxing_enabled  {
             return Err(Error::from_str("Sandboxing is not supported on your system. You can enable set_allow_insecure/POLKAVM_ALLOW_INSECURE to run with reduced sandboxing, if you know what you're doing"));
         }
@@ -51,23 +51,60 @@ impl GlobalState {
         })
     }
 
-    fn is_sandboxing_supported() -> bool {
-        let child_pid = unsafe { linux_raw::syscall!(linux_raw::SYS_clone, SANDBOX_FLAGS, 0, 0, 0, 0) };
-        if child_pid < 0 {
-            return false;
-        }
+    fn is_sandboxing_supported() -> Result<bool, Error> {
+        let sigset = Sigmask::block_all_signals()?;
 
-        if !cfg!(polkavm_dev_debug_zygote) {
-            // Overwrite the hostname and domainname.
-            match linux_raw::sys_sethostname("localhost") {
-                Ok(()) => {},
-                Err(error) => {
-                    log::trace!("Failed to call sys_sethostname: {}", error);
-                    return false
-                },
+        let mut pidfd: c_int = -1;
+        let args = CloneArgs {
+            flags: linux_raw::CLONE_CLEAR_SIGHAND | u64::from(linux_raw::CLONE_PIDFD) | u64::from(SANDBOX_FLAGS),
+            pidfd: &mut pidfd,
+            child_tid: 0,
+            parent_tid: 0,
+            exit_signal: 0,
+            stack: 0,
+            stack_size: 0,
+            tls: 0,
+        };
+
+        // Fork a new process.
+        let mut child_pid = unsafe { linux_raw::syscall!(linux_raw::SYS_clone3, core::ptr::addr_of!(args), core::mem::size_of::<CloneArgs>()) };
+
+        if child_pid < 0 {
+            // Fallback for Linux versions older than 5.5.
+            child_pid = unsafe { linux_raw::syscall!(linux_raw::SYS_clone, SANDBOX_FLAGS, 0, 0, 0, 0) };
+            if child_pid < 0 {
+                return Ok(false);
             }
         }
-        true
+        if child_pid == 0 {
+            // We're in the child process.
+            core::mem::forget(sigset);
+            let status = if linux_raw::sys_sethostname("localhost").is_ok() { 1 } else { 0 };
+            let _ = linux_raw::sys_exit(status);
+            linux_raw::abort();
+        } else {
+            // We're in the host process.
+            sigset.unblock()?;
+            let mut child = ChildProcess {
+                pid: child_pid as c_int,
+                pidfd: if pidfd < 0 { None } else { Some(Fd::from_raw_unchecked(pidfd)) },
+            };
+            // The __WALL here is needed since we're not specifying an exit signal
+            // when cloning the child process, so we'd get an ECHILD error without this flag.
+            //
+            // (And we're not using __WCLONE since that doesn't work for children which ran execve.)
+            // Added non_blocking flag 'WNOHANG'
+            let flags = linux_raw::WEXITED | linux_raw::__WALL | linux_raw::WNOHANG;
+            child.waitid(flags)?;
+            loop {
+                // wait for process to exit
+                match child.check_status(true)?{
+                    ChildStatus::Running => continue,
+                    ChildStatus::Exited(status) => if status == 0 { return Ok(false); } else { return Ok(true); },
+                    _ => return Ok(false)
+                };
+            }
+        }
     }
 }
 
