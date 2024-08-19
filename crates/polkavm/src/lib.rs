@@ -95,6 +95,18 @@ if_compiler_is_supported! {
     mod shm_allocator;
 }
 
+// These are needed due to: https://github.com/rust-lang/rustfmt/issues/3253
+#[cfg(rustfmt)]
+mod bit_mask;
+#[cfg(rustfmt)]
+mod compiler;
+#[cfg(rustfmt)]
+mod generic_allocator;
+#[cfg(rustfmt)]
+mod sandbox;
+#[cfg(rustfmt)]
+mod shm_allocator;
+
 pub use polkavm_common::{
     abi::MemoryMap,
     program::{ProgramBlob, ProgramCounter, ProgramParts, Reg},
