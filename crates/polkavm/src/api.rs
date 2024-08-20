@@ -960,6 +960,40 @@ impl RawInstance {
         self.write_memory(address, &value.to_le_bytes())
     }
 
+    /// A convenience function to read an `u16` from the VM's memory.
+    ///
+    /// This is equivalent to calling [`RawInstance::read_memory_into`].
+    pub fn read_u16(&self, address: u32) -> Result<u16, MemoryAccessError> {
+        let mut buffer = [0; 2];
+        self.read_memory_into(address, &mut buffer)?;
+
+        Ok(u16::from_le_bytes(buffer))
+    }
+
+    /// A convenience function to write an `u16` into the VM's memory.
+    ///
+    /// This is equivalent to calling [`RawInstance::write_memory`].
+    pub fn write_u16(&mut self, address: u32, value: u16) -> Result<(), MemoryAccessError> {
+        self.write_memory(address, &value.to_le_bytes())
+    }
+
+    /// A convenience function to read an `u8` from the VM's memory.
+    ///
+    /// This is equivalent to calling [`RawInstance::read_memory_into`].
+    pub fn read_u8(&self, address: u32) -> Result<u8, MemoryAccessError> {
+        let mut buffer = [0; 1];
+        self.read_memory_into(address, &mut buffer)?;
+
+        Ok(buffer[0])
+    }
+
+    /// A convenience function to write an `u8` into the VM's memory.
+    ///
+    /// This is equivalent to calling [`RawInstance::write_memory`].
+    pub fn write_u8(&mut self, address: u32, value: u8) -> Result<(), MemoryAccessError> {
+        self.write_memory(address, &[value])
+    }
+
     /// Fills the given memory region with zeros.
     ///
     /// `address` must be greater or equal to 0x10000 and `address + length` cannot be greater than 0x100000000.
