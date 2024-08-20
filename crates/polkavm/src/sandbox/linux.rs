@@ -5,7 +5,7 @@ extern crate polkavm_linux_raw as linux_raw;
 
 use polkavm_common::{
     program::Reg,
-    utils::{align_to_next_page_usize, slice_assume_init_mut, AsUninitSliceMut},
+    utils::{align_to_next_page_usize, slice_assume_init_mut},
     zygote::{
         AddressTable, AddressTablePacked, ExtTable, ExtTablePacked, VmCtx, VmFd, VmMap, VMCTX_FUTEX_BUSY, VMCTX_FUTEX_GUEST_ECALLI,
         VMCTX_FUTEX_GUEST_SIGNAL, VMCTX_FUTEX_GUEST_STEP, VMCTX_FUTEX_GUEST_TRAP, VMCTX_FUTEX_IDLE, VM_ADDR_NATIVE_CODE,
@@ -16,6 +16,7 @@ pub use linux_raw::Error;
 
 use core::cell::UnsafeCell;
 use core::ffi::{c_int, c_uint};
+use core::mem::MaybeUninit;
 use core::sync::atomic::Ordering;
 use core::time::Duration;
 use linux_raw::{abort, cstr, syscall_readonly, Fd, Mmap, STDERR_FILENO, STDIN_FILENO};
@@ -1863,11 +1864,7 @@ impl super::Sandbox for Sandbox {
         }
     }
 
-    fn read_memory_into<'slice, B>(&self, address: u32, buffer: &'slice mut B) -> Result<&'slice mut [u8], MemoryAccessError>
-    where
-        B: ?Sized + AsUninitSliceMut,
-    {
-        let slice = buffer.as_uninit_slice_mut();
+    fn read_memory_into<'slice>(&self, address: u32, slice: &'slice mut [MaybeUninit<u8>]) -> Result<&'slice mut [u8], MemoryAccessError> {
         log::trace!(
             "Reading memory: 0x{:x}-0x{:x} ({} bytes)",
             address,
