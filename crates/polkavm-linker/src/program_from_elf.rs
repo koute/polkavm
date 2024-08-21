@@ -1,4 +1,4 @@
-use polkavm_common::abi::{MemoryMap, VM_CODE_ADDRESS_ALIGNMENT, VM_MAX_PAGE_SIZE, VM_MIN_PAGE_SIZE};
+use polkavm_common::abi::{MemoryMapBuilder, VM_CODE_ADDRESS_ALIGNMENT, VM_MAX_PAGE_SIZE, VM_MIN_PAGE_SIZE};
 use polkavm_common::program::{self, FrameKind, Instruction, LineProgramOp, ProgramBlob, ProgramCounter, ProgramSymbol};
 use polkavm_common::utils::{align_to_next_page_u32, align_to_next_page_u64};
 use polkavm_common::varint;
@@ -1103,7 +1103,12 @@ fn extract_memory_config(
         let rw_data_size_physical = u32::try_from(rw_data_size_physical).expect("overflow");
         assert!(rw_data_size_physical <= rw_data_size);
 
-        let config = match MemoryMap::new(VM_MAX_PAGE_SIZE, ro_data_size, rw_data_size, min_stack_size) {
+        let config = match MemoryMapBuilder::new(VM_MAX_PAGE_SIZE)
+            .ro_data_size(ro_data_size)
+            .rw_data_size(rw_data_size)
+            .stack_size(min_stack_size)
+            .build()
+        {
             Ok(config) => config,
             Err(error) => {
                 return Err(ProgramFromElfError::other(error));
