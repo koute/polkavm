@@ -463,10 +463,6 @@ fn dynamic_jump_to_null(engine_config: Config) {
 }
 
 fn dynamic_paging_basic(mut engine_config: Config) {
-    if engine_config.backend() == Some(BackendKind::Interpreter) || engine_config.crosscheck() {
-        return; // TODO: Unimplemented.
-    }
-
     engine_config.set_allow_experimental(true); // TODO: Delete this.
     engine_config.set_allow_dynamic_paging(true);
 
@@ -544,10 +540,6 @@ fn dynamic_paging_basic(mut engine_config: Config) {
 }
 
 fn dynamic_paging_freeing_pages(mut engine_config: Config) {
-    if engine_config.backend() == Some(BackendKind::Interpreter) || engine_config.crosscheck() {
-        return; // TODO: Unimplemented.
-    }
-
     engine_config.set_allow_experimental(true); // TODO: Delete this.
     engine_config.set_allow_dynamic_paging(true);
 
@@ -588,11 +580,6 @@ fn dynamic_paging_stress_test(_engine_config: Config) {}
 #[cfg(feature = "std")]
 fn dynamic_paging_stress_test(mut engine_config: Config) {
     let _ = env_logger::try_init();
-
-    if engine_config.backend() == Some(BackendKind::Interpreter) || engine_config.crosscheck() {
-        return; // TODO: Unimplemented.
-    }
-
     engine_config.set_allow_experimental(true); // TODO: Delete this.
     engine_config.set_allow_dynamic_paging(true);
     engine_config.set_worker_count(0);
@@ -633,10 +620,6 @@ fn dynamic_paging_stress_test(mut engine_config: Config) {
 }
 
 fn dynamic_paging_initialize_multiple_pages(mut engine_config: Config) {
-    if engine_config.backend() == Some(BackendKind::Interpreter) || engine_config.crosscheck() {
-        return; // TODO: Unimplemented.
-    }
-
     engine_config.set_allow_experimental(true); // TODO: Delete this.
     engine_config.set_allow_dynamic_paging(true);
 
@@ -673,10 +656,6 @@ fn dynamic_paging_initialize_multiple_pages(mut engine_config: Config) {
 }
 
 fn dynamic_paging_preinitialize_pages(mut engine_config: Config) {
-    if engine_config.backend() == Some(BackendKind::Interpreter) || engine_config.crosscheck() {
-        return; // TODO: Unimplemented.
-    }
-
     engine_config.set_allow_experimental(true); // TODO: Delete this.
     engine_config.set_allow_dynamic_paging(true);
 
@@ -710,10 +689,6 @@ fn dynamic_paging_preinitialize_pages(mut engine_config: Config) {
 }
 
 fn dynamic_paging_reading_does_not_resolve_segfaults(mut engine_config: Config) {
-    if engine_config.backend() == Some(BackendKind::Interpreter) || engine_config.crosscheck() {
-        return; // TODO: Unimplemented.
-    }
-
     engine_config.set_allow_experimental(true); // TODO: Delete this.
     engine_config.set_allow_dynamic_paging(true);
 
@@ -743,11 +718,37 @@ fn dynamic_paging_reading_does_not_resolve_segfaults(mut engine_config: Config) 
     assert_eq!(segfault.page_address, 0x10000);
 }
 
-fn dynamic_paging_write_at_page_boundary_with_no_pages(mut engine_config: Config) {
-    if engine_config.backend() == Some(BackendKind::Interpreter) || engine_config.crosscheck() {
-        return; // TODO: Unimplemented.
-    }
+fn dynamic_paging_read_at_page_boundary(mut engine_config: Config) {
+    engine_config.set_allow_experimental(true); // TODO: Delete this.
+    engine_config.set_allow_dynamic_paging(true);
 
+    let _ = env_logger::try_init();
+
+    let engine = Engine::new(&engine_config).unwrap();
+    let page_size = get_native_page_size() as u32;
+    let mut builder = ProgramBlobBuilder::new();
+    builder.add_export_by_basic_block(0, b"main");
+    builder.set_code(&[asm::load_u32(Reg::A0, 0x10ffe), asm::ret()], &[]);
+
+    let blob = ProgramBlob::parse(builder.into_vec().into()).unwrap();
+    let mut module_config = ModuleConfig::new();
+    module_config.set_page_size(page_size);
+    module_config.set_dynamic_paging(true);
+    let module = Module::from_blob(&engine, &module_config, blob).unwrap();
+    let offsets: Vec<_> = module.instructions_at(ProgramCounter(0)).unwrap().map(|inst| inst.offset).collect();
+
+    let mut instance = module.instantiate().unwrap();
+    instance.set_reg(Reg::RA, crate::RETURN_TO_HOST);
+    instance.set_next_program_counter(offsets[0]);
+    let segfault = expect_segfault(instance.run().unwrap());
+    assert_eq!(segfault.page_address, 0x10000);
+    instance.write_memory(0x10fff, &[0xaa, 0xbb]).unwrap();
+
+    match_interrupt!(instance.run().unwrap(), InterruptKind::Finished);
+    assert_eq!(instance.reg(Reg::A0), 0x00bbaa00);
+}
+
+fn dynamic_paging_write_at_page_boundary_with_no_pages(mut engine_config: Config) {
     engine_config.set_allow_experimental(true); // TODO: Delete this.
     engine_config.set_allow_dynamic_paging(true);
 
@@ -775,16 +776,14 @@ fn dynamic_paging_write_at_page_boundary_with_no_pages(mut engine_config: Config
 
     let segfault = expect_segfault(instance.run().unwrap());
     assert_eq!(segfault.page_address, 0x11000);
+    assert_eq!(instance.read_memory(0x10ffe, 2).unwrap(), vec![0, 0]);
     instance.zero_memory(0x11000, page_size).unwrap();
 
     match_interrupt!(instance.run().unwrap(), InterruptKind::Finished);
+    assert_eq!(instance.read_memory(0x10ffe, 2).unwrap(), vec![0x78, 0x56]);
 }
 
 fn dynamic_paging_write_at_page_boundary_with_first_page(mut engine_config: Config) {
-    if engine_config.backend() == Some(BackendKind::Interpreter) || engine_config.crosscheck() {
-        return; // TODO: Unimplemented.
-    }
-
     engine_config.set_allow_experimental(true); // TODO: Delete this.
     engine_config.set_allow_dynamic_paging(true);
 
@@ -818,10 +817,6 @@ fn dynamic_paging_write_at_page_boundary_with_first_page(mut engine_config: Conf
 }
 
 fn dynamic_paging_write_at_page_boundary_with_second_page(mut engine_config: Config) {
-    if engine_config.backend() == Some(BackendKind::Interpreter) || engine_config.crosscheck() {
-        return; // TODO: Unimplemented.
-    }
-
     engine_config.set_allow_experimental(true); // TODO: Delete this.
     engine_config.set_allow_dynamic_paging(true);
 
@@ -854,11 +849,71 @@ fn dynamic_paging_write_at_page_boundary_with_second_page(mut engine_config: Con
     assert_eq!(instance.read_memory(0x11000, 2).unwrap(), vec![0x34, 0x12]);
 }
 
-fn dynamic_paging_worker_recycle_turn_dynamic_paging_on_and_off(mut engine_config: Config) {
-    if engine_config.backend() == Some(BackendKind::Interpreter) || engine_config.crosscheck() {
-        return; // TODO: Unimplemented.
-    }
+fn dynamic_paging_change_written_value_and_address_during_segfault(mut engine_config: Config) {
+    engine_config.set_allow_experimental(true); // TODO: Delete this.
+    engine_config.set_allow_dynamic_paging(true);
 
+    let _ = env_logger::try_init();
+
+    let engine = Engine::new(&engine_config).unwrap();
+    let page_size = get_native_page_size() as u32;
+    let mut builder = ProgramBlobBuilder::new();
+    builder.add_export_by_basic_block(0, b"main");
+    builder.set_code(&[asm::store_indirect_u32(Reg::A0, Reg::A1, 0), asm::ret()], &[]);
+
+    let blob = ProgramBlob::parse(builder.into_vec().into()).unwrap();
+    let mut module_config = ModuleConfig::new();
+    module_config.set_page_size(page_size);
+    module_config.set_dynamic_paging(true);
+    let module = Module::from_blob(&engine, &module_config, blob).unwrap();
+    let offsets: Vec<_> = module.instructions_at(ProgramCounter(0)).unwrap().map(|inst| inst.offset).collect();
+
+    let mut instance = module.instantiate().unwrap();
+    instance.set_reg(Reg::RA, crate::RETURN_TO_HOST);
+    instance.set_next_program_counter(offsets[0]);
+    instance.set_reg(Reg::A0, 0x11223344);
+    instance.set_reg(Reg::A1, 0x10001);
+    let segfault = expect_segfault(instance.run().unwrap());
+    assert_eq!(segfault.page_address, 0x10000);
+    instance.zero_memory(0x10000, page_size).unwrap();
+    instance.set_reg(Reg::A0, 0x55667788);
+    instance.set_reg(Reg::A1, 0x10002);
+    match_interrupt!(instance.run().unwrap(), InterruptKind::Finished);
+    assert_eq!(instance.read_memory(0x10000, 6).unwrap(), vec![0, 0, 0x88, 0x77, 0x66, 0x55]);
+}
+
+fn dynamic_paging_cancel_segfault_by_changing_address(mut engine_config: Config) {
+    engine_config.set_allow_experimental(true); // TODO: Delete this.
+    engine_config.set_allow_dynamic_paging(true);
+
+    let _ = env_logger::try_init();
+
+    let engine = Engine::new(&engine_config).unwrap();
+    let page_size = get_native_page_size() as u32;
+    let mut builder = ProgramBlobBuilder::new();
+    builder.add_export_by_basic_block(0, b"main");
+    builder.set_code(&[asm::store_imm_indirect_u32(Reg::A0, 0, 0x12345678), asm::ret()], &[]);
+
+    let blob = ProgramBlob::parse(builder.into_vec().into()).unwrap();
+    let mut module_config = ModuleConfig::new();
+    module_config.set_page_size(page_size);
+    module_config.set_dynamic_paging(true);
+    let module = Module::from_blob(&engine, &module_config, blob).unwrap();
+    let offsets: Vec<_> = module.instructions_at(ProgramCounter(0)).unwrap().map(|inst| inst.offset).collect();
+
+    let mut instance = module.instantiate().unwrap();
+    instance.zero_memory(0x11000, page_size).unwrap();
+    instance.set_reg(Reg::RA, crate::RETURN_TO_HOST);
+    instance.set_next_program_counter(offsets[0]);
+    instance.set_reg(Reg::A0, 0x10000);
+    let segfault = expect_segfault(instance.run().unwrap());
+    assert_eq!(segfault.page_address, 0x10000);
+    instance.set_reg(Reg::A0, 0x11000);
+    match_interrupt!(instance.run().unwrap(), InterruptKind::Finished);
+    assert_eq!(instance.read_memory(0x11000, 4).unwrap(), vec![0x78, 0x56, 0x34, 0x12]);
+}
+
+fn dynamic_paging_worker_recycle_turn_dynamic_paging_on_and_off(mut engine_config: Config) {
     engine_config.set_allow_experimental(true); // TODO: Delete this.
     engine_config.set_allow_dynamic_paging(true);
     engine_config.set_worker_count(1);
@@ -912,10 +967,6 @@ fn dynamic_paging_worker_recycle_turn_dynamic_paging_on_and_off(mut engine_confi
 }
 
 fn dynamic_paging_worker_recycle_during_segfault(mut engine_config: Config) {
-    if engine_config.backend() == Some(BackendKind::Interpreter) || engine_config.crosscheck() {
-        return; // TODO: Unimplemented.
-    }
-
     engine_config.set_allow_experimental(true); // TODO: Delete this.
     engine_config.set_allow_dynamic_paging(true);
     engine_config.set_worker_count(1);
@@ -970,10 +1021,6 @@ fn dynamic_paging_worker_recycle_during_segfault(mut engine_config: Config) {
 }
 
 fn dynamic_paging_change_program_counter_during_segfault(mut engine_config: Config) {
-    if engine_config.backend() == Some(BackendKind::Interpreter) || engine_config.crosscheck() {
-        return; // TODO: Unimplemented.
-    }
-
     engine_config.set_allow_experimental(true); // TODO: Delete this.
     engine_config.set_allow_dynamic_paging(true);
 
@@ -1186,10 +1233,6 @@ fn doom_o3_dwarf2(config: Config) {
 }
 
 fn pinky_dynamic_paging(mut config: Config) {
-    if config.backend() == Some(BackendKind::Interpreter) || config.crosscheck() {
-        return; // TODO: Unimplemented.
-    }
-
     config.set_allow_experimental(true); // TODO: Delete this.
     config.set_allow_dynamic_paging(true);
     pinky_standard(config);
@@ -1229,6 +1272,53 @@ fn pinky_standard(config: Config) {
     if framebuffer != *expected_frame.as_raw() {
         panic!("frames doesn't match!");
     }
+}
+
+fn dispatch_table(config: Config) {
+    let _ = env_logger::try_init();
+    let engine = Engine::new(&config).unwrap();
+    let page_size = get_native_page_size() as u32;
+    let mut builder = ProgramBlobBuilder::new();
+    builder.add_export_by_basic_block(0, b"block_0");
+    builder.add_export_by_basic_block(1, b"block_1");
+    builder.add_export_by_basic_block(2, b"block_2");
+    builder.add_dispatch_table_entry("block_2");
+    builder.add_dispatch_table_entry("block_0");
+    builder.add_dispatch_table_entry("block_1");
+    let code = vec![
+        asm::load_imm(Reg::A0, 10),
+        asm::ret(),
+        asm::load_imm(Reg::A0, 11),
+        asm::ret(),
+        asm::load_imm(Reg::A0, 12),
+        asm::ret(),
+    ];
+
+    builder.set_code(&code, &[]);
+
+    let blob = ProgramBlob::parse(builder.into_vec().into()).unwrap();
+    let mut module_config = ModuleConfig::new();
+    module_config.set_page_size(page_size);
+    let module = Module::from_blob(&engine, &module_config, blob).unwrap();
+    let offsets: Vec<_> = module.instructions_at(ProgramCounter(0)).unwrap().map(|inst| inst.offset).collect();
+    assert_eq!(offsets[0], ProgramCounter(0));
+    assert_eq!(offsets[1], ProgramCounter(5));
+    assert_eq!(offsets[2], ProgramCounter(10));
+
+    let mut instance = module.instantiate().unwrap();
+    instance.set_reg(Reg::RA, crate::RETURN_TO_HOST);
+
+    instance.set_next_program_counter(ProgramCounter(0));
+    match_interrupt!(instance.run().unwrap(), InterruptKind::Finished);
+    assert_eq!(instance.reg(Reg::A0), 12);
+
+    instance.set_next_program_counter(ProgramCounter(5));
+    match_interrupt!(instance.run().unwrap(), InterruptKind::Finished);
+    assert_eq!(instance.reg(Reg::A0), 10);
+
+    instance.set_next_program_counter(ProgramCounter(10));
+    match_interrupt!(instance.run().unwrap(), InterruptKind::Finished);
+    assert_eq!(instance.reg(Reg::A0), 11);
 }
 
 struct TestInstance {
@@ -1781,9 +1871,12 @@ run_tests! {
     dynamic_paging_initialize_multiple_pages
     dynamic_paging_preinitialize_pages
     dynamic_paging_reading_does_not_resolve_segfaults
+    dynamic_paging_read_at_page_boundary
     dynamic_paging_write_at_page_boundary_with_no_pages
     dynamic_paging_write_at_page_boundary_with_first_page
     dynamic_paging_write_at_page_boundary_with_second_page
+    dynamic_paging_change_written_value_and_address_during_segfault
+    dynamic_paging_cancel_segfault_by_changing_address
     dynamic_paging_worker_recycle_turn_dynamic_paging_on_and_off
     dynamic_paging_worker_recycle_during_segfault
     dynamic_paging_change_program_counter_during_segfault
@@ -1793,6 +1886,7 @@ run_tests! {
     doom_o3_dwarf2
     pinky_standard
     pinky_dynamic_paging
+    dispatch_table
 
     test_blob_basic_test
     test_blob_atomic_fetch_add

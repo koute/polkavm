@@ -136,10 +136,6 @@ impl Engine {
             }
         };
 
-        if (crosscheck || selected_backend == BackendKind::Interpreter) && config.allow_dynamic_paging() {
-            bail!("dynamic paging is currently not supported by the interpreter");
-        }
-
         if config.allow_dynamic_paging() && !config.allow_experimental {
             bail!("cannot enable dynamic paging: this is not production ready nor even finished; you can enable `set_allow_experimental`/`POLKAVM_ALLOW_EXPERIMENTAL` to be able to use it anyway");
         }
@@ -867,23 +863,31 @@ impl RawInstance {
     where
         B: ?Sized + AsUninitSliceMut,
     {
+        let slice = buffer.as_uninit_slice_mut();
         if address < 0x10000 {
             return Err(MemoryAccessError {
                 address,
-                length: buffer.as_uninit_slice_mut().len() as u64,
+                length: slice.len() as u64,
                 error: "out of range read (accessing addresses lower than 0x10000 is forbidden)".into(),
             });
         }
 
-        if u64::from(address) + buffer.as_uninit_slice_mut().len() as u64 > 0x100000000 {
+        if u64::from(address) + slice.len() as u64 > 0x100000000 {
             return Err(MemoryAccessError {
                 address,
-                length: buffer.as_uninit_slice_mut().len() as u64,
+                length: slice.len() as u64,
                 error: "out of range read".into(),
             });
         }
 
-        access_backend!(self.backend, |backend| backend.read_memory_into(address, buffer))
+        if slice.is_empty() {
+            // SAFETY: The slice is empty so it's always safe to assume it's initialized.
+            unsafe {
+                return Ok(polkavm_common::utils::slice_assume_init_mut(slice));
+            }
+        }
+
+        access_backend!(self.backend, |backend| backend.read_memory_into(address, slice))
     }
 
     /// Writes into the VM's memory.
@@ -905,6 +909,10 @@ impl RawInstance {
                 length: data.len() as u64,
                 error: "out of range write".into(),
             });
+        }
+
+        if data.is_empty() {
+            return Ok(());
         }
 
         let result = access_backend!(self.backend, |mut backend| backend.write_memory(address, data));
@@ -960,6 +968,40 @@ impl RawInstance {
         self.write_memory(address, &value.to_le_bytes())
     }
 
+    /// A convenience function to read an `u16` from the VM's memory.
+    ///
+    /// This is equivalent to calling [`RawInstance::read_memory_into`].
+    pub fn read_u16(&self, address: u32) -> Result<u16, MemoryAccessError> {
+        let mut buffer = [0; 2];
+        self.read_memory_into(address, &mut buffer)?;
+
+        Ok(u16::from_le_bytes(buffer))
+    }
+
+    /// A convenience function to write an `u16` into the VM's memory.
+    ///
+    /// This is equivalent to calling [`RawInstance::write_memory`].
+    pub fn write_u16(&mut self, address: u32, value: u16) -> Result<(), MemoryAccessError> {
+        self.write_memory(address, &value.to_le_bytes())
+    }
+
+    /// A convenience function to read an `u8` from the VM's memory.
+    ///
+    /// This is equivalent to calling [`RawInstance::read_memory_into`].
+    pub fn read_u8(&self, address: u32) -> Result<u8, MemoryAccessError> {
+        let mut buffer = [0; 1];
+        self.read_memory_into(address, &mut buffer)?;
+
+        Ok(buffer[0])
+    }
+
+    /// A convenience function to write an `u8` into the VM's memory.
+    ///
+    /// This is equivalent to calling [`RawInstance::write_memory`].
+    pub fn write_u8(&mut self, address: u32, value: u8) -> Result<(), MemoryAccessError> {
+        self.write_memory(address, &[value])
+    }
+
     /// Fills the given memory region with zeros.
     ///
     /// `address` must be greater or equal to 0x10000 and `address + length` cannot be greater than 0x100000000.
@@ -1007,6 +1049,10 @@ impl RawInstance {
     pub fn free_pages(&mut self, address: u32, length: u32) -> Result<(), Error> {
         if !self.module.is_multiple_of_page_size(address) {
             return Err("address not a multiple of page size".into());
+        }
+
+        if length == 0 {
+            return Ok(());
         }
 
         access_backend!(self.backend, |mut backend| backend

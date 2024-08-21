@@ -6909,6 +6909,7 @@ pub struct Config {
     optimize: bool,
     inline_threshold: usize,
     elide_unnecessary_loads: bool,
+    dispatch_table: Vec<Vec<u8>>,
 }
 
 impl Default for Config {
@@ -6918,6 +6919,7 @@ impl Default for Config {
             optimize: true,
             inline_threshold: 2,
             elide_unnecessary_loads: true,
+            dispatch_table: Vec::new(),
         }
     }
 }
@@ -6940,6 +6942,11 @@ impl Config {
 
     pub fn set_elide_unnecessary_loads(&mut self, value: bool) -> &mut Self {
         self.elide_unnecessary_loads = value;
+        self
+    }
+
+    pub fn set_dispatch_table(&mut self, dispatch_table: Vec<Vec<u8>>) -> &mut Self {
+        self.dispatch_table = dispatch_table;
         self
     }
 }
@@ -7652,6 +7659,10 @@ where
             },
             function_name = function_name.unwrap_or("")
         );
+    }
+
+    for symbol in config.dispatch_table {
+        builder.add_dispatch_table_entry(symbol);
     }
 
     builder.set_code(&raw_code, &jump_table);
