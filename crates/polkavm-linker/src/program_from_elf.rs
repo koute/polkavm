@@ -1830,7 +1830,7 @@ fn convert_instruction(
             };
 
             emit(InstExt::Basic(BasicInst::LoadIndirect {
-                kind: if rv64 { LoadKind::U64 } else { LoadKind::U32 },
+                kind: if rv64 { LoadKind::I32 } else { LoadKind::U32 },
                 dst,
                 base: src,
                 offset: 0,
@@ -1838,7 +1838,7 @@ fn convert_instruction(
 
             Ok(())
         }
-        Inst::LoadReserved64 { dst, src, .. } => {
+        Inst::LoadReserved64 { dst, src, .. } if rv64 => {
             let Some(dst) = cast_reg_non_zero(dst)? else {
                 return Err(ProgramFromElfError::other(
                     "found an atomic load with a zero register as the destination",
@@ -1852,7 +1852,7 @@ fn convert_instruction(
             };
 
             emit(InstExt::Basic(BasicInst::LoadIndirect {
-                kind: LoadKind::I32,
+                kind: LoadKind::U64,
                 dst,
                 base: src,
                 offset: 0,
@@ -1861,28 +1861,6 @@ fn convert_instruction(
             Ok(())
         }
         Inst::StoreConditional { src, addr, dst, .. } => {
-            let Some(addr) = cast_reg_non_zero(addr)? else {
-                return Err(ProgramFromElfError::other(
-                    "found an atomic store with a zero register as the address",
-                ));
-            };
-
-            let src = cast_reg_any(src)?;
-            emit(InstExt::Basic(BasicInst::StoreIndirect {
-                kind: if rv64 { StoreKind::U64 } else { StoreKind::U32 },
-                src,
-                base: addr,
-                offset: 0,
-            }));
-
-            if let Some(dst) = cast_reg_non_zero(dst)? {
-                // The store always succeeds, so write zero here.
-                emit(InstExt::Basic(BasicInst::LoadImmediate { dst, imm: 0 }));
-            }
-
-            Ok(())
-        }
-        Inst::StoreConditional64 { src, addr, dst, .. } => {
             let Some(addr) = cast_reg_non_zero(addr)? else {
                 return Err(ProgramFromElfError::other(
                     "found an atomic store with a zero register as the address",
@@ -1903,6 +1881,31 @@ fn convert_instruction(
             }
 
             Ok(())
+        }
+        Inst::StoreConditional64 { src, addr, dst, .. } if rv64 => {
+            let Some(addr) = cast_reg_non_zero(addr)? else {
+                return Err(ProgramFromElfError::other(
+                    "found an atomic store with a zero register as the address",
+                ));
+            };
+
+            let src = cast_reg_any(src)?;
+            emit(InstExt::Basic(BasicInst::StoreIndirect {
+                kind: StoreKind::U64,
+                src,
+                base: addr,
+                offset: 0,
+            }));
+
+            if let Some(dst) = cast_reg_non_zero(dst)? {
+                // The store always succeeds, so write zero here.
+                emit(InstExt::Basic(BasicInst::LoadImmediate { dst, imm: 0 }));
+            }
+
+            Ok(())
+        }
+        Inst::LoadReserved64 { .. } | Inst::StoreConditional64 { .. } => {
+            Err(ProgramFromElfError::other("found a 64bit instruction in a 32bit binary"))
         }
         Inst::Atomic {
             kind,
