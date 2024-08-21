@@ -4,7 +4,7 @@ use alloc::format;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 
-use polkavm_common::abi::MemoryMap;
+use polkavm_common::abi::{MemoryMap, MemoryMapBuilder};
 use polkavm_common::abi::{VM_ADDR_RETURN_TO_HOST, VM_ADDR_USER_STACK_HIGH};
 use polkavm_common::program::{FrameKind, Imports, Reg};
 use polkavm_common::program::{Instructions, JumpTable, ProgramBlob};
@@ -269,7 +269,12 @@ impl Module {
         }
 
         // Do an early check for memory config validity.
-        MemoryMap::new(config.page_size, blob.ro_data_size(), blob.rw_data_size(), blob.stack_size()).map_err(Error::from_static_str)?;
+        MemoryMapBuilder::new(config.page_size)
+            .ro_data_size(blob.ro_data_size())
+            .rw_data_size(blob.rw_data_size())
+            .stack_size(blob.stack_size())
+            .build()
+            .map_err(Error::from_static_str)?;
 
         if config.is_strict || cfg!(debug_assertions) {
             log::trace!("Checking imports...");

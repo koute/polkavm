@@ -424,7 +424,8 @@ impl<'a> Disassembler<'a> {
 
 #[cfg(test)]
 mod tests {
-    use polkavm::{MemoryMap, Reg::*};
+    use polkavm::Reg::*;
+    use polkavm_common::abi::MemoryMapBuilder;
     use polkavm_common::program::asm;
     use polkavm_common::writer::ProgramBlobBuilder;
 
@@ -454,7 +455,7 @@ mod tests {
 
     #[test]
     fn simple() {
-        let memory_map = MemoryMap::new(0x4000, 0, 0x4000, 0).unwrap();
+        let memory_map = MemoryMapBuilder::new(0x4000).rw_data_size(0x4000).build().unwrap();
         let mut builder = ProgramBlobBuilder::new();
         builder.set_rw_data_size(0x4000);
         builder.add_export_by_basic_block(0, b"main");

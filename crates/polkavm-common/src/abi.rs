@@ -37,34 +37,47 @@ pub const VM_MAXIMUM_IMPORT_COUNT: u32 = 1024;
 /// The minimum required alignment of runtime code pointers.
 pub const VM_CODE_ADDRESS_ALIGNMENT: u32 = 2;
 
-/// The memory map of a given guest program.
 #[derive(Clone)]
-#[repr(C)] // NOTE: Used on the host <-> zygote boundary.
-pub struct MemoryMap {
+pub struct MemoryMapBuilder {
     page_size: u32,
     ro_data_size: u32,
     rw_data_size: u32,
     stack_size: u32,
-    heap_base: u32,
-    max_heap_size: u32,
 }
 
-impl MemoryMap {
-    /// Creates an empty memory map.
-    #[inline]
-    pub const fn empty() -> Self {
-        Self {
-            page_size: 0,
+impl MemoryMapBuilder {
+    pub fn new(page_size: u32) -> Self {
+        MemoryMapBuilder {
+            page_size,
             ro_data_size: 0,
             rw_data_size: 0,
             stack_size: 0,
-            heap_base: 0,
-            max_heap_size: 0,
         }
     }
 
-    /// Calculates the memory map from the given parameters.
-    pub fn new(page_size: u32, ro_data_size: u32, rw_data_size: u32, stack_size: u32) -> Result<Self, &'static str> {
+    pub fn ro_data_size(&mut self, value: u32) -> &mut Self {
+        self.ro_data_size = value;
+        self
+    }
+
+    pub fn rw_data_size(&mut self, value: u32) -> &mut Self {
+        self.rw_data_size = value;
+        self
+    }
+
+    pub fn stack_size(&mut self, value: u32) -> &mut Self {
+        self.stack_size = value;
+        self
+    }
+
+    pub fn build(&self) -> Result<MemoryMap, &'static str> {
+        let MemoryMapBuilder {
+            page_size,
+            ro_data_size,
+            rw_data_size,
+            stack_size,
+        } = *self;
+
         if page_size < VM_MIN_PAGE_SIZE {
             return Err("invalid page size: page size is too small");
         }
@@ -122,7 +135,7 @@ impl MemoryMap {
 
         let max_heap_size = address_high - address_low + heap_slack;
 
-        Ok(Self {
+        Ok(MemoryMap {
             page_size,
             ro_data_size,
             rw_data_size,
@@ -130,6 +143,32 @@ impl MemoryMap {
             heap_base: heap_base as u32,
             max_heap_size: max_heap_size as u32,
         })
+    }
+}
+
+/// The memory map of a given guest program.
+#[derive(Clone)]
+pub struct MemoryMap {
+    page_size: u32,
+    ro_data_size: u32,
+    rw_data_size: u32,
+    stack_size: u32,
+    heap_base: u32,
+    max_heap_size: u32,
+}
+
+impl MemoryMap {
+    /// Creates an empty memory map.
+    #[inline]
+    pub const fn empty() -> Self {
+        Self {
+            page_size: 0,
+            ro_data_size: 0,
+            rw_data_size: 0,
+            stack_size: 0,
+            heap_base: 0,
+            max_heap_size: 0,
+        }
     }
 
     /// The page size of the program.
@@ -217,7 +256,12 @@ impl MemoryMap {
 #[test]
 fn test_memory_map() {
     {
-        let map = MemoryMap::new(0x4000, 1, 1, 1).unwrap();
+        let map = MemoryMapBuilder::new(0x4000)
+            .ro_data_size(1)
+            .rw_data_size(1)
+            .stack_size(1)
+            .build()
+            .unwrap();
         assert_eq!(map.ro_data_address(), 0x10000);
         assert_eq!(map.ro_data_size(), 0x4000);
         assert_eq!(map.rw_data_address(), 0x30000);
@@ -237,7 +281,7 @@ fn test_memory_map() {
 
     {
         // Read-only data takes the whole address space.
-        let map = MemoryMap::new(0x4000, max_size, 0, 0).unwrap();
+        let map = MemoryMapBuilder::new(0x4000).ro_data_size(max_size).build().unwrap();
         assert_eq!(map.ro_data_address(), 0x10000);
         assert_eq!(map.ro_data_size(), max_size);
         assert_eq!(map.rw_data_address(), map.ro_data_address() + VM_MAX_PAGE_SIZE + max_size);
@@ -250,13 +294,17 @@ fn test_memory_map() {
         assert_eq!(map.max_heap_size(), 0);
     }
 
-    assert!(MemoryMap::new(0x4000, max_size + 1, 0, 0).is_err());
-    assert!(MemoryMap::new(0x4000, max_size, 1, 0).is_err());
-    assert!(MemoryMap::new(0x4000, max_size, 0, 1).is_err());
+    assert!(MemoryMapBuilder::new(0x4000).ro_data_size(max_size + 1).build().is_err());
+    assert!(MemoryMapBuilder::new(0x4000)
+        .ro_data_size(max_size)
+        .rw_data_size(1)
+        .build()
+        .is_err());
+    assert!(MemoryMapBuilder::new(0x4000).ro_data_size(max_size).stack_size(1).build().is_err());
 
     {
         // Read-write data takes the whole address space.
-        let map = MemoryMap::new(0x4000, 0, max_size, 0).unwrap();
+        let map = MemoryMapBuilder::new(0x4000).rw_data_size(max_size).build().unwrap();
         assert_eq!(map.ro_data_address(), VM_MAX_PAGE_SIZE);
         assert_eq!(map.ro_data_size(), 0);
         assert_eq!(map.rw_data_address(), VM_MAX_PAGE_SIZE * 2);
@@ -271,7 +319,7 @@ fn test_memory_map() {
 
     {
         // Stack takes the whole address space.
-        let map = MemoryMap::new(0x4000, 0, 0, max_size).unwrap();
+        let map = MemoryMapBuilder::new(0x4000).stack_size(max_size).build().unwrap();
         assert_eq!(map.ro_data_address(), VM_MAX_PAGE_SIZE);
         assert_eq!(map.ro_data_size(), 0);
         assert_eq!(map.rw_data_address(), VM_MAX_PAGE_SIZE * 2);

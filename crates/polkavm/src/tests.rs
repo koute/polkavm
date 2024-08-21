@@ -1,7 +1,7 @@
 use crate::mutex::Mutex;
 use crate::{
-    BackendKind, CallError, Caller, Config, Engine, GasMeteringKind, InterruptKind, Linker, MemoryAccessError, MemoryMap, Module,
-    ModuleConfig, ProgramBlob, ProgramCounter, Reg, Segfault,
+    BackendKind, CallError, Caller, Config, Engine, GasMeteringKind, InterruptKind, Linker, MemoryAccessError, Module, ModuleConfig,
+    ProgramBlob, ProgramCounter, Reg, Segfault,
 };
 use alloc::collections::BTreeMap;
 use alloc::format;
@@ -9,6 +9,7 @@ use alloc::string::{String, ToString};
 use alloc::vec;
 use alloc::vec::Vec;
 
+use polkavm_common::abi::MemoryMapBuilder;
 use polkavm_common::program::asm;
 use polkavm_common::program::Reg::*;
 use polkavm_common::utils::align_to_next_page_u32;
@@ -98,7 +99,7 @@ macro_rules! run_tests {
 }
 
 fn basic_test_blob() -> ProgramBlob {
-    let memory_map = MemoryMap::new(0x4000, 0, 0x4000, 0).unwrap();
+    let memory_map = MemoryMapBuilder::new(0x4000).rw_data_size(0x4000).build().unwrap();
     let mut builder = ProgramBlobBuilder::new();
     builder.set_rw_data_size(0x4000);
     builder.add_export_by_basic_block(0, b"main");
@@ -399,7 +400,7 @@ fn zero_memory(engine_config: Config) {
     let _ = env_logger::try_init();
     let engine = Engine::new(&engine_config).unwrap();
 
-    let memory_map = MemoryMap::new(0x4000, 0, 0x4000, 0).unwrap();
+    let memory_map = MemoryMapBuilder::new(0x4000).rw_data_size(0x4000).build().unwrap();
     let mut builder = ProgramBlobBuilder::new();
     builder.set_rw_data_size(0x4000);
     builder.add_export_by_basic_block(0, b"main");
