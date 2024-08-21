@@ -1309,14 +1309,22 @@ where
     };
 
     // Ignore the address as written; we'll just use the relocations instead.
-    b.read_u32()?;
+    if elf.is_64() {
+        b.read_u64()?;
+    } else {
+        b.read_u32()?;
+    };
 
-    let RelocationKind::Abs {
-        target: symbol_location,
-        size: RelocationSize::U32 | RelocationSize::U64,
-    } = symbol_relocation
-    else {
-        return Err(format!("unexpected relocation for the symbol: {symbol_relocation:?}"));
+    let symbol_location = match symbol_relocation {
+        RelocationKind::Abs {
+            target,
+            size: RelocationSize::U64,
+        } if elf.is_64() => target,
+        RelocationKind::Abs {
+            target,
+            size: RelocationSize::U32,
+        } if !elf.is_64() => target,
+        _ => return Err(format!("unexpected relocation for the symbol: {symbol_relocation:?}")),
     };
 
     let Some(symbol) = elf
