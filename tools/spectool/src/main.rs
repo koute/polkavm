@@ -88,6 +88,7 @@ fn main_generate() {
 
     let engine = Engine::new(&config).unwrap();
     let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("spec");
+    let mut found_errors = false;
     for entry in std::fs::read_dir(root.join("src")).unwrap() {
         let mut initial_regs = [0; 13];
         let mut initial_gas = 10000;
@@ -122,6 +123,7 @@ fn main_generate() {
             Ok(blob) => blob,
             Err(error) => {
                 eprintln!("Failed to assemble {path:?}: {error}");
+                found_errors = true;
                 continue;
             }
         };
@@ -205,6 +207,7 @@ fn main_generate() {
 
         if final_pc.0 != expected_final_pc {
             eprintln!("Unexpected final program counter for {path:?}: expected {expected_final_pc}, is {final_pc}");
+            found_errors = true;
             continue;
         }
 
@@ -387,6 +390,10 @@ fn main_generate() {
     }
 
     std::fs::write(root.join("output").join("TESTCASES.md"), index_md).unwrap();
+
+    if found_errors {
+        std::process::exit(1);
+    }
 }
 
 fn main_test() {
