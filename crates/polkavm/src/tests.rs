@@ -1322,6 +1322,26 @@ fn dispatch_table(config: Config) {
     assert_eq!(instance.reg(Reg::A0), 11);
 }
 
+fn implicit_trap_after_fallthrough(config: Config) {
+    let _ = env_logger::try_init();
+    let engine = Engine::new(&config).unwrap();
+    let page_size = get_native_page_size() as u32;
+    let mut builder = ProgramBlobBuilder::new();
+    builder.add_export_by_basic_block(0, b"main");
+    builder.set_code(&[asm::fallthrough()], &[]);
+
+    let blob = ProgramBlob::parse(builder.into_vec().into()).unwrap();
+    let mut module_config = ModuleConfig::new();
+    module_config.set_page_size(page_size);
+    let module = Module::from_blob(&engine, &module_config, blob).unwrap();
+
+    let mut instance = module.instantiate().unwrap();
+    instance.set_next_program_counter(ProgramCounter(0));
+    match_interrupt!(instance.run().unwrap(), InterruptKind::Trap);
+    assert_eq!(instance.program_counter().unwrap().0, 1);
+    assert_eq!(instance.next_program_counter(), None);
+}
+
 struct TestInstance {
     module: crate::Module,
     instance: crate::Instance,
@@ -1782,6 +1802,29 @@ fn gas_metering_with_more_than_one_basic_block(config: Config) {
     }
 }
 
+fn gas_metering_with_implicit_trap(config: Config) {
+    let _ = env_logger::try_init();
+
+    let mut builder = ProgramBlobBuilder::new();
+    builder.add_export_by_basic_block(0, b"main");
+    builder.set_code(&[asm::add_imm(A0, A0, 666)], &[]);
+
+    let blob = ProgramBlob::parse(builder.into_vec().into()).unwrap();
+    let engine = Engine::new(&config).unwrap();
+    let mut module_config = ModuleConfig::default();
+    module_config.set_gas_metering(Some(GasMeteringKind::Sync));
+
+    let module = Module::from_blob(&engine, &module_config, blob).unwrap();
+    let linker: Linker = Linker::new();
+    let instance_pre = linker.instantiate_pre(&module).unwrap();
+    let mut instance = instance_pre.instantiate().unwrap();
+
+    instance.set_gas(10);
+    assert!(matches!(instance.call_typed(&mut (), "main", ()).unwrap_err(), CallError::Trap));
+    assert_eq!(instance.get_result_typed::<i32>(), 666);
+    assert_eq!(instance.gas(), 8);
+}
+
 #[test]
 fn test_basic_debug_info() {
     let _ = env_logger::try_init();
@@ -1888,6 +1931,7 @@ run_tests! {
     pinky_standard
     pinky_dynamic_paging
     dispatch_table
+    implicit_trap_after_fallthrough
 
     test_blob_basic_test
     test_blob_atomic_fetch_add
@@ -1907,6 +1951,7 @@ run_tests! {
     consume_gas_in_host_function_sync
     consume_gas_in_host_function_async
     gas_metering_with_more_than_one_basic_block
+    gas_metering_with_implicit_trap
 
     spawn_stress_test
 }

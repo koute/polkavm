@@ -658,7 +658,7 @@ impl InterpretedInstance {
     #[inline(never)]
     #[cold]
     fn compile_block<const DEBUG: bool>(&mut self, program_counter: ProgramCounter) -> Option<Target> {
-        let instructions = self.module.instructions_at(program_counter)?;
+        let mut instructions = self.module.instructions_at(program_counter)?;
 
         if program_counter.0 > 0
             && !instructions
@@ -666,10 +666,6 @@ impl InterpretedInstance {
                 .next_back()
                 .map_or(true, |instruction| instruction.starts_new_basic_block())
         {
-            return None;
-        }
-
-        if program_counter.0 == self.module.code_len() {
             return None;
         }
 
@@ -681,7 +677,9 @@ impl InterpretedInstance {
         let mut gas_visitor = GasVisitor::default();
         let mut charge_gas_index = None;
         let mut is_first = true;
-        for instruction in instructions {
+        let mut is_properly_terminated = false;
+        let mut last_program_counter = program_counter;
+        while let Some(instruction) = instructions.next() {
             self.compiled_offset_for_block
                 .insert(instruction.offset.0, Self::pack_target(self.compiled_handlers.len(), is_first));
 
@@ -718,9 +716,43 @@ impl InterpretedInstance {
                 module: &self.module,
             });
 
+            last_program_counter = instruction.next_offset();
             if instruction.opcode().starts_new_basic_block() {
+                is_properly_terminated =
+                    instruction.opcode() != polkavm_common::program::Opcode::fallthrough || instructions.next().is_some();
                 break;
             }
+        }
+
+        if !is_properly_terminated {
+            let instruction = polkavm_common::program::ParsedInstruction {
+                kind: polkavm_common::program::Instruction::trap,
+                offset: last_program_counter,
+                length: 1,
+            };
+
+            if self.step_tracing {
+                if DEBUG {
+                    log::debug!("  [{}]: {}: step", self.compiled_handlers.len(), instruction.offset);
+                }
+                emit!(self, step(instruction.offset));
+            }
+
+            if DEBUG {
+                log::debug!("  [{}]: {}: trap (implicit)", self.compiled_handlers.len(), instruction.offset);
+            }
+
+            if self.module.gas_metering().is_some() {
+                instruction.visit(&mut gas_visitor);
+            }
+
+            instruction.visit(&mut Compiler::<DEBUG, false> {
+                program_counter: instruction.offset,
+                instruction_length: instruction.length,
+                compiled_handlers: &mut self.compiled_handlers,
+                compiled_args: &mut self.compiled_args,
+                module: &self.module,
+            });
         }
 
         if let Some((program_counter, index)) = charge_gas_index {
