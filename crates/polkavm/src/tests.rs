@@ -1274,6 +1274,53 @@ fn pinky_standard(config: Config) {
     }
 }
 
+fn dispatch_table(config: Config) {
+    let _ = env_logger::try_init();
+    let engine = Engine::new(&config).unwrap();
+    let page_size = get_native_page_size() as u32;
+    let mut builder = ProgramBlobBuilder::new();
+    builder.add_export_by_basic_block(0, b"block_0");
+    builder.add_export_by_basic_block(1, b"block_1");
+    builder.add_export_by_basic_block(2, b"block_2");
+    builder.add_dispatch_table_entry("block_2");
+    builder.add_dispatch_table_entry("block_0");
+    builder.add_dispatch_table_entry("block_1");
+    let code = vec![
+        asm::load_imm(Reg::A0, 10),
+        asm::ret(),
+        asm::load_imm(Reg::A0, 11),
+        asm::ret(),
+        asm::load_imm(Reg::A0, 12),
+        asm::ret(),
+    ];
+
+    builder.set_code(&code, &[]);
+
+    let blob = ProgramBlob::parse(builder.into_vec().into()).unwrap();
+    let mut module_config = ModuleConfig::new();
+    module_config.set_page_size(page_size);
+    let module = Module::from_blob(&engine, &module_config, blob).unwrap();
+    let offsets: Vec<_> = module.instructions_at(ProgramCounter(0)).unwrap().map(|inst| inst.offset).collect();
+    assert_eq!(offsets[0], ProgramCounter(0));
+    assert_eq!(offsets[1], ProgramCounter(5));
+    assert_eq!(offsets[2], ProgramCounter(10));
+
+    let mut instance = module.instantiate().unwrap();
+    instance.set_reg(Reg::RA, crate::RETURN_TO_HOST);
+
+    instance.set_next_program_counter(ProgramCounter(0));
+    match_interrupt!(instance.run().unwrap(), InterruptKind::Finished);
+    assert_eq!(instance.reg(Reg::A0), 12);
+
+    instance.set_next_program_counter(ProgramCounter(5));
+    match_interrupt!(instance.run().unwrap(), InterruptKind::Finished);
+    assert_eq!(instance.reg(Reg::A0), 10);
+
+    instance.set_next_program_counter(ProgramCounter(10));
+    match_interrupt!(instance.run().unwrap(), InterruptKind::Finished);
+    assert_eq!(instance.reg(Reg::A0), 11);
+}
+
 struct TestInstance {
     module: crate::Module,
     instance: crate::Instance,
@@ -1839,6 +1886,7 @@ run_tests! {
     doom_o3_dwarf2
     pinky_standard
     pinky_dynamic_paging
+    dispatch_table
 
     test_blob_basic_test
     test_blob_atomic_fetch_add
