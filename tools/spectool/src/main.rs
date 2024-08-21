@@ -132,6 +132,7 @@ fn main_generate() {
         let mut module_config = ModuleConfig::default();
         module_config.set_strict(true);
         module_config.set_gas_metering(Some(polkavm::GasMeteringKind::Sync));
+        module_config.set_step_tracing(true);
 
         let module = Module::from_blob(&engine, &module_config, blob.clone()).unwrap();
         let mut instance = module.instantiate().unwrap();
@@ -183,16 +184,25 @@ fn main_generate() {
             instance.set_reg(reg, value);
         }
 
-        let expected_status = match instance.run().unwrap() {
-            InterruptKind::Finished => "halt",
-            InterruptKind::Trap => "trap",
-            InterruptKind::Ecalli(..) => todo!(),
-            InterruptKind::NotEnoughGas => "out-of-gas",
-            InterruptKind::Segfault(..) => todo!(),
-            InterruptKind::Step => unreachable!(),
+        let mut final_pc = initial_pc;
+        let expected_status = loop {
+            match instance.run().unwrap() {
+                InterruptKind::Finished => break "halt",
+                InterruptKind::Trap => break "trap",
+                InterruptKind::Ecalli(..) => todo!(),
+                InterruptKind::NotEnoughGas => break "out-of-gas",
+                InterruptKind::Segfault(..) => todo!(),
+                InterruptKind::Step => {
+                    final_pc = instance.program_counter().unwrap();
+                    continue;
+                }
+            }
         };
 
-        let final_pc = instance.program_counter().unwrap();
+        if expected_status != "halt" {
+            final_pc = instance.program_counter().unwrap();
+        }
+
         if final_pc.0 != expected_final_pc {
             eprintln!("Unexpected final program counter for {path:?}: expected {expected_final_pc}, is {final_pc}");
             continue;
