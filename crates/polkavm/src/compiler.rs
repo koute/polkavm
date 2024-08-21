@@ -246,12 +246,14 @@ where
     where
         S: Sandbox,
     {
-        if self
-            .program_counter_to_label
-            .get(self.code_length)
-            .and_then(|label| self.asm.get_label_origin_offset(label))
-            .is_none()
-        {
+        let is_properly_terminated = Instructions::new(self.code, self.bitmask, 0)
+            .next_back()
+            .map_or(false, |instruction| {
+                let opcode = instruction.opcode();
+                opcode.starts_new_basic_block() && opcode != polkavm_common::program::Opcode::fallthrough
+            });
+
+        if !is_properly_terminated {
             // Finish with a trap in case the code doesn't end with a basic block terminator.
             log::trace!("Adding an implicit trap to the last block...");
             use polkavm_common::program::ParsingVisitor;
