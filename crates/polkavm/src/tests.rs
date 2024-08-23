@@ -1,7 +1,7 @@
 use crate::mutex::Mutex;
 use crate::{
-    BackendKind, CallError, Caller, Config, Engine, GasMeteringKind, InterruptKind, Linker, MemoryAccessError, MemoryMap, Module,
-    ModuleConfig, ProgramBlob, ProgramCounter, Reg, Segfault,
+    BackendKind, CallError, Caller, Config, Engine, GasMeteringKind, InterruptKind, Linker, MemoryAccessError, Module, ModuleConfig,
+    ProgramBlob, ProgramCounter, Reg, Segfault,
 };
 use alloc::collections::BTreeMap;
 use alloc::format;
@@ -9,6 +9,7 @@ use alloc::string::{String, ToString};
 use alloc::vec;
 use alloc::vec::Vec;
 
+use polkavm_common::abi::MemoryMapBuilder;
 use polkavm_common::program::asm;
 use polkavm_common::program::Reg::*;
 use polkavm_common::utils::align_to_next_page_u32;
@@ -98,7 +99,7 @@ macro_rules! run_tests {
 }
 
 fn basic_test_blob() -> ProgramBlob {
-    let memory_map = MemoryMap::new(0x4000, 0, 0x4000, 0).unwrap();
+    let memory_map = MemoryMapBuilder::new(0x4000).rw_data_size(0x4000).build().unwrap();
     let mut builder = ProgramBlobBuilder::new();
     builder.set_rw_data_size(0x4000);
     builder.add_export_by_basic_block(0, b"main");
@@ -399,7 +400,7 @@ fn zero_memory(engine_config: Config) {
     let _ = env_logger::try_init();
     let engine = Engine::new(&engine_config).unwrap();
 
-    let memory_map = MemoryMap::new(0x4000, 0, 0x4000, 0).unwrap();
+    let memory_map = MemoryMapBuilder::new(0x4000).rw_data_size(0x4000).build().unwrap();
     let mut builder = ProgramBlobBuilder::new();
     builder.set_rw_data_size(0x4000);
     builder.add_export_by_basic_block(0, b"main");
@@ -463,7 +464,6 @@ fn dynamic_jump_to_null(engine_config: Config) {
 }
 
 fn dynamic_paging_basic(mut engine_config: Config) {
-    engine_config.set_allow_experimental(true); // TODO: Delete this.
     engine_config.set_allow_dynamic_paging(true);
 
     let _ = env_logger::try_init();
@@ -540,7 +540,6 @@ fn dynamic_paging_basic(mut engine_config: Config) {
 }
 
 fn dynamic_paging_freeing_pages(mut engine_config: Config) {
-    engine_config.set_allow_experimental(true); // TODO: Delete this.
     engine_config.set_allow_dynamic_paging(true);
 
     let _ = env_logger::try_init();
@@ -580,7 +579,6 @@ fn dynamic_paging_stress_test(_engine_config: Config) {}
 #[cfg(feature = "std")]
 fn dynamic_paging_stress_test(mut engine_config: Config) {
     let _ = env_logger::try_init();
-    engine_config.set_allow_experimental(true); // TODO: Delete this.
     engine_config.set_allow_dynamic_paging(true);
     engine_config.set_worker_count(0);
 
@@ -620,7 +618,6 @@ fn dynamic_paging_stress_test(mut engine_config: Config) {
 }
 
 fn dynamic_paging_initialize_multiple_pages(mut engine_config: Config) {
-    engine_config.set_allow_experimental(true); // TODO: Delete this.
     engine_config.set_allow_dynamic_paging(true);
 
     let _ = env_logger::try_init();
@@ -656,7 +653,6 @@ fn dynamic_paging_initialize_multiple_pages(mut engine_config: Config) {
 }
 
 fn dynamic_paging_preinitialize_pages(mut engine_config: Config) {
-    engine_config.set_allow_experimental(true); // TODO: Delete this.
     engine_config.set_allow_dynamic_paging(true);
 
     let _ = env_logger::try_init();
@@ -689,7 +685,6 @@ fn dynamic_paging_preinitialize_pages(mut engine_config: Config) {
 }
 
 fn dynamic_paging_reading_does_not_resolve_segfaults(mut engine_config: Config) {
-    engine_config.set_allow_experimental(true); // TODO: Delete this.
     engine_config.set_allow_dynamic_paging(true);
 
     let _ = env_logger::try_init();
@@ -719,7 +714,6 @@ fn dynamic_paging_reading_does_not_resolve_segfaults(mut engine_config: Config) 
 }
 
 fn dynamic_paging_read_at_page_boundary(mut engine_config: Config) {
-    engine_config.set_allow_experimental(true); // TODO: Delete this.
     engine_config.set_allow_dynamic_paging(true);
 
     let _ = env_logger::try_init();
@@ -749,7 +743,6 @@ fn dynamic_paging_read_at_page_boundary(mut engine_config: Config) {
 }
 
 fn dynamic_paging_write_at_page_boundary_with_no_pages(mut engine_config: Config) {
-    engine_config.set_allow_experimental(true); // TODO: Delete this.
     engine_config.set_allow_dynamic_paging(true);
 
     let _ = env_logger::try_init();
@@ -784,7 +777,6 @@ fn dynamic_paging_write_at_page_boundary_with_no_pages(mut engine_config: Config
 }
 
 fn dynamic_paging_write_at_page_boundary_with_first_page(mut engine_config: Config) {
-    engine_config.set_allow_experimental(true); // TODO: Delete this.
     engine_config.set_allow_dynamic_paging(true);
 
     let _ = env_logger::try_init();
@@ -817,7 +809,6 @@ fn dynamic_paging_write_at_page_boundary_with_first_page(mut engine_config: Conf
 }
 
 fn dynamic_paging_write_at_page_boundary_with_second_page(mut engine_config: Config) {
-    engine_config.set_allow_experimental(true); // TODO: Delete this.
     engine_config.set_allow_dynamic_paging(true);
 
     let _ = env_logger::try_init();
@@ -850,7 +841,6 @@ fn dynamic_paging_write_at_page_boundary_with_second_page(mut engine_config: Con
 }
 
 fn dynamic_paging_change_written_value_and_address_during_segfault(mut engine_config: Config) {
-    engine_config.set_allow_experimental(true); // TODO: Delete this.
     engine_config.set_allow_dynamic_paging(true);
 
     let _ = env_logger::try_init();
@@ -883,7 +873,6 @@ fn dynamic_paging_change_written_value_and_address_during_segfault(mut engine_co
 }
 
 fn dynamic_paging_cancel_segfault_by_changing_address(mut engine_config: Config) {
-    engine_config.set_allow_experimental(true); // TODO: Delete this.
     engine_config.set_allow_dynamic_paging(true);
 
     let _ = env_logger::try_init();
@@ -914,7 +903,6 @@ fn dynamic_paging_cancel_segfault_by_changing_address(mut engine_config: Config)
 }
 
 fn dynamic_paging_worker_recycle_turn_dynamic_paging_on_and_off(mut engine_config: Config) {
-    engine_config.set_allow_experimental(true); // TODO: Delete this.
     engine_config.set_allow_dynamic_paging(true);
     engine_config.set_worker_count(1);
 
@@ -967,7 +955,6 @@ fn dynamic_paging_worker_recycle_turn_dynamic_paging_on_and_off(mut engine_confi
 }
 
 fn dynamic_paging_worker_recycle_during_segfault(mut engine_config: Config) {
-    engine_config.set_allow_experimental(true); // TODO: Delete this.
     engine_config.set_allow_dynamic_paging(true);
     engine_config.set_worker_count(1);
 
@@ -1021,7 +1008,6 @@ fn dynamic_paging_worker_recycle_during_segfault(mut engine_config: Config) {
 }
 
 fn dynamic_paging_change_program_counter_during_segfault(mut engine_config: Config) {
-    engine_config.set_allow_experimental(true); // TODO: Delete this.
     engine_config.set_allow_dynamic_paging(true);
 
     let _ = env_logger::try_init();
@@ -1233,7 +1219,6 @@ fn doom_o3_dwarf2(config: Config) {
 }
 
 fn pinky_dynamic_paging(mut config: Config) {
-    config.set_allow_experimental(true); // TODO: Delete this.
     config.set_allow_dynamic_paging(true);
     pinky_standard(config);
 }
@@ -1319,6 +1304,145 @@ fn dispatch_table(config: Config) {
     instance.set_next_program_counter(ProgramCounter(10));
     match_interrupt!(instance.run().unwrap(), InterruptKind::Finished);
     assert_eq!(instance.reg(Reg::A0), 11);
+}
+
+fn implicit_trap_after_fallthrough(config: Config) {
+    let _ = env_logger::try_init();
+    let engine = Engine::new(&config).unwrap();
+    let page_size = get_native_page_size() as u32;
+    let mut builder = ProgramBlobBuilder::new();
+    builder.add_export_by_basic_block(0, b"main");
+    builder.set_code(&[asm::fallthrough()], &[]);
+
+    let blob = ProgramBlob::parse(builder.into_vec().into()).unwrap();
+    let mut module_config = ModuleConfig::new();
+    module_config.set_page_size(page_size);
+    let module = Module::from_blob(&engine, &module_config, blob).unwrap();
+
+    let mut instance = module.instantiate().unwrap();
+    instance.set_next_program_counter(ProgramCounter(0));
+    match_interrupt!(instance.run().unwrap(), InterruptKind::Trap);
+    assert_eq!(instance.program_counter().unwrap().0, 1);
+    assert_eq!(instance.next_program_counter(), None);
+}
+
+fn aux_data_works(config: Config) {
+    let _ = env_logger::try_init();
+    let engine = Engine::new(&config).unwrap();
+    let page_size = get_native_page_size() as u32;
+    let mut builder = ProgramBlobBuilder::new();
+    builder.add_export_by_basic_block(0, b"main");
+    builder.set_code(
+        &[
+            asm::load_indirect_u32(Reg::A1, Reg::A0, 0),
+            asm::store_imm_indirect_u32(Reg::A0, 0, 0x11223344),
+            asm::ret(),
+        ],
+        &[],
+    );
+
+    let blob = ProgramBlob::parse(builder.into_vec().into()).unwrap();
+    let mut module_config = ModuleConfig::new();
+    module_config.set_page_size(page_size);
+    module_config.set_aux_data_size(1);
+    let module = Module::from_blob(&engine, &module_config, blob).unwrap();
+    let offsets: Vec<_> = module.instructions_at(ProgramCounter(0)).unwrap().map(|inst| inst.offset).collect();
+
+    let mut instance = module.instantiate().unwrap();
+    instance.write_u32(module.memory_map().aux_data_address(), 0x12345678).unwrap();
+    instance.set_reg(Reg::A0, module.memory_map().aux_data_address());
+    instance.set_reg(Reg::RA, crate::RETURN_TO_HOST);
+    instance.set_next_program_counter(offsets[0]);
+    match_interrupt!(instance.run().unwrap(), InterruptKind::Trap);
+    assert_eq!(instance.program_counter().unwrap(), offsets[1]);
+    assert_eq!(instance.reg(Reg::A1), 0x12345678);
+
+    instance.zero_memory(module.memory_map().aux_data_address(), 1).unwrap();
+    assert_eq!(instance.read_u32(module.memory_map().aux_data_address()).unwrap(), 0x12345600);
+    instance
+        .zero_memory(module.memory_map().aux_data_address(), module.memory_map().aux_data_size())
+        .unwrap();
+    assert_eq!(instance.read_u32(module.memory_map().aux_data_address()).unwrap(), 0);
+}
+
+fn access_memory_from_host(config: Config) {
+    let _ = env_logger::try_init();
+    let engine = Engine::new(&config).unwrap();
+    let page_size = get_native_page_size() as u32;
+    let mut builder = ProgramBlobBuilder::new();
+    builder.add_export_by_basic_block(0, b"main");
+    builder.set_code(&[asm::trap()], &[]);
+    builder.set_ro_data_size(1);
+    builder.set_rw_data_size(1);
+    builder.set_stack_size(1);
+
+    let blob = ProgramBlob::parse(builder.into_vec().into()).unwrap();
+    let mut module_config = ModuleConfig::new();
+    module_config.set_page_size(page_size);
+    module_config.set_aux_data_size(1);
+    let module = Module::from_blob(&engine, &module_config, blob).unwrap();
+    let memory_map = module.memory_map();
+
+    let mut instance = module.instantiate().unwrap();
+
+    let mut page_size_blob = Vec::new();
+    let mut page_size_blob_plus_1 = Vec::new();
+    page_size_blob.resize(page_size as usize, 1);
+    page_size_blob_plus_1.resize(page_size as usize + 1, 1);
+
+    let list = [
+        (memory_map.ro_data_range(), true),
+        (memory_map.rw_data_range(), false),
+        (memory_map.stack_range(), false),
+        (memory_map.aux_data_range(), false),
+    ];
+
+    for (range, is_read_only) in list {
+        log::debug!("Testing host access for range: 0x{:x}-0x{:x}", range.start, range.end);
+
+        // Partial writes should not clobber the memory region, so do the failing writes first.
+        assert!(instance.write_memory(range.start - 1, &[1]).is_err());
+        assert!(instance.write_memory(range.start + page_size, &[1]).is_err());
+        assert!(instance.write_memory(range.start, &page_size_blob_plus_1).is_err());
+        assert!(instance.read_memory(range.start, page_size).unwrap().iter().all(|&byte| byte == 0));
+
+        assert_eq!(instance.read_memory(range.start, 1).unwrap(), vec![0]);
+        assert_eq!(instance.read_memory(range.start + page_size - 1, 1).unwrap(), vec![0]);
+        assert_eq!(instance.read_memory(range.start, page_size).unwrap().len(), page_size as usize);
+        assert!(instance.read_memory(range.start - 1, 1).is_err());
+        assert!(instance.read_memory(range.start + page_size, 1).is_err());
+        assert!(instance.read_memory(range.start, page_size + 1).is_err());
+
+        if is_read_only {
+            assert!(instance.write_memory(range.start, &[1]).is_err());
+            assert!(instance.write_memory(range.start + page_size - 1, &[1]).is_err());
+            assert!(instance.write_memory(range.start, &page_size_blob).is_err());
+
+            assert!(instance.zero_memory(range.start, 1).is_err());
+            assert!(instance.zero_memory(range.start + page_size - 1, 1).is_err());
+            assert!(instance.zero_memory(range.start, page_size).is_err());
+        } else {
+            assert!(instance.write_memory(range.start, &[1]).is_ok());
+            assert_eq!(instance.read_memory(range.start, 2).unwrap(), vec![1, 0]);
+            assert!(instance.write_memory(range.start + page_size - 1, &[1]).is_ok());
+            assert!(instance.write_memory(range.start, &page_size_blob).is_ok());
+            assert!(instance.read_memory(range.start, page_size).unwrap().iter().all(|&byte| byte == 1));
+
+            assert!(instance.zero_memory(range.start, 1).is_ok());
+            assert!(instance.zero_memory(range.start + page_size - 1, 1).is_ok());
+            assert!(instance.zero_memory(range.start, page_size).is_ok());
+        }
+
+        assert_eq!(instance.read_memory(range.start, 0).unwrap(), vec![]);
+    }
+
+    // If length is zero then these should always succeed.
+    assert_eq!(instance.read_memory(0, 0).unwrap(), vec![]);
+    assert_eq!(instance.read_memory(0xffffffff, 0).unwrap(), vec![]);
+    assert!(instance.write_memory(0, &[]).is_ok());
+    assert!(instance.write_memory(0xffffffff, &[]).is_ok());
+    assert!(instance.zero_memory(0, 0).is_ok());
+    assert!(instance.zero_memory(0xffffffff, 0).is_ok());
 }
 
 struct TestInstance {
@@ -1781,6 +1905,29 @@ fn gas_metering_with_more_than_one_basic_block(config: Config) {
     }
 }
 
+fn gas_metering_with_implicit_trap(config: Config) {
+    let _ = env_logger::try_init();
+
+    let mut builder = ProgramBlobBuilder::new();
+    builder.add_export_by_basic_block(0, b"main");
+    builder.set_code(&[asm::add_imm(A0, A0, 666)], &[]);
+
+    let blob = ProgramBlob::parse(builder.into_vec().into()).unwrap();
+    let engine = Engine::new(&config).unwrap();
+    let mut module_config = ModuleConfig::default();
+    module_config.set_gas_metering(Some(GasMeteringKind::Sync));
+
+    let module = Module::from_blob(&engine, &module_config, blob).unwrap();
+    let linker: Linker = Linker::new();
+    let instance_pre = linker.instantiate_pre(&module).unwrap();
+    let mut instance = instance_pre.instantiate().unwrap();
+
+    instance.set_gas(10);
+    assert!(matches!(instance.call_typed(&mut (), "main", ()).unwrap_err(), CallError::Trap));
+    assert_eq!(instance.get_result_typed::<i32>(), 666);
+    assert_eq!(instance.gas(), 8);
+}
+
 #[test]
 fn test_basic_debug_info() {
     let _ = env_logger::try_init();
@@ -1887,6 +2034,9 @@ run_tests! {
     pinky_standard
     pinky_dynamic_paging
     dispatch_table
+    implicit_trap_after_fallthrough
+    aux_data_works
+    access_memory_from_host
 
     test_blob_basic_test
     test_blob_atomic_fetch_add
@@ -1906,6 +2056,7 @@ run_tests! {
     consume_gas_in_host_function_sync
     consume_gas_in_host_function_async
     gas_metering_with_more_than_one_basic_block
+    gas_metering_with_implicit_trap
 
     spawn_stress_test
 }

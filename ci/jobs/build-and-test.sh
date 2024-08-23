@@ -15,3 +15,6 @@ POLKAVM_TRACE_EXECUTION=1 POLKAVM_ALLOW_INSECURE=1 cargo run -p hello-world-host
 
 echo ">> cargo test (no_std)"
 RUSTC_BOOTSTRAP=1 cargo test --no-default-features -p polkavm
+
+echo ">> cargo run generate (spectool)"
+cargo run -p spectool generate

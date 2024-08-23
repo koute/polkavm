@@ -771,11 +771,17 @@ unsafe fn child_main(zygote_memfd: Fd, child_socket: Fd, uid_map: &str, gid_map:
 #[derive(Clone)]
 pub struct SandboxProgram(Arc<SandboxProgramInner>);
 
+enum InitializeWith {
+    None,
+    Shm(ShmAllocation),
+    Mem(u32),
+}
+
 struct ProgramMap {
     address: u64,
     length: u64,
     is_writable: bool,
-    initialize_with: Option<ShmAllocation>,
+    initialize_with: InitializeWith,
 }
 
 struct SandboxProgramInner {
@@ -1107,7 +1113,7 @@ impl super::Sandbox for Sandbox {
                     address: u64::from(cfg.ro_data_address()),
                     length: physical_size,
                     is_writable: false,
-                    initialize_with: Some(shm_ro_data),
+                    initialize_with: InitializeWith::Shm(shm_ro_data),
                 });
             }
 
@@ -1117,7 +1123,7 @@ impl super::Sandbox for Sandbox {
                     address: u64::from(cfg.ro_data_address()) + physical_size,
                     length: padding,
                     is_writable: false,
-                    initialize_with: None,
+                    initialize_with: InitializeWith::None,
                 });
             }
         }
@@ -1130,7 +1136,7 @@ impl super::Sandbox for Sandbox {
                     address: u64::from(cfg.rw_data_address()),
                     length: physical_size,
                     is_writable: true,
-                    initialize_with: Some(shm_rw_data),
+                    initialize_with: InitializeWith::Shm(shm_rw_data),
                 });
             }
 
@@ -1140,7 +1146,7 @@ impl super::Sandbox for Sandbox {
                     address: u64::from(cfg.rw_data_address()) + physical_size,
                     length: padding,
                     is_writable: true,
-                    initialize_with: None,
+                    initialize_with: InitializeWith::None,
                 });
             }
         }
@@ -1150,7 +1156,16 @@ impl super::Sandbox for Sandbox {
                 address: u64::from(cfg.stack_address_low()),
                 length: u64::from(cfg.stack_size()),
                 is_writable: true,
-                initialize_with: None,
+                initialize_with: InitializeWith::None,
+            });
+        }
+
+        if cfg.aux_data_size() > 0 {
+            memory_map.push(ProgramMap {
+                address: u64::from(cfg.aux_data_address()),
+                length: u64::from(cfg.aux_data_size()),
+                is_writable: false,
+                initialize_with: InitializeWith::Mem(cfg.aux_data_address()),
             });
         }
 
@@ -1467,10 +1482,12 @@ impl super::Sandbox for Sandbox {
         vmctx.futex.store(VMCTX_FUTEX_BUSY, Ordering::Release);
         linux_raw::sys_futex_wake_one(&vmctx.futex)?;
 
-        let (iouring, memory_mmap, userfaultfd) = if global.uffd_available {
+        // TODO: If not using userfaultfd then don't mmap all of this immediately.
+        let (memory_memfd, memory_mmap) = prepare_memory()?;
+        linux_raw::sendfd(socket.borrow(), memory_memfd.borrow())?;
+
+        let (iouring, userfaultfd) = if global.uffd_available {
             let iouring = linux_raw::IoUring::new(3)?;
-            let (memory_memfd, memory_mmap) = prepare_memory()?;
-            linux_raw::sendfd(socket.borrow(), memory_memfd.borrow())?;
 
             let userfaultfd = linux_raw::recvfd(socket.borrow()).map_err(|error| {
                 let mut error = format!("failed to fetch the userfaultfd from the child process: {error}");
@@ -1492,9 +1509,9 @@ impl super::Sandbox for Sandbox {
 
             linux_raw::sys_ptrace_seize(child.pid)?;
 
-            (Some(iouring), memory_mmap, userfaultfd)
+            (Some(iouring), userfaultfd)
         } else {
-            (None, Mmap::default(), Fd::from_raw_unchecked(-1))
+            (None, Fd::from_raw_unchecked(-1))
         };
 
         // Close the socket; we don't need it anymore.
@@ -1592,17 +1609,23 @@ impl super::Sandbox for Sandbox {
 
             let vm_maps = unsafe { memory_map.as_typed_slice_mut::<VmMap>() };
             for (chunk, vm_map) in program.memory_map.iter().zip(vm_maps.iter_mut()) {
+                let (fd, fd_offset) = match chunk.initialize_with {
+                    InitializeWith::None => (VmFd::None, 0),
+                    InitializeWith::Shm(ref alloc) => (VmFd::Shm, alloc.offset() as u64),
+                    InitializeWith::Mem(offset) => (VmFd::Mem, u64::from(offset)),
+                };
+
                 *vm_map = VmMap {
                     address: chunk.address,
                     length: chunk.length,
                     protection: linux_raw::PROT_READ | if chunk.is_writable { linux_raw::PROT_WRITE } else { 0 },
-                    flags: if chunk.initialize_with.is_some() {
+                    flags: if !matches!(chunk.initialize_with, InitializeWith::None) {
                         linux_raw::MAP_FIXED | linux_raw::MAP_PRIVATE
                     } else {
                         linux_raw::MAP_FIXED | linux_raw::MAP_PRIVATE | linux_raw::MAP_ANONYMOUS
                     },
-                    fd: if chunk.initialize_with.is_some() { VmFd::Shm } else { VmFd::None },
-                    fd_offset: chunk.initialize_with.as_ref().map_or(0, |alloc| alloc.offset() as u64),
+                    fd,
+                    fd_offset,
                 };
             }
 
@@ -1876,16 +1899,8 @@ impl super::Sandbox for Sandbox {
             let length = slice.len();
             match linux_raw::vm_read_memory(self.child.pid, [slice], [(address as usize, length)]) {
                 Ok(actual_length) if actual_length == length => unsafe { Ok(slice_assume_init_mut(slice)) },
-                Ok(_) => Err(MemoryAccessError {
-                    address,
-                    length: slice.len() as u64,
-                    error: "incomplete read".into(),
-                }),
-                Err(error) => Err(MemoryAccessError {
-                    address,
-                    length: slice.len() as u64,
-                    error: error.to_string().into(),
-                }),
+                Ok(_) => Err(MemoryAccessError::Error("incomplete read".into())),
+                Err(error) => Err(MemoryAccessError::Error(error.into())),
             }
         } else {
             let module = self.module.as_ref().unwrap();
@@ -1918,23 +1933,42 @@ impl super::Sandbox for Sandbox {
             return Ok(());
         }
 
+        let module = self.module.as_ref().unwrap();
         if !self.dynamic_paging_enabled {
+            let memory_map = module.memory_map();
+            let is_ok = if address >= memory_map.aux_data_address() {
+                let aux_data_size = module.memory_map().aux_data_size();
+                let aux_data_end = module.memory_map().aux_data_address() + aux_data_size;
+                let address_end = address as usize + data.len();
+                if address_end <= aux_data_end as usize {
+                    self.memory_mmap.as_slice_mut()[address as usize..address as usize + data.len()].copy_from_slice(data);
+                    return Ok(());
+                } else {
+                    false
+                }
+            } else if address >= memory_map.stack_address_low() {
+                u64::from(address) + data.len() as u64 <= u64::from(memory_map.stack_range().end)
+            } else if address >= memory_map.rw_data_address() {
+                let end = unsafe { *self.vmctx().heap_info.heap_threshold.get() };
+                u64::from(address) + data.len() as u64 <= end
+            } else {
+                false
+            };
+
+            if !is_ok {
+                return Err(MemoryAccessError::OutOfRangeAccess {
+                    address,
+                    length: data.len() as u64,
+                });
+            }
+
             let length = data.len();
             match linux_raw::vm_write_memory(self.child.pid, [data], [(address as usize, length)]) {
                 Ok(actual_length) if actual_length == length => Ok(()),
-                Ok(_) => Err(MemoryAccessError {
-                    address,
-                    length: data.len() as u64,
-                    error: "incomplete write".into(),
-                }),
-                Err(error) => Err(MemoryAccessError {
-                    address,
-                    length: data.len() as u64,
-                    error: error.to_string().into(),
-                }),
+                Ok(_) => Err(MemoryAccessError::Error("incomplete write".into())),
+                Err(error) => Err(MemoryAccessError::Error(error.into())),
             }
         } else {
-            let module = self.module.as_ref().unwrap();
             let page_start = module.address_to_page(module.round_to_page_size_down(address));
             let page_end = module.address_to_page(module.round_to_page_size_down(address + data.len() as u32));
             self.page_set.insert((page_start, page_end));
@@ -1951,21 +1985,41 @@ impl super::Sandbox for Sandbox {
             length
         );
 
+        let module = self.module.as_ref().unwrap();
         if !self.dynamic_paging_enabled {
+            let memory_map = module.memory_map();
+            let is_ok = if address >= memory_map.aux_data_address() {
+                if u64::from(address) + u64::from(length) <= u64::from(memory_map.aux_data_range().end) {
+                    self.memory_mmap.as_slice_mut()[address as usize..address as usize + length as usize].fill(0);
+                    return Ok(());
+                } else {
+                    false
+                }
+            } else if address >= memory_map.stack_address_low() {
+                u64::from(address) + u64::from(length) <= u64::from(memory_map.stack_range().end)
+            } else if address >= memory_map.rw_data_address() {
+                let end = unsafe { *self.vmctx().heap_info.heap_threshold.get() };
+                u64::from(address) + u64::from(length) <= end
+            } else {
+                false
+            };
+
+            if !is_ok {
+                return Err(MemoryAccessError::OutOfRangeAccess {
+                    address,
+                    length: u64::from(length),
+                });
+            }
+
             self.vmctx().arg.store(address, Ordering::Relaxed);
             self.vmctx().arg2.store(length, Ordering::Relaxed);
             self.vmctx()
                 .jump_into
                 .store(ZYGOTE_TABLES.1.ext_zero_memory_chunk, Ordering::Relaxed);
             if let Err(error) = self.wake_oneshot_and_expect_idle() {
-                return Err(MemoryAccessError {
-                    address,
-                    length: u64::from(length),
-                    error: error.to_string().into(),
-                });
+                return Err(MemoryAccessError::Error(error.into()));
             }
         } else {
-            let module = self.module.as_ref().unwrap();
             let page_start = module.address_to_page(module.round_to_page_size_down(address));
             let page_end = module.address_to_page(module.round_to_page_size_down(address + length));
             if module.is_multiple_of_page_size(address)
@@ -1984,11 +2038,7 @@ impl super::Sandbox for Sandbox {
                 );
 
                 if let Err(error) = linux_raw::sys_uffdio_zeropage(self.userfaultfd.borrow(), &mut arg) {
-                    return Err(MemoryAccessError {
-                        address,
-                        length: u64::from(length),
-                        error: error.to_string().into(),
-                    });
+                    return Err(MemoryAccessError::Error(error.into()));
                 }
             } else {
                 self.memory_mmap.as_slice_mut()[address as usize..address as usize + length as usize].fill(0);

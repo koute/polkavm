@@ -537,11 +537,10 @@ unsafe fn initialize(mut stack: *mut usize) {
     )
     .unwrap_or_else(|error| abort_with_error("failed to make sure the jump table address space is unmapped", error));
 
+    let memory_fd = linux_raw::recvfd(socket.borrow()).unwrap_or_else(|error| abort_with_error("failed to read memory fd", error));
+    MEMORY_FD.store(memory_fd.leak(), Ordering::Relaxed);
+
     if VMCTX.init.uffd_available.load(Ordering::Relaxed) {
-        let memory_fd = linux_raw::recvfd(socket.borrow()).unwrap_or_else(|error| abort_with_error("failed to read memory fd", error));
-
-        MEMORY_FD.store(memory_fd.leak(), Ordering::Relaxed);
-
         // Set up and send the userfaultfd to the host.
         let userfaultfd = linux_raw::sys_userfaultfd(linux_raw::O_CLOEXEC)
             .unwrap_or_else(|error| abort_with_error("failed to create an userfaultfd", error));

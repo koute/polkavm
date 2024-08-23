@@ -78,6 +78,7 @@ impl InterpretedModule {
 pub(crate) struct BasicMemory {
     rw_data: Vec<u8>,
     stack: Vec<u8>,
+    aux: Vec<u8>,
     is_memory_dirty: bool,
     heap_size: u32,
 }
@@ -87,6 +88,7 @@ impl BasicMemory {
         Self {
             rw_data: Vec::new(),
             stack: Vec::new(),
+            aux: Vec::new(),
             is_memory_dirty: false,
             heap_size: 0,
         }
@@ -109,6 +111,7 @@ impl BasicMemory {
     fn force_reset(&mut self, module: &Module) {
         self.rw_data.clear();
         self.stack.clear();
+        self.aux.clear();
         self.heap_size = 0;
         self.is_memory_dirty = false;
 
@@ -116,13 +119,18 @@ impl BasicMemory {
             self.rw_data.extend_from_slice(&interpreted_module.rw_data);
             self.rw_data.resize(module.memory_map().rw_data_size() as usize, 0);
             self.stack.resize(module.memory_map().stack_size() as usize, 0);
+
+            // TODO: Do this lazily?
+            self.aux.resize(module.memory_map().aux_data_size() as usize, 0);
         }
     }
 
     #[inline]
     fn get_memory_slice<'a>(&'a self, module: &'a Module, address: u32, length: u32) -> Option<&'a [u8]> {
         let memory_map = module.memory_map();
-        let (start, memory_slice) = if address >= memory_map.stack_address_low() {
+        let (start, memory_slice) = if address >= memory_map.aux_data_address() {
+            (memory_map.aux_data_address(), &self.aux)
+        } else if address >= memory_map.stack_address_low() {
             (memory_map.stack_address_low(), &self.stack)
         } else if address >= memory_map.rw_data_address() {
             (memory_map.rw_data_address(), &self.rw_data)
@@ -138,9 +146,11 @@ impl BasicMemory {
     }
 
     #[inline]
-    fn get_memory_slice_mut(&mut self, module: &Module, address: u32, length: u32) -> Option<&mut [u8]> {
+    fn get_memory_slice_mut<const IS_EXTERNAL: bool>(&mut self, module: &Module, address: u32, length: u32) -> Option<&mut [u8]> {
         let memory_map = module.memory_map();
-        let (start, memory_slice) = if address >= memory_map.stack_address_low() {
+        let (start, memory_slice) = if IS_EXTERNAL && address >= memory_map.aux_data_address() {
+            (memory_map.aux_data_address(), &mut self.aux)
+        } else if address >= memory_map.stack_address_low() {
             (memory_map.stack_address_low(), &mut self.stack)
         } else if address >= memory_map.rw_data_address() {
             (memory_map.rw_data_address(), &mut self.rw_data)
@@ -227,7 +237,7 @@ macro_rules! emit_branch {
     };
 }
 
-fn each_page(module: &Module, address: u32, length: u32, callback: impl FnMut(u32, usize, usize, usize) -> Option<()>) -> Option<()> {
+fn each_page(module: &Module, address: u32, length: u32, callback: impl FnMut(u32, usize, usize, usize)) {
     let page_size = module.memory_map().page_size();
     let page_address_lo = module.round_to_page_size_down(address);
     let page_address_hi = module.round_to_page_size_down(address + (length - 1));
@@ -240,8 +250,8 @@ fn each_page_impl(
     page_address_hi: u32,
     address: u32,
     length: u32,
-    mut callback: impl FnMut(u32, usize, usize, usize) -> Option<()>,
-) -> Option<()> {
+    mut callback: impl FnMut(u32, usize, usize, usize),
+) {
     let page_size = page_size as usize;
     let mut page_address_lo = page_address_lo as usize;
     let page_address_hi = page_address_hi as usize;
@@ -249,22 +259,21 @@ fn each_page_impl(
 
     let initial_page_offset = address as usize - page_address_lo;
     let initial_chunk_length = core::cmp::min(length, page_size - initial_page_offset);
-    callback(page_address_lo as u32, initial_page_offset, 0, initial_chunk_length)?;
+    callback(page_address_lo as u32, initial_page_offset, 0, initial_chunk_length);
 
     if page_address_lo == page_address_hi {
-        return Some(());
+        return;
     }
 
     page_address_lo += page_size;
     let mut buffer_offset = initial_chunk_length;
     while page_address_lo < page_address_hi {
-        callback(page_address_lo as u32, 0, buffer_offset, page_size)?;
+        callback(page_address_lo as u32, 0, buffer_offset, page_size);
         buffer_offset += page_size;
         page_address_lo += page_size;
     }
 
-    callback(page_address_lo as u32, 0, buffer_offset, length - buffer_offset)?;
-    Some(())
+    callback(page_address_lo as u32, 0, buffer_offset, length - buffer_offset)
 }
 
 #[test]
@@ -282,7 +291,6 @@ fn test_each_page() {
             length,
             |page_address, page_offset, buffer_offset, length| {
                 output.push((page_address, page_offset, buffer_offset, length));
-                Some(())
             },
         );
         output
@@ -408,10 +416,9 @@ impl InterpretedInstance {
     ) -> Result<&'slice mut [u8], MemoryAccessError> {
         if !self.module.is_dynamic_paging() {
             let Some(slice) = self.basic_memory.get_memory_slice(&self.module, address, buffer.len() as u32) else {
-                return Err(MemoryAccessError {
+                return Err(MemoryAccessError::OutOfRangeAccess {
                     address,
                     length: buffer.len() as u64,
-                    error: "out of range read".into(),
                 });
             };
 
@@ -422,17 +429,20 @@ impl InterpretedInstance {
                 address,
                 buffer.len() as u32,
                 |page_address, page_offset, buffer_offset, length| {
-                    let page = self.dynamic_memory.pages.get(&page_address)?;
                     assert!(buffer_offset + length <= buffer.len());
                     assert!(page_offset + length <= self.module.memory_map().page_size() as usize);
+                    let page = self.dynamic_memory.pages.get(&page_address);
 
                     // SAFETY: Buffers are non-overlapping and the ranges are in-bounds.
                     unsafe {
                         let dst = buffer.as_mut_ptr().cast::<u8>().add(buffer_offset);
-                        let src = page.as_ptr().add(page_offset);
-                        core::ptr::copy_nonoverlapping(src, dst, length);
+                        if let Some(page) = page {
+                            let src = page.as_ptr().add(page_offset);
+                            core::ptr::copy_nonoverlapping(src, dst, length);
+                        } else {
+                            core::ptr::write_bytes(dst, 0, length);
+                        }
                     }
-                    Some(())
                 },
             );
 
@@ -443,11 +453,13 @@ impl InterpretedInstance {
 
     pub fn write_memory(&mut self, address: u32, data: &[u8]) -> Result<(), MemoryAccessError> {
         if !self.module.is_dynamic_paging() {
-            let Some(slice) = self.basic_memory.get_memory_slice_mut(&self.module, address, data.len() as u32) else {
-                return Err(MemoryAccessError {
+            let Some(slice) = self
+                .basic_memory
+                .get_memory_slice_mut::<true>(&self.module, address, data.len() as u32)
+            else {
+                return Err(MemoryAccessError::OutOfRangeAccess {
                     address,
                     length: data.len() as u64,
-                    error: "out of range write".into(),
                 });
             };
 
@@ -462,7 +474,6 @@ impl InterpretedInstance {
                 move |page_address, page_offset, buffer_offset, length| {
                     let page = dynamic_memory.pages.entry(page_address).or_insert_with(|| empty_page(page_size));
                     page[page_offset..page_offset + length].copy_from_slice(&data[buffer_offset..buffer_offset + length]);
-                    Some(())
                 },
             );
         }
@@ -472,11 +483,10 @@ impl InterpretedInstance {
 
     pub fn zero_memory(&mut self, address: u32, length: u32) -> Result<(), MemoryAccessError> {
         if !self.module.is_dynamic_paging() {
-            let Some(slice) = self.basic_memory.get_memory_slice_mut(&self.module, address, length) else {
-                return Err(MemoryAccessError {
+            let Some(slice) = self.basic_memory.get_memory_slice_mut::<true>(&self.module, address, length) else {
+                return Err(MemoryAccessError::OutOfRangeAccess {
                     address,
                     length: u64::from(length),
-                    error: "out of range write (of zeroes)".into(),
                 });
             };
 
@@ -484,8 +494,11 @@ impl InterpretedInstance {
         } else {
             let dynamic_memory = &mut self.dynamic_memory;
             let page_size = self.module.memory_map().page_size();
-            each_page(&self.module, address, length, move |page_address, page_offset, _, length| {
-                match dynamic_memory.pages.entry(page_address) {
+            each_page(
+                &self.module,
+                address,
+                length,
+                move |page_address, page_offset, _, length| match dynamic_memory.pages.entry(page_address) {
                     Entry::Occupied(mut entry) => {
                         let page = entry.get_mut();
                         page[page_offset..page_offset + length].fill(0);
@@ -493,10 +506,8 @@ impl InterpretedInstance {
                     Entry::Vacant(entry) => {
                         entry.insert(empty_page(page_size));
                     }
-                }
-
-                Some(())
-            });
+                },
+            );
         }
 
         Ok(())
@@ -512,7 +523,6 @@ impl InterpretedInstance {
             let dynamic_memory = &mut self.dynamic_memory;
             each_page(&self.module, address, length, move |page_address, _, _, _| {
                 dynamic_memory.pages.remove(&page_address);
-                Some(())
             });
         }
     }
@@ -658,7 +668,7 @@ impl InterpretedInstance {
     #[inline(never)]
     #[cold]
     fn compile_block<const DEBUG: bool>(&mut self, program_counter: ProgramCounter) -> Option<Target> {
-        let instructions = self.module.instructions_at(program_counter)?;
+        let mut instructions = self.module.instructions_at(program_counter)?;
 
         if program_counter.0 > 0
             && !instructions
@@ -666,10 +676,6 @@ impl InterpretedInstance {
                 .next_back()
                 .map_or(true, |instruction| instruction.starts_new_basic_block())
         {
-            return None;
-        }
-
-        if program_counter.0 == self.module.code_len() {
             return None;
         }
 
@@ -681,7 +687,9 @@ impl InterpretedInstance {
         let mut gas_visitor = GasVisitor::default();
         let mut charge_gas_index = None;
         let mut is_first = true;
-        for instruction in instructions {
+        let mut is_properly_terminated = false;
+        let mut last_program_counter = program_counter;
+        while let Some(instruction) = instructions.next() {
             self.compiled_offset_for_block
                 .insert(instruction.offset.0, Self::pack_target(self.compiled_handlers.len(), is_first));
 
@@ -718,9 +726,43 @@ impl InterpretedInstance {
                 module: &self.module,
             });
 
+            last_program_counter = instruction.next_offset();
             if instruction.opcode().starts_new_basic_block() {
+                is_properly_terminated =
+                    instruction.opcode() != polkavm_common::program::Opcode::fallthrough || instructions.next().is_some();
                 break;
             }
+        }
+
+        if !is_properly_terminated {
+            let instruction = polkavm_common::program::ParsedInstruction {
+                kind: polkavm_common::program::Instruction::trap,
+                offset: last_program_counter,
+                length: 1,
+            };
+
+            if self.step_tracing {
+                if DEBUG {
+                    log::debug!("  [{}]: {}: step", self.compiled_handlers.len(), instruction.offset);
+                }
+                emit!(self, step(instruction.offset));
+            }
+
+            if DEBUG {
+                log::debug!("  [{}]: {}: trap (implicit)", self.compiled_handlers.len(), instruction.offset);
+            }
+
+            if self.module.gas_metering().is_some() {
+                instruction.visit(&mut gas_visitor);
+            }
+
+            instruction.visit(&mut Compiler::<DEBUG, false> {
+                program_counter: instruction.offset,
+                instruction_length: instruction.length,
+                compiled_handlers: &mut self.compiled_handlers,
+                compiled_args: &mut self.compiled_args,
+                module: &self.module,
+            });
         }
 
         if let Some((program_counter, index)) = charge_gas_index {
@@ -933,7 +975,11 @@ impl<'a> Visitor<'a> {
         let value = T::into_bytes(value);
 
         if !IS_DYNAMIC {
-            let Some(slice) = self.inner.basic_memory.get_memory_slice_mut(&self.inner.module, address, length) else {
+            let Some(slice) = self
+                .inner
+                .basic_memory
+                .get_memory_slice_mut::<false>(&self.inner.module, address, length)
+            else {
                 if DEBUG {
                     log::debug!(
                         "Store of {length} bytes to 0x{address:x} failed! (pc = {program_counter}, cycle = {cycle})",

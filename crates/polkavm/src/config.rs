@@ -311,6 +311,7 @@ pub struct ModuleConfig {
     pub(crate) is_strict: bool,
     pub(crate) step_tracing: bool,
     pub(crate) dynamic_paging: bool,
+    pub(crate) aux_data_size: u32,
 }
 
 impl Default for ModuleConfig {
@@ -328,6 +329,7 @@ impl ModuleConfig {
             is_strict: false,
             step_tracing: false,
             dynamic_paging: false,
+            aux_data_size: 0,
         }
     }
 
@@ -336,6 +338,19 @@ impl ModuleConfig {
     /// Default: `4096` (4k)
     pub fn set_page_size(&mut self, page_size: u32) -> &mut Self {
         self.page_size = page_size;
+        self
+    }
+
+    /// Returns the size of the auxiliary data region.
+    pub fn aux_data_size(&self) -> u32 {
+        self.aux_data_size
+    }
+
+    /// Sets the size of the auxiliary data region.
+    ///
+    /// Default: `0`
+    pub fn set_aux_data_size(&mut self, aux_data_size: u32) -> &mut Self {
+        self.aux_data_size = aux_data_size;
         self
     }
 
