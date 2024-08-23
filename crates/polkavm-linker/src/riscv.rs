@@ -1357,9 +1357,7 @@ impl Inst {
                     | (u32::from(acquire) << 26)
                     | (0b00011 << 27),
             ),
-            Inst::StoreConditional64 { .. } | Inst::LoadReserved64 { .. } => {
-                unreachable!("internal error: encoding a 64bit instruction in a 32bit context")
-            }
+            Inst::StoreConditional64 { .. } | Inst::LoadReserved64 { .. } => None,
             Inst::Atomic {
                 acquire,
                 release,
