@@ -1943,15 +1943,32 @@ impl super::Sandbox for Sandbox {
 
         let module = self.module.as_ref().unwrap();
         if !self.dynamic_paging_enabled {
-            let aux_data_address = module.memory_map().aux_data_address();
-            if address >= aux_data_address {
+            let memory_map = module.memory_map();
+            let is_ok = if address >= memory_map.aux_data_address() {
                 let aux_data_size = module.memory_map().aux_data_size();
-                let aux_data_end = aux_data_address + aux_data_size;
+                let aux_data_end = module.memory_map().aux_data_address() + aux_data_size;
                 let address_end = address as usize + data.len();
                 if address_end <= aux_data_end as usize {
                     self.memory_mmap.as_slice_mut()[address as usize..address as usize + data.len()].copy_from_slice(data);
                     return Ok(());
+                } else {
+                    false
                 }
+            } else if address >= memory_map.stack_address_low() {
+                u64::from(address) + data.len() as u64 <= u64::from(memory_map.stack_range().end)
+            } else if address >= memory_map.rw_data_address() {
+                let end = unsafe { *self.vmctx().heap_info.heap_threshold.get() };
+                u64::from(address) + data.len() as u64 <= end
+            } else {
+                false
+            };
+
+            if !is_ok {
+                return Err(MemoryAccessError {
+                    address,
+                    length: data.len() as u64,
+                    error: "invalid address range".into(),
+                });
             }
 
             let length = data.len();
