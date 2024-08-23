@@ -1381,6 +1381,86 @@ fn aux_data_works(config: Config) {
     assert_eq!(instance.read_u32(module.memory_map().aux_data_address()).unwrap(), 0);
 }
 
+fn access_memory_from_host(config: Config) {
+    let _ = env_logger::try_init();
+    let engine = Engine::new(&config).unwrap();
+    let page_size = get_native_page_size() as u32;
+    let mut builder = ProgramBlobBuilder::new();
+    builder.add_export_by_basic_block(0, b"main");
+    builder.set_code(&[asm::trap()], &[]);
+    builder.set_ro_data_size(1);
+    builder.set_rw_data_size(1);
+    builder.set_stack_size(1);
+
+    let blob = ProgramBlob::parse(builder.into_vec().into()).unwrap();
+    let mut module_config = ModuleConfig::new();
+    module_config.set_page_size(page_size);
+    module_config.set_aux_data_size(1);
+    let module = Module::from_blob(&engine, &module_config, blob).unwrap();
+    let memory_map = module.memory_map();
+
+    let mut instance = module.instantiate().unwrap();
+
+    let mut page_size_blob = Vec::new();
+    let mut page_size_blob_plus_1 = Vec::new();
+    page_size_blob.resize(page_size as usize, 1);
+    page_size_blob_plus_1.resize(page_size as usize + 1, 1);
+
+    let list = [
+        (memory_map.ro_data_range(), true),
+        (memory_map.rw_data_range(), false),
+        (memory_map.stack_range(), false),
+        (memory_map.aux_data_range(), false),
+    ];
+
+    for (range, is_read_only) in list {
+        log::debug!("Testing host access for range: 0x{:x}-0x{:x}", range.start, range.end);
+
+        // Partial writes should not clobber the memory region, so do the failing writes first.
+        assert!(instance.write_memory(range.start - 1, &[1]).is_err());
+        assert!(instance.write_memory(range.start + page_size, &[1]).is_err());
+        assert!(instance.write_memory(range.start, &page_size_blob_plus_1).is_err());
+        assert!(instance.read_memory(range.start, page_size).unwrap().iter().all(|&byte| byte == 0));
+
+        assert_eq!(instance.read_memory(range.start, 1).unwrap(), vec![0]);
+        assert_eq!(instance.read_memory(range.start + page_size - 1, 1).unwrap(), vec![0]);
+        assert_eq!(instance.read_memory(range.start, page_size).unwrap().len(), page_size as usize);
+        assert!(instance.read_memory(range.start - 1, 1).is_err());
+        assert!(instance.read_memory(range.start + page_size, 1).is_err());
+        assert!(instance.read_memory(range.start, page_size + 1).is_err());
+
+        if is_read_only {
+            assert!(instance.write_memory(range.start, &[1]).is_err());
+            assert!(instance.write_memory(range.start + page_size - 1, &[1]).is_err());
+            assert!(instance.write_memory(range.start, &page_size_blob).is_err());
+
+            assert!(instance.zero_memory(range.start, 1).is_err());
+            assert!(instance.zero_memory(range.start + page_size - 1, 1).is_err());
+            assert!(instance.zero_memory(range.start, page_size).is_err());
+        } else {
+            assert!(instance.write_memory(range.start, &[1]).is_ok());
+            assert_eq!(instance.read_memory(range.start, 2).unwrap(), vec![1, 0]);
+            assert!(instance.write_memory(range.start + page_size - 1, &[1]).is_ok());
+            assert!(instance.write_memory(range.start, &page_size_blob).is_ok());
+            assert!(instance.read_memory(range.start, page_size).unwrap().iter().all(|&byte| byte == 1));
+
+            assert!(instance.zero_memory(range.start, 1).is_ok());
+            assert!(instance.zero_memory(range.start + page_size - 1, 1).is_ok());
+            assert!(instance.zero_memory(range.start, page_size).is_ok());
+        }
+
+        assert_eq!(instance.read_memory(range.start, 0).unwrap(), vec![]);
+    }
+
+    // If length is zero then these should always succeed.
+    assert_eq!(instance.read_memory(0, 0).unwrap(), vec![]);
+    assert_eq!(instance.read_memory(0xffffffff, 0).unwrap(), vec![]);
+    assert!(instance.write_memory(0, &[]).is_ok());
+    assert!(instance.write_memory(0xffffffff, &[]).is_ok());
+    assert!(instance.zero_memory(0, 0).is_ok());
+    assert!(instance.zero_memory(0xffffffff, 0).is_ok());
+}
+
 struct TestInstance {
     module: crate::Module,
     instance: crate::Instance,
@@ -1972,6 +2052,7 @@ run_tests! {
     dispatch_table
     implicit_trap_after_fallthrough
     aux_data_works
+    access_memory_from_host
 
     test_blob_basic_test
     test_blob_atomic_fetch_add
