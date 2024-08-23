@@ -464,7 +464,6 @@ fn dynamic_jump_to_null(engine_config: Config) {
 }
 
 fn dynamic_paging_basic(mut engine_config: Config) {
-    engine_config.set_allow_experimental(true); // TODO: Delete this.
     engine_config.set_allow_dynamic_paging(true);
 
     let _ = env_logger::try_init();
@@ -541,7 +540,6 @@ fn dynamic_paging_basic(mut engine_config: Config) {
 }
 
 fn dynamic_paging_freeing_pages(mut engine_config: Config) {
-    engine_config.set_allow_experimental(true); // TODO: Delete this.
     engine_config.set_allow_dynamic_paging(true);
 
     let _ = env_logger::try_init();
@@ -581,7 +579,6 @@ fn dynamic_paging_stress_test(_engine_config: Config) {}
 #[cfg(feature = "std")]
 fn dynamic_paging_stress_test(mut engine_config: Config) {
     let _ = env_logger::try_init();
-    engine_config.set_allow_experimental(true); // TODO: Delete this.
     engine_config.set_allow_dynamic_paging(true);
     engine_config.set_worker_count(0);
 
@@ -621,7 +618,6 @@ fn dynamic_paging_stress_test(mut engine_config: Config) {
 }
 
 fn dynamic_paging_initialize_multiple_pages(mut engine_config: Config) {
-    engine_config.set_allow_experimental(true); // TODO: Delete this.
     engine_config.set_allow_dynamic_paging(true);
 
     let _ = env_logger::try_init();
@@ -657,7 +653,6 @@ fn dynamic_paging_initialize_multiple_pages(mut engine_config: Config) {
 }
 
 fn dynamic_paging_preinitialize_pages(mut engine_config: Config) {
-    engine_config.set_allow_experimental(true); // TODO: Delete this.
     engine_config.set_allow_dynamic_paging(true);
 
     let _ = env_logger::try_init();
@@ -690,7 +685,6 @@ fn dynamic_paging_preinitialize_pages(mut engine_config: Config) {
 }
 
 fn dynamic_paging_reading_does_not_resolve_segfaults(mut engine_config: Config) {
-    engine_config.set_allow_experimental(true); // TODO: Delete this.
     engine_config.set_allow_dynamic_paging(true);
 
     let _ = env_logger::try_init();
@@ -720,7 +714,6 @@ fn dynamic_paging_reading_does_not_resolve_segfaults(mut engine_config: Config) 
 }
 
 fn dynamic_paging_read_at_page_boundary(mut engine_config: Config) {
-    engine_config.set_allow_experimental(true); // TODO: Delete this.
     engine_config.set_allow_dynamic_paging(true);
 
     let _ = env_logger::try_init();
@@ -750,7 +743,6 @@ fn dynamic_paging_read_at_page_boundary(mut engine_config: Config) {
 }
 
 fn dynamic_paging_write_at_page_boundary_with_no_pages(mut engine_config: Config) {
-    engine_config.set_allow_experimental(true); // TODO: Delete this.
     engine_config.set_allow_dynamic_paging(true);
 
     let _ = env_logger::try_init();
@@ -785,7 +777,6 @@ fn dynamic_paging_write_at_page_boundary_with_no_pages(mut engine_config: Config
 }
 
 fn dynamic_paging_write_at_page_boundary_with_first_page(mut engine_config: Config) {
-    engine_config.set_allow_experimental(true); // TODO: Delete this.
     engine_config.set_allow_dynamic_paging(true);
 
     let _ = env_logger::try_init();
@@ -818,7 +809,6 @@ fn dynamic_paging_write_at_page_boundary_with_first_page(mut engine_config: Conf
 }
 
 fn dynamic_paging_write_at_page_boundary_with_second_page(mut engine_config: Config) {
-    engine_config.set_allow_experimental(true); // TODO: Delete this.
     engine_config.set_allow_dynamic_paging(true);
 
     let _ = env_logger::try_init();
@@ -851,7 +841,6 @@ fn dynamic_paging_write_at_page_boundary_with_second_page(mut engine_config: Con
 }
 
 fn dynamic_paging_change_written_value_and_address_during_segfault(mut engine_config: Config) {
-    engine_config.set_allow_experimental(true); // TODO: Delete this.
     engine_config.set_allow_dynamic_paging(true);
 
     let _ = env_logger::try_init();
@@ -884,7 +873,6 @@ fn dynamic_paging_change_written_value_and_address_during_segfault(mut engine_co
 }
 
 fn dynamic_paging_cancel_segfault_by_changing_address(mut engine_config: Config) {
-    engine_config.set_allow_experimental(true); // TODO: Delete this.
     engine_config.set_allow_dynamic_paging(true);
 
     let _ = env_logger::try_init();
@@ -915,7 +903,6 @@ fn dynamic_paging_cancel_segfault_by_changing_address(mut engine_config: Config)
 }
 
 fn dynamic_paging_worker_recycle_turn_dynamic_paging_on_and_off(mut engine_config: Config) {
-    engine_config.set_allow_experimental(true); // TODO: Delete this.
     engine_config.set_allow_dynamic_paging(true);
     engine_config.set_worker_count(1);
 
@@ -968,7 +955,6 @@ fn dynamic_paging_worker_recycle_turn_dynamic_paging_on_and_off(mut engine_confi
 }
 
 fn dynamic_paging_worker_recycle_during_segfault(mut engine_config: Config) {
-    engine_config.set_allow_experimental(true); // TODO: Delete this.
     engine_config.set_allow_dynamic_paging(true);
     engine_config.set_worker_count(1);
 
@@ -1022,7 +1008,6 @@ fn dynamic_paging_worker_recycle_during_segfault(mut engine_config: Config) {
 }
 
 fn dynamic_paging_change_program_counter_during_segfault(mut engine_config: Config) {
-    engine_config.set_allow_experimental(true); // TODO: Delete this.
     engine_config.set_allow_dynamic_paging(true);
 
     let _ = env_logger::try_init();
@@ -1234,7 +1219,6 @@ fn doom_o3_dwarf2(config: Config) {
 }
 
 fn pinky_dynamic_paging(mut config: Config) {
-    config.set_allow_experimental(true); // TODO: Delete this.
     config.set_allow_dynamic_paging(true);
     pinky_standard(config);
 }
