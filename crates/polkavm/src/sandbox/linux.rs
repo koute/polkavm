@@ -1985,7 +1985,33 @@ impl super::Sandbox for Sandbox {
             length
         );
 
+        let module = self.module.as_ref().unwrap();
         if !self.dynamic_paging_enabled {
+            let memory_map = module.memory_map();
+            let is_ok = if address >= memory_map.aux_data_address() {
+                if u64::from(address) + u64::from(length) <= u64::from(memory_map.aux_data_range().end) {
+                    self.memory_mmap.as_slice_mut()[address as usize..address as usize + length as usize].fill(0);
+                    return Ok(());
+                } else {
+                    false
+                }
+            } else if address >= memory_map.stack_address_low() {
+                u64::from(address) + u64::from(length) <= u64::from(memory_map.stack_range().end)
+            } else if address >= memory_map.rw_data_address() {
+                let end = unsafe { *self.vmctx().heap_info.heap_threshold.get() };
+                u64::from(address) + u64::from(length) <= end
+            } else {
+                false
+            };
+
+            if !is_ok {
+                return Err(MemoryAccessError {
+                    address,
+                    length: u64::from(length),
+                    error: "invalid address range".into(),
+                });
+            }
+
             self.vmctx().arg.store(address, Ordering::Relaxed);
             self.vmctx().arg2.store(length, Ordering::Relaxed);
             self.vmctx()
@@ -1999,7 +2025,6 @@ impl super::Sandbox for Sandbox {
                 });
             }
         } else {
-            let module = self.module.as_ref().unwrap();
             let page_start = module.address_to_page(module.round_to_page_size_down(address));
             let page_end = module.address_to_page(module.round_to_page_size_down(address + length));
             if module.is_multiple_of_page_size(address)
