@@ -78,6 +78,7 @@ impl InterpretedModule {
 pub(crate) struct BasicMemory {
     rw_data: Vec<u8>,
     stack: Vec<u8>,
+    aux: Vec<u8>,
     is_memory_dirty: bool,
     heap_size: u32,
 }
@@ -87,6 +88,7 @@ impl BasicMemory {
         Self {
             rw_data: Vec::new(),
             stack: Vec::new(),
+            aux: Vec::new(),
             is_memory_dirty: false,
             heap_size: 0,
         }
@@ -109,6 +111,7 @@ impl BasicMemory {
     fn force_reset(&mut self, module: &Module) {
         self.rw_data.clear();
         self.stack.clear();
+        self.aux.clear();
         self.heap_size = 0;
         self.is_memory_dirty = false;
 
@@ -116,13 +119,18 @@ impl BasicMemory {
             self.rw_data.extend_from_slice(&interpreted_module.rw_data);
             self.rw_data.resize(module.memory_map().rw_data_size() as usize, 0);
             self.stack.resize(module.memory_map().stack_size() as usize, 0);
+
+            // TODO: Do this lazily?
+            self.aux.resize(module.memory_map().aux_data_size() as usize, 0);
         }
     }
 
     #[inline]
     fn get_memory_slice<'a>(&'a self, module: &'a Module, address: u32, length: u32) -> Option<&'a [u8]> {
         let memory_map = module.memory_map();
-        let (start, memory_slice) = if address >= memory_map.stack_address_low() {
+        let (start, memory_slice) = if address >= memory_map.aux_data_address() {
+            (memory_map.aux_data_address(), &self.aux)
+        } else if address >= memory_map.stack_address_low() {
             (memory_map.stack_address_low(), &self.stack)
         } else if address >= memory_map.rw_data_address() {
             (memory_map.rw_data_address(), &self.rw_data)
@@ -138,9 +146,11 @@ impl BasicMemory {
     }
 
     #[inline]
-    fn get_memory_slice_mut(&mut self, module: &Module, address: u32, length: u32) -> Option<&mut [u8]> {
+    fn get_memory_slice_mut<const IS_EXTERNAL: bool>(&mut self, module: &Module, address: u32, length: u32) -> Option<&mut [u8]> {
         let memory_map = module.memory_map();
-        let (start, memory_slice) = if address >= memory_map.stack_address_low() {
+        let (start, memory_slice) = if IS_EXTERNAL && address >= memory_map.aux_data_address() {
+            (memory_map.aux_data_address(), &mut self.aux)
+        } else if address >= memory_map.stack_address_low() {
             (memory_map.stack_address_low(), &mut self.stack)
         } else if address >= memory_map.rw_data_address() {
             (memory_map.rw_data_address(), &mut self.rw_data)
@@ -443,7 +453,10 @@ impl InterpretedInstance {
 
     pub fn write_memory(&mut self, address: u32, data: &[u8]) -> Result<(), MemoryAccessError> {
         if !self.module.is_dynamic_paging() {
-            let Some(slice) = self.basic_memory.get_memory_slice_mut(&self.module, address, data.len() as u32) else {
+            let Some(slice) = self
+                .basic_memory
+                .get_memory_slice_mut::<true>(&self.module, address, data.len() as u32)
+            else {
                 return Err(MemoryAccessError {
                     address,
                     length: data.len() as u64,
@@ -472,7 +485,7 @@ impl InterpretedInstance {
 
     pub fn zero_memory(&mut self, address: u32, length: u32) -> Result<(), MemoryAccessError> {
         if !self.module.is_dynamic_paging() {
-            let Some(slice) = self.basic_memory.get_memory_slice_mut(&self.module, address, length) else {
+            let Some(slice) = self.basic_memory.get_memory_slice_mut::<true>(&self.module, address, length) else {
                 return Err(MemoryAccessError {
                     address,
                     length: u64::from(length),
@@ -965,7 +978,11 @@ impl<'a> Visitor<'a> {
         let value = T::into_bytes(value);
 
         if !IS_DYNAMIC {
-            let Some(slice) = self.inner.basic_memory.get_memory_slice_mut(&self.inner.module, address, length) else {
+            let Some(slice) = self
+                .inner
+                .basic_memory
+                .get_memory_slice_mut::<false>(&self.inner.module, address, length)
+            else {
                 if DEBUG {
                     log::debug!(
                         "Store of {length} bytes to 0x{address:x} failed! (pc = {program_counter}, cycle = {cycle})",
