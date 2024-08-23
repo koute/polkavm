@@ -1707,35 +1707,35 @@ impl<'a, 'b> InstructionVisitor for InstructionFormatter<'a, 'b> {
         let d = self.format_reg(d);
         let s1 = self.format_reg(s1);
         let s2 = self.format_reg(s2);
-        write!(self, "i64 {d} = {s1} <u {s2}")
+        write!(self, "{d} = {s1} <u64 {s2}")
     }
 
     fn set_less_than_signed_64(&mut self, d: RawReg, s1: RawReg, s2: RawReg) -> Self::ReturnTy {
         let d = self.format_reg(d);
         let s1 = self.format_reg(s1);
         let s2 = self.format_reg(s2);
-        write!(self, "i64 {d} = {s1} <s {s2}")
+        write!(self, "{d} = {s1} <s64 {s2}")
     }
 
     fn shift_logical_right_64(&mut self, d: RawReg, s1: RawReg, s2: RawReg) -> Self::ReturnTy {
         let d = self.format_reg(d);
         let s1 = self.format_reg(s1);
         let s2 = self.format_reg(s2);
-        write!(self, "i64 {d} = i64 {s1} >> i64 {s2}")
+        write!(self, "{d} = {s1} >>64 {s2}")
     }
 
     fn shift_arithmetic_right_64(&mut self, d: RawReg, s1: RawReg, s2: RawReg) -> Self::ReturnTy {
         let d = self.format_reg(d);
         let s1 = self.format_reg(s1);
         let s2 = self.format_reg(s2);
-        write!(self, "i64 {d} = i64 {s1} >>a i64 {s2}")
+        write!(self, "{d} = {s1} >>a64 {s2}")
     }
 
     fn shift_logical_left_64(&mut self, d: RawReg, s1: RawReg, s2: RawReg) -> Self::ReturnTy {
         let d = self.format_reg(d);
         let s1 = self.format_reg(s1);
         let s2 = self.format_reg(s2);
-        write!(self, "i64 {d} = i64 {s1} << i64 {s2}")
+        write!(self, "{d} = {s1} <<64 {s2}")
     }
 
     fn shift_logical_right(&mut self, d: RawReg, s1: RawReg, s2: RawReg) -> Self::ReturnTy {
@@ -2046,19 +2046,19 @@ impl<'a, 'b> InstructionVisitor for InstructionFormatter<'a, 'b> {
     fn shift_logical_right_64_imm(&mut self, d: RawReg, s1: RawReg, s2: u32) -> Self::ReturnTy {
         let d = self.format_reg(d);
         let s1 = self.format_reg(s1);
-        write!(self, "i64 {d} = i64 {s1} >> i64 {s2}")
+        write!(self, "{d} = {s1} >>64 {s2}")
     }
 
     fn shift_logical_right_64_imm_alt(&mut self, d: RawReg, s2: RawReg, s1: u32) -> Self::ReturnTy {
         let d = self.format_reg(d);
         let s2 = self.format_reg(s2);
-        write!(self, "i64 {d} = i64 {s1} >> i64 {s2}")
+        write!(self, "{d} = {s1} >>64 {s2}")
     }
 
     fn shift_arithmetic_right_64_imm(&mut self, d: RawReg, s1: RawReg, s2: u32) -> Self::ReturnTy {
         let d = self.format_reg(d);
         let s1 = self.format_reg(s1);
-        write!(self, "i64 {d} = i64 {s1} >>a i64 {s2}")
+        write!(self, "{d} = {s1} >>a64 {s2}")
     }
 
     fn shift_arithmetic_right_imm_alt(&mut self, d: RawReg, s2: RawReg, s1: u32) -> Self::ReturnTy {
@@ -2082,19 +2082,19 @@ impl<'a, 'b> InstructionVisitor for InstructionFormatter<'a, 'b> {
     fn shift_arithmetic_right_64_imm_alt(&mut self, d: RawReg, s2: RawReg, s1: u32) -> Self::ReturnTy {
         let d = self.format_reg(d);
         let s2 = self.format_reg(s2);
-        write!(self, "i64 {d} = i64 {s1} >>a i64 {s2}")
+        write!(self, "{d} = {s1} >>a64 {s2}")
     }
 
     fn shift_logical_left_64_imm(&mut self, d: RawReg, s1: RawReg, s2: u32) -> Self::ReturnTy {
         let d = self.format_reg(d);
         let s1 = self.format_reg(s1);
-        write!(self, "i64 {d} = i64 {s1} << i64 {s2}")
+        write!(self, "{d} = {s1} <<64 {s2}")
     }
 
     fn shift_logical_left_64_imm_alt(&mut self, d: RawReg, s2: RawReg, s1: u32) -> Self::ReturnTy {
         let d = self.format_reg(d);
         let s2 = self.format_reg(s2);
-        write!(self, "i64 {d} = i64 {s1} << i64 {s2}")
+        write!(self, "{d} = {s1} <<64 {s2}")
     }
 
     fn or_imm(&mut self, d: RawReg, s1: RawReg, s2: u32) -> Self::ReturnTy {
