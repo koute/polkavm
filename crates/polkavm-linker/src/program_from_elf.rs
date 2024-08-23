@@ -3912,7 +3912,8 @@ where
                         LoadKind::U64 => section
                             .data()
                             .get(target.offset as usize..target.offset as usize + 8)
-                            .map(|xs| u64::from_le_bytes([xs[0], xs[1], xs[2], xs[3], xs[4], xs[5], xs[6], xs[7]]) as i32),
+                            .map(|xs| u64::from_le_bytes([xs[0], xs[1], xs[2], xs[3], xs[4], xs[5], xs[6], xs[7]]))
+                            .map(|_| todo!("64bit support")),
                         LoadKind::U32 => section
                             .data()
                             .get(target.offset as usize..target.offset as usize + 4)
