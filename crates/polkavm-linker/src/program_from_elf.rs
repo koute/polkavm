@@ -6793,7 +6793,21 @@ where
 
             match lo_inst {
                 Inst::Load {
-                    kind: LoadKind::U32 | LoadKind::U64 | LoadKind::I32,
+                    kind: LoadKind::U64,
+                    base,
+                    dst,
+                    ..
+                } if elf.is_64() => {
+                    let Some(dst) = cast_reg_non_zero(dst)? else {
+                        return Err(ProgramFromElfError::other(format!(
+                            "{lo_rel_name} with a zero destination register: 0x{lo_inst_raw:08x} in {section_name}[0x{relative_lo:08x}]"
+                        )));
+                    };
+
+                    (base, InstExt::Basic(BasicInst::LoadAddressIndirect { dst, target }))
+                }
+                Inst::Load {
+                    kind: LoadKind::U32,
                     base,
                     dst,
                     ..
@@ -6970,8 +6984,7 @@ pub fn program_from_elf(config: Config, data: &[u8]) -> Result<Vec<u8>, ProgramF
         Ok(elf) => program_from_elf_internal(config, elf),
         Err(ProgramFromElfError(ProgramFromElfErrorKind::FailedToParseElf(e))) if e.to_string() == "Unsupported ELF header" => {
             let _elf = Elf::<object::elf::FileHeader64<object::endian::LittleEndian>>::parse(data)?;
-            todo!("64bit isn't fully supported yet");
-            //program_from_elf_internal(config, _elf)
+            Err(ProgramFromElfError::other("64bit isn't fully supported yet"))
         }
         Err(e) => Err(e),
     }
