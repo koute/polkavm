@@ -876,6 +876,13 @@ impl RawInstance {
         B: ?Sized + AsUninitSliceMut,
     {
         let slice = buffer.as_uninit_slice_mut();
+        if slice.is_empty() {
+            // SAFETY: The slice is empty so it's always safe to assume it's initialized.
+            unsafe {
+                return Ok(polkavm_common::utils::slice_assume_init_mut(slice));
+            }
+        }
+
         if address < 0x10000 {
             return Err(MemoryAccessError {
                 address,
@@ -892,13 +899,6 @@ impl RawInstance {
             });
         }
 
-        if slice.is_empty() {
-            // SAFETY: The slice is empty so it's always safe to assume it's initialized.
-            unsafe {
-                return Ok(polkavm_common::utils::slice_assume_init_mut(slice));
-            }
-        }
-
         access_backend!(self.backend, |backend| backend.read_memory_into(address, slice))
     }
 
@@ -907,6 +907,10 @@ impl RawInstance {
     /// When dynamic paging is enabled calling this can be used to resolve a segfault. It can also
     /// be used to preemptively initialize pages for which no segfault is currently triggered.
     pub fn write_memory(&mut self, address: u32, data: &[u8]) -> Result<(), MemoryAccessError> {
+        if data.is_empty() {
+            return Ok(());
+        }
+
         if address < 0x10000 {
             return Err(MemoryAccessError {
                 address,
@@ -921,10 +925,6 @@ impl RawInstance {
                 length: data.len() as u64,
                 error: "out of range write".into(),
             });
-        }
-
-        if data.is_empty() {
-            return Ok(());
         }
 
         let result = access_backend!(self.backend, |mut backend| backend.write_memory(address, data));
@@ -1017,10 +1017,15 @@ impl RawInstance {
     /// Fills the given memory region with zeros.
     ///
     /// `address` must be greater or equal to 0x10000 and `address + length` cannot be greater than 0x100000000.
+    /// If `length` is zero then this call has no effect and will always succeed.
     ///
     /// When dynamic paging is enabled calling this can be used to resolve a segfault. It can also
     /// be used to preemptively initialize pages for which no segfault is currently triggered.
     pub fn zero_memory(&mut self, address: u32, length: u32) -> Result<(), MemoryAccessError> {
+        if length == 0 {
+            return Ok(());
+        }
+
         if address < 0x10000 {
             return Err(MemoryAccessError {
                 address,
@@ -1035,10 +1040,6 @@ impl RawInstance {
                 length: u64::from(length),
                 error: "out of range write (address overflow)".into(),
             });
-        }
-
-        if length == 0 {
-            return Ok(());
         }
 
         let result = access_backend!(self.backend, |mut backend| backend.zero_memory(address, length));
@@ -1058,13 +1059,14 @@ impl RawInstance {
     /// Frees the given page(s).
     ///
     /// `address` must be a multiple of the page size. The value of `length` will be rounded up to the nearest multiple of the page size.
+    /// If `length` is zero then this call has no effect and will always succeed.
     pub fn free_pages(&mut self, address: u32, length: u32) -> Result<(), Error> {
-        if !self.module.is_multiple_of_page_size(address) {
-            return Err("address not a multiple of page size".into());
-        }
-
         if length == 0 {
             return Ok(());
+        }
+
+        if !self.module.is_multiple_of_page_size(address) {
+            return Err("address not a multiple of page size".into());
         }
 
         access_backend!(self.backend, |mut backend| backend
