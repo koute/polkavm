@@ -899,7 +899,30 @@ impl RawInstance {
             });
         }
 
-        access_backend!(self.backend, |backend| backend.read_memory_into(address, slice))
+        let length = slice.len();
+        let result = access_backend!(self.backend, |backend| backend.read_memory_into(address, slice));
+        if let Some(ref crosscheck) = self.crosscheck_instance {
+            let mut expected_data: Vec<core::mem::MaybeUninit<u8>> = alloc::vec![core::mem::MaybeUninit::new(0xfa); length];
+            let expected_result = crosscheck.read_memory_into(address, &mut expected_data);
+            let expected_success = expected_result.is_ok();
+            let success = result.is_ok();
+            let results_match = match (&result, &expected_result) {
+                (Ok(result), Ok(expected_result)) => result == expected_result,
+                (Err(_), Err(_)) => true,
+                _ => false,
+            };
+            if !results_match {
+                let address_end = u64::from(address) + length as u64;
+                if cfg!(debug_assertions) {
+                    if let (Ok(result), Ok(expected_result)) = (result, expected_result) {
+                        log::trace!("read_memory result (interpreter): {expected_result:?}");
+                        log::trace!("read_memory result (backend):     {result:?}");
+                    }
+                }
+                panic!("read_memory: crosscheck mismatch, range = 0x{address:x}..0x{address_end:x}, interpreter = {expected_success}, backend = {success}");
+            }
+        }
+        result
     }
 
     /// Writes into the VM's memory.
