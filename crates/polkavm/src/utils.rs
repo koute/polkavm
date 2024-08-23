@@ -29,6 +29,7 @@ pub struct GuestInit<'a> {
     pub ro_data_size: u32,
     pub rw_data_size: u32,
     pub stack_size: u32,
+    pub aux_data_size: u32,
 }
 
 impl<'a> GuestInit<'a> {
@@ -37,6 +38,7 @@ impl<'a> GuestInit<'a> {
             .ro_data_size(self.ro_data_size)
             .rw_data_size(self.rw_data_size)
             .stack_size(self.stack_size)
+            .aux_data_size(self.aux_data_size)
             .build()
     }
 }

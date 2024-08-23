@@ -4,8 +4,7 @@ use alloc::format;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 
-use polkavm_common::abi::{MemoryMap, MemoryMapBuilder};
-use polkavm_common::abi::{VM_ADDR_RETURN_TO_HOST, VM_ADDR_USER_STACK_HIGH};
+use polkavm_common::abi::{MemoryMap, MemoryMapBuilder, VM_ADDR_RETURN_TO_HOST};
 use polkavm_common::program::{FrameKind, Imports, Reg};
 use polkavm_common::program::{Instructions, JumpTable, ProgramBlob};
 use polkavm_common::utils::{ArcBytes, AsUninitSliceMut};
@@ -329,6 +328,7 @@ impl Module {
             ro_data_size: blob.ro_data_size(),
             rw_data_size: blob.rw_data_size(),
             stack_size: blob.stack_size(),
+            aux_data_size: config.aux_data_size(),
         };
 
         #[allow(unused_macros)]
@@ -435,6 +435,13 @@ impl Module {
             memory_map.stack_range().end,
             blob.stack_size(),
             memory_map.stack_range().len(),
+        );
+        log::debug!(
+            "  Memory map:     Aux: 0x{:08x}..0x{:08x} ({}/{} bytes requested)",
+            memory_map.aux_data_range().start,
+            memory_map.aux_data_range().end,
+            config.aux_data_size(),
+            memory_map.aux_data_range().len(),
         );
 
         let page_shift = memory_map.page_size().ilog2();
@@ -1093,15 +1100,16 @@ impl RawInstance {
     ///
     /// This function will:
     ///   1) clear all registers to zero,
-    ///   2) initialize `RA` and `SP` to `0xffff0000`,
-    ///   3) set the program counter.
+    ///   2) initialize `RA` to `0xffff0000`,
+    ///   3) initialize `SP` to its default value,
+    ///   4) set the program counter.
     ///
     /// Will panic if `args` has more than 9 elements.
     pub fn prepare_call_untyped(&mut self, pc: ProgramCounter, args: &[RegValue]) {
         assert!(args.len() <= Reg::ARG_REGS.len(), "too many arguments");
 
         self.clear_regs();
-        self.set_reg(Reg::SP, VM_ADDR_USER_STACK_HIGH);
+        self.set_reg(Reg::SP, self.module.default_sp());
         self.set_reg(Reg::RA, VM_ADDR_RETURN_TO_HOST);
         self.set_next_program_counter(pc);
 

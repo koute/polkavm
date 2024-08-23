@@ -1342,6 +1342,45 @@ fn implicit_trap_after_fallthrough(config: Config) {
     assert_eq!(instance.next_program_counter(), None);
 }
 
+fn aux_data_works(config: Config) {
+    let _ = env_logger::try_init();
+    let engine = Engine::new(&config).unwrap();
+    let page_size = get_native_page_size() as u32;
+    let mut builder = ProgramBlobBuilder::new();
+    builder.add_export_by_basic_block(0, b"main");
+    builder.set_code(
+        &[
+            asm::load_indirect_u32(Reg::A1, Reg::A0, 0),
+            asm::store_imm_indirect_u32(Reg::A0, 0, 0x11223344),
+            asm::ret(),
+        ],
+        &[],
+    );
+
+    let blob = ProgramBlob::parse(builder.into_vec().into()).unwrap();
+    let mut module_config = ModuleConfig::new();
+    module_config.set_page_size(page_size);
+    module_config.set_aux_data_size(1);
+    let module = Module::from_blob(&engine, &module_config, blob).unwrap();
+    let offsets: Vec<_> = module.instructions_at(ProgramCounter(0)).unwrap().map(|inst| inst.offset).collect();
+
+    let mut instance = module.instantiate().unwrap();
+    instance.write_u32(module.memory_map().aux_data_address(), 0x12345678).unwrap();
+    instance.set_reg(Reg::A0, module.memory_map().aux_data_address());
+    instance.set_reg(Reg::RA, crate::RETURN_TO_HOST);
+    instance.set_next_program_counter(offsets[0]);
+    match_interrupt!(instance.run().unwrap(), InterruptKind::Trap);
+    assert_eq!(instance.program_counter().unwrap(), offsets[1]);
+    assert_eq!(instance.reg(Reg::A1), 0x12345678);
+
+    instance.zero_memory(module.memory_map().aux_data_address(), 1).unwrap();
+    assert_eq!(instance.read_u32(module.memory_map().aux_data_address()).unwrap(), 0x12345600);
+    instance
+        .zero_memory(module.memory_map().aux_data_address(), module.memory_map().aux_data_size())
+        .unwrap();
+    assert_eq!(instance.read_u32(module.memory_map().aux_data_address()).unwrap(), 0);
+}
+
 struct TestInstance {
     module: crate::Module,
     instance: crate::Instance,
@@ -1932,6 +1971,7 @@ run_tests! {
     pinky_dynamic_paging
     dispatch_table
     implicit_trap_after_fallthrough
+    aux_data_works
 
     test_blob_basic_test
     test_blob_atomic_fetch_add

@@ -771,11 +771,17 @@ unsafe fn child_main(zygote_memfd: Fd, child_socket: Fd, uid_map: &str, gid_map:
 #[derive(Clone)]
 pub struct SandboxProgram(Arc<SandboxProgramInner>);
 
+enum InitializeWith {
+    None,
+    Shm(ShmAllocation),
+    Mem(u32),
+}
+
 struct ProgramMap {
     address: u64,
     length: u64,
     is_writable: bool,
-    initialize_with: Option<ShmAllocation>,
+    initialize_with: InitializeWith,
 }
 
 struct SandboxProgramInner {
@@ -1107,7 +1113,7 @@ impl super::Sandbox for Sandbox {
                     address: u64::from(cfg.ro_data_address()),
                     length: physical_size,
                     is_writable: false,
-                    initialize_with: Some(shm_ro_data),
+                    initialize_with: InitializeWith::Shm(shm_ro_data),
                 });
             }
 
@@ -1117,7 +1123,7 @@ impl super::Sandbox for Sandbox {
                     address: u64::from(cfg.ro_data_address()) + physical_size,
                     length: padding,
                     is_writable: false,
-                    initialize_with: None,
+                    initialize_with: InitializeWith::None,
                 });
             }
         }
@@ -1130,7 +1136,7 @@ impl super::Sandbox for Sandbox {
                     address: u64::from(cfg.rw_data_address()),
                     length: physical_size,
                     is_writable: true,
-                    initialize_with: Some(shm_rw_data),
+                    initialize_with: InitializeWith::Shm(shm_rw_data),
                 });
             }
 
@@ -1140,7 +1146,7 @@ impl super::Sandbox for Sandbox {
                     address: u64::from(cfg.rw_data_address()) + physical_size,
                     length: padding,
                     is_writable: true,
-                    initialize_with: None,
+                    initialize_with: InitializeWith::None,
                 });
             }
         }
@@ -1150,7 +1156,16 @@ impl super::Sandbox for Sandbox {
                 address: u64::from(cfg.stack_address_low()),
                 length: u64::from(cfg.stack_size()),
                 is_writable: true,
-                initialize_with: None,
+                initialize_with: InitializeWith::None,
+            });
+        }
+
+        if cfg.aux_data_size() > 0 {
+            memory_map.push(ProgramMap {
+                address: u64::from(cfg.aux_data_address()),
+                length: u64::from(cfg.aux_data_size()),
+                is_writable: false,
+                initialize_with: InitializeWith::Mem(cfg.aux_data_address()),
             });
         }
 
@@ -1467,10 +1482,12 @@ impl super::Sandbox for Sandbox {
         vmctx.futex.store(VMCTX_FUTEX_BUSY, Ordering::Release);
         linux_raw::sys_futex_wake_one(&vmctx.futex)?;
 
-        let (iouring, memory_mmap, userfaultfd) = if global.uffd_available {
+        // TODO: If not using userfaultfd then don't mmap all of this immediately.
+        let (memory_memfd, memory_mmap) = prepare_memory()?;
+        linux_raw::sendfd(socket.borrow(), memory_memfd.borrow())?;
+
+        let (iouring, userfaultfd) = if global.uffd_available {
             let iouring = linux_raw::IoUring::new(3)?;
-            let (memory_memfd, memory_mmap) = prepare_memory()?;
-            linux_raw::sendfd(socket.borrow(), memory_memfd.borrow())?;
 
             let userfaultfd = linux_raw::recvfd(socket.borrow()).map_err(|error| {
                 let mut error = format!("failed to fetch the userfaultfd from the child process: {error}");
@@ -1492,9 +1509,9 @@ impl super::Sandbox for Sandbox {
 
             linux_raw::sys_ptrace_seize(child.pid)?;
 
-            (Some(iouring), memory_mmap, userfaultfd)
+            (Some(iouring), userfaultfd)
         } else {
-            (None, Mmap::default(), Fd::from_raw_unchecked(-1))
+            (None, Fd::from_raw_unchecked(-1))
         };
 
         // Close the socket; we don't need it anymore.
@@ -1592,17 +1609,23 @@ impl super::Sandbox for Sandbox {
 
             let vm_maps = unsafe { memory_map.as_typed_slice_mut::<VmMap>() };
             for (chunk, vm_map) in program.memory_map.iter().zip(vm_maps.iter_mut()) {
+                let (fd, fd_offset) = match chunk.initialize_with {
+                    InitializeWith::None => (VmFd::None, 0),
+                    InitializeWith::Shm(ref alloc) => (VmFd::Shm, alloc.offset() as u64),
+                    InitializeWith::Mem(offset) => (VmFd::Mem, u64::from(offset)),
+                };
+
                 *vm_map = VmMap {
                     address: chunk.address,
                     length: chunk.length,
                     protection: linux_raw::PROT_READ | if chunk.is_writable { linux_raw::PROT_WRITE } else { 0 },
-                    flags: if chunk.initialize_with.is_some() {
+                    flags: if !matches!(chunk.initialize_with, InitializeWith::None) {
                         linux_raw::MAP_FIXED | linux_raw::MAP_PRIVATE
                     } else {
                         linux_raw::MAP_FIXED | linux_raw::MAP_PRIVATE | linux_raw::MAP_ANONYMOUS
                     },
-                    fd: if chunk.initialize_with.is_some() { VmFd::Shm } else { VmFd::None },
-                    fd_offset: chunk.initialize_with.as_ref().map_or(0, |alloc| alloc.offset() as u64),
+                    fd,
+                    fd_offset,
                 };
             }
 
@@ -1918,7 +1941,19 @@ impl super::Sandbox for Sandbox {
             return Ok(());
         }
 
+        let module = self.module.as_ref().unwrap();
         if !self.dynamic_paging_enabled {
+            let aux_data_address = module.memory_map().aux_data_address();
+            if address >= aux_data_address {
+                let aux_data_size = module.memory_map().aux_data_size();
+                let aux_data_end = aux_data_address + aux_data_size;
+                let address_end = address as usize + data.len();
+                if address_end <= aux_data_end as usize {
+                    self.memory_mmap.as_slice_mut()[address as usize..address as usize + data.len()].copy_from_slice(data);
+                    return Ok(());
+                }
+            }
+
             let length = data.len();
             match linux_raw::vm_write_memory(self.child.pid, [data], [(address as usize, length)]) {
                 Ok(actual_length) if actual_length == length => Ok(()),
@@ -1934,7 +1969,6 @@ impl super::Sandbox for Sandbox {
                 }),
             }
         } else {
-            let module = self.module.as_ref().unwrap();
             let page_start = module.address_to_page(module.round_to_page_size_down(address));
             let page_end = module.address_to_page(module.round_to_page_size_down(address + data.len() as u32));
             self.page_set.insert((page_start, page_end));
