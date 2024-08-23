@@ -1899,16 +1899,8 @@ impl super::Sandbox for Sandbox {
             let length = slice.len();
             match linux_raw::vm_read_memory(self.child.pid, [slice], [(address as usize, length)]) {
                 Ok(actual_length) if actual_length == length => unsafe { Ok(slice_assume_init_mut(slice)) },
-                Ok(_) => Err(MemoryAccessError {
-                    address,
-                    length: slice.len() as u64,
-                    error: "incomplete read".into(),
-                }),
-                Err(error) => Err(MemoryAccessError {
-                    address,
-                    length: slice.len() as u64,
-                    error: error.to_string().into(),
-                }),
+                Ok(_) => Err(MemoryAccessError::Error("incomplete read".into())),
+                Err(error) => Err(MemoryAccessError::Error(error.into())),
             }
         } else {
             let module = self.module.as_ref().unwrap();
@@ -1964,26 +1956,17 @@ impl super::Sandbox for Sandbox {
             };
 
             if !is_ok {
-                return Err(MemoryAccessError {
+                return Err(MemoryAccessError::OutOfRangeAccess {
                     address,
                     length: data.len() as u64,
-                    error: "invalid address range".into(),
                 });
             }
 
             let length = data.len();
             match linux_raw::vm_write_memory(self.child.pid, [data], [(address as usize, length)]) {
                 Ok(actual_length) if actual_length == length => Ok(()),
-                Ok(_) => Err(MemoryAccessError {
-                    address,
-                    length: data.len() as u64,
-                    error: "incomplete write".into(),
-                }),
-                Err(error) => Err(MemoryAccessError {
-                    address,
-                    length: data.len() as u64,
-                    error: error.to_string().into(),
-                }),
+                Ok(_) => Err(MemoryAccessError::Error("incomplete write".into())),
+                Err(error) => Err(MemoryAccessError::Error(error.into())),
             }
         } else {
             let page_start = module.address_to_page(module.round_to_page_size_down(address));
@@ -2022,10 +2005,9 @@ impl super::Sandbox for Sandbox {
             };
 
             if !is_ok {
-                return Err(MemoryAccessError {
+                return Err(MemoryAccessError::OutOfRangeAccess {
                     address,
                     length: u64::from(length),
-                    error: "invalid address range".into(),
                 });
             }
 
@@ -2035,11 +2017,7 @@ impl super::Sandbox for Sandbox {
                 .jump_into
                 .store(ZYGOTE_TABLES.1.ext_zero_memory_chunk, Ordering::Relaxed);
             if let Err(error) = self.wake_oneshot_and_expect_idle() {
-                return Err(MemoryAccessError {
-                    address,
-                    length: u64::from(length),
-                    error: error.to_string().into(),
-                });
+                return Err(MemoryAccessError::Error(error.into()));
             }
         } else {
             let page_start = module.address_to_page(module.round_to_page_size_down(address));
@@ -2060,11 +2038,7 @@ impl super::Sandbox for Sandbox {
                 );
 
                 if let Err(error) = linux_raw::sys_uffdio_zeropage(self.userfaultfd.borrow(), &mut arg) {
-                    return Err(MemoryAccessError {
-                        address,
-                        length: u64::from(length),
-                        error: error.to_string().into(),
-                    });
+                    return Err(MemoryAccessError::Error(error.into()));
                 }
             } else {
                 self.memory_mmap.as_slice_mut()[address as usize..address as usize + length as usize].fill(0);

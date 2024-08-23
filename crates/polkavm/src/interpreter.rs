@@ -416,10 +416,9 @@ impl InterpretedInstance {
     ) -> Result<&'slice mut [u8], MemoryAccessError> {
         if !self.module.is_dynamic_paging() {
             let Some(slice) = self.basic_memory.get_memory_slice(&self.module, address, buffer.len() as u32) else {
-                return Err(MemoryAccessError {
+                return Err(MemoryAccessError::OutOfRangeAccess {
                     address,
                     length: buffer.len() as u64,
-                    error: "out of range read".into(),
                 });
             };
 
@@ -458,10 +457,9 @@ impl InterpretedInstance {
                 .basic_memory
                 .get_memory_slice_mut::<true>(&self.module, address, data.len() as u32)
             else {
-                return Err(MemoryAccessError {
+                return Err(MemoryAccessError::OutOfRangeAccess {
                     address,
                     length: data.len() as u64,
-                    error: "out of range write".into(),
                 });
             };
 
@@ -486,10 +484,9 @@ impl InterpretedInstance {
     pub fn zero_memory(&mut self, address: u32, length: u32) -> Result<(), MemoryAccessError> {
         if !self.module.is_dynamic_paging() {
             let Some(slice) = self.basic_memory.get_memory_slice_mut::<true>(&self.module, address, length) else {
-                return Err(MemoryAccessError {
+                return Err(MemoryAccessError::OutOfRangeAccess {
                     address,
                     length: u64::from(length),
-                    error: "out of range write (of zeroes)".into(),
                 });
             };
 

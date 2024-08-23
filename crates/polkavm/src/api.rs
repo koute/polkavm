@@ -1,4 +1,3 @@
-use alloc::borrow::Cow;
 use alloc::boxed::Box;
 use alloc::format;
 use alloc::sync::Arc;
@@ -656,12 +655,11 @@ if_compiler_is_supported! {
     }
 }
 
+/// The host failed to access the guest's memory.
 #[derive(Debug)]
-#[non_exhaustive]
-pub struct MemoryAccessError {
-    pub address: u32,
-    pub length: u64,
-    pub error: Cow<'static, str>,
+pub enum MemoryAccessError {
+    OutOfRangeAccess { address: u32, length: u64 },
+    Error(Error),
 }
 
 #[cfg(feature = "std")]
@@ -669,14 +667,20 @@ impl std::error::Error for MemoryAccessError {}
 
 impl core::fmt::Display for MemoryAccessError {
     fn fmt(&self, fmt: &mut core::fmt::Formatter) -> core::fmt::Result {
-        write!(
-            fmt,
-            "out of range memory access in 0x{:x}-0x{:x} ({} bytes): {}",
-            self.address,
-            u64::from(self.address) + self.length,
-            self.length,
-            self.error
-        )
+        match self {
+            MemoryAccessError::OutOfRangeAccess { address, length } => {
+                write!(
+                    fmt,
+                    "out of range memory access in 0x{:x}-0x{:x} ({} bytes)",
+                    address,
+                    u64::from(*address) + length,
+                    length
+                )
+            }
+            MemoryAccessError::Error(error) => {
+                write!(fmt, "memory access failed: {error}")
+            }
+        }
     }
 }
 
@@ -880,18 +884,16 @@ impl RawInstance {
         }
 
         if address < 0x10000 {
-            return Err(MemoryAccessError {
+            return Err(MemoryAccessError::OutOfRangeAccess {
                 address,
                 length: slice.len() as u64,
-                error: "out of range read (accessing addresses lower than 0x10000 is forbidden)".into(),
             });
         }
 
         if u64::from(address) + slice.len() as u64 > 0x100000000 {
-            return Err(MemoryAccessError {
+            return Err(MemoryAccessError::OutOfRangeAccess {
                 address,
                 length: slice.len() as u64,
-                error: "out of range read".into(),
             });
         }
 
@@ -931,18 +933,16 @@ impl RawInstance {
         }
 
         if address < 0x10000 {
-            return Err(MemoryAccessError {
+            return Err(MemoryAccessError::OutOfRangeAccess {
                 address,
                 length: data.len() as u64,
-                error: "out of range write (accessing addresses lower than 0x10000 is forbidden)".into(),
             });
         }
 
         if u64::from(address) + data.len() as u64 > 0x100000000 {
-            return Err(MemoryAccessError {
+            return Err(MemoryAccessError::OutOfRangeAccess {
                 address,
                 length: data.len() as u64,
-                error: "out of range write".into(),
             });
         }
 
@@ -1046,18 +1046,16 @@ impl RawInstance {
         }
 
         if address < 0x10000 {
-            return Err(MemoryAccessError {
+            return Err(MemoryAccessError::OutOfRangeAccess {
                 address,
                 length: u64::from(length),
-                error: "out of range write (accessing addresses lower than 0x10000 is forbidden)".into(),
             });
         }
 
         if u64::from(address) + u64::from(length) > 0x100000000 {
-            return Err(MemoryAccessError {
+            return Err(MemoryAccessError::OutOfRangeAccess {
                 address,
                 length: u64::from(length),
-                error: "out of range write (address overflow)".into(),
             });
         }
 
