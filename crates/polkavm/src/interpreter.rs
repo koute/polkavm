@@ -2755,6 +2755,14 @@ impl<'a, const DEBUG: bool, const STEP_TRACING: bool> InstructionVisitor for Com
         emit!(self, set_less_than_signed(d, s1, s2));
     }
 
+    fn set_less_than_unsigned_64(&mut self, _d: RawReg, _s1: RawReg, _s2: RawReg) -> Self::ReturnTy {
+        self.trap()
+    }
+
+    fn set_less_than_signed_64(&mut self, _d: RawReg, _s1: RawReg, _s2: RawReg) -> Self::ReturnTy {
+        self.trap()
+    }
+
     fn shift_logical_right(&mut self, d: RawReg, s1: RawReg, s2: RawReg) -> Self::ReturnTy {
         emit!(self, shift_logical_right(d, s1, s2));
     }
@@ -2765,6 +2773,18 @@ impl<'a, const DEBUG: bool, const STEP_TRACING: bool> InstructionVisitor for Com
 
     fn shift_logical_left(&mut self, d: RawReg, s1: RawReg, s2: RawReg) -> Self::ReturnTy {
         emit!(self, shift_logical_left(d, s1, s2));
+    }
+
+    fn shift_logical_right_64(&mut self, _d: RawReg, _s1: RawReg, _s2: RawReg) -> Self::ReturnTy {
+        self.trap()
+    }
+
+    fn shift_arithmetic_right_64(&mut self, _d: RawReg, _s1: RawReg, _s2: RawReg) -> Self::ReturnTy {
+        self.trap()
+    }
+
+    fn shift_logical_left_64(&mut self, _d: RawReg, _s1: RawReg, _s2: RawReg) -> Self::ReturnTy {
+        self.trap()
     }
 
     fn xor(&mut self, d: RawReg, s1: RawReg, s2: RawReg) -> Self::ReturnTy {
@@ -2779,12 +2799,32 @@ impl<'a, const DEBUG: bool, const STEP_TRACING: bool> InstructionVisitor for Com
         emit!(self, or(d, s1, s2));
     }
 
+    fn xor_64(&mut self, _d: RawReg, _s1: RawReg, _s2: RawReg) -> Self::ReturnTy {
+        self.trap()
+    }
+
+    fn and_64(&mut self, _d: RawReg, _s1: RawReg, _s2: RawReg) -> Self::ReturnTy {
+        self.trap()
+    }
+
+    fn or_64(&mut self, _d: RawReg, _s1: RawReg, _s2: RawReg) -> Self::ReturnTy {
+        self.trap()
+    }
+
     fn add(&mut self, d: RawReg, s1: RawReg, s2: RawReg) -> Self::ReturnTy {
         emit!(self, add(d, s1, s2));
     }
 
+    fn add_64(&mut self, _d: RawReg, _s1: RawReg, _s2: RawReg) -> Self::ReturnTy {
+        self.trap()
+    }
+
     fn sub(&mut self, d: RawReg, s1: RawReg, s2: RawReg) -> Self::ReturnTy {
         emit!(self, sub(d, s1, s2));
+    }
+
+    fn sub_64(&mut self, _d: RawReg, _s1: RawReg, _s2: RawReg) -> Self::ReturnTy {
+        self.trap()
     }
 
     fn negate_and_add_imm(&mut self, d: RawReg, s1: RawReg, s2: u32) -> Self::ReturnTy {
@@ -2795,8 +2835,36 @@ impl<'a, const DEBUG: bool, const STEP_TRACING: bool> InstructionVisitor for Com
         emit!(self, mul(d, s1, s2));
     }
 
+    fn mul_64(&mut self, _d: RawReg, _s1: RawReg, _s2: RawReg) -> Self::ReturnTy {
+        self.trap()
+    }
+
     fn mul_imm(&mut self, d: RawReg, s1: RawReg, s2: u32) -> Self::ReturnTy {
         emit!(self, mul_imm(d, s1, s2));
+    }
+
+    fn mul_64_imm(&mut self, _d: RawReg, _s1: RawReg, _s2: u32) -> Self::ReturnTy {
+        self.trap()
+    }
+
+    fn mul_upper_signed_signed_imm_64(&mut self, _: RawReg, _: RawReg, _: u32) -> <Self as InstructionVisitor>::ReturnTy {
+        self.trap()
+    }
+
+    fn mul_upper_unsigned_unsigned_imm_64(&mut self, _: RawReg, _: RawReg, _: u32) -> <Self as InstructionVisitor>::ReturnTy {
+        self.trap()
+    }
+
+    fn mul_upper_signed_signed_64(&mut self, _: RawReg, _: RawReg, _: RawReg) -> <Self as InstructionVisitor>::ReturnTy {
+        self.trap()
+    }
+
+    fn mul_upper_unsigned_unsigned_64(&mut self, _: RawReg, _: RawReg, _: RawReg) -> <Self as InstructionVisitor>::ReturnTy {
+        self.trap()
+    }
+
+    fn mul_upper_signed_unsigned_64(&mut self, _: RawReg, _: RawReg, _: RawReg) -> <Self as InstructionVisitor>::ReturnTy {
+        self.trap()
     }
 
     fn mul_upper_signed_signed(&mut self, d: RawReg, s1: RawReg, s2: RawReg) -> Self::ReturnTy {
@@ -2835,6 +2903,22 @@ impl<'a, const DEBUG: bool, const STEP_TRACING: bool> InstructionVisitor for Com
         emit!(self, rem_signed(d, s1, s2));
     }
 
+    fn div_unsigned_64(&mut self, _d: RawReg, _s1: RawReg, _s2: RawReg) -> Self::ReturnTy {
+        self.trap()
+    }
+
+    fn div_signed_64(&mut self, _d: RawReg, _s1: RawReg, _s2: RawReg) -> Self::ReturnTy {
+        self.trap()
+    }
+
+    fn rem_unsigned_64(&mut self, _d: RawReg, _s1: RawReg, _s2: RawReg) -> Self::ReturnTy {
+        self.trap()
+    }
+
+    fn rem_signed_64(&mut self, _d: RawReg, _s1: RawReg, _s2: RawReg) -> Self::ReturnTy {
+        self.trap()
+    }
+
     fn set_less_than_unsigned_imm(&mut self, d: RawReg, s1: RawReg, s2: u32) -> Self::ReturnTy {
         emit!(self, set_less_than_unsigned_imm(d, s1, s2));
     }
@@ -2849,6 +2933,22 @@ impl<'a, const DEBUG: bool, const STEP_TRACING: bool> InstructionVisitor for Com
 
     fn set_greater_than_signed_imm(&mut self, d: RawReg, s1: RawReg, s2: u32) -> Self::ReturnTy {
         emit!(self, set_greater_than_signed_imm(d, s1, s2));
+    }
+
+    fn set_less_than_unsigned_64_imm(&mut self, _d: RawReg, _s1: RawReg, _s2: u32) -> Self::ReturnTy {
+        self.trap()
+    }
+
+    fn set_greater_than_unsigned_64_imm(&mut self, _d: RawReg, _s1: RawReg, _s2: u32) -> Self::ReturnTy {
+        self.trap()
+    }
+
+    fn set_less_than_signed_64_imm(&mut self, _d: RawReg, _s1: RawReg, _s2: u32) -> Self::ReturnTy {
+        self.trap()
+    }
+
+    fn set_greater_than_signed_64_imm(&mut self, _d: RawReg, _s1: RawReg, _s2: u32) -> Self::ReturnTy {
+        self.trap()
     }
 
     fn shift_logical_right_imm(&mut self, d: RawReg, s1: RawReg, s2: u32) -> Self::ReturnTy {
@@ -2875,6 +2975,30 @@ impl<'a, const DEBUG: bool, const STEP_TRACING: bool> InstructionVisitor for Com
         emit!(self, shift_logical_left_imm_alt(d, s2, s1));
     }
 
+    fn shift_logical_right_64_imm(&mut self, _d: RawReg, _s1: RawReg, _s2: u32) -> Self::ReturnTy {
+        self.trap()
+    }
+
+    fn shift_logical_right_64_imm_alt(&mut self, _d: RawReg, _s2: RawReg, _s1: u32) -> Self::ReturnTy {
+        self.trap()
+    }
+
+    fn shift_arithmetic_right_64_imm(&mut self, _d: RawReg, _s1: RawReg, _s2: u32) -> Self::ReturnTy {
+        self.trap()
+    }
+
+    fn shift_arithmetic_right_64_imm_alt(&mut self, _d: RawReg, _s2: RawReg, _s1: u32) -> Self::ReturnTy {
+        self.trap()
+    }
+
+    fn shift_logical_left_64_imm(&mut self, _d: RawReg, _s1: RawReg, _s2: u32) -> Self::ReturnTy {
+        self.trap()
+    }
+
+    fn shift_logical_left_64_imm_alt(&mut self, _d: RawReg, _s2: RawReg, _s1: u32) -> Self::ReturnTy {
+        self.trap()
+    }
+
     fn or_imm(&mut self, d: RawReg, s1: RawReg, s2: u32) -> Self::ReturnTy {
         emit!(self, or_imm(d, s1, s2));
     }
@@ -2885,6 +3009,18 @@ impl<'a, const DEBUG: bool, const STEP_TRACING: bool> InstructionVisitor for Com
 
     fn xor_imm(&mut self, d: RawReg, s1: RawReg, s2: u32) -> Self::ReturnTy {
         emit!(self, xor_imm(d, s1, s2));
+    }
+
+    fn or_64_imm(&mut self, _d: RawReg, _s1: RawReg, _s2: u32) -> Self::ReturnTy {
+        self.trap()
+    }
+
+    fn and_64_imm(&mut self, _d: RawReg, _s1: RawReg, _s2: u32) -> Self::ReturnTy {
+        self.trap()
+    }
+
+    fn xor_64_imm(&mut self, _d: RawReg, _s1: RawReg, _s2: u32) -> Self::ReturnTy {
+        self.trap()
     }
 
     fn load_imm(&mut self, dst: RawReg, imm: u32) -> Self::ReturnTy {
@@ -2909,6 +3045,10 @@ impl<'a, const DEBUG: bool, const STEP_TRACING: bool> InstructionVisitor for Com
 
     fn cmov_if_not_zero_imm(&mut self, d: RawReg, c: RawReg, s: u32) -> Self::ReturnTy {
         emit!(self, cmov_if_not_zero_imm(d, c, s));
+    }
+
+    fn add_64_imm(&mut self, _d: RawReg, _s1: RawReg, _s2: u32) -> Self::ReturnTy {
+        self.trap()
     }
 
     fn add_imm(&mut self, d: RawReg, s1: RawReg, s2: u32) -> Self::ReturnTy {
@@ -2939,6 +3079,10 @@ impl<'a, const DEBUG: bool, const STEP_TRACING: bool> InstructionVisitor for Com
         }
     }
 
+    fn store_imm_u64(&mut self, _offset: u32, _value: u32) -> Self::ReturnTy {
+        self.trap()
+    }
+
     fn store_imm_indirect_u8(&mut self, base: RawReg, offset: u32, value: u32) -> Self::ReturnTy {
         if !self.module.is_dynamic_paging() {
             emit!(self, store_imm_indirect_u8_basic(self.program_counter, base, offset, value));
@@ -2961,6 +3105,10 @@ impl<'a, const DEBUG: bool, const STEP_TRACING: bool> InstructionVisitor for Com
         } else {
             emit!(self, store_imm_indirect_u32_dynamic(self.program_counter, base, offset, value));
         }
+    }
+
+    fn store_imm_indirect_u64(&mut self, _base: RawReg, _offset: u32, _value: u32) -> Self::ReturnTy {
+        self.trap()
     }
 
     fn store_indirect_u8(&mut self, src: RawReg, base: RawReg, offset: u32) -> Self::ReturnTy {
@@ -2987,6 +3135,10 @@ impl<'a, const DEBUG: bool, const STEP_TRACING: bool> InstructionVisitor for Com
         }
     }
 
+    fn store_indirect_u64(&mut self, _src: RawReg, _base: RawReg, _offset: u32) -> Self::ReturnTy {
+        self.trap()
+    }
+
     fn store_u8(&mut self, src: RawReg, offset: u32) -> Self::ReturnTy {
         if !self.module.is_dynamic_paging() {
             emit!(self, store_u8_basic(self.program_counter, src, offset));
@@ -3009,6 +3161,10 @@ impl<'a, const DEBUG: bool, const STEP_TRACING: bool> InstructionVisitor for Com
         } else {
             emit!(self, store_u32_dynamic(self.program_counter, src, offset));
         }
+    }
+
+    fn store_u64(&mut self, _src: RawReg, _offset: u32) -> Self::ReturnTy {
+        self.trap()
     }
 
     fn load_u8(&mut self, dst: RawReg, offset: u32) -> Self::ReturnTy {
@@ -3051,6 +3207,14 @@ impl<'a, const DEBUG: bool, const STEP_TRACING: bool> InstructionVisitor for Com
         }
     }
 
+    fn load_i32(&mut self, _dst: RawReg, _offset: u32) -> Self::ReturnTy {
+        self.trap()
+    }
+
+    fn load_u64(&mut self, _dst: RawReg, _offset: u32) -> Self::ReturnTy {
+        self.trap()
+    }
+
     fn load_indirect_u8(&mut self, dst: RawReg, base: RawReg, offset: u32) -> Self::ReturnTy {
         if !self.module.is_dynamic_paging() {
             emit!(self, load_indirect_u8_basic(self.program_counter, dst, base, offset));
@@ -3089,6 +3253,14 @@ impl<'a, const DEBUG: bool, const STEP_TRACING: bool> InstructionVisitor for Com
         } else {
             emit!(self, load_indirect_u32_dynamic(self.program_counter, dst, base, offset));
         }
+    }
+
+    fn load_indirect_i32(&mut self, _dst: RawReg, _base: RawReg, _offset: u32) -> Self::ReturnTy {
+        self.trap()
+    }
+
+    fn load_indirect_u64(&mut self, _dst: RawReg, _base: RawReg, _offset: u32) -> Self::ReturnTy {
+        self.trap()
     }
 
     fn branch_less_unsigned(&mut self, s1: RawReg, s2: RawReg, i: u32) -> Self::ReturnTy {
