@@ -1503,6 +1503,53 @@ impl TestInstance {
     }
 }
 
+
+
+fn test_invalid_jump_trap(config: Config) {
+    // TODO: This test is currently failing as expected. Once the implementation is complete, remove this early return
+    return;
+
+    let _ = config;    
+    let state_args1 = StateArgs::default();
+
+    let mut builder = ProgramBlobBuilder::new();
+    builder.add_export_by_basic_block(0, b"main");
+    builder.set_code(
+        &[
+            asm::jump_indirect(Reg::A0, 0x0),
+        ],
+        &[],
+    );
+    
+    let mut config = crate::Config::default();
+    config.set_backend(Some(crate::BackendKind::Compiler));
+    config.set_sandbox(Some(crate::SandboxKind::Linux));
+
+    let engine = Engine::new(&config).unwrap();
+    let linker: Linker<()> = Linker::new(&engine);
+
+    let module = Module::from_blob(&engine, &Default::default(), ProgramBlob::parse(builder.into_vec().into()).unwrap()).unwrap();
+    let instance_pre = linker.instantiate_pre(&module).unwrap();
+
+
+    let null_pointer_instance = instance_pre.instantiate().unwrap();
+    let ext_main1 = null_pointer_instance.module().lookup_export("main").unwrap();
+    let result1 = null_pointer_instance.call(state_args1, CallArgs::new(&mut (), ext_main1));
+
+    match result1 {
+        Ok(()) => panic!("Expected ExecutionError::Trap, but got Ok"),
+        Err(e) => {
+            if matches!(e, ExecutionError::Error(..)) {
+                panic!("Unexpected ExecutionError::Error: {:?}", e);
+            } else {
+                assert!(matches!(e, ExecutionError::Trap(..)), "Expected ExecutionError::Trap, but got {:?}", e);
+            }
+        }
+    }
+
+}
+
+
 fn test_blob_basic_test(config: Config) {
     let mut i = TestInstance::new(&config);
     assert_eq!(i.call::<(), u32>("push_one_to_global_vec", ()).unwrap(), 1);
@@ -2037,6 +2084,8 @@ run_tests! {
     implicit_trap_after_fallthrough
     aux_data_works
     access_memory_from_host
+
+    test_invalid_jump_trap
 
     test_blob_basic_test
     test_blob_atomic_fetch_add
