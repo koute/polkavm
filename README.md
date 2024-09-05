@@ -33,6 +33,46 @@ PolkaVM is a general purpose user-level RISC-V based virtual machine.
 - Floating point support, SIMD, and other more niche RISC-V extensions. These could be added as an opt-in feature in the future if necessary, but this is not currently planned.
 - Support for full 32-register RISC-V ISA. This VM currently only targets the RV32EM.
 
+## Getting started
+
+Reproducible on Debian 12.7
+```sh
+## enable unprivileged userfaultfd
+sudo sysctl -w vm.unprivileged_userfaultfd=1
+
+## install dependencies
+sudo apt-get install -y curl git build-essential
+
+## install rust
+curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
+. "$HOME/.cargo/env"
+
+## install riscv toolchain
+curl -L --output /tmp/rust-riscv32em-nightly-2024-01-05-r0-x86_64-unknown-linux-gnu.tar.xz "https://github.com/koute/rustc-rv32e/releases/download/nightly-2024-01-05-r0/rust-riscv32em-nightly-2024-01-05-r0-x86_64-unknown-linux-gnu.tar.xz"
+tar -C /tmp -xf /tmp/rust-riscv32em-nightly-2024-01-05-r0-x86_64-unknown-linux-gnu.tar.xz
+mkdir -p ~/.rustup/toolchains
+mv /tmp/rust-riscv32em-x86_64-unknown-linux-gnu/riscv32em-nightly-2024-01-05-r0-x86_64-unknown-linux-gnu ~/.rustup/toolchains/
+
+## workaround for old libssl
+wget http://nz2.archive.ubuntu.com/ubuntu/pool/main/o/openssl/libssl1.1_1.1.1f-1ubuntu2_amd64.deb
+sudo dpkg -i libssl1.1_1.1.1f-1ubuntu2_amd64.deb
+rm libssl1.1_1.1.1f-1ubuntu2_amd64.deb
+
+## clone polkavm and clean up of existing guest program we want to compile here
+git clone --depth 1 https://github.com/koute/polkavm.git
+rm polkavm/guest-programs/output/example-hello-world.polkavm
+
+## compile our guest program
+cd polkavm/guest-programs
+RV32E_TOOLCHAIN="riscv32em-nightly-2024-01-05-r0-x86_64-unknown-linux-gnu" RUSTFLAGS="-C target-feature=+c -C relocation-model=pie -C link-arg=--emit-relocs -C link-arg=--unique --remap-path-prefix=$(pwd)= --remap-path-prefix=$HOME=~" cargo build -q --release --bin example-hello-world -p example-hello-world
+cd ..
+cargo run -q -p polkatool link --run-only-if-newer -s guest-programs/target/riscv32ema-unknown-none-elf/release/example-hello-world -o guest-programs/output/example-hello-world.polkavm
+
+## compile and run our host program
+cargo build --release --manifest-path examples/hello-world/Cargo.toml
+./target/release/hello-world-host
+```
+
 ## License
 
 Licensed under either of
