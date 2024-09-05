@@ -100,8 +100,8 @@ pub struct Config {
     pub(crate) sandbox: Option<SandboxKind>,
     pub(crate) crosscheck: bool,
     pub(crate) allow_experimental: bool,
+    pub(crate) allow_dynamic_paging: bool,
     pub(crate) worker_count: usize,
-    pub(crate) dynamic_paging: bool,
 }
 
 impl Default for Config {
@@ -150,8 +150,8 @@ impl Config {
             sandbox: None,
             crosscheck: false,
             allow_experimental: false,
+            allow_dynamic_paging: false,
             worker_count: 2,
-            dynamic_paging: false,
         }
     }
 
@@ -267,16 +267,20 @@ impl Config {
         self.worker_count
     }
 
-    /// Returns whether dynamic paging is enabled.
-    pub fn dynamic_paging(&self) -> bool {
-        self.dynamic_paging
+    /// Returns whether dynamic paging is allowed.
+    pub fn allow_dynamic_paging(&self) -> bool {
+        self.allow_dynamic_paging
     }
 
-    /// Sets whether dynamic paging is enabled.
+    /// Sets whether dynamic paging is allowed.
+    ///
+    /// Enabling this increases the minimum system requirements of the recompiler backend:
+    ///  - At least Linux 6.7 is required.
+    ///  - Unpriviledged `userfaultfd` must be enabled (`/proc/sys/vm/unprivileged_userfaultfd` must be set to `1`).
     ///
     /// Default: `false`
-    pub fn set_dynamic_paging(&mut self, value: bool) -> &mut Self {
-        self.dynamic_paging = value;
+    pub fn set_allow_dynamic_paging(&mut self, value: bool) -> &mut Self {
+        self.allow_dynamic_paging = value;
         self
     }
 }
@@ -306,6 +310,8 @@ pub struct ModuleConfig {
     pub(crate) gas_metering: Option<GasMeteringKind>,
     pub(crate) is_strict: bool,
     pub(crate) step_tracing: bool,
+    pub(crate) dynamic_paging: bool,
+    pub(crate) aux_data_size: u32,
 }
 
 impl Default for ModuleConfig {
@@ -322,6 +328,8 @@ impl ModuleConfig {
             gas_metering: None,
             is_strict: false,
             step_tracing: false,
+            dynamic_paging: false,
+            aux_data_size: 0,
         }
     }
 
@@ -333,11 +341,39 @@ impl ModuleConfig {
         self
     }
 
+    /// Returns the size of the auxiliary data region.
+    pub fn aux_data_size(&self) -> u32 {
+        self.aux_data_size
+    }
+
+    /// Sets the size of the auxiliary data region.
+    ///
+    /// Default: `0`
+    pub fn set_aux_data_size(&mut self, aux_data_size: u32) -> &mut Self {
+        self.aux_data_size = aux_data_size;
+        self
+    }
+
     /// Sets the type of gas metering to enable for this module.
     ///
     /// Default: `None`
     pub fn set_gas_metering(&mut self, kind: Option<GasMeteringKind>) -> &mut Self {
         self.gas_metering = kind;
+        self
+    }
+
+    /// Returns whether dynamic paging is enabled.
+    pub fn dynamic_paging(&self) -> bool {
+        self.dynamic_paging
+    }
+
+    /// Sets whether dynamic paging is enabled.
+    ///
+    /// [`Config::allow_dynamic_paging`] also needs to be `true` for dynamic paging to be enabled.
+    ///
+    /// Default: `false`
+    pub fn set_dynamic_paging(&mut self, value: bool) -> &mut Self {
+        self.dynamic_paging = value;
         self
     }
 

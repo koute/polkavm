@@ -246,12 +246,14 @@ where
     where
         S: Sandbox,
     {
-        if self
-            .program_counter_to_label
-            .get(self.code_length)
-            .and_then(|label| self.asm.get_label_origin_offset(label))
-            .is_none()
-        {
+        let is_properly_terminated = Instructions::new(self.code, self.bitmask, 0)
+            .next_back()
+            .map_or(false, |instruction| {
+                let opcode = instruction.opcode();
+                opcode.starts_new_basic_block() && opcode != polkavm_common::program::Opcode::fallthrough
+            });
+
+        if !is_properly_terminated {
             // Finish with a trap in case the code doesn't end with a basic block terminator.
             log::trace!("Adding an implicit trap to the last block...");
             use polkavm_common::program::ParsingVisitor;
@@ -506,6 +508,136 @@ where
     S: Sandbox,
 {
     type ReturnTy = ();
+
+    fn load_i32(&mut self, code_offset: u32, args_length: u32, _: RawReg, _: u32) -> Self::ReturnTy {
+        self.trap(code_offset, args_length)
+    }
+    fn load_u64(&mut self, code_offset: u32, args_length: u32, _: RawReg, _: u32) -> Self::ReturnTy {
+        self.trap(code_offset, args_length)
+    }
+    fn store_u64(&mut self, code_offset: u32, args_length: u32, _: RawReg, _: u32) -> Self::ReturnTy {
+        self.trap(code_offset, args_length)
+    }
+    fn store_imm_indirect_u64(&mut self, code_offset: u32, args_length: u32, _: RawReg, _: u32, _: u32) -> Self::ReturnTy {
+        self.trap(code_offset, args_length)
+    }
+    fn store_indirect_u64(&mut self, code_offset: u32, args_length: u32, _: RawReg, _: RawReg, _: u32) -> Self::ReturnTy {
+        self.trap(code_offset, args_length)
+    }
+    fn load_indirect_i32(&mut self, code_offset: u32, args_length: u32, _: RawReg, _: RawReg, _: u32) -> Self::ReturnTy {
+        self.trap(code_offset, args_length)
+    }
+    fn load_indirect_u64(&mut self, code_offset: u32, args_length: u32, _: RawReg, _: RawReg, _: u32) -> Self::ReturnTy {
+        self.trap(code_offset, args_length)
+    }
+    fn add_64_imm(&mut self, code_offset: u32, args_length: u32, _: RawReg, _: RawReg, _: u32) -> Self::ReturnTy {
+        self.trap(code_offset, args_length)
+    }
+    fn and_64_imm(&mut self, code_offset: u32, args_length: u32, _: RawReg, _: RawReg, _: u32) -> Self::ReturnTy {
+        self.trap(code_offset, args_length)
+    }
+    fn xor_64_imm(&mut self, code_offset: u32, args_length: u32, _: RawReg, _: RawReg, _: u32) -> Self::ReturnTy {
+        self.trap(code_offset, args_length)
+    }
+    fn or_64_imm(&mut self, code_offset: u32, args_length: u32, _: RawReg, _: RawReg, _: u32) -> Self::ReturnTy {
+        self.trap(code_offset, args_length)
+    }
+    fn mul_64_imm(&mut self, code_offset: u32, args_length: u32, _: RawReg, _: RawReg, _: u32) -> Self::ReturnTy {
+        self.trap(code_offset, args_length)
+    }
+    fn mul_upper_signed_signed_imm_64(&mut self, code_offset: u32, args_length: u32, _: RawReg, _: RawReg, _: u32) -> Self::ReturnTy {
+        self.trap(code_offset, args_length)
+    }
+    fn mul_upper_unsigned_unsigned_imm_64(&mut self, code_offset: u32, args_length: u32, _: RawReg, _: RawReg, _: u32) -> Self::ReturnTy {
+        self.trap(code_offset, args_length)
+    }
+    fn set_less_than_unsigned_64_imm(&mut self, code_offset: u32, args_length: u32, _: RawReg, _: RawReg, _: u32) -> Self::ReturnTy {
+        self.trap(code_offset, args_length)
+    }
+    fn set_less_than_signed_64_imm(&mut self, code_offset: u32, args_length: u32, _: RawReg, _: RawReg, _: u32) -> Self::ReturnTy {
+        self.trap(code_offset, args_length)
+    }
+    fn shift_logical_left_64_imm(&mut self, code_offset: u32, args_length: u32, _: RawReg, _: RawReg, _: u32) -> Self::ReturnTy {
+        self.trap(code_offset, args_length)
+    }
+    fn shift_logical_right_64_imm(&mut self, code_offset: u32, args_length: u32, _: RawReg, _: RawReg, _: u32) -> Self::ReturnTy {
+        self.trap(code_offset, args_length)
+    }
+    fn shift_arithmetic_right_64_imm(&mut self, code_offset: u32, args_length: u32, _: RawReg, _: RawReg, _: u32) -> Self::ReturnTy {
+        self.trap(code_offset, args_length)
+    }
+    fn set_greater_than_unsigned_64_imm(&mut self, code_offset: u32, args_length: u32, _: RawReg, _: RawReg, _: u32) -> Self::ReturnTy {
+        self.trap(code_offset, args_length)
+    }
+    fn set_greater_than_signed_64_imm(&mut self, code_offset: u32, args_length: u32, _: RawReg, _: RawReg, _: u32) -> Self::ReturnTy {
+        self.trap(code_offset, args_length)
+    }
+    fn shift_logical_right_64_imm_alt(&mut self, code_offset: u32, args_length: u32, _: RawReg, _: RawReg, _: u32) -> Self::ReturnTy {
+        self.trap(code_offset, args_length)
+    }
+    fn shift_arithmetic_right_64_imm_alt(&mut self, code_offset: u32, args_length: u32, _: RawReg, _: RawReg, _: u32) -> Self::ReturnTy {
+        self.trap(code_offset, args_length)
+    }
+    fn shift_logical_left_64_imm_alt(&mut self, code_offset: u32, args_length: u32, _: RawReg, _: RawReg, _: u32) -> Self::ReturnTy {
+        self.trap(code_offset, args_length)
+    }
+    fn add_64(&mut self, code_offset: u32, args_length: u32, _: RawReg, _: RawReg, _: RawReg) -> Self::ReturnTy {
+        self.trap(code_offset, args_length)
+    }
+    fn sub_64(&mut self, code_offset: u32, args_length: u32, _: RawReg, _: RawReg, _: RawReg) -> Self::ReturnTy {
+        self.trap(code_offset, args_length)
+    }
+    fn and_64(&mut self, code_offset: u32, args_length: u32, _: RawReg, _: RawReg, _: RawReg) -> Self::ReturnTy {
+        self.trap(code_offset, args_length)
+    }
+    fn xor_64(&mut self, code_offset: u32, args_length: u32, _: RawReg, _: RawReg, _: RawReg) -> Self::ReturnTy {
+        self.trap(code_offset, args_length)
+    }
+    fn or_64(&mut self, code_offset: u32, args_length: u32, _: RawReg, _: RawReg, _: RawReg) -> Self::ReturnTy {
+        self.trap(code_offset, args_length)
+    }
+    fn mul_64(&mut self, code_offset: u32, args_length: u32, _: RawReg, _: RawReg, _: RawReg) -> Self::ReturnTy {
+        self.trap(code_offset, args_length)
+    }
+    fn mul_upper_signed_signed_64(&mut self, code_offset: u32, args_length: u32, _: RawReg, _: RawReg, _: RawReg) -> Self::ReturnTy {
+        self.trap(code_offset, args_length)
+    }
+    fn mul_upper_unsigned_unsigned_64(&mut self, code_offset: u32, args_length: u32, _: RawReg, _: RawReg, _: RawReg) -> Self::ReturnTy {
+        self.trap(code_offset, args_length)
+    }
+    fn mul_upper_signed_unsigned_64(&mut self, code_offset: u32, args_length: u32, _: RawReg, _: RawReg, _: RawReg) -> Self::ReturnTy {
+        self.trap(code_offset, args_length)
+    }
+    fn set_less_than_unsigned_64(&mut self, code_offset: u32, args_length: u32, _: RawReg, _: RawReg, _: RawReg) -> Self::ReturnTy {
+        self.trap(code_offset, args_length)
+    }
+    fn set_less_than_signed_64(&mut self, code_offset: u32, args_length: u32, _: RawReg, _: RawReg, _: RawReg) -> Self::ReturnTy {
+        self.trap(code_offset, args_length)
+    }
+    fn shift_logical_left_64(&mut self, code_offset: u32, args_length: u32, _: RawReg, _: RawReg, _: RawReg) -> Self::ReturnTy {
+        self.trap(code_offset, args_length)
+    }
+    fn shift_logical_right_64(&mut self, code_offset: u32, args_length: u32, _: RawReg, _: RawReg, _: RawReg) -> Self::ReturnTy {
+        self.trap(code_offset, args_length)
+    }
+    fn shift_arithmetic_right_64(&mut self, code_offset: u32, args_length: u32, _: RawReg, _: RawReg, _: RawReg) -> Self::ReturnTy {
+        self.trap(code_offset, args_length)
+    }
+    fn div_unsigned_64(&mut self, code_offset: u32, args_length: u32, _: RawReg, _: RawReg, _: RawReg) -> Self::ReturnTy {
+        self.trap(code_offset, args_length)
+    }
+    fn div_signed_64(&mut self, code_offset: u32, args_length: u32, _: RawReg, _: RawReg, _: RawReg) -> Self::ReturnTy {
+        self.trap(code_offset, args_length)
+    }
+    fn rem_unsigned_64(&mut self, code_offset: u32, args_length: u32, _: RawReg, _: RawReg, _: RawReg) -> Self::ReturnTy {
+        self.trap(code_offset, args_length)
+    }
+    fn rem_signed_64(&mut self, code_offset: u32, args_length: u32, _: RawReg, _: RawReg, _: RawReg) -> Self::ReturnTy {
+        self.trap(code_offset, args_length)
+    }
+    fn store_imm_u64(&mut self, code_offset: u32, args_length: u32, _: u32, _: u32) -> Self::ReturnTy {
+        self.trap(code_offset, args_length)
+    }
 
     #[inline(always)]
     fn invalid(&mut self, code_offset: u32, args_length: u32) -> Self::ReturnTy {

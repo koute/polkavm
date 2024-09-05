@@ -88,17 +88,21 @@ pub enum LoadKind {
     U32 = 0b010,
     U8 = 0b100,
     U16 = 0b101,
+    I32 = 0b110,
+    U64 = 0b011,
 }
 
 impl LoadKind {
     #[inline(always)]
-    const fn decode(value: u32) -> Option<Self> {
+    const fn decode(value: u32, rv64: bool) -> Option<Self> {
         match value & 0b111 {
             0b000 => Some(LoadKind::I8),
             0b001 => Some(LoadKind::I16),
             0b010 => Some(LoadKind::U32),
             0b100 => Some(LoadKind::U8),
             0b101 => Some(LoadKind::U16),
+            0b110 if rv64 => Some(LoadKind::I32),
+            0b011 if rv64 => Some(LoadKind::U64),
             _ => None,
         }
     }
@@ -110,6 +114,7 @@ pub enum StoreKind {
     U8 = 0b000,
     U16 = 0b001,
     U32 = 0b010,
+    U64 = 0b011,
 }
 
 impl StoreKind {
@@ -119,6 +124,7 @@ impl StoreKind {
             0b000 => Some(StoreKind::U8),
             0b001 => Some(StoreKind::U16),
             0b010 => Some(StoreKind::U32),
+            0b011 => Some(StoreKind::U64),
             _ => None,
         }
     }
@@ -134,15 +140,32 @@ pub enum RegImmKind {
     Or = 0b110,                  // ORI
     And = 0b111,                 // ANDI
 
+    Add64 = 0b1000,
+    SetLessThanSigned64 = 0b1010,
+    SetLessThanUnsigned64 = 0b1011,
+    Xor64 = 0b1100,
+    Or64 = 0b1110,
+    And64 = 0b1111,
+
     ShiftLogicalLeft,
     ShiftLogicalRight,
     ShiftArithmeticRight,
+
+    ShiftLogicalLeft64,
+    ShiftLogicalRight64,
+    ShiftArithmeticRight64,
 }
 
 impl RegImmKind {
     #[inline(always)]
-    const fn decode(value: u32) -> Option<Self> {
+    const fn decode(value: u32, rv64: bool) -> Option<Self> {
         match value & 0b111 {
+            0b000 if rv64 => Some(Self::Add64),
+            0b010 if rv64 => Some(Self::SetLessThanSigned64),
+            0b011 if rv64 => Some(Self::SetLessThanUnsigned64),
+            0b100 if rv64 => Some(Self::Xor64),
+            0b110 if rv64 => Some(Self::Or64),
+            0b111 if rv64 => Some(Self::And64),
             0b000 => Some(Self::Add),
             0b010 => Some(Self::SetLessThanSigned),
             0b011 => Some(Self::SetLessThanUnsigned),
@@ -175,6 +198,25 @@ pub enum RegRegKind {
     DivUnsigned = 0b01101,
     Rem = 0b01110,
     RemUnsigned = 0b01111,
+
+    Add64 = 0b100000,
+    Sub64 = 0b110000,
+    SetLessThanSigned64 = 0b100010,
+    SetLessThanUnsigned64 = 0b100011,
+    ShiftLogicalLeft64 = 0b100001,
+    ShiftLogicalRight64 = 0b100101,
+    ShiftArithmeticRight64 = 0b110101,
+    MulUpperSignedSigned64 = 0b101001,
+    MulUpperSignedUnsigned64 = 0b101010,
+    MulUpperUnsignedUnsigned64 = 0b101011,
+    Or64 = 0b100110,
+    And64 = 0b100111,
+    Xor64 = 0b100100,
+    Mul64 = 0b101000,
+    Div64 = 0b101100,
+    DivUnsigned64 = 0b101101,
+    Rem64 = 0b101110,
+    RemUnsigned64 = 0b101111,
 }
 
 #[derive(Copy, Clone, PartialEq, Eq, Debug, Hash)]
@@ -255,6 +297,19 @@ pub enum Inst {
         dst: Reg,
         src: Reg,
     },
+    LoadReserved64 {
+        acquire: bool,
+        release: bool,
+        dst: Reg,
+        src: Reg,
+    },
+    StoreConditional64 {
+        acquire: bool,
+        release: bool,
+        addr: Reg,
+        dst: Reg,
+        src: Reg,
+    },
     Atomic {
         acquire: bool,
         release: bool,
@@ -273,15 +328,40 @@ pub enum Inst {
 
 #[derive(Copy, Clone, PartialEq, Eq, Debug, Hash)]
 pub enum AtomicKind {
-    Swap = 0b00001,
-    Add = 0b00000,
-    And = 0b01100,
-    Or = 0b01000,
-    Xor = 0b00100,
-    MaxSigned = 0b10100,
-    MinSigned = 0b10000,
-    MaxUnsigned = 0b11100,
-    MinUnsigned = 0b11000,
+    Swap = 0b100001,
+    Swap64 = 0b00001,
+    Add = 0b100000,
+    Add64 = 0b00000,
+    And = 0b101100,
+    And64 = 0b01100,
+    Or = 0b101000,
+    Or64 = 0b01000,
+    Xor = 0b100100,
+    Xor64 = 0b00100,
+    MaxSigned = 0b110100,
+    MaxSigned64 = 0b10100,
+    MinSigned = 0b110000,
+    MinSigned64 = 0b10000,
+    MaxUnsigned = 0b111100,
+    MaxUnsigned64 = 0b11100,
+    MinUnsigned = 0b111000,
+    MinUnsigned64 = 0b11000,
+}
+
+impl From<AtomicKind> for u32 {
+    fn from(value: AtomicKind) -> Self {
+        match value {
+            AtomicKind::Add | AtomicKind::Add64 => 0b00000,
+            AtomicKind::Swap | AtomicKind::Swap64 => 0b00001,
+            AtomicKind::And | AtomicKind::And64 => 0b01100,
+            AtomicKind::Or | AtomicKind::Or64 => 0b01000,
+            AtomicKind::Xor | AtomicKind::Xor64 => 0b00100,
+            AtomicKind::MaxSigned | AtomicKind::MaxSigned64 => 0b10100,
+            AtomicKind::MinSigned | AtomicKind::MinSigned64 => 0b10000,
+            AtomicKind::MaxUnsigned | AtomicKind::MaxUnsigned64 => 0b11100,
+            AtomicKind::MinUnsigned | AtomicKind::MinUnsigned64 => 0b11000,
+        }
+    }
 }
 
 #[derive(Copy, Clone, PartialEq, Eq, Debug, Hash)]
@@ -456,12 +536,28 @@ impl R {
     }
 }
 
+macro_rules! ctx {
+    ($is_rv64:expr) => {
+        macro_rules! xlen {
+            ($path:tt, $variant_32:ident, $variant_64:ident) => {
+                if $is_rv64 {
+                    <$path>::$variant_64
+                } else {
+                    <$path>::$variant_32
+                }
+            };
+        }
+    };
+}
+
 impl Inst {
     pub const fn is_compressed(op: u8) -> bool {
         op & 0b00000011 < 0b00000011
     }
 
-    pub fn decode_compressed(op: u32) -> Option<Self> {
+    pub fn decode_compressed(op: u32, rv64: bool) -> Option<Self> {
+        ctx!(rv64);
+
         let quadrant = op & 0b11;
         let funct3 = (op >> 13) & 0b111;
 
@@ -473,17 +569,24 @@ impl Inst {
             // RVC, Quadrant 0
             // C.ADDI4SPN expands to addi rd′, x2, nzuimm[9:2]
             (0b00, 0b000) if op & 0b00011111_11100000 != 0 => Some(Inst::RegImm {
-                kind: RegImmKind::Add,
+                kind: xlen!(RegImmKind, Add, Add64),
                 dst: Reg::decode_compressed(op >> 2),
                 src: Reg::SP,
                 imm: (bits(4, 5, op, 11) | bits(6, 9, op, 7) | bits(2, 2, op, 6) | bits(3, 3, op, 5)) as i32,
             }),
             // C.LW expands to lw rd′, offset[6:2](rs1′)
             (0b00, 0b010) => Some(Inst::Load {
-                kind: LoadKind::U32,
+                kind: if rv64 { LoadKind::I32 } else { LoadKind::U32 },
                 dst: Reg::decode_compressed(op >> 2),
                 base: Reg::decode_compressed(op >> 7),
                 offset: (bits(3, 5, op, 10) | bits(2, 2, op, 6) | bits(6, 6, op, 5)) as i32,
+            }),
+            // C.LD expands ld rd′, offset[7:3](rs1′)
+            (0b00, 0b011) if rv64 => Some(Inst::Load {
+                kind: LoadKind::U64,
+                dst: Reg::decode_compressed(op >> 2),
+                base: Reg::decode_compressed(op >> 7),
+                offset: (bits(3, 5, op, 10) | bits(6, 7, op, 5)) as i32,
             }),
             // C.SW expands to sw rs2′, offset[6:2](rs1′)
             (0b00, 0b110) => Some(Inst::Store {
@@ -492,11 +595,18 @@ impl Inst {
                 base: Reg::decode_compressed(op >> 7),
                 offset: (bits(3, 5, op, 10) | bits(2, 2, op, 6) | bits(6, 6, op, 5)) as i32,
             }),
+            // C.SD expands to sd rs2′, offset[7:3](rs1′)
+            (0b00, 0b111) if rv64 => Some(Inst::Store {
+                kind: StoreKind::U64,
+                src: Reg::decode_compressed(op >> 2),
+                base: Reg::decode_compressed(op >> 7),
+                offset: (bits(3, 5, op, 10) | bits(6, 7, op, 5)) as i32,
+            }),
 
             // RVC, Quadrant 1
             // C.NOP expands to addi x0, x0, 0
             (0b01, 0b000) if op & 0b11111111_11111110 == 0 => Some(Inst::RegImm {
-                kind: RegImmKind::Add,
+                kind: xlen!(RegImmKind, Add, Add64),
                 dst: Reg::Zero,
                 src: Reg::Zero,
                 imm: 0,
@@ -508,7 +618,7 @@ impl Inst {
                 (imm != 0).then(|| {
                     let rd = Reg::decode(op >> 7);
                     Inst::RegImm {
-                        kind: RegImmKind::Add,
+                        kind: if rv64 { RegImmKind::Add64 } else { RegImmKind::Add },
                         dst: rd,
                         src: rd,
                         imm: sign_ext(imm, 6),
@@ -516,20 +626,31 @@ impl Inst {
                 })
             }
             // C.JAL expands to jal x1, offset[11:1]
-            (0b01, 0b001) => Some(Inst::JumpAndLink {
+            (0b01, 0b001) if !rv64 => Some(Inst::JumpAndLink {
                 dst: Reg::RA,
                 target: bits_imm_c_jump(op),
             }),
+            // C.ADDIW extends to addiw rd, rd, imm[5:0]
+            (0b01, 0b001) => {
+                let imm = bits(5, 5, op, 12) | bits(0, 4, op, 2);
+                let rd = Reg::decode(op >> 7);
+                Some(Inst::RegImm {
+                    kind: RegImmKind::Add,
+                    dst: rd,
+                    src: rd,
+                    imm: sign_ext(imm, 6),
+                })
+            }
             // C.LI expands into addi rd, x0, imm[5:0]
             (0b01, 0b010) if op & 0b00001111_10000000 != 0 => Some(Inst::RegImm {
-                kind: RegImmKind::Add,
+                kind: xlen!(RegImmKind, Add, Add64),
                 dst: Reg::decode(op >> 7),
                 src: Reg::Zero,
                 imm: sign_ext(bits(5, 5, op, 12) | bits(0, 4, op, 2), 6),
             }),
             // C.ADDI16SP expands into addi x2, x2, nzimm[9:4]
             (0b01, 0b011) if Reg::decode(op >> 7) == Reg::SP && op & 0b00010000_01111100 != 0 => Some(Inst::RegImm {
-                kind: RegImmKind::Add,
+                kind: xlen!(RegImmKind, Add, Add64),
                 dst: Reg::SP,
                 src: Reg::SP,
                 imm: sign_ext(
@@ -549,21 +670,21 @@ impl Inst {
                     (0b000, 0) | (0b001, 0) => None,
                     // C.SRLI expands into srli rd′, rd′, shamt[5:0]
                     (0b000, shamt) => Some(Inst::RegImm {
-                        kind: RegImmKind::ShiftLogicalRight,
+                        kind: xlen!(RegImmKind, ShiftLogicalRight, ShiftLogicalRight64),
                         dst: rd,
                         src: rd,
                         imm: shamt as i32,
                     }),
                     // C.SRAI expands into srai rd′, rd′, shamt[5:0]
                     (0b001, shamt) => Some(Inst::RegImm {
-                        kind: RegImmKind::ShiftArithmeticRight,
+                        kind: xlen!(RegImmKind, ShiftArithmeticRight, ShiftArithmeticRight64),
                         dst: rd,
                         src: rd,
                         imm: shamt as i32,
                     }),
                     // C.ANDI expands to andi rd′, rd′, imm[5:0]
                     (0b110, imm4_0) | (0b010, imm4_0) => Some(Inst::RegImm {
-                        kind: RegImmKind::And,
+                        kind: xlen!(RegImmKind, And, And64),
                         dst: rd,
                         src: rd,
                         imm: sign_ext(bits(5, 5, op, 12) | imm4_0, 6),
@@ -572,13 +693,17 @@ impl Inst {
                     // C.XOR expands into xor rd′, rd′, rs2′
                     // C.OR expands into or rd′, rd′, rs2′
                     // C.AND expands into and rd′, rd′, rs2′
+                    // C.ADDW expands into addw rd′, rd′, rs2′
+                    // C.SUBW expands into subw rd′, rd′, rs2′
                     (0b011, _) => Some(Inst::RegReg {
-                        kind: match (op >> 5) & 0b11 {
-                            0b00 => RegRegKind::Sub,
-                            0b01 => RegRegKind::Xor,
-                            0b10 => RegRegKind::Or,
-                            0b11 => RegRegKind::And,
-                            _ => unreachable!(),
+                        kind: match ((op >> 12) & 0b1, (op >> 5) & 0b11) {
+                            (0b0, 0b00) => xlen!(RegRegKind, Sub, Sub64),
+                            (0b0, 0b01) => xlen!(RegRegKind, Xor, Xor64),
+                            (0b0, 0b10) => xlen!(RegRegKind, Or, Or64),
+                            (0b0, 0b11) => xlen!(RegRegKind, And, And64),
+                            (0b1, 0b00) if rv64 => RegRegKind::Add64,
+                            (0b1, 0b01) if rv64 => RegRegKind::Sub64,
+                            _ => return None,
                         },
                         dst: rd,
                         src1: rd,
@@ -609,7 +734,7 @@ impl Inst {
             (0b10, 0b000) if (op >> 12) & 0b1 == 0 => match (Reg::decode(op >> 7), bits(0, 4, op, 2)) {
                 (Reg::Zero, _) | (_, 0) => None,
                 (rd, shamt) => Some(Inst::RegImm {
-                    kind: RegImmKind::ShiftLogicalLeft,
+                    kind: xlen!(RegImmKind, ShiftLogicalLeft, ShiftLogicalLeft64),
                     dst: rd,
                     src: rd,
                     imm: shamt as i32,
@@ -619,10 +744,20 @@ impl Inst {
             (0b10, 0b010) => match Reg::decode(op >> 7) {
                 Reg::Zero => None,
                 rd => Some(Inst::Load {
-                    kind: LoadKind::U32,
+                    kind: xlen!(LoadKind, U32, I32),
                     dst: rd,
                     base: Reg::SP,
                     offset: (bits(5, 5, op, 12) | bits(2, 4, op, 4) | bits(6, 7, op, 2)) as i32,
+                }),
+            },
+            // C.LDSP expands to ld rd, offset[8:3](x2)
+            (0b10, 0b011) if rv64 => match Reg::decode(op >> 7) {
+                Reg::Zero => None,
+                rd => Some(Inst::Load {
+                    kind: LoadKind::U64,
+                    dst: rd,
+                    base: Reg::SP,
+                    offset: (bits(5, 5, op, 12) | bits(3, 4, op, 5) | bits(6, 8, op, 2)) as i32,
                 }),
             },
             (0b10, 0b100) => match ((op >> 12) & 0b1, Reg::decode(op >> 7), Reg::decode(op >> 2)) {
@@ -635,7 +770,7 @@ impl Inst {
                 }),
                 // C.MV expands to add rd, x0, rs2
                 (0b0, rd, rs2) => Some(Inst::RegReg {
-                    kind: RegRegKind::Add,
+                    kind: xlen!(RegRegKind, Add, Add64),
                     dst: rd,
                     src1: Reg::Zero,
                     src2: rs2,
@@ -648,7 +783,7 @@ impl Inst {
                 }),
                 // C.ADD expands to add rd, rd, rs2
                 (0b1, rd, rs2) => Some(Inst::RegReg {
-                    kind: RegRegKind::Add,
+                    kind: xlen!(RegRegKind, Add, Add64),
                     dst: rd,
                     src1: rd,
                     src2: rs2,
@@ -662,14 +797,23 @@ impl Inst {
                 base: Reg::SP,
                 offset: (bits(2, 5, op, 9) | bits(6, 7, op, 7)) as i32,
             }),
+            // C.SDSP expands to sd rs2, offset[8:3](x2)
+            (0b10, 0b111) if rv64 => Some(Inst::Store {
+                kind: StoreKind::U64,
+                src: Reg::decode(op >> 2),
+                base: Reg::SP,
+                offset: (bits(3, 5, op, 10) | bits(6, 8, op, 7)) as i32,
+            }),
 
             // F, D, ebreak, reserved, hint, NSE and illegal instructions
             _ => None,
         }
     }
 
-    pub fn decode(op: u32) -> Option<Self> {
-        if let Some(compressed_instruction) = Self::decode_compressed(op) {
+    pub fn decode(op: u32, rv64: bool) -> Option<Self> {
+        ctx!(rv64);
+
+        if let Some(compressed_instruction) = Self::decode_compressed(op, rv64) {
             return Some(compressed_instruction);
         }
 
@@ -725,7 +869,7 @@ impl Inst {
                 ) as u32,
             }),
             0b0000011 => Some(Inst::Load {
-                kind: LoadKind::decode(op >> 12)?,
+                kind: LoadKind::decode(op >> 12, rv64)?,
                 dst: Reg::decode(op >> 7),
                 base: Reg::decode(op >> 15),
                 offset: sign_ext(bits(0, 11, op, 20), 12),
@@ -738,18 +882,58 @@ impl Inst {
             }),
             0b0010011 => match (op >> 12) & 0b111 {
                 0b001 => {
-                    if op & 0xfe000000 != 0 {
+                    if !rv64 && op & 0xfe000000 != 0 {
+                        return None;
+                    }
+                    if rv64 && op & 0xfc000000 != 0 {
                         return None;
                     }
 
+                    let end = if rv64 { 5 } else { 4 };
                     Some(Inst::RegImm {
-                        kind: RegImmKind::ShiftLogicalLeft,
+                        kind: xlen!(RegImmKind, ShiftLogicalLeft, ShiftLogicalLeft64),
                         dst: Reg::decode(op >> 7),
                         src: Reg::decode(op >> 15),
-                        imm: bits(0, 4, op, 20) as i32,
+                        imm: bits(0, end, op, 20) as i32,
                     })
                 }
                 0b101 => {
+                    let mask = if rv64 { 0xfc000000 } else { 0xfe000000 };
+                    let kind = match (op & mask) >> 24 {
+                        0b00000000 => xlen!(RegImmKind, ShiftLogicalRight, ShiftLogicalRight64),
+                        0b01000000 => xlen!(RegImmKind, ShiftArithmeticRight, ShiftArithmeticRight64),
+                        _ => return None,
+                    };
+
+                    let end = if rv64 { 5 } else { 4 };
+                    Some(Inst::RegImm {
+                        kind,
+                        dst: Reg::decode(op >> 7),
+                        src: Reg::decode(op >> 15),
+                        imm: bits(0, end, op, 20) as i32,
+                    })
+                }
+                _ => Some(Inst::RegImm {
+                    kind: RegImmKind::decode(op >> 12, rv64)?,
+                    dst: Reg::decode(op >> 7),
+                    src: Reg::decode(op >> 15),
+                    imm: sign_ext(op >> 20, 12),
+                }),
+            },
+            0b0011011 if rv64 => match (op >> 12) & 0b111 {
+                0b000 => Some(Inst::RegImm {
+                    kind: RegImmKind::Add,
+                    dst: Reg::decode(op >> 7),
+                    src: Reg::decode(op >> 15),
+                    imm: sign_ext(op >> 20, 12),
+                }),
+                0b001 if op >> 24 == 0 => Some(Inst::RegImm {
+                    kind: RegImmKind::ShiftLogicalLeft,
+                    dst: Reg::decode(op >> 7),
+                    src: Reg::decode(op >> 15),
+                    imm: bits(0, 4, op, 20) as i32,
+                }),
+                0b101 if op >> 24 == 0 || op >> 24 == 0b01000000 => {
                     let kind = match (op & 0xfe000000) >> 24 {
                         0b00000000 => RegImmKind::ShiftLogicalRight,
                         0b01000000 => RegImmKind::ShiftArithmeticRight,
@@ -763,33 +947,51 @@ impl Inst {
                         imm: bits(0, 4, op, 20) as i32,
                     })
                 }
-                _ => Some(Inst::RegImm {
-                    kind: RegImmKind::decode(op >> 12)?,
-                    dst: Reg::decode(op >> 7),
-                    src: Reg::decode(op >> 15),
-                    imm: sign_ext(op >> 20, 12),
-                }),
+                _ => None,
             },
             0b0110011 => {
                 let dst = Reg::decode(op >> 7);
                 let src1 = Reg::decode(op >> 15);
                 let src2 = Reg::decode(op >> 20);
                 let kind = match op & 0b1111111_00000_00000_111_00000_0000000 {
+                    0b0000000_00000_00000_000_00000_0000000 => xlen!(RegRegKind, Add, Add64),
+                    0b0100000_00000_00000_000_00000_0000000 => xlen!(RegRegKind, Sub, Sub64),
+                    0b0000000_00000_00000_001_00000_0000000 => xlen!(RegRegKind, ShiftLogicalLeft, ShiftLogicalLeft64),
+                    0b0000000_00000_00000_010_00000_0000000 => xlen!(RegRegKind, SetLessThanSigned, SetLessThanSigned64),
+                    0b0000000_00000_00000_011_00000_0000000 => xlen!(RegRegKind, SetLessThanUnsigned, SetLessThanUnsigned64),
+                    0b0000000_00000_00000_100_00000_0000000 => xlen!(RegRegKind, Xor, Xor64),
+                    0b0000000_00000_00000_101_00000_0000000 => xlen!(RegRegKind, ShiftLogicalRight, ShiftLogicalRight64),
+                    0b0100000_00000_00000_101_00000_0000000 => xlen!(RegRegKind, ShiftArithmeticRight, ShiftArithmeticRight64),
+                    0b0000000_00000_00000_110_00000_0000000 => xlen!(RegRegKind, Or, Or64),
+                    0b0000000_00000_00000_111_00000_0000000 => xlen!(RegRegKind, And, And64),
+
+                    0b0000001_00000_00000_000_00000_0000000 => xlen!(RegRegKind, Mul, Mul64),
+                    0b0000001_00000_00000_001_00000_0000000 => xlen!(RegRegKind, MulUpperSignedSigned, MulUpperSignedSigned64),
+                    0b0000001_00000_00000_010_00000_0000000 => xlen!(RegRegKind, MulUpperSignedUnsigned, MulUpperSignedUnsigned64),
+                    0b0000001_00000_00000_011_00000_0000000 => xlen!(RegRegKind, MulUpperUnsignedUnsigned, MulUpperUnsignedUnsigned64),
+                    0b0000001_00000_00000_100_00000_0000000 => xlen!(RegRegKind, Div, Div64),
+                    0b0000001_00000_00000_101_00000_0000000 => xlen!(RegRegKind, DivUnsigned, DivUnsigned64),
+                    0b0000001_00000_00000_110_00000_0000000 => xlen!(RegRegKind, Rem, Rem64),
+                    0b0000001_00000_00000_111_00000_0000000 => xlen!(RegRegKind, RemUnsigned, RemUnsigned64),
+
+                    _ => return None,
+                };
+
+                Some(Inst::RegReg { kind, dst, src1, src2 })
+            }
+            0b0111011 if rv64 => {
+                let dst = Reg::decode(op >> 7);
+                let src1 = Reg::decode(op >> 15);
+                let src2 = Reg::decode(op >> 20);
+
+                let kind = match op & 0b1111111_00000_00000_111_00000_0000000 {
                     0b0000000_00000_00000_000_00000_0000000 => RegRegKind::Add,
                     0b0100000_00000_00000_000_00000_0000000 => RegRegKind::Sub,
                     0b0000000_00000_00000_001_00000_0000000 => RegRegKind::ShiftLogicalLeft,
-                    0b0000000_00000_00000_010_00000_0000000 => RegRegKind::SetLessThanSigned,
-                    0b0000000_00000_00000_011_00000_0000000 => RegRegKind::SetLessThanUnsigned,
-                    0b0000000_00000_00000_100_00000_0000000 => RegRegKind::Xor,
                     0b0000000_00000_00000_101_00000_0000000 => RegRegKind::ShiftLogicalRight,
                     0b0100000_00000_00000_101_00000_0000000 => RegRegKind::ShiftArithmeticRight,
-                    0b0000000_00000_00000_110_00000_0000000 => RegRegKind::Or,
-                    0b0000000_00000_00000_111_00000_0000000 => RegRegKind::And,
 
                     0b0000001_00000_00000_000_00000_0000000 => RegRegKind::Mul,
-                    0b0000001_00000_00000_001_00000_0000000 => RegRegKind::MulUpperSignedSigned,
-                    0b0000001_00000_00000_010_00000_0000000 => RegRegKind::MulUpperSignedUnsigned,
-                    0b0000001_00000_00000_011_00000_0000000 => RegRegKind::MulUpperUnsignedUnsigned,
                     0b0000001_00000_00000_100_00000_0000000 => RegRegKind::Div,
                     0b0000001_00000_00000_101_00000_0000000 => RegRegKind::DivUnsigned,
                     0b0000001_00000_00000_110_00000_0000000 => RegRegKind::Rem,
@@ -829,21 +1031,42 @@ impl Inst {
                     None
                 }
             }
-            0b0101111 if (op >> 12) & 0b111 == 0b010 => {
+            0b0101111 => {
                 let dst = Reg::decode(op >> 7);
                 let src1 = Reg::decode(op >> 15);
                 let src2 = Reg::decode(op >> 20);
                 let kind = op >> 27;
                 let release = ((op >> 25) & 1) != 0;
                 let acquire = ((op >> 26) & 1) != 0;
-                match kind {
-                    0b00010 if src2 == Reg::Zero => Some(Inst::LoadReserved {
+                let funct3 = (op >> 12) & 0b111;
+                let is_word = match funct3 {
+                    0b011 if rv64 => false,
+                    0b010 if rv64 => true,
+                    0b010 => false,
+                    _ => return None,
+                };
+
+                match (kind, is_word) {
+                    (0b00010, true) if src2 == Reg::Zero => Some(Inst::LoadReserved64 {
                         acquire,
                         release,
                         dst,
                         src: src1,
                     }),
-                    0b00011 => Some(Inst::StoreConditional {
+                    (0b00011, true) => Some(Inst::StoreConditional64 {
+                        acquire,
+                        release,
+                        addr: src1,
+                        dst,
+                        src: src2,
+                    }),
+                    (0b00010, false) if src2 == Reg::Zero => Some(Inst::LoadReserved {
+                        acquire,
+                        release,
+                        dst,
+                        src: src1,
+                    }),
+                    (0b00011, false) => Some(Inst::StoreConditional {
                         acquire,
                         release,
                         addr: src1,
@@ -851,16 +1074,25 @@ impl Inst {
                         src: src2,
                     }),
                     _ => {
-                        let kind = match kind {
-                            0b00000 => AtomicKind::Add,
-                            0b00001 => AtomicKind::Swap,
-                            0b00100 => AtomicKind::Xor,
-                            0b01100 => AtomicKind::And,
-                            0b01000 => AtomicKind::Or,
-                            0b10000 => AtomicKind::MinSigned,
-                            0b10100 => AtomicKind::MaxSigned,
-                            0b11000 => AtomicKind::MinUnsigned,
-                            0b11100 => AtomicKind::MaxUnsigned,
+                        let kind = match (kind, is_word) {
+                            (0b00000, true) => AtomicKind::Add64,
+                            (0b00001, true) => AtomicKind::Swap64,
+                            (0b00100, true) => AtomicKind::Xor64,
+                            (0b01100, true) => AtomicKind::And64,
+                            (0b01000, true) => AtomicKind::Or64,
+                            (0b10000, true) => AtomicKind::MinSigned64,
+                            (0b10100, true) => AtomicKind::MaxSigned64,
+                            (0b11000, true) => AtomicKind::MinUnsigned64,
+                            (0b11100, true) => AtomicKind::MaxUnsigned64,
+                            (0b00000, false) => AtomicKind::Add,
+                            (0b00001, false) => AtomicKind::Swap,
+                            (0b00100, false) => AtomicKind::Xor,
+                            (0b01100, false) => AtomicKind::And,
+                            (0b01000, false) => AtomicKind::Or,
+                            (0b10000, false) => AtomicKind::MinSigned,
+                            (0b10100, false) => AtomicKind::MaxSigned,
+                            (0b11000, false) => AtomicKind::MinUnsigned,
+                            (0b11100, false) => AtomicKind::MaxUnsigned,
                             _ => return None,
                         };
 
@@ -908,7 +1140,7 @@ impl Inst {
     }
 
     #[cfg(test)]
-    pub fn encode(self) -> Option<u32> {
+    pub fn encode(self, rv64: bool) -> Option<u32> {
         match self {
             Inst::LoadUpperImmediate { dst, value } => {
                 if value & 0xfff != 0 {
@@ -973,8 +1205,9 @@ impl Inst {
                         imm = 0;
                     }
 
+                    let end = if rv64 { 5 } else { 4 };
                     Some(
-                        0b0010011
+                        if rv64 { 0b0011011 } else { 0b0010011 }
                             | match kind {
                                 RegImmKind::ShiftLogicalLeft => 0b001 << 12,
                                 RegImmKind::ShiftLogicalRight => 0b101 << 12,
@@ -983,15 +1216,41 @@ impl Inst {
                             }
                             | ((dst as u32) << 7)
                             | ((src as u32) << 15)
-                            | unbits(0, 4, imm as u32, 20),
+                            | unbits(0, end, imm as u32, 20),
                     )
                 }
-                _ => {
-                    Some(0b0010011 | ((kind as u32) << 12) | ((dst as u32) << 7) | ((src as u32) << 15) | sign_unext(imm as u32, 12)? << 20)
+                RegImmKind::Add if rv64 => Some(0b0011011 | ((dst as u32) << 7) | ((src as u32) << 15) | unbits(0, 11, imm as u32, 20)),
+                RegImmKind::ShiftLogicalLeft64 | RegImmKind::ShiftLogicalRight64 | RegImmKind::ShiftArithmeticRight64 if rv64 => {
+                    let max_imm = if rv64 { 64 } else { 32 };
+                    if imm > max_imm {
+                        imm = max_imm;
+                    } else if imm < 0 {
+                        imm = 0;
+                    }
+
+                    Some(
+                        0b0010011
+                            | match kind {
+                                RegImmKind::ShiftLogicalLeft64 => 0b001 << 12,
+                                RegImmKind::ShiftLogicalRight64 => 0b101 << 12,
+                                RegImmKind::ShiftArithmeticRight64 => (0b101 << 12) | (1 << 30),
+                                _ => unreachable!(),
+                            }
+                            | ((dst as u32) << 7)
+                            | ((src as u32) << 15)
+                            | unbits(0, 5, imm as u32, 20),
+                    )
                 }
+                _ => Some(
+                    0b0010011
+                        | (((kind as u32) & 0b111) << 12)
+                        | ((dst as u32) << 7)
+                        | ((src as u32) << 15)
+                        | sign_unext(imm as u32, 12)? << 20,
+                ),
             },
 
-            Inst::RegReg { kind, dst, src1, src2 } => Some(
+            Inst::RegReg { kind, dst, src1, src2 } if (kind as u32) >= (RegRegKind::Add64 as u32) => Some(
                 0b0110011
                     | ((kind as u32 & 0b00111) << 12)
                     | ((kind as u32 & 0b01000) << 22)
@@ -1000,6 +1259,30 @@ impl Inst {
                     | ((src1 as u32) << 15)
                     | ((src2 as u32) << 20),
             ),
+            Inst::RegReg { kind, dst, src1, src2 } => {
+                let op = match kind {
+                    RegRegKind::Add
+                    | RegRegKind::Sub
+                    | RegRegKind::ShiftLogicalLeft
+                    | RegRegKind::ShiftLogicalRight
+                    | RegRegKind::ShiftArithmeticRight
+                        if rv64 =>
+                    {
+                        0b0111011
+                    }
+                    _ if rv64 => 0b0111011,
+                    _ => 0b0110011,
+                };
+
+                Some(
+                    op | ((kind as u32 & 0b000111) << 12)
+                        | (((kind as u32 & 0b00010000) >> 4) << 30)
+                        | (((kind as u32 & 0b00001000) >> 3) << 25)
+                        | ((dst as u32) << 7)
+                        | ((src1 as u32) << 15)
+                        | ((src2 as u32) << 20),
+                )
+            }
             Inst::Ecall => Some(0x00000073),
             Inst::FenceI => Some(0x0000100f),
             Inst::Fence { predecessor, successor } => Some(
@@ -1021,6 +1304,20 @@ impl Inst {
                 src,
             } => Some(
                 0b0101111
+                    | if rv64 { 0b011 << 12 } else { 0b010 << 12 }
+                    | ((dst as u32) << 7)
+                    | ((src as u32) << 15)
+                    | (u32::from(release) << 25)
+                    | (u32::from(acquire) << 26)
+                    | (0b00010 << 27),
+            ),
+            Inst::LoadReserved64 {
+                acquire,
+                release,
+                dst,
+                src,
+            } if rv64 => Some(
+                0b0101111
                     | (0b010 << 12)
                     | ((dst as u32) << 7)
                     | ((src as u32) << 15)
@@ -1036,6 +1333,22 @@ impl Inst {
                 src,
             } => Some(
                 0b0101111
+                    | (if rv64 { 0b011 } else { 0b010 } << 12)
+                    | ((dst as u32) << 7)
+                    | ((addr as u32) << 15)
+                    | ((src as u32) << 20)
+                    | (u32::from(release) << 25)
+                    | (u32::from(acquire) << 26)
+                    | (0b00011 << 27),
+            ),
+            Inst::StoreConditional64 {
+                acquire,
+                release,
+                addr,
+                dst,
+                src,
+            } if rv64 => Some(
+                0b0101111
                     | (0b010 << 12)
                     | ((dst as u32) << 7)
                     | ((addr as u32) << 15)
@@ -1044,6 +1357,7 @@ impl Inst {
                     | (u32::from(acquire) << 26)
                     | (0b00011 << 27),
             ),
+            Inst::StoreConditional64 { .. } | Inst::LoadReserved64 { .. } => None,
             Inst::Atomic {
                 acquire,
                 release,
@@ -1054,12 +1368,13 @@ impl Inst {
             } => Some(
                 0b0101111
                     | (0b010 << 12)
+                    | (((kind as u32 >> 5) & u32::from(rv64)) << 12)
                     | ((dst as u32) << 7)
                     | ((addr as u32) << 15)
                     | ((src as u32) << 20)
                     | (u32::from(release) << 25)
                     | (u32::from(acquire) << 26)
-                    | ((kind as u32) << 27),
+                    | (u32::from(kind) << 27),
             ),
             Inst::Cmov { kind, dst, src, cond } => Some(
                 0b0001011
@@ -1077,7 +1392,7 @@ impl Inst {
 #[test]
 fn test_decode_jump_and_link() {
     assert_eq!(
-        Inst::decode(0xd6dff06f).unwrap(),
+        Inst::decode(0xd6dff06f, false).unwrap(),
         Inst::JumpAndLink {
             dst: Reg::Zero,
             target: 0x9f40_u32.wrapping_sub(0xa1d4)
@@ -1088,7 +1403,7 @@ fn test_decode_jump_and_link() {
 #[test]
 fn test_decode_branch() {
     assert_eq!(
-        Inst::decode(0x00c5fe63).unwrap(),
+        Inst::decode(0x00c5fe63, false).unwrap(),
         Inst::Branch {
             kind: BranchKind::GreaterOrEqualUnsigned,
             src1: Reg::A1,
@@ -1098,7 +1413,7 @@ fn test_decode_branch() {
     );
 
     assert_eq!(
-        Inst::decode(0xfeb96ce3).unwrap(),
+        Inst::decode(0xfeb96ce3, false).unwrap(),
         Inst::Branch {
             kind: BranchKind::LessUnsigned,
             src1: Reg::S2,
@@ -1112,7 +1427,7 @@ fn test_decode_branch() {
 fn test_decode_multiply() {
     assert_eq!(
         // 02f333b3                mulhu   t2,t1,a5
-        Inst::decode(0x02f333b3).unwrap(),
+        Inst::decode(0x02f333b3, false).unwrap(),
         Inst::RegReg {
             kind: RegRegKind::MulUpperUnsignedUnsigned,
             dst: Reg::T2,
@@ -1123,7 +1438,7 @@ fn test_decode_multiply() {
 
     assert_eq!(
         // 029426b3                mulhsu  a3,s0,s1
-        Inst::decode(0x029426b3).unwrap(),
+        Inst::decode(0x029426b3, false).unwrap(),
         Inst::RegReg {
             kind: RegRegKind::MulUpperSignedUnsigned,
             dst: Reg::A3,
@@ -1134,7 +1449,7 @@ fn test_decode_multiply() {
 
     assert_eq!(
         // 02941633                mulh    a2,s0,s1
-        Inst::decode(0x02941633).unwrap(),
+        Inst::decode(0x02941633, false).unwrap(),
         Inst::RegReg {
             kind: RegRegKind::MulUpperSignedSigned,
             dst: Reg::A2,
@@ -1147,7 +1462,7 @@ fn test_decode_multiply() {
 #[test]
 fn test_decode_cmov() {
     assert_eq!(
-        Inst::decode(0x42a6158b).unwrap(),
+        Inst::decode(0x42a6158b, false).unwrap(),
         Inst::Cmov {
             kind: CmovKind::NotEqZero,
             dst: Reg::A1,
@@ -1158,11 +1473,11 @@ fn test_decode_cmov() {
 }
 
 #[cfg_attr(debug_assertions, ignore)]
-#[test]
-fn test_encode() {
-    for op in (0..=0xFFFFFFFF_u32).filter(|op| Inst::decode_compressed(*op).is_none()) {
-        if let Some(inst) = Inst::decode(op) {
-            let encoded = inst.encode();
+#[cfg(test)]
+fn test_encode(rv64: bool) {
+    for op in (0..=0xFFFFFFFF_u32).filter(|op| Inst::decode_compressed(*op, rv64).is_none()) {
+        if let Some(inst) = Inst::decode(op, rv64) {
+            let encoded = inst.encode(rv64);
             if encoded != Some(op) {
                 panic!(
                     "failed to encode instruction: {inst:?}, expected = 0x{expected:08x} (0b{expected:b}, {expected}), actual = {actual} ({actual_binary}, {actual_dec})",
@@ -1175,6 +1490,18 @@ fn test_encode() {
             }
         }
     }
+}
+
+#[cfg_attr(debug_assertions, ignore)]
+#[test]
+fn test_encode_32bit() {
+    test_encode(false)
+}
+
+#[cfg_attr(debug_assertions, ignore)]
+#[test]
+fn test_encode_64bit() {
+    test_encode(true)
 }
 
 #[cfg(test)]
@@ -1195,7 +1522,8 @@ mod test_decode_compressed {
 
     #[test]
     fn illegal_instruction() {
-        assert_eq!(Inst::decode_compressed(1 << 16), Some(Inst::Unimplemented));
+        assert_eq!(Inst::decode_compressed(1 << 16, false), Some(Inst::Unimplemented));
+        assert_eq!(Inst::decode_compressed(1 << 16, true), Some(Inst::Unimplemented));
     }
 
     #[test]
@@ -1209,7 +1537,7 @@ mod test_decode_compressed {
         let op = 0b000_10101010_111_00;
 
         assert_eq!(
-            Inst::decode_compressed(op),
+            Inst::decode_compressed(op, false),
             Some(Inst::RegImm {
                 kind: RegImmKind::Add,
                 dst: Reg::decode_compressed(0b111),
@@ -1218,9 +1546,20 @@ mod test_decode_compressed {
             })
         );
 
+        assert_eq!(
+            Inst::decode_compressed(op, true),
+            Some(Inst::RegImm {
+                kind: RegImmKind::Add64,
+                dst: Reg::decode_compressed(0b111),
+                src: Reg::SP,
+                imm: 0b1010100100
+            })
+        );
+
         let op = 0b000_00000000_111_00;
         // RES, nzuimm=0
-        assert_eq!(Inst::decode_compressed(op), None);
+        assert_eq!(Inst::decode_compressed(op, false), None);
+        assert_eq!(Inst::decode_compressed(op, true), None);
     }
 
     #[test]
@@ -1228,9 +1567,19 @@ mod test_decode_compressed {
         let op = 0b010_101_010_01_111_00;
 
         assert_eq!(
-            Inst::decode_compressed(op),
+            Inst::decode_compressed(op, false),
             Some(Inst::Load {
                 kind: LoadKind::U32,
+                dst: Reg::decode_compressed(0b111),
+                base: Reg::decode_compressed(0b010),
+                offset: 0b1101000
+            })
+        );
+
+        assert_eq!(
+            Inst::decode_compressed(op, true),
+            Some(Inst::Load {
+                kind: LoadKind::I32,
                 dst: Reg::decode_compressed(0b111),
                 base: Reg::decode_compressed(0b010),
                 offset: 0b1101000
@@ -1239,11 +1588,38 @@ mod test_decode_compressed {
     }
 
     #[test]
+    fn c_ld() {
+        let op = 0b011_110_110_10_101_00;
+
+        assert_eq!(
+            Inst::decode_compressed(op, true),
+            Some(Inst::Load {
+                kind: LoadKind::U64,
+                dst: Reg::A3,
+                base: Reg::A4,
+                offset: 0b10110000
+            })
+        );
+
+        assert_eq!(Inst::decode_compressed(op, false), None);
+    }
+
+    #[test]
     fn c_sw() {
         let op = 0b110_101_010_01_111_00;
 
         assert_eq!(
-            Inst::decode_compressed(op),
+            Inst::decode_compressed(op, false),
+            Some(Inst::Store {
+                kind: StoreKind::U32,
+                src: Reg::decode_compressed(0b111),
+                base: Reg::decode_compressed(0b010),
+                offset: 0b1101000
+            })
+        );
+
+        assert_eq!(
+            Inst::decode_compressed(op, true),
             Some(Inst::Store {
                 kind: StoreKind::U32,
                 src: Reg::decode_compressed(0b111),
@@ -1254,11 +1630,28 @@ mod test_decode_compressed {
     }
 
     #[test]
+    fn c_sd() {
+        let op = 0b111_101_010_01_111_00;
+
+        assert_eq!(
+            Inst::decode_compressed(op, true),
+            Some(Inst::Store {
+                kind: StoreKind::U64,
+                src: Reg::decode_compressed(0b111),
+                base: Reg::decode_compressed(0b010),
+                offset: 0b01101000
+            })
+        );
+
+        assert_eq!(Inst::decode_compressed(op, false), None);
+    }
+
+    #[test]
     fn c_nop() {
         let op = 0b000_0_00000_00000_01;
 
         assert_eq!(
-            Inst::decode_compressed(op),
+            Inst::decode_compressed(op, false),
             Some(Inst::RegImm {
                 kind: RegImmKind::Add,
                 dst: Reg::Zero,
@@ -1273,7 +1666,7 @@ mod test_decode_compressed {
         let op = 0b000_1_01000_11011_01;
 
         assert_eq!(
-            Inst::decode_compressed(op),
+            Inst::decode_compressed(op, false),
             Some(Inst::RegImm {
                 kind: RegImmKind::Add,
                 dst: Reg::S0,
@@ -1282,9 +1675,20 @@ mod test_decode_compressed {
             })
         );
 
+        assert_eq!(
+            Inst::decode_compressed(op, true),
+            Some(Inst::RegImm {
+                kind: RegImmKind::Add64,
+                dst: Reg::S0,
+                src: Reg::S0,
+                imm: -5
+            })
+        );
+
         let op = 0b000_0_01000_00000_01;
         // HINT, nzimm=0
-        assert_eq!(Inst::decode_compressed(op), None);
+        assert_eq!(Inst::decode_compressed(op, false), None);
+        assert_eq!(Inst::decode_compressed(op, true), None);
     }
 
     #[test]
@@ -1292,7 +1696,7 @@ mod test_decode_compressed {
         let op = 0b001_10101010101_01;
 
         assert_eq!(
-            Inst::decode_compressed(op),
+            Inst::decode_compressed(op, false),
             Some(Inst::JumpAndLink {
                 dst: Reg::RA,
                 target: bits_imm_c_jump(op)
@@ -1301,16 +1705,30 @@ mod test_decode_compressed {
     }
 
     #[test]
-    fn c_j() {
-        let op = 0b101_01010101010_01;
+    fn c_addiw() {
+        let op = 0b001_10101010101_01;
 
         assert_eq!(
-            Inst::decode_compressed(op),
-            Some(Inst::JumpAndLink {
-                dst: Reg::Zero,
-                target: bits_imm_c_jump(op)
+            Inst::decode_compressed(op, true),
+            Some(Inst::RegImm {
+                kind: RegImmKind::Add,
+                dst: Reg::A0,
+                src: Reg::A0,
+                imm: 0b11111111_11111111_11111111_11110101u32 as i32
             })
         );
+    }
+
+    #[test]
+    fn c_j() {
+        let op = 0b101_01010101010_01;
+        let insn = Some(Inst::JumpAndLink {
+            dst: Reg::Zero,
+            target: bits_imm_c_jump(op),
+        });
+
+        assert_eq!(Inst::decode_compressed(op, false), insn);
+        assert_eq!(Inst::decode_compressed(op, true), insn);
     }
 
     #[test]
@@ -1318,7 +1736,7 @@ mod test_decode_compressed {
         let op = 0b010_1_01000_10101_01;
 
         assert_eq!(
-            Inst::decode_compressed(op),
+            Inst::decode_compressed(op, false),
             Some(Inst::RegImm {
                 kind: RegImmKind::Add,
                 dst: Reg::decode(0b01000),
@@ -1327,49 +1745,77 @@ mod test_decode_compressed {
             })
         );
 
+        assert_eq!(
+            Inst::decode_compressed(op, true),
+            Some(Inst::RegImm {
+                kind: RegImmKind::Add64,
+                dst: Reg::decode(0b01000),
+                src: Reg::Zero,
+                imm: -11
+            })
+        );
+
         let op = 0b010_0_00000_10101_01;
         // HINT, rd=0
-        assert_eq!(Inst::decode_compressed(op), None);
+        assert_eq!(Inst::decode_compressed(op, false), None);
+        assert_eq!(Inst::decode_compressed(op, true), None);
     }
 
     #[test]
     fn c_addi16sp() {
         let op = 0b011_1_00010_01010_01;
+        let imm = 0b11111111_11111111_11111110_11000000u32 as i32;
 
         assert_eq!(
-            Inst::decode_compressed(op),
+            Inst::decode_compressed(op, false),
             Some(Inst::RegImm {
                 kind: RegImmKind::Add,
                 dst: Reg::SP,
                 src: Reg::SP,
-                imm: 0b11111111_11111111_11111110_11000000u32 as i32
+                imm,
+            })
+        );
+
+        assert_eq!(
+            Inst::decode_compressed(op, true),
+            Some(Inst::RegImm {
+                kind: RegImmKind::Add64,
+                dst: Reg::SP,
+                src: Reg::SP,
+                imm,
             })
         );
 
         let op = 0b011_0_00010_00000_01;
         // RES, nzimm=0
-        assert_eq!(Inst::decode(op), None);
+        assert_eq!(Inst::decode(op, false), None);
+        assert_eq!(Inst::decode(op, true), None);
     }
 
     #[test]
     fn c_lui() {
         let op = 0b011_1_01100_10101_01;
+        let value = 0b11111111_11111111_01010000_00000000;
 
         assert_eq!(
-            Inst::decode_compressed(op),
-            Some(Inst::LoadUpperImmediate {
-                dst: Reg::A2,
-                value: 0b11111111_11111111_01010000_00000000
-            })
+            Inst::decode_compressed(op, false),
+            Some(Inst::LoadUpperImmediate { dst: Reg::A2, value })
+        );
+
+        assert_eq!(
+            Inst::decode_compressed(op, true),
+            Some(Inst::LoadUpperImmediate { dst: Reg::A2, value })
         );
 
         let op = 0b011_0_01100_00000_01;
         // RES, nzimm=0
-        assert_eq!(Inst::decode(op), None);
+        assert_eq!(Inst::decode(op, false), None);
+        assert_eq!(Inst::decode(op, true), None);
 
         let op = 0b011_1_00000_10101_01;
         // HINT, rd=0
-        assert_eq!(Inst::decode(op), None);
+        assert_eq!(Inst::decode(op, false), None);
+        assert_eq!(Inst::decode(op, true), None);
     }
 
     #[test]
@@ -1377,7 +1823,7 @@ mod test_decode_compressed {
         let op = 0b100_0_00_100_10000_01;
 
         assert_eq!(
-            Inst::decode_compressed(op),
+            Inst::decode_compressed(op, false),
             Some(Inst::RegImm {
                 kind: RegImmKind::ShiftLogicalRight,
                 dst: Reg::A2,
@@ -1386,13 +1832,25 @@ mod test_decode_compressed {
             })
         );
 
+        assert_eq!(
+            Inst::decode_compressed(op, true),
+            Some(Inst::RegImm {
+                kind: RegImmKind::ShiftLogicalRight64,
+                dst: Reg::A2,
+                src: Reg::A2,
+                imm: 0b10000
+            })
+        );
+
         let op = 0b100_1_00_100_10000_01;
         // RV32 NSE, nzuimm[5]=1
-        assert_eq!(Inst::decode_compressed(op), None);
+        assert_eq!(Inst::decode_compressed(op, false), None);
+        assert_eq!(Inst::decode_compressed(op, true), None);
 
         let op = 0b100_0_00_100_00000_01;
         // non-zero imm
-        assert_eq!(Inst::decode_compressed(op), None);
+        assert_eq!(Inst::decode_compressed(op, false), None);
+        assert_eq!(Inst::decode_compressed(op, true), None);
     }
 
     #[test]
@@ -1400,7 +1858,7 @@ mod test_decode_compressed {
         let op = 0b100_0_01_100_10000_01;
 
         assert_eq!(
-            Inst::decode_compressed(op),
+            Inst::decode_compressed(op, false),
             Some(Inst::RegImm {
                 kind: RegImmKind::ShiftArithmeticRight,
                 dst: Reg::A2,
@@ -1409,13 +1867,25 @@ mod test_decode_compressed {
             })
         );
 
+        assert_eq!(
+            Inst::decode_compressed(op, true),
+            Some(Inst::RegImm {
+                kind: RegImmKind::ShiftArithmeticRight64,
+                dst: Reg::A2,
+                src: Reg::A2,
+                imm: 0b10000
+            })
+        );
+
         let op = 0b100_1_01_100_10000_01;
         // RV32 NSE, nzuimm[5]=1
-        assert_eq!(Inst::decode_compressed(op), None);
+        assert_eq!(Inst::decode_compressed(op, false), None);
+        assert_eq!(Inst::decode_compressed(op, true), None);
 
         let op = 0b100_0_01_100_00000_01;
         // non-zero imm
-        assert_eq!(Inst::decode_compressed(op), None);
+        assert_eq!(Inst::decode_compressed(op, false), None);
+        assert_eq!(Inst::decode_compressed(op, true), None);
     }
 
     #[test]
@@ -1423,14 +1893,24 @@ mod test_decode_compressed {
         let op = 0b100_1_10_100_10101_01;
 
         assert_eq!(
-            Inst::decode_compressed(op),
+            Inst::decode_compressed(op, false),
             Some(Inst::RegImm {
                 kind: RegImmKind::And,
                 dst: Reg::A2,
                 src: Reg::A2,
                 imm: -11
             })
-        )
+        );
+
+        assert_eq!(
+            Inst::decode_compressed(op, true),
+            Some(Inst::RegImm {
+                kind: RegImmKind::And64,
+                dst: Reg::A2,
+                src: Reg::A2,
+                imm: -11
+            })
+        );
     }
 
     #[test]
@@ -1438,14 +1918,24 @@ mod test_decode_compressed {
         let op = 0b100_0_11_111_00_100_01;
 
         assert_eq!(
-            Inst::decode_compressed(op),
+            Inst::decode_compressed(op, false),
             Some(Inst::RegReg {
                 kind: RegRegKind::Sub,
                 dst: Reg::A5,
                 src1: Reg::A5,
                 src2: Reg::A2
             })
-        )
+        );
+
+        assert_eq!(
+            Inst::decode_compressed(op, true),
+            Some(Inst::RegReg {
+                kind: RegRegKind::Sub64,
+                dst: Reg::A5,
+                src1: Reg::A5,
+                src2: Reg::A2
+            })
+        );
     }
 
     #[test]
@@ -1453,14 +1943,24 @@ mod test_decode_compressed {
         let op = 0b100_0_11_111_01_100_01;
 
         assert_eq!(
-            Inst::decode_compressed(op),
+            Inst::decode_compressed(op, false),
             Some(Inst::RegReg {
                 kind: RegRegKind::Xor,
                 dst: Reg::A5,
                 src1: Reg::A5,
                 src2: Reg::A2
             })
-        )
+        );
+
+        assert_eq!(
+            Inst::decode_compressed(op, true),
+            Some(Inst::RegReg {
+                kind: RegRegKind::Xor64,
+                dst: Reg::A5,
+                src1: Reg::A5,
+                src2: Reg::A2
+            })
+        );
     }
 
     #[test]
@@ -1468,14 +1968,24 @@ mod test_decode_compressed {
         let op = 0b100_0_11_111_10_100_01;
 
         assert_eq!(
-            Inst::decode_compressed(op),
+            Inst::decode_compressed(op, false),
             Some(Inst::RegReg {
                 kind: RegRegKind::Or,
                 dst: Reg::A5,
                 src1: Reg::A5,
                 src2: Reg::A2
             })
-        )
+        );
+
+        assert_eq!(
+            Inst::decode_compressed(op, true),
+            Some(Inst::RegReg {
+                kind: RegRegKind::Or64,
+                dst: Reg::A5,
+                src1: Reg::A5,
+                src2: Reg::A2
+            })
+        );
     }
 
     #[test]
@@ -1483,14 +1993,24 @@ mod test_decode_compressed {
         let op = 0b100_0_11_111_11_100_01;
 
         assert_eq!(
-            Inst::decode_compressed(op),
+            Inst::decode_compressed(op, false),
             Some(Inst::RegReg {
                 kind: RegRegKind::And,
                 dst: Reg::A5,
                 src1: Reg::A5,
                 src2: Reg::A2
             })
-        )
+        );
+
+        assert_eq!(
+            Inst::decode_compressed(op, true),
+            Some(Inst::RegReg {
+                kind: RegRegKind::And64,
+                dst: Reg::A5,
+                src1: Reg::A5,
+                src2: Reg::A2
+            })
+        );
     }
 
     #[test]
@@ -1498,7 +2018,7 @@ mod test_decode_compressed {
         let op = 0b110_101_100_01010_01;
 
         assert_eq!(
-            Inst::decode_compressed(op),
+            Inst::decode_compressed(op, false),
             Some(Inst::Branch {
                 kind: BranchKind::Eq,
                 src1: Reg::A2,
@@ -1513,7 +2033,7 @@ mod test_decode_compressed {
         let op = 0b111_001_100_10101_01;
 
         assert_eq!(
-            Inst::decode_compressed(op),
+            Inst::decode_compressed(op, false),
             Some(Inst::Branch {
                 kind: BranchKind::NotEq,
                 src1: Reg::A2,
@@ -1528,7 +2048,7 @@ mod test_decode_compressed {
         let op = 0b000_0_01100_10101_10;
 
         assert_eq!(
-            Inst::decode_compressed(op),
+            Inst::decode_compressed(op, false),
             Some(Inst::RegImm {
                 kind: RegImmKind::ShiftLogicalLeft,
                 dst: Reg::A2,
@@ -1537,17 +2057,30 @@ mod test_decode_compressed {
             })
         );
 
+        assert_eq!(
+            Inst::decode_compressed(op, true),
+            Some(Inst::RegImm {
+                kind: RegImmKind::ShiftLogicalLeft64,
+                dst: Reg::A2,
+                src: Reg::A2,
+                imm: 0b10101
+            })
+        );
+
         let op = 0b000_0_00000_10101_10;
         // HINT, rd=0
-        assert_eq!(Inst::decode_compressed(op), None);
+        assert_eq!(Inst::decode_compressed(op, false), None);
+        assert_eq!(Inst::decode_compressed(op, true), None);
 
         let op = 0b000_1_01100_10101_10;
         // RV32 NSE, nzuimm[5]=1
-        assert_eq!(Inst::decode_compressed(op), None);
+        assert_eq!(Inst::decode_compressed(op, false), None);
+        assert_eq!(Inst::decode_compressed(op, true), None);
 
         let op = 0b000_0_01100_00000_10;
         // non-zero shamt
-        assert_eq!(Inst::decode_compressed(op), None);
+        assert_eq!(Inst::decode_compressed(op, false), None);
+        assert_eq!(Inst::decode_compressed(op, true), None);
     }
 
     #[test]
@@ -1555,7 +2088,7 @@ mod test_decode_compressed {
         let op = 0b010_1_01100_01010_10;
 
         assert_eq!(
-            Inst::decode_compressed(op),
+            Inst::decode_compressed(op, false),
             Some(Inst::Load {
                 kind: LoadKind::U32,
                 dst: Reg::A2,
@@ -1566,7 +2099,28 @@ mod test_decode_compressed {
 
         let op = 0b010_1_00000_01010_10;
         // RES, rd=0
-        assert_eq!(Inst::decode_compressed(op), None);
+        assert_eq!(Inst::decode_compressed(op, false), None);
+    }
+
+    #[test]
+    fn c_ldsp() {
+        let op = 0b011_1_01100_01010_10;
+
+        assert_eq!(
+            Inst::decode_compressed(op, true),
+            Some(Inst::Load {
+                kind: LoadKind::U64,
+                dst: Reg::A2,
+                base: Reg::SP,
+                offset: 0b010101000
+            })
+        );
+
+        assert_eq!(Inst::decode_compressed(op, false), None);
+
+        let op = 0b011_1_00000_01010_10;
+        // RES, rd=0
+        assert_eq!(Inst::decode_compressed(op, true), None);
     }
 
     #[test]
@@ -1574,7 +2128,7 @@ mod test_decode_compressed {
         let op = 0b100_0_01100_00000_10;
 
         assert_eq!(
-            Inst::decode_compressed(op),
+            Inst::decode_compressed(op, false),
             Some(Inst::JumpAndLinkRegister {
                 dst: Reg::Zero,
                 base: Reg::A2,
@@ -1584,7 +2138,7 @@ mod test_decode_compressed {
 
         let op = 0b100_0_00000_00000_10;
         // RES, rs1=0
-        assert_eq!(Inst::decode_compressed(op), None);
+        assert_eq!(Inst::decode_compressed(op, false), None);
     }
 
     #[test]
@@ -1592,7 +2146,7 @@ mod test_decode_compressed {
         let op = 0b100_0_01100_01101_10;
 
         assert_eq!(
-            Inst::decode_compressed(op),
+            Inst::decode_compressed(op, false),
             Some(Inst::RegReg {
                 kind: RegRegKind::Add,
                 dst: Reg::A2,
@@ -1601,16 +2155,28 @@ mod test_decode_compressed {
             })
         );
 
+        assert_eq!(
+            Inst::decode_compressed(op, true),
+            Some(Inst::RegReg {
+                kind: RegRegKind::Add64,
+                dst: Reg::A2,
+                src1: Reg::Zero,
+                src2: Reg::A3
+            })
+        );
+
         let op = 0b100_0_00000_01101_10;
         // HINT, rd=0
-        assert_eq!(Inst::decode_compressed(op), None);
+        assert_eq!(Inst::decode_compressed(op, false), None);
+        assert_eq!(Inst::decode_compressed(op, true), None);
     }
 
     #[test]
     fn c_ebreak() {
         let op = 0b100_1_00000_00000_10;
         // ebreak is not supported
-        assert_eq!(Inst::decode_compressed(op), None);
+        assert_eq!(Inst::decode_compressed(op, false), None);
+        assert_eq!(Inst::decode_compressed(op, true), None);
     }
 
     #[test]
@@ -1618,7 +2184,16 @@ mod test_decode_compressed {
         let op = 0b100_1_01100_00000_10;
 
         assert_eq!(
-            Inst::decode_compressed(op),
+            Inst::decode_compressed(op, false),
+            Some(Inst::JumpAndLinkRegister {
+                dst: Reg::RA,
+                base: Reg::A2,
+                value: 0
+            })
+        );
+
+        assert_eq!(
+            Inst::decode_compressed(op, true),
             Some(Inst::JumpAndLinkRegister {
                 dst: Reg::RA,
                 base: Reg::A2,
@@ -1632,7 +2207,7 @@ mod test_decode_compressed {
         let op = 0b100_1_01100_01101_10;
 
         assert_eq!(
-            Inst::decode_compressed(op),
+            Inst::decode_compressed(op, false),
             Some(Inst::RegReg {
                 kind: RegRegKind::Add,
                 dst: Reg::A2,
@@ -1641,9 +2216,20 @@ mod test_decode_compressed {
             })
         );
 
+        assert_eq!(
+            Inst::decode_compressed(op, true),
+            Some(Inst::RegReg {
+                kind: RegRegKind::Add64,
+                dst: Reg::A2,
+                src1: Reg::A2,
+                src2: Reg::A3
+            })
+        );
+
         let op = 0b100_1_00000_01101_10;
         // HINT, rd=0
-        assert_eq!(Inst::decode_compressed(op), None);
+        assert_eq!(Inst::decode_compressed(op, false), None);
+        assert_eq!(Inst::decode_compressed(op, true), None);
     }
 
     #[test]
@@ -1651,7 +2237,7 @@ mod test_decode_compressed {
         let op = 0b110_101010_01100_10;
 
         assert_eq!(
-            Inst::decode_compressed(op),
+            Inst::decode_compressed(op, false),
             Some(Inst::Store {
                 kind: StoreKind::U32,
                 src: Reg::A2,
@@ -1661,77 +2247,90 @@ mod test_decode_compressed {
         )
     }
 
+    #[test]
+    fn c_sdsp() {
+        let op = 0b111_101010_01100_10;
+
+        assert_eq!(
+            Inst::decode_compressed(op, true),
+            Some(Inst::Store {
+                kind: StoreKind::U64,
+                src: Reg::A2,
+                base: Reg::SP,
+                offset: 0b010101000
+            })
+        );
+
+        assert_eq!(Inst::decode_compressed(op, false), None);
+    }
+
     proptest::proptest! {
         #[test]
         fn c_invalid_q0(value in BitSetStrategy::masked(0b000_111_111_11_111_00)) {
             let op = 0b001_000_000_00_000_00 | value;
             // C.FLD; C.LQ
-            assert_eq!(Inst::decode_compressed(op), None);
+            assert_eq!(Inst::decode_compressed(op, false), None);
 
             let op = 0b011_000_000_00_000_00 | value;
             // C.FLW; C.LD
-            assert_eq!(Inst::decode_compressed(op), None);
+            assert_eq!(Inst::decode_compressed(op, false), None);
 
             let op = 0b100_000_000_00_000_00 | value;
             // reserved
-            assert_eq!(Inst::decode_compressed(op), None);
+            assert_eq!(Inst::decode_compressed(op, false), None);
 
             let op = 0b101_000_000_00_000_00 | value;
             // C.FSD; C.SQ
-            assert_eq!(Inst::decode_compressed(op), None);
+            assert_eq!(Inst::decode_compressed(op, false), None);
 
             let op = 0b111_000_000_00_000_00 | value;
             // C.FSw; C.SD
-            assert_eq!(Inst::decode_compressed(op), None);
+            assert_eq!(Inst::decode_compressed(op, false), None);
         }
 
         #[test]
         fn c_invalid_q1(value in BitSetStrategy::masked(0b000_0_00_111_00_000_00)) {
             let op = 0b100_1_11_000_00_000_01 | value;
             // C.SUBW
-            assert_eq!(Inst::decode_compressed(op), None);
+            assert_eq!(Inst::decode_compressed(op, false), None);
 
             let op = 0b100_1_11_000_01_000_01 | value;
             // C.ADDW
-            assert_eq!(Inst::decode_compressed(op), None);
+            assert_eq!(Inst::decode_compressed(op, false), None);
 
             let op = 0b100_1_11_000_10_000_01 | value;
             // reserved
-            assert_eq!(Inst::decode_compressed(op), None);
+            assert_eq!(Inst::decode_compressed(op, false), None);
 
             let op = 0b100_1_11_000_11_000_01 | value;
             // reserved
-            assert_eq!(Inst::decode_compressed(op), None);
+            assert_eq!(Inst::decode_compressed(op, false), None);
         }
 
         #[test]
         fn c_invalid_q2(value in BitSetStrategy::masked(0b000_1_11111_11111_00)) {
             let op = 0b001_0_00000_00000_10 | value;
             // C.FLDSP; C.LQSP
-            assert_eq!(Inst::decode_compressed(op), None);
+            assert_eq!(Inst::decode_compressed(op, false), None);
 
             let op = 0b011_0_00000_00000_10 | value;
             // C.FLWSP; C.LDSP
-            assert_eq!(Inst::decode_compressed(op), None);
+            assert_eq!(Inst::decode_compressed(op, false), None);
 
             let op = 0b101_0_00000_00000_10 | value;
             // C.FSDSP; C.SQSP
-            assert_eq!(Inst::decode_compressed(op), None);
-
-            let op = 0b111_0_00000_00000_10 | value;
-            // C.FLWSP; C.LDSP
-            assert_eq!(Inst::decode_compressed(op), None);
+            assert_eq!(Inst::decode_compressed(op, false), None);
         }
 
         #[test]
         fn c_reserved(value in BitSetStrategy::masked(0b000_0_00_111_00_111_00)) {
             let op = 0b100_1_11_000_10_000_01 | value;
             // reserved
-            assert_eq!(Inst::decode_compressed(op), None);
+            assert_eq!(Inst::decode_compressed(op, false), None);
 
             let op = 0b100_1_11_000_11_000_01 | value;
             // reserved
-            assert_eq!(Inst::decode_compressed(op), None);
+            assert_eq!(Inst::decode_compressed(op, false), None);
         }
     }
 }

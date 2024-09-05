@@ -4,14 +4,14 @@
 
 use core::ptr::addr_of_mut;
 use core::sync::atomic::Ordering;
-use core::sync::atomic::{AtomicBool, AtomicI32, AtomicUsize};
+use core::sync::atomic::{AtomicBool, AtomicI32, AtomicU64, AtomicUsize};
 
 #[rustfmt::skip]
 use polkavm_common::{
     utils::align_to_next_page_usize,
     zygote::{
         AddressTableRaw, ExtTableRaw, VmCtx as VmCtxInner,
-        VmMap,
+        VmMap, VmFd, JmpBuf,
         VM_ADDR_JUMP_TABLE_RETURN_TO_HOST,
         VM_ADDR_JUMP_TABLE,
         VM_ADDR_NATIVE_CODE,
@@ -260,15 +260,20 @@ unsafe extern "C" fn entry_point(stack: *mut usize) -> ! {
 }
 
 static SHM_FD: AtomicI32 = AtomicI32::new(-1);
+static MEMORY_FD: AtomicI32 = AtomicI32::new(-1);
 
 #[inline]
 fn shm_fd() -> linux_raw::FdRef<'static> {
     linux_raw::FdRef::from_raw_unchecked(SHM_FD.load(Ordering::Relaxed))
 }
 
+#[inline]
+fn memory_fd() -> linux_raw::FdRef<'static> {
+    linux_raw::FdRef::from_raw_unchecked(MEMORY_FD.load(Ordering::Relaxed))
+}
+
 static IN_SIGNAL_HANDLER: AtomicBool = AtomicBool::new(false);
 static NATIVE_PAGE_SIZE: AtomicUsize = AtomicUsize::new(!0);
-static IS_PROGRAM_DIRTY: AtomicBool = AtomicBool::new(false);
 
 unsafe extern "C" fn signal_handler(signal: u32, _info: &linux_raw::siginfo_t, context: &linux_raw::ucontext) {
     if IN_SIGNAL_HANDLER.load(Ordering::Relaxed) || signal == linux_raw::SIGIO {
@@ -317,7 +322,7 @@ unsafe extern "C" fn signal_handler(signal: u32, _info: &linux_raw::siginfo_t, c
         Hex(context.uc_mcontext.r15)
     );
 
-    if rip < VM_ADDR_NATIVE_CODE || rip > VM_ADDR_NATIVE_CODE + *VMCTX.shm_code_length.get() {
+    if rip < VM_ADDR_NATIVE_CODE || rip > VM_ADDR_NATIVE_CODE + VMCTX.shm_code_length.load(Ordering::Relaxed) {
         abort_with_message("segmentation fault")
     }
 
@@ -350,29 +355,15 @@ unsafe extern "C" fn signal_handler(signal: u32, _info: &linux_raw::siginfo_t, c
     signal_host_and_longjmp(VMCTX_FUTEX_GUEST_SIGNAL);
 }
 
-#[repr(C)]
-struct JmpBuf {
-    return_address: u64,
-    rbx: u64,
-    rsp: u64,
-    rbp: u64,
-    r12: u64,
-    r13: u64,
-    r14: u64,
-    r15: u64,
-    return_value: u64,
-}
-
 static mut RESUME_MAIN_LOOP_JMPBUF: JmpBuf = JmpBuf {
-    return_address: 0,
-    rbx: 0,
-    rsp: 0,
-    rbp: 0,
-    r12: 0,
-    r13: 0,
-    r14: 0,
-    r15: 0,
-    return_value: 0,
+    rip: AtomicU64::new(0),
+    rbx: AtomicU64::new(0),
+    rsp: AtomicU64::new(0),
+    rbp: AtomicU64::new(0),
+    r12: AtomicU64::new(0),
+    r13: AtomicU64::new(0),
+    r14: AtomicU64::new(0),
+    r15: AtomicU64::new(0),
 };
 
 extern "C" {
@@ -546,24 +537,10 @@ unsafe fn initialize(mut stack: *mut usize) {
     )
     .unwrap_or_else(|error| abort_with_error("failed to make sure the jump table address space is unmapped", error));
 
-    if VMCTX.init.uffd_enabled.load(Ordering::Relaxed) {
-        let memory_fd = linux_raw::recvfd(socket.borrow()).unwrap_or_else(|error| abort_with_error("failed to read memory fd", error));
+    let memory_fd = linux_raw::recvfd(socket.borrow()).unwrap_or_else(|error| abort_with_error("failed to read memory fd", error));
+    MEMORY_FD.store(memory_fd.leak(), Ordering::Relaxed);
 
-        linux_raw::sys_mmap(
-            0x10000 as *mut core::ffi::c_void,
-            (u32::MAX as usize) + 1 - 0x10000,
-            linux_raw::PROT_READ | linux_raw::PROT_WRITE,
-            linux_raw::MAP_FIXED | linux_raw::MAP_SHARED,
-            Some(memory_fd.borrow()),
-            0x10000,
-        )
-        .unwrap_or_else(|error| abort_with_error("failed to mmap the guest memory", error));
-
-        // We don't need it anymore; close it.
-        memory_fd
-            .close()
-            .unwrap_or_else(|error| abort_with_error("failed to close memory fd", error));
-
+    if VMCTX.init.uffd_available.load(Ordering::Relaxed) {
         // Set up and send the userfaultfd to the host.
         let userfaultfd = linux_raw::sys_userfaultfd(linux_raw::O_CLOEXEC)
             .unwrap_or_else(|error| abort_with_error("failed to create an userfaultfd", error));
@@ -795,7 +772,7 @@ pub unsafe extern "C" fn ext_reset_memory() -> ! {
 
     let memory_map = memory_map();
     for map in memory_map {
-        if !map.is_writable {
+        if (map.protection & linux_raw::PROT_WRITE) == 0 {
             continue;
         }
 
@@ -817,7 +794,6 @@ pub unsafe extern "C" fn ext_reset_memory() -> ! {
     *VMCTX.heap_info.heap_top.get() = heap_base;
     *VMCTX.heap_info.heap_threshold.get() = heap_initial_threshold;
 
-    VMCTX.is_memory_dirty.store(false, Ordering::Relaxed);
     signal_host_and_longjmp(VMCTX_FUTEX_IDLE);
 }
 
@@ -930,6 +906,7 @@ pub static EXT_TABLE: ExtTableRaw = ExtTableRaw {
     ext_zero_memory_chunk,
     ext_load_program,
     ext_recycle,
+    ext_fetch_idle_regs,
 };
 
 #[inline(always)]
@@ -943,9 +920,9 @@ fn signal_host_and_longjmp(futex_value_to_set: u32) -> ! {
 
 fn memory_map() -> &'static [VmMap] {
     unsafe {
-        let shm_memory_map_count = *VMCTX.shm_memory_map_count.get();
+        let shm_memory_map_count = VMCTX.shm_memory_map_count.load(Ordering::Relaxed);
         if shm_memory_map_count > 0 {
-            let shm_memory_map_offset = *VMCTX.shm_memory_map_offset.get();
+            let shm_memory_map_offset = VMCTX.shm_memory_map_offset.load(Ordering::Relaxed);
             core::slice::from_raw_parts(
                 (VM_ADDR_SHARED_MEMORY as *const u8)
                     .add(shm_memory_map_offset as usize)
@@ -967,63 +944,54 @@ pub unsafe extern "C" fn ext_load_program() -> ! {
     }
 
     recycle();
-    IS_PROGRAM_DIRTY.store(true, Ordering::Relaxed);
 
     let shm_fd = shm_fd();
+    let memory_fd = memory_fd();
     let memory_map = memory_map();
 
     for map in memory_map {
-        let mut protection = linux_raw::PROT_READ;
-        if map.is_writable {
-            protection |= linux_raw::PROT_WRITE;
-        }
+        linux_raw::sys_mmap(
+            map.address as *mut core::ffi::c_void,
+            map.length as usize,
+            map.protection,
+            map.flags,
+            match map.fd {
+                VmFd::None => None,
+                VmFd::Shm => Some(shm_fd),
+                VmFd::Mem => Some(memory_fd),
+            },
+            map.fd_offset,
+        )
+        .unwrap_or_else(|error| abort_with_error("failed to mmap memory", error));
 
-        if map.shm_offset == u64::MAX {
-            linux_raw::sys_mmap(
-                map.address as *mut core::ffi::c_void,
-                map.length as usize,
-                protection,
-                linux_raw::MAP_FIXED | linux_raw::MAP_PRIVATE | linux_raw::MAP_ANONYMOUS,
-                None,
-                0,
-            )
-            .unwrap_or_else(|error| abort_with_error("failed to mmap anonymous memory", error));
-
-            trace!(
-                "mapped anonymous: ",
-                Hex(map.address),
-                "-",
-                Hex(map.address + map.length),
-                " (",
-                Hex(map.length),
-                ")"
-            );
-        } else {
-            linux_raw::sys_mmap(
-                map.address as *mut core::ffi::c_void,
-                map.length as usize,
-                protection,
-                linux_raw::MAP_FIXED | linux_raw::MAP_PRIVATE,
-                Some(shm_fd),
-                map.shm_offset,
-            )
-            .unwrap_or_else(|error| abort_with_error("failed to mmap from shared memory", error));
-
-            trace!(
-                "mapped from shared memory: ",
-                Hex(map.address),
-                "-",
-                Hex(map.address + map.length),
-                " (",
-                Hex(map.length),
-                ")"
-            );
-        }
+        trace!(
+            "Mapped memory (",
+            if map.protection == linux_raw::PROT_READ {
+                "RO"
+            } else if map.protection == linux_raw::PROT_READ | linux_raw::PROT_WRITE {
+                "RW"
+            } else {
+                "??"
+            },
+            ", ",
+            match map.fd {
+                VmFd::None => "anon",
+                VmFd::Shm => "shm",
+                VmFd::Mem => "mem",
+            },
+            "): ",
+            Hex(map.address),
+            "-",
+            Hex(map.address + map.length),
+            " (",
+            Hex(map.length),
+            ")"
+        );
     }
 
-    let shm_code_length = *VMCTX.shm_code_length.get();
+    let shm_code_length = VMCTX.shm_code_length.load(Ordering::Relaxed);
     if shm_code_length > 0 {
-        let shm_code_offset = *VMCTX.shm_code_offset.get();
+        let shm_code_offset = VMCTX.shm_code_offset.load(Ordering::Relaxed);
         linux_raw::sys_mmap(
             VM_ADDR_NATIVE_CODE as *mut core::ffi::c_void,
             shm_code_length as usize,
@@ -1045,9 +1013,9 @@ pub unsafe extern "C" fn ext_load_program() -> ! {
         );
     }
 
-    let shm_jump_table_length = *VMCTX.shm_jump_table_length.get();
+    let shm_jump_table_length = VMCTX.shm_jump_table_length.load(Ordering::Relaxed);
     if shm_jump_table_length > 0 {
-        let shm_jump_table_offset = *VMCTX.shm_jump_table_offset.get();
+        let shm_jump_table_offset = VMCTX.shm_jump_table_offset.load(Ordering::Relaxed);
         linux_raw::sys_mmap(
             VM_ADDR_JUMP_TABLE as *mut core::ffi::c_void,
             shm_jump_table_length as usize,
@@ -1069,7 +1037,7 @@ pub unsafe extern "C" fn ext_load_program() -> ! {
         );
     }
 
-    let sysreturn_address = *VMCTX.sysreturn_address.get();
+    let sysreturn_address = VMCTX.sysreturn_address.load(Ordering::Relaxed);
     trace!(
         "new sysreturn address: ",
         Hex(sysreturn_address),
@@ -1078,22 +1046,15 @@ pub unsafe extern "C" fn ext_load_program() -> ! {
         ")"
     );
     *(VM_ADDR_JUMP_TABLE_RETURN_TO_HOST as *mut u64) = sysreturn_address;
-    VMCTX.is_memory_dirty.store(false, Ordering::Relaxed);
 
     signal_host_and_longjmp(VMCTX_FUTEX_IDLE);
 }
 
 unsafe fn recycle() {
-    if !IS_PROGRAM_DIRTY.load(Ordering::Relaxed) {
-        return;
-    }
-
     polkavm_common::static_assert!(VM_ADDR_NATIVE_CODE + (VM_SANDBOX_MAXIMUM_NATIVE_CODE_SIZE as u64) < 0x200000000);
 
-    if !VMCTX.init.uffd_enabled.load(Ordering::Relaxed) {
-        linux_raw::sys_munmap(core::ptr::null_mut(), 0x200000000)
-            .unwrap_or_else(|error| abort_with_error("failed to unmap user accessible memory", error));
-    }
+    linux_raw::sys_munmap(core::ptr::null_mut(), 0x200000000)
+        .unwrap_or_else(|error| abort_with_error("failed to unmap user accessible memory", error));
 
     linux_raw::sys_munmap(
         VM_ADDR_JUMP_TABLE as *mut core::ffi::c_void,
@@ -1102,13 +1063,37 @@ unsafe fn recycle() {
     .unwrap_or_else(|error| abort_with_error("failed to unmap jump table", error));
 
     *(VM_ADDR_JUMP_TABLE_RETURN_TO_HOST as *mut u64) = 0;
-    VMCTX.is_memory_dirty.store(false, Ordering::Relaxed);
-    IS_PROGRAM_DIRTY.store(false, Ordering::Relaxed);
 }
 
 #[inline(never)]
 pub unsafe extern "C" fn ext_recycle() -> ! {
     trace!("Entry point: ext_recycle");
     recycle();
+    signal_host_and_longjmp(VMCTX_FUTEX_IDLE);
+}
+
+#[inline(never)]
+pub unsafe extern "C" fn ext_fetch_idle_regs() -> ! {
+    trace!("Entry point: ext_fetch_idle_regs");
+
+    macro_rules! copy_regs {
+        ($($name:ident),+) => {
+            $(
+                VMCTX.init.idle_regs.$name.store(RESUME_MAIN_LOOP_JMPBUF.$name.load(Ordering::Relaxed), Ordering::Relaxed);
+            )+
+        }
+    }
+
+    copy_regs! {
+        rip,
+        rbp,
+        rsp,
+        rbp,
+        r12,
+        r13,
+        r14,
+        r15
+    }
+
     signal_host_and_longjmp(VMCTX_FUTEX_IDLE);
 }

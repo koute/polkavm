@@ -1,11 +1,9 @@
-use alloc::borrow::Cow;
 use alloc::boxed::Box;
 use alloc::format;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 
-use polkavm_common::abi::MemoryMap;
-use polkavm_common::abi::{VM_ADDR_RETURN_TO_HOST, VM_ADDR_USER_STACK_HIGH};
+use polkavm_common::abi::{MemoryMap, MemoryMapBuilder, VM_ADDR_RETURN_TO_HOST};
 use polkavm_common::program::{FrameKind, Imports, Reg};
 use polkavm_common::program::{Instructions, JumpTable, ProgramBlob};
 use polkavm_common::utils::{ArcBytes, AsUninitSliceMut};
@@ -66,6 +64,7 @@ pub struct Engine {
     interpreter_enabled: bool,
     crosscheck: bool,
     state: Arc<EngineState>,
+    allow_dynamic_paging: bool,
 }
 
 impl Engine {
@@ -135,20 +134,13 @@ impl Engine {
             }
         };
 
-        if (crosscheck || selected_backend == BackendKind::Interpreter) && config.dynamic_paging() {
-            bail!("dynamic paging is currently not supported by the interpreter");
-        }
-
-        if config.dynamic_paging() && !config.allow_experimental {
-            bail!("cannot enable dynamic paging: this is not production ready nor even finished; you can enable `set_allow_experimental`/`POLKAVM_ALLOW_EXPERIMENTAL` to be able to use it anyway");
-        }
-
         Ok(Engine {
             selected_backend,
             selected_sandbox,
             interpreter_enabled: crosscheck || selected_backend == BackendKind::Interpreter,
             crosscheck,
             state,
+            allow_dynamic_paging: config.allow_dynamic_paging(),
         })
     }
 }
@@ -186,6 +178,7 @@ struct ModulePrivate {
     gas_metering: Option<GasMeteringKind>,
     is_strict: bool,
     step_tracing: bool,
+    dynamic_paging: bool,
     page_size_mask: u32,
     page_shift: u32,
 }
@@ -201,6 +194,10 @@ impl Module {
 
     pub(crate) fn is_step_tracing(&self) -> bool {
         self.0.step_tracing
+    }
+
+    pub(crate) fn is_dynamic_paging(&self) -> bool {
+        self.0.dynamic_paging
     }
 
     pub(crate) fn compiled_module(&self) -> &CompiledModuleKind {
@@ -235,7 +232,7 @@ impl Module {
         self.0.gas_metering
     }
 
-    fn is_multiple_of_page_size(&self, value: u32) -> bool {
+    pub(crate) fn is_multiple_of_page_size(&self, value: u32) -> bool {
         (value & self.0.page_size_mask) == 0
     }
 
@@ -261,8 +258,17 @@ impl Module {
 
     /// Creates a new module from a deserialized program `blob`.
     pub fn from_blob(engine: &Engine, config: &ModuleConfig, blob: ProgramBlob) -> Result<Self, Error> {
+        if config.dynamic_paging() && !engine.allow_dynamic_paging {
+            bail!("dynamic paging was not enabled; use `Config::set_allow_dynamic_paging` to enable it");
+        }
+
         // Do an early check for memory config validity.
-        MemoryMap::new(config.page_size, blob.ro_data_size(), blob.rw_data_size(), blob.stack_size()).map_err(Error::from_static_str)?;
+        MemoryMapBuilder::new(config.page_size)
+            .ro_data_size(blob.ro_data_size())
+            .rw_data_size(blob.rw_data_size())
+            .stack_size(blob.stack_size())
+            .build()
+            .map_err(Error::from_static_str)?;
 
         if config.is_strict || cfg!(debug_assertions) {
             log::trace!("Checking imports...");
@@ -317,6 +323,7 @@ impl Module {
             ro_data_size: blob.ro_data_size(),
             rw_data_size: blob.rw_data_size(),
             stack_size: blob.stack_size(),
+            aux_data_size: config.aux_data_size(),
         };
 
         #[allow(unused_macros)]
@@ -424,6 +431,13 @@ impl Module {
             blob.stack_size(),
             memory_map.stack_range().len(),
         );
+        log::debug!(
+            "  Memory map:     Aux: 0x{:08x}..0x{:08x} ({}/{} bytes requested)",
+            memory_map.aux_data_range().start,
+            memory_map.aux_data_range().end,
+            config.aux_data_size(),
+            memory_map.aux_data_range().len(),
+        );
 
         let page_shift = memory_map.page_size().ilog2();
         let page_size_mask = (1 << page_shift) - 1;
@@ -438,6 +452,7 @@ impl Module {
             gas_metering: config.gas_metering,
             is_strict: config.is_strict,
             step_tracing: config.step_tracing,
+            dynamic_paging: config.dynamic_paging,
             crosscheck: engine.crosscheck,
             page_size_mask,
             page_shift,
@@ -640,12 +655,11 @@ if_compiler_is_supported! {
     }
 }
 
+/// The host failed to access the guest's memory.
 #[derive(Debug)]
-#[non_exhaustive]
-pub struct MemoryAccessError {
-    pub address: u32,
-    pub length: u64,
-    pub error: Cow<'static, str>,
+pub enum MemoryAccessError {
+    OutOfRangeAccess { address: u32, length: u64 },
+    Error(Error),
 }
 
 #[cfg(feature = "std")]
@@ -653,14 +667,20 @@ impl std::error::Error for MemoryAccessError {}
 
 impl core::fmt::Display for MemoryAccessError {
     fn fmt(&self, fmt: &mut core::fmt::Formatter) -> core::fmt::Result {
-        write!(
-            fmt,
-            "out of range memory access in 0x{:x}-0x{:x} ({} bytes): {}",
-            self.address,
-            u64::from(self.address) + self.length,
-            self.length,
-            self.error
-        )
+        match self {
+            MemoryAccessError::OutOfRangeAccess { address, length } => {
+                write!(
+                    fmt,
+                    "out of range memory access in 0x{:x}-0x{:x} ({} bytes)",
+                    address,
+                    u64::from(*address) + length,
+                    length
+                )
+            }
+            MemoryAccessError::Error(error) => {
+                write!(fmt, "memory access failed: {error}")
+            }
+        }
     }
 }
 
@@ -855,23 +875,52 @@ impl RawInstance {
     where
         B: ?Sized + AsUninitSliceMut,
     {
+        let slice = buffer.as_uninit_slice_mut();
+        if slice.is_empty() {
+            // SAFETY: The slice is empty so it's always safe to assume it's initialized.
+            unsafe {
+                return Ok(polkavm_common::utils::slice_assume_init_mut(slice));
+            }
+        }
+
         if address < 0x10000 {
-            return Err(MemoryAccessError {
+            return Err(MemoryAccessError::OutOfRangeAccess {
                 address,
-                length: buffer.as_uninit_slice_mut().len() as u64,
-                error: "out of range read (accessing addresses lower than 0x10000 is forbidden)".into(),
+                length: slice.len() as u64,
             });
         }
 
-        if u64::from(address) + buffer.as_uninit_slice_mut().len() as u64 > 0x100000000 {
-            return Err(MemoryAccessError {
+        if u64::from(address) + slice.len() as u64 > 0x100000000 {
+            return Err(MemoryAccessError::OutOfRangeAccess {
                 address,
-                length: buffer.as_uninit_slice_mut().len() as u64,
-                error: "out of range read".into(),
+                length: slice.len() as u64,
             });
         }
 
-        access_backend!(self.backend, |backend| backend.read_memory_into(address, buffer))
+        let length = slice.len();
+        let result = access_backend!(self.backend, |backend| backend.read_memory_into(address, slice));
+        if let Some(ref crosscheck) = self.crosscheck_instance {
+            let mut expected_data: Vec<core::mem::MaybeUninit<u8>> = alloc::vec![core::mem::MaybeUninit::new(0xfa); length];
+            let expected_result = crosscheck.read_memory_into(address, &mut expected_data);
+            let expected_success = expected_result.is_ok();
+            let success = result.is_ok();
+            let results_match = match (&result, &expected_result) {
+                (Ok(result), Ok(expected_result)) => result == expected_result,
+                (Err(_), Err(_)) => true,
+                _ => false,
+            };
+            if !results_match {
+                let address_end = u64::from(address) + length as u64;
+                if cfg!(debug_assertions) {
+                    if let (Ok(result), Ok(expected_result)) = (result, expected_result) {
+                        log::trace!("read_memory result (interpreter): {expected_result:?}");
+                        log::trace!("read_memory result (backend):     {result:?}");
+                    }
+                }
+                panic!("read_memory: crosscheck mismatch, range = 0x{address:x}..0x{address_end:x}, interpreter = {expected_success}, backend = {success}");
+            }
+        }
+        result
     }
 
     /// Writes into the VM's memory.
@@ -879,19 +928,21 @@ impl RawInstance {
     /// When dynamic paging is enabled calling this can be used to resolve a segfault. It can also
     /// be used to preemptively initialize pages for which no segfault is currently triggered.
     pub fn write_memory(&mut self, address: u32, data: &[u8]) -> Result<(), MemoryAccessError> {
+        if data.is_empty() {
+            return Ok(());
+        }
+
         if address < 0x10000 {
-            return Err(MemoryAccessError {
+            return Err(MemoryAccessError::OutOfRangeAccess {
                 address,
                 length: data.len() as u64,
-                error: "out of range write (accessing addresses lower than 0x10000 is forbidden)".into(),
             });
         }
 
         if u64::from(address) + data.len() as u64 > 0x100000000 {
-            return Err(MemoryAccessError {
+            return Err(MemoryAccessError::OutOfRangeAccess {
                 address,
                 length: data.len() as u64,
-                error: "out of range write".into(),
             });
         }
 
@@ -948,31 +999,64 @@ impl RawInstance {
         self.write_memory(address, &value.to_le_bytes())
     }
 
+    /// A convenience function to read an `u16` from the VM's memory.
+    ///
+    /// This is equivalent to calling [`RawInstance::read_memory_into`].
+    pub fn read_u16(&self, address: u32) -> Result<u16, MemoryAccessError> {
+        let mut buffer = [0; 2];
+        self.read_memory_into(address, &mut buffer)?;
+
+        Ok(u16::from_le_bytes(buffer))
+    }
+
+    /// A convenience function to write an `u16` into the VM's memory.
+    ///
+    /// This is equivalent to calling [`RawInstance::write_memory`].
+    pub fn write_u16(&mut self, address: u32, value: u16) -> Result<(), MemoryAccessError> {
+        self.write_memory(address, &value.to_le_bytes())
+    }
+
+    /// A convenience function to read an `u8` from the VM's memory.
+    ///
+    /// This is equivalent to calling [`RawInstance::read_memory_into`].
+    pub fn read_u8(&self, address: u32) -> Result<u8, MemoryAccessError> {
+        let mut buffer = [0; 1];
+        self.read_memory_into(address, &mut buffer)?;
+
+        Ok(buffer[0])
+    }
+
+    /// A convenience function to write an `u8` into the VM's memory.
+    ///
+    /// This is equivalent to calling [`RawInstance::write_memory`].
+    pub fn write_u8(&mut self, address: u32, value: u8) -> Result<(), MemoryAccessError> {
+        self.write_memory(address, &[value])
+    }
+
     /// Fills the given memory region with zeros.
     ///
     /// `address` must be greater or equal to 0x10000 and `address + length` cannot be greater than 0x100000000.
+    /// If `length` is zero then this call has no effect and will always succeed.
     ///
     /// When dynamic paging is enabled calling this can be used to resolve a segfault. It can also
     /// be used to preemptively initialize pages for which no segfault is currently triggered.
     pub fn zero_memory(&mut self, address: u32, length: u32) -> Result<(), MemoryAccessError> {
+        if length == 0 {
+            return Ok(());
+        }
+
         if address < 0x10000 {
-            return Err(MemoryAccessError {
+            return Err(MemoryAccessError::OutOfRangeAccess {
                 address,
                 length: u64::from(length),
-                error: "out of range write (accessing addresses lower than 0x10000 is forbidden)".into(),
             });
         }
 
         if u64::from(address) + u64::from(length) > 0x100000000 {
-            return Err(MemoryAccessError {
+            return Err(MemoryAccessError::OutOfRangeAccess {
                 address,
                 length: u64::from(length),
-                error: "out of range write (address overflow)".into(),
             });
-        }
-
-        if length == 0 {
-            return Ok(());
         }
 
         let result = access_backend!(self.backend, |mut backend| backend.zero_memory(address, length));
@@ -992,7 +1076,12 @@ impl RawInstance {
     /// Frees the given page(s).
     ///
     /// `address` must be a multiple of the page size. The value of `length` will be rounded up to the nearest multiple of the page size.
+    /// If `length` is zero then this call has no effect and will always succeed.
     pub fn free_pages(&mut self, address: u32, length: u32) -> Result<(), Error> {
+        if length == 0 {
+            return Ok(());
+        }
+
         if !self.module.is_multiple_of_page_size(address) {
             return Err("address not a multiple of page size".into());
         }
@@ -1030,15 +1119,16 @@ impl RawInstance {
     ///
     /// This function will:
     ///   1) clear all registers to zero,
-    ///   2) initialize `RA` and `SP` to `0xffff0000`,
-    ///   3) set the program counter.
+    ///   2) initialize `RA` to `0xffff0000`,
+    ///   3) initialize `SP` to its default value,
+    ///   4) set the program counter.
     ///
     /// Will panic if `args` has more than 9 elements.
     pub fn prepare_call_untyped(&mut self, pc: ProgramCounter, args: &[RegValue]) {
         assert!(args.len() <= Reg::ARG_REGS.len(), "too many arguments");
 
         self.clear_regs();
-        self.set_reg(Reg::SP, VM_ADDR_USER_STACK_HIGH);
+        self.set_reg(Reg::SP, self.module.default_sp());
         self.set_reg(Reg::RA, VM_ADDR_RETURN_TO_HOST);
         self.set_next_program_counter(pc);
 

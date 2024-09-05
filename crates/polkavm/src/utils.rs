@@ -29,11 +29,17 @@ pub struct GuestInit<'a> {
     pub ro_data_size: u32,
     pub rw_data_size: u32,
     pub stack_size: u32,
+    pub aux_data_size: u32,
 }
 
 impl<'a> GuestInit<'a> {
     pub fn memory_map(&self) -> Result<polkavm_common::abi::MemoryMap, &'static str> {
-        polkavm_common::abi::MemoryMap::new(self.page_size, self.ro_data_size, self.rw_data_size, self.stack_size)
+        polkavm_common::abi::MemoryMapBuilder::new(self.page_size)
+            .ro_data_size(self.ro_data_size)
+            .rw_data_size(self.rw_data_size)
+            .stack_size(self.stack_size)
+            .aux_data_size(self.aux_data_size)
+            .build()
     }
 }
 
@@ -115,7 +121,7 @@ pub enum InterruptKind {
     /// This happens when a program accesses a memory page that is not mapped,
     /// or tries to write to a read-only page.
     ///
-    /// Requires dynamic paging to be enabled with [`Config::set_dynamic_paging`](crate::Config::set_dynamic_paging), otherwise is never emitted.
+    /// Requires dynamic paging to be enabled with [`ModuleConfig::set_dynamic_paging`](crate::ModuleConfig::set_dynamic_paging), otherwise is never emitted.
     Segfault(Segfault),
 
     /// The execution ran out of gas.

@@ -2241,11 +2241,14 @@ where
     Ok(None)
 }
 
-pub(crate) fn load_dwarf(
+pub(crate) fn load_dwarf<H>(
     string_cache: &mut StringCache,
-    elf: &Elf,
+    elf: &Elf<H>,
     relocations: &BTreeMap<SectionTarget, RelocationKind>,
-) -> Result<DwarfInfo, ProgramFromElfError> {
+) -> Result<DwarfInfo, ProgramFromElfError>
+where
+    H: object::read::elf::FileHeader<Endian = object::LittleEndian>,
+{
     log::trace!("Loading DWARF...");
 
     let Some(debug_info) = elf.section_by_name(".debug_info").next() else {

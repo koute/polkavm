@@ -1,4 +1,5 @@
 use alloc::sync::Arc;
+use core::mem::MaybeUninit;
 use core::sync::atomic::{AtomicUsize, Ordering};
 
 use polkavm_common::zygote::AddressTable;
@@ -9,7 +10,7 @@ use crate::config::{Config, SandboxKind};
 use crate::error::Error;
 use crate::mutex::Mutex;
 use crate::utils::GuestInit;
-use crate::{AsUninitSliceMut, Gas, InterruptKind, MemoryAccessError, ProgramCounter, Reg, RegValue};
+use crate::{Gas, InterruptKind, MemoryAccessError, ProgramCounter, Reg, RegValue};
 
 macro_rules! get_field_offset {
     ($struct:expr, |$struct_ident:ident| $get_field:expr) => {{
@@ -122,9 +123,7 @@ pub(crate) trait Sandbox: Sized {
     fn next_native_program_counter(&self) -> Option<usize>;
     fn set_next_program_counter(&mut self, pc: ProgramCounter);
     fn reset_memory(&mut self) -> Result<(), Self::Error>;
-    fn read_memory_into<'slice, B>(&self, address: u32, buffer: &'slice mut B) -> Result<&'slice mut [u8], MemoryAccessError>
-    where
-        B: ?Sized + AsUninitSliceMut;
+    fn read_memory_into<'slice>(&self, address: u32, slice: &'slice mut [MaybeUninit<u8>]) -> Result<&'slice mut [u8], MemoryAccessError>;
     fn write_memory(&mut self, address: u32, data: &[u8]) -> Result<(), MemoryAccessError>;
     fn zero_memory(&mut self, address: u32, length: u32) -> Result<(), MemoryAccessError>;
     fn free_pages(&mut self, address: u32, length: u32) -> Result<(), Self::Error>;

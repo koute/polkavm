@@ -209,6 +209,7 @@ pub use crate::arch_bindings::{
     ETOOMANYREFS,
     ETXTBSY,
     EXDEV,
+    ERESTARTSYS,
     F_ADD_SEALS,
     F_DUPFD,
     F_GETFD,
@@ -1310,6 +1311,7 @@ impl Error {
             ERANGE => Some("ERANGE"),
             EOPNOTSUPP => Some("EOPNOTSUPP"),
             ETOOMANYREFS => Some("ETOOMANYREFS"),
+            ERESTARTSYS => Some("ERESTARTSYS"),
             _ => None,
         };
 
@@ -1835,6 +1837,7 @@ pub fn sys_ptrace_detach(pid: pid_t) -> Result<(), Error> {
 
 #[cfg(target_arch = "x86_64")]
 #[repr(C)]
+#[derive(Default, Debug)]
 pub struct user_regs_struct {
     pub r15: c_ulong,
     pub r14: c_ulong,

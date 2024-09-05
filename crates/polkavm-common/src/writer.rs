@@ -3,7 +3,7 @@ use alloc::boxed::Box;
 use alloc::vec::Vec;
 use core::ops::Range;
 
-#[derive(Copy, Clone)]
+#[derive(Copy, Clone, Default)]
 struct InstructionBuffer {
     bytes: [u8; program::MAX_INSTRUCTION_LENGTH],
     length: u8,
@@ -13,24 +13,35 @@ impl InstructionBuffer {
     fn len(&self) -> usize {
         self.length as usize
     }
+
+    fn new(position: u32, minimum_size: u8, instruction: Instruction) -> Self {
+        let mut buffer = Self {
+            bytes: [0; program::MAX_INSTRUCTION_LENGTH],
+            length: 0,
+        };
+
+        let minimum_size = minimum_size as usize;
+        let mut length = instruction.serialize_into(position, &mut buffer.bytes);
+        if length < minimum_size {
+            let Instruction::jump(target) = instruction else {
+                // We currently only need this for jumps.
+                unreachable!();
+            };
+            assert!(minimum_size >= 1 && minimum_size <= 5);
+
+            buffer.bytes[1..minimum_size].copy_from_slice(&u32::to_le_bytes(target.wrapping_sub(position))[..minimum_size - 1]);
+            length = minimum_size;
+        }
+
+        buffer.length = length as u8;
+        buffer
+    }
 }
 
 impl core::ops::Deref for InstructionBuffer {
     type Target = [u8];
     fn deref(&self) -> &Self::Target {
         &self.bytes[..self.length as usize]
-    }
-}
-
-impl From<(u32, Instruction)> for InstructionBuffer {
-    fn from((position, instruction): (u32, Instruction)) -> Self {
-        let mut buffer = Self {
-            bytes: [0; program::MAX_INSTRUCTION_LENGTH],
-            length: 0,
-        };
-
-        buffer.length = instruction.serialize_into(position, &mut buffer.bytes) as u8;
-        buffer
     }
 }
 
@@ -66,10 +77,10 @@ pub struct RawInstruction {
     starts_new_basic_block: bool,
 }
 
-impl From<(u32, Instruction)> for RawInstruction {
-    fn from((position, instruction): (u32, Instruction)) -> Self {
+impl From<(u32, u8, Instruction)> for RawInstruction {
+    fn from((position, minimum_size, instruction): (u32, u8, Instruction)) -> Self {
         Self {
-            buffer: InstructionBuffer::from((position, instruction)),
+            buffer: InstructionBuffer::new(position, minimum_size, instruction),
             starts_new_basic_block: instruction.opcode().starts_new_basic_block(),
         }
     }
@@ -99,6 +110,7 @@ struct SerializedInstruction {
     bytes: InstructionBuffer,
     target_nth_instruction: Option<usize>,
     position: u32,
+    minimum_size: u8,
 }
 
 #[derive(Default)]
@@ -110,14 +122,19 @@ pub struct ProgramBlobBuilder {
     rw_data: Vec<u8>,
     imports: Vec<ProgramSymbol<Box<[u8]>>>,
     exports: Vec<(u32, ProgramSymbol<Box<[u8]>>)>,
+    code: Vec<InstructionOrBytes>,
+    jump_table: Vec<u32>,
+    custom: Vec<(u8, Vec<u8>)>,
+    dispatch_table: Vec<Vec<u8>>,
+}
+
+struct SerializedCode {
     jump_table: Vec<u8>,
     jump_table_entry_count: u32,
     jump_table_entry_size: u8,
     code: Vec<u8>,
     bitmask: Vec<u8>,
-    custom: Vec<(u8, Vec<u8>)>,
-    basic_block_to_instruction_index: Vec<usize>,
-    instruction_index_to_code_offset: Vec<u32>,
+    exports: Vec<(u32, Vec<u8>)>,
 }
 
 impl ProgramBlobBuilder {
@@ -153,8 +170,20 @@ impl ProgramBlobBuilder {
         self.exports.push((target_basic_block, ProgramSymbol::new(symbol.into())));
     }
 
+    // pub fn set_code(&mut self, code: &[impl Into<InstructionOrBytes> + Copy], jump_table: &[u32]) {
+    //     let code: Vec<InstructionOrBytes> = code.iter().map(|inst| (*inst).into()).collect();
+
+    pub fn add_dispatch_table_entry(&mut self, symbol: impl Into<Vec<u8>>) {
+        self.dispatch_table.push(symbol.into());
+    }
+
     pub fn set_code(&mut self, code: &[impl Into<InstructionOrBytes> + Copy], jump_table: &[u32]) {
         let code: Vec<InstructionOrBytes> = code.iter().map(|inst| (*inst).into()).collect();
+        self.code = code.to_vec();
+        self.jump_table = jump_table.to_vec();
+    }
+
+    fn serialize_code(&self) -> SerializedCode {
         fn mutate<T>(slot: &mut T, value: T) -> bool
         where
             T: PartialEq,
@@ -167,74 +196,109 @@ impl ProgramBlobBuilder {
             }
         }
 
-        let mut basic_block_to_instruction_index = Vec::with_capacity(code.len());
+        // We will need to shift all of the basic block indexes by how many entries are in our injected dispatch table.
+        let basic_block_shift = self.dispatch_table.len() as u32;
+
+        let mut instructions = Vec::with_capacity(self.dispatch_table.len() + self.code.len());
+        for (nth, symbol) in self.dispatch_table.iter().enumerate() {
+            let Some(&(target_basic_block, _)) = self.exports.iter().find(|(_, export_symbol)| symbol == export_symbol.as_bytes()) else {
+                // TODO: Return an error.
+                panic!("failed to build a dispatch table: symbol not found: {}", ProgramSymbol::new(symbol));
+            };
+
+            let minimum_size = if nth + 1 == self.dispatch_table.len() {
+                // The last entry doesn't have to be padded.
+                0
+            } else {
+                5
+            };
+
+            instructions.push(SerializedInstruction {
+                instruction: Some(Instruction::jump(target_basic_block + basic_block_shift)),
+                bytes: InstructionBuffer::default(),
+                target_nth_instruction: None,
+                position: 0,
+                minimum_size,
+            });
+        }
+
+        for instruction in &self.code {
+            let mut instruction = *instruction;
+
+            match instruction {
+                InstructionOrBytes::Instruction(mut inst) => {
+                    if let Some(target_basic_block) = inst.target_mut() {
+                        *target_basic_block += basic_block_shift;
+                    }
+
+                    instructions.push(SerializedInstruction {
+                        instruction: Some(inst),
+                        bytes: InstructionBuffer::default(),
+                        target_nth_instruction: None,
+                        position: 0,
+                        minimum_size: 0,
+                    });
+                }
+
+                // The instruction in the form of raw bytes, that should only be appended, as we want to
+                // be able to slip in invalid instructions, e.g., jump instruction with an invalid offset
+                InstructionOrBytes::Raw(raw_inst) => {
+                    instructions.push(SerializedInstruction {
+                        instruction: None,
+                        bytes: raw_inst.buffer,
+                        target_nth_instruction: None,
+                        position: 0,
+                        minimum_size: 0,
+                    });
+                }
+            }
+        }
+
+        let mut basic_block_to_instruction_index = Vec::with_capacity(self.code.len());
         basic_block_to_instruction_index.push(0);
 
-        for (nth_instruction, instruction) in code.iter().enumerate() {
-            if let InstructionOrBytes::Instruction(inst) = instruction {
+        for (nth_instruction, entry) in instructions.iter().enumerate() {
+            if let Some(inst) = entry.instruction {
                 if inst.opcode().starts_new_basic_block() {
                     basic_block_to_instruction_index.push(nth_instruction + 1);
                 }
             }
-
-            if let InstructionOrBytes::Raw(raw_inst) = instruction {
-                if raw_inst.starts_new_basic_block {
-                    basic_block_to_instruction_index.push(nth_instruction + 1);
-                }
-            }
         }
 
-        self.jump_table.clear();
-        self.code.clear();
-
-        let mut instructions = Vec::new();
         let mut position: u32 = 0;
-        for (nth_instruction, instruction) in code.iter().enumerate() {
-            let entry = match instruction {
-                InstructionOrBytes::Instruction(mut instruction) => {
-                    let target = instruction.target_mut();
-                    let target_nth_instruction = target.map(|target| {
-                        let target_nth_instruction = basic_block_to_instruction_index[*target as usize];
 
-                        // This is completely inaccurate, but that's fine.
-                        *target = position.wrapping_add((target_nth_instruction as i32 - nth_instruction as i32) as u32);
-                        target_nth_instruction
-                    });
+        for (nth_instruction, entry) in instructions.iter_mut().enumerate() {
+            if let Some(mut inst) = entry.instruction {
+                entry.target_nth_instruction = inst.target_mut().map(|target| {
+                    let target_nth_instruction = basic_block_to_instruction_index[*target as usize];
+                    // Here we change the target from a basic block index into a byte offset.
+                    // This is completely inaccurate, but that's fine. This is just a guess, and we'll correct it in the next loop.
+                    *target = position.wrapping_add((target_nth_instruction as i32 - nth_instruction as i32) as u32);
+                    target_nth_instruction
+                });
 
-                    SerializedInstruction {
-                        instruction: Some(instruction),
-                        bytes: InstructionBuffer::from((position, instruction)),
-                        target_nth_instruction,
-                        position,
-                    }
-                }
-                // The instruction in the form of raw bytes, that should only be appended, as we want to
-                // be able to slip in invalid instructions, e.g., jump instruction with an invalid offset
-                InstructionOrBytes::Raw(raw_inst) => SerializedInstruction {
-                    instruction: None,
-                    bytes: raw_inst.buffer,
-                    target_nth_instruction: None,
-                    position,
-                },
-            };
-
-            position = position.checked_add(entry.bytes.len() as u32).expect("too many instructions");
-            instructions.push(entry);
+                entry.position = position;
+                entry.bytes = InstructionBuffer::new(position, entry.minimum_size, inst);
+                position = position.checked_add(entry.bytes.len() as u32).expect("too many instructions");
+            }
         }
 
         // Adjust offsets to other instructions until we reach a steady state.
         loop {
-            let mut modified = false;
+            let mut any_modified = false;
             position = 0;
             for nth_instruction in 0..instructions.len() {
-                modified |= mutate(&mut instructions[nth_instruction].position, position);
-
+                let mut self_modified = mutate(&mut instructions[nth_instruction].position, position);
                 if let Some(target_nth_instruction) = instructions[nth_instruction].target_nth_instruction {
                     let new_target = instructions[target_nth_instruction].position;
 
-                    if let Some(mut instruction) = instructions[nth_instruction].instruction {
-                        if mutate(instruction.target_mut().unwrap(), new_target) || modified {
-                            instructions[nth_instruction].bytes = InstructionBuffer::from((position, instruction));
+                    if let Some(mut inst) = instructions[nth_instruction].instruction {
+                        let old_target = inst.target_mut().unwrap();
+                        self_modified |= mutate(old_target, new_target);
+
+                        if self_modified {
+                            instructions[nth_instruction].bytes =
+                                InstructionBuffer::new(position, instructions[nth_instruction].minimum_size, inst);
                         }
                     }
                 }
@@ -242,26 +306,36 @@ impl ProgramBlobBuilder {
                 position = position
                     .checked_add(instructions[nth_instruction].bytes.len() as u32)
                     .expect("too many instructions");
+
+                any_modified |= self_modified;
             }
 
-            if !modified {
+            if !any_modified {
                 break;
             }
         }
 
         let mut jump_table_entry_size = 0;
-        let mut jump_table_entries = Vec::with_capacity(jump_table.len());
-        for &target in jump_table {
+        let mut jump_table_entries = Vec::with_capacity(self.jump_table.len());
+        for &target in &self.jump_table {
+            let target = target + basic_block_shift;
             let target_nth_instruction = basic_block_to_instruction_index[target as usize];
             let offset = instructions[target_nth_instruction].position.to_le_bytes();
             jump_table_entries.push(offset);
             jump_table_entry_size = core::cmp::max(jump_table_entry_size, offset.iter().take_while(|&&b| b != 0).count());
         }
 
-        self.jump_table_entry_count = jump_table_entries.len() as u32;
-        self.jump_table_entry_size = jump_table_entry_size as u8;
+        let mut output = SerializedCode {
+            jump_table_entry_count: jump_table_entries.len() as u32,
+            jump_table_entry_size: jump_table_entry_size as u8,
+            jump_table: Vec::with_capacity(jump_table_entry_size * jump_table_entries.len()),
+            code: Vec::with_capacity(instructions.iter().map(|entry| entry.bytes.len()).sum()),
+            bitmask: Vec::new(),
+            exports: Vec::with_capacity(self.exports.len()),
+        };
+
         for target in jump_table_entries {
-            self.jump_table.extend_from_slice(&target[..jump_table_entry_size]);
+            output.jump_table.extend_from_slice(&target[..jump_table_entry_size]);
         }
 
         struct BitVec {
@@ -271,9 +345,9 @@ impl ProgramBlobBuilder {
         }
 
         impl BitVec {
-            fn new() -> Self {
+            fn with_capacity(capacity: usize) -> Self {
                 BitVec {
-                    bytes: Vec::new(),
+                    bytes: Vec::with_capacity(capacity),
                     current: 0,
                     bits: 0,
                 }
@@ -297,44 +371,87 @@ impl ProgramBlobBuilder {
             }
         }
 
-        let mut bitmask = BitVec::new();
+        let mut bitmask = BitVec::with_capacity(output.code.capacity() / 8 + 1);
         for entry in &instructions {
             bitmask.push(true);
             for _ in 1..entry.bytes.len() {
                 bitmask.push(false);
             }
 
-            self.code.extend_from_slice(&entry.bytes);
+            output.code.extend_from_slice(&entry.bytes);
         }
 
-        self.bitmask = bitmask.finish();
+        output.bitmask = bitmask.finish();
 
-        log::debug!("code: {:?}", self.code);
-        log::debug!("bitmask: {:?}", self.bitmask);
+        // log::debug!("code: {:?}", self.code);
+        // log::debug!("bitmask: {:?}", self.bitmask);
 
-        self.basic_block_to_instruction_index = basic_block_to_instruction_index;
-        self.instruction_index_to_code_offset = instructions.iter().map(|entry| entry.position).collect();
+        // self.basic_block_to_instruction_index = basic_block_to_instruction_index;
+        // self.instruction_index_to_code_offset = instructions.iter().map(|entry| entry.position).collect();
+        for (target_basic_block, symbol) in &self.exports {
+            let target_basic_block = *target_basic_block as usize + basic_block_shift as usize;
+            let nth_instruction = basic_block_to_instruction_index[target_basic_block];
+            let offset = instructions[nth_instruction].position;
+            output.exports.push((offset, symbol.as_bytes().to_vec()));
+        }
 
         if cfg!(debug_assertions) {
             // Sanity check.
             let mut parsed = Vec::new();
             let mut offsets = alloc::collections::BTreeSet::new();
-            for instruction in crate::program::Instructions::new(&self.code, &self.bitmask, 0) {
-                parsed.push((instruction.offset, instruction.kind));
+            for instruction in crate::program::Instructions::new(&output.code, &output.bitmask, 0) {
+                parsed.push(instruction);
                 offsets.insert(instruction.offset);
             }
             assert_eq!(parsed.len(), instructions.len());
 
-            for ((offset, mut instruction), entry) in parsed.into_iter().zip(instructions.into_iter()) {
-                if let Some(entry_instruction) = entry.instruction {
-                    assert_eq!(instruction, entry_instruction, "broken serialization: {:?}", entry.bytes.bytes);
-                    assert_eq!(entry.position, offset.0);
-                    if let Some(target) = instruction.target_mut() {
-                        assert!(offsets.contains(&ProgramCounter(*target)));
-                    }
+            // for ((offset, mut instruction), entry) in parsed.into_iter().zip(instructions.into_iter()) {
+            //     if let Some(entry_instruction) = entry.instruction {
+            //         assert_eq!(instruction, entry_instruction, "broken serialization: {:?}", entry.bytes.bytes);
+            //         assert_eq!(entry.position, offset.0);
+            //         if let Some(target) = instruction.target_mut() {
+            //             assert!(offsets.contains(&ProgramCounter(*target)));
+            //         }
+            for (nth_instruction, (mut parsed, entry)) in parsed.into_iter().zip(instructions.into_iter()).enumerate() {
+                let mut kind_check = false;
+                if let Some(inst) = entry.instruction {
+                    kind_check = parsed.kind != inst;
+                }
+
+                if kind_check || entry.position != parsed.offset.0 || u32::from(entry.bytes.length) != parsed.length {
+                    panic!(
+                        concat!(
+                            "Broken serialization for instruction #{}:\n",
+                            "  Serialized:\n",
+                            "    Instruction: {:?}\n",
+                            "    Offset:      {}\n",
+                            "    Length:      {}\n",
+                            "    Bytes:       {:?}\n",
+                            "  Deserialized:\n",
+                            "    Instruction: {:?}\n",
+                            "    Offset:      {}\n",
+                            "    Length:      {}\n",
+                            "    Bytes:       {:?}\n",
+                        ),
+                        nth_instruction,
+                        entry.instruction,
+                        entry.position,
+                        entry.bytes.len(),
+                        &entry.bytes.bytes[..entry.bytes.length as usize],
+                        parsed.kind,
+                        parsed.offset.0,
+                        parsed.length,
+                        &output.code[parsed.offset.0 as usize..parsed.offset.0 as usize + parsed.length as usize],
+                    );
+                }
+
+                if let Some(target) = parsed.kind.target_mut() {
+                    assert!(offsets.contains(&ProgramCounter(*target)));
                 }
             }
         }
+
+        output
     }
 
     pub fn add_custom_section(&mut self, section: u8, contents: Vec<u8>) {
@@ -346,6 +463,7 @@ impl ProgramBlobBuilder {
     }
 
     pub fn to_vec(&self) -> Vec<u8> {
+        let code = self.serialize_code();
         let mut output = Vec::new();
         let mut writer = Writer::new(&mut output);
 
@@ -377,25 +495,23 @@ impl ProgramBlobBuilder {
             });
         }
 
-        if !self.exports.is_empty() {
+        if !code.exports.is_empty() {
             writer.push_section_inplace(program::SECTION_EXPORTS, |writer| {
-                writer.push_varint(self.exports.len().try_into().expect("too many exports"));
-                for (target_basic_block, symbol) in &self.exports {
-                    let nth_instruction = self.basic_block_to_instruction_index[*target_basic_block as usize];
-                    let offset = self.instruction_index_to_code_offset[nth_instruction];
+                writer.push_varint(code.exports.len().try_into().expect("too many exports"));
+                for (offset, symbol) in code.exports {
                     writer.push_varint(offset);
-                    writer.push_bytes_with_length(symbol.as_bytes());
+                    writer.push_bytes_with_length(&symbol);
                 }
             });
         }
 
         writer.push_section_inplace(program::SECTION_CODE_AND_JUMP_TABLE, |writer| {
-            writer.push_varint(self.jump_table_entry_count);
-            writer.push_byte(self.jump_table_entry_size);
-            writer.push_varint(self.code.len() as u32);
-            writer.push_raw_bytes(&self.jump_table);
-            writer.push_raw_bytes(&self.code);
-            writer.push_raw_bytes(&self.bitmask);
+            writer.push_varint(code.jump_table_entry_count);
+            writer.push_byte(code.jump_table_entry_size);
+            writer.push_varint(code.code.len() as u32);
+            writer.push_raw_bytes(&code.jump_table);
+            writer.push_raw_bytes(&code.code);
+            writer.push_raw_bytes(&code.bitmask);
         });
 
         for (section, contents) in &self.custom {

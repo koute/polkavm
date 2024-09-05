@@ -70,6 +70,7 @@ define_address_table! {
     ext_zero_memory_chunk: unsafe extern "C" fn() -> !,
     ext_load_program: unsafe extern "C" fn() -> !,
     ext_recycle: unsafe extern "C" fn() -> !,
+    ext_fetch_idle_regs: unsafe extern "C" fn() -> !,
 }
 
 /// The address where the native code starts inside of the VM.
@@ -125,6 +126,18 @@ pub const VM_SANDBOX_MAXIMUM_JUMP_TABLE_VIRTUAL_SIZE: u64 = 0x100000000 * core::
 pub const VM_SANDBOX_MAXIMUM_NATIVE_CODE_SIZE: u32 = 2048 * 1024 * 1024 - 1;
 
 #[repr(C)]
+pub struct JmpBuf {
+    pub rip: AtomicU64,
+    pub rbx: AtomicU64,
+    pub rsp: AtomicU64,
+    pub rbp: AtomicU64,
+    pub r12: AtomicU64,
+    pub r13: AtomicU64,
+    pub r14: AtomicU64,
+    pub r15: AtomicU64,
+}
+
+#[repr(C)]
 pub struct VmInit {
     pub stack_address: AtomicU64,
     pub stack_length: AtomicU64,
@@ -133,11 +146,13 @@ pub struct VmInit {
     pub vvar_address: AtomicU64,
     pub vvar_length: AtomicU64,
 
-    /// Whether userfaultfd-based memory management is enabled.
-    pub uffd_enabled: AtomicBool,
+    /// Whether userfaultfd-based memory management is available.
+    pub uffd_available: AtomicBool,
 
     /// Whether sandboxing is disabled.
     pub sandbox_disabled: AtomicBool,
+
+    pub idle_regs: JmpBuf,
 }
 
 const MESSAGE_BUFFER_SIZE: usize = 512;
@@ -175,11 +190,20 @@ pub struct VmCtxCounters {
 }
 
 #[repr(C)]
+pub enum VmFd {
+    None,
+    Shm,
+    Mem,
+}
+
+#[repr(C)]
 pub struct VmMap {
     pub address: u64,
     pub length: u64,
-    pub shm_offset: u64,
-    pub is_writable: bool,
+    pub protection: u32,
+    pub flags: u32,
+    pub fd: VmFd,
+    pub fd_offset: u64,
 }
 
 /// The virtual machine context.
@@ -224,26 +248,26 @@ pub struct VmCtx {
     /// The state of the program's heap.
     pub heap_info: VmCtxHeapInfo,
 
-    /// Whether the memory of the sandbox is dirty.
-    pub is_memory_dirty: AtomicBool,
-
     pub arg2: AtomicU32,
 
     /// Offset in shared memory to this sandbox's memory map.
-    pub shm_memory_map_offset: UnsafeCell<u64>,
+    pub shm_memory_map_offset: AtomicU64,
     /// Number of maps to map.
-    pub shm_memory_map_count: UnsafeCell<u64>,
+    pub shm_memory_map_count: AtomicU64,
     /// Offset in shared memory to this sandbox's code.
-    pub shm_code_offset: UnsafeCell<u64>,
+    pub shm_code_offset: AtomicU64,
     /// Length this sandbox's code.
-    pub shm_code_length: UnsafeCell<u64>,
+    pub shm_code_length: AtomicU64,
     /// Offset in shared memory to this sandbox's jump table.
-    pub shm_jump_table_offset: UnsafeCell<u64>,
+    pub shm_jump_table_offset: AtomicU64,
     /// Length of sandbox's jump table, in bytes.
-    pub shm_jump_table_length: UnsafeCell<u64>,
+    pub shm_jump_table_length: AtomicU64,
 
     /// Address of the sysreturn routine.
-    pub sysreturn_address: UnsafeCell<u64>,
+    pub sysreturn_address: AtomicU64,
+
+    /// Whether userfaultfd-based memory management is enabled.
+    pub uffd_enabled: AtomicBool,
 
     /// Address to the base of the heap.
     pub heap_base: UnsafeCell<u32>,
@@ -312,14 +336,14 @@ impl VmCtx {
 
             futex: AtomicU32::new(VMCTX_FUTEX_BUSY),
 
-            is_memory_dirty: AtomicBool::new(false),
-            shm_memory_map_offset: UnsafeCell::new(0),
-            shm_memory_map_count: UnsafeCell::new(0),
-            shm_code_offset: UnsafeCell::new(0),
-            shm_code_length: UnsafeCell::new(0),
-            shm_jump_table_offset: UnsafeCell::new(0),
-            shm_jump_table_length: UnsafeCell::new(0),
-            sysreturn_address: UnsafeCell::new(0),
+            shm_memory_map_offset: AtomicU64::new(0),
+            shm_memory_map_count: AtomicU64::new(0),
+            shm_code_offset: AtomicU64::new(0),
+            shm_code_length: AtomicU64::new(0),
+            shm_jump_table_offset: AtomicU64::new(0),
+            shm_jump_table_length: AtomicU64::new(0),
+            uffd_enabled: AtomicBool::new(false),
+            sysreturn_address: AtomicU64::new(0),
             heap_base: UnsafeCell::new(0),
             heap_initial_threshold: UnsafeCell::new(0),
             heap_max_size: UnsafeCell::new(0),
@@ -342,8 +366,18 @@ impl VmCtx {
                 vdso_length: AtomicU64::new(0),
                 vvar_address: AtomicU64::new(0),
                 vvar_length: AtomicU64::new(0),
-                uffd_enabled: AtomicBool::new(false),
+                uffd_available: AtomicBool::new(false),
                 sandbox_disabled: AtomicBool::new(false),
+                idle_regs: JmpBuf {
+                    rip: AtomicU64::new(0),
+                    rbx: AtomicU64::new(0),
+                    rsp: AtomicU64::new(0),
+                    rbp: AtomicU64::new(0),
+                    r12: AtomicU64::new(0),
+                    r13: AtomicU64::new(0),
+                    r14: AtomicU64::new(0),
+                    r15: AtomicU64::new(0),
+                },
             },
 
             message_length: UnsafeCell::new(0),
