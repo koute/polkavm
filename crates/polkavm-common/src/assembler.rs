@@ -734,7 +734,7 @@ pub fn assemble(code: &str) -> Result<Vec<u8>, String> {
                 }
                 TargetKind::Offset(offset) => {
                     let instruction = Instruction::load_imm_and_jump(dst.into(), value as u32, offset as u32);
-                    code.push(RawInstruction::from((0, instruction)).into());
+                    code.push(RawInstruction::from((0, 2, instruction)).into());
                 }
             },
             MaybeInstruction::Jump(label) => {
