@@ -3,7 +3,7 @@ use alloc::boxed::Box;
 use alloc::vec::Vec;
 use core::ops::Range;
 
-#[derive(Copy, Clone, Default)]
+#[derive(Copy, Clone, Debug, Default)]
 struct InstructionBuffer {
     bytes: [u8; program::MAX_INSTRUCTION_LENGTH],
     length: u8,
@@ -71,7 +71,7 @@ impl Instruction {
     }
 }
 
-#[derive(Copy, Clone)]
+#[derive(Copy, Clone, Debug)]
 pub struct RawInstruction {
     buffer: InstructionBuffer,
     starts_new_basic_block: bool,
@@ -86,7 +86,7 @@ impl From<(u32, u8, Instruction)> for RawInstruction {
     }
 }
 
-#[derive(Copy, Clone)]
+#[derive(Copy, Clone, Debug)]
 pub enum InstructionOrBytes {
     Instruction(Instruction),
     Raw(RawInstruction),
@@ -106,7 +106,7 @@ impl From<RawInstruction> for InstructionOrBytes {
 
 #[derive(Copy, Clone)]
 struct SerializedInstruction {
-    instruction: Option<Instruction>,
+    instruction: InstructionOrBytes,
     bytes: InstructionBuffer,
     target_nth_instruction: Option<usize>,
     position: u32,
@@ -178,8 +178,7 @@ impl ProgramBlobBuilder {
     }
 
     pub fn set_code(&mut self, code: &[impl Into<InstructionOrBytes> + Copy], jump_table: &[u32]) {
-        let code: Vec<InstructionOrBytes> = code.iter().map(|inst| (*inst).into()).collect();
-        self.code = code.to_vec();
+        self.code = code.iter().map(|inst| (*inst).into()).collect();
         self.jump_table = jump_table.to_vec();
     }
 
@@ -214,7 +213,7 @@ impl ProgramBlobBuilder {
             };
 
             instructions.push(SerializedInstruction {
-                instruction: Some(Instruction::jump(target_basic_block + basic_block_shift)),
+                instruction: Instruction::jump(target_basic_block + basic_block_shift).into(),
                 bytes: InstructionBuffer::default(),
                 target_nth_instruction: None,
                 position: 0,
@@ -223,7 +222,7 @@ impl ProgramBlobBuilder {
         }
 
         for instruction in &self.code {
-            let mut instruction = *instruction;
+            let instruction = *instruction;
 
             match instruction {
                 InstructionOrBytes::Instruction(mut inst) => {
@@ -232,7 +231,7 @@ impl ProgramBlobBuilder {
                     }
 
                     instructions.push(SerializedInstruction {
-                        instruction: Some(inst),
+                        instruction,
                         bytes: InstructionBuffer::default(),
                         target_nth_instruction: None,
                         position: 0,
@@ -244,8 +243,8 @@ impl ProgramBlobBuilder {
                 // be able to slip in invalid instructions, e.g., jump instruction with an invalid offset
                 InstructionOrBytes::Raw(raw_inst) => {
                     instructions.push(SerializedInstruction {
-                        instruction: None,
-                        bytes: raw_inst.buffer,
+                        instruction,
+                        bytes: raw_inst.buffer, // ??? do I need to add it here already since the raw instruction is now stored inside instruction?
                         target_nth_instruction: None,
                         position: 0,
                         minimum_size: 0,
@@ -258,17 +257,20 @@ impl ProgramBlobBuilder {
         basic_block_to_instruction_index.push(0);
 
         for (nth_instruction, entry) in instructions.iter().enumerate() {
-            if let Some(inst) = entry.instruction {
-                if inst.opcode().starts_new_basic_block() {
-                    basic_block_to_instruction_index.push(nth_instruction + 1);
-                }
+            let start_new_basic_block = match entry.instruction {
+                InstructionOrBytes::Instruction(inst) => inst.opcode().starts_new_basic_block(),
+                InstructionOrBytes::Raw(inst) => inst.starts_new_basic_block,
+            };
+
+            if start_new_basic_block {
+                basic_block_to_instruction_index.push(nth_instruction + 1);
             }
         }
 
         let mut position: u32 = 0;
 
         for (nth_instruction, entry) in instructions.iter_mut().enumerate() {
-            if let Some(mut inst) = entry.instruction {
+            if let InstructionOrBytes::Instruction(mut inst) = entry.instruction {
                 entry.target_nth_instruction = inst.target_mut().map(|target| {
                     let target_nth_instruction = basic_block_to_instruction_index[*target as usize];
                     // Here we change the target from a basic block index into a byte offset.
@@ -276,11 +278,11 @@ impl ProgramBlobBuilder {
                     *target = position.wrapping_add((target_nth_instruction as i32 - nth_instruction as i32) as u32);
                     target_nth_instruction
                 });
-
-                entry.position = position;
                 entry.bytes = InstructionBuffer::new(position, entry.minimum_size, inst);
-                position = position.checked_add(entry.bytes.len() as u32).expect("too many instructions");
             }
+
+            entry.position = position;
+            position = position.checked_add(entry.bytes.len() as u32).expect("too many instructions");
         }
 
         // Adjust offsets to other instructions until we reach a steady state.
@@ -289,28 +291,35 @@ impl ProgramBlobBuilder {
             position = 0;
             for nth_instruction in 0..instructions.len() {
                 let mut self_modified = mutate(&mut instructions[nth_instruction].position, position);
-                if let Some(target_nth_instruction) = instructions[nth_instruction].target_nth_instruction {
-                    let new_target = instructions[target_nth_instruction].position;
+                log::debug!("1. self_modified: {}", self_modified);
 
-                    if let Some(mut inst) = instructions[nth_instruction].instruction {
+                if let InstructionOrBytes::Instruction(mut inst) = instructions[nth_instruction].instruction {
+                    log::debug!("2. inst: {}", inst);
+                    if let Some(target_nth_instruction) = instructions[nth_instruction].target_nth_instruction {
+
+                        let new_target = instructions[target_nth_instruction].position;
                         let old_target = inst.target_mut().unwrap();
+
                         self_modified |= mutate(old_target, new_target);
+                        log::debug!("3. self_modified: {}", self_modified);
 
                         if self_modified {
                             instructions[nth_instruction].bytes =
                                 InstructionBuffer::new(position, instructions[nth_instruction].minimum_size, inst);
                         }
                     }
+
+                    position = position
+                        .checked_add(instructions[nth_instruction].bytes.len() as u32)
+                        .expect("too many instructions");
                 }
-
-                position = position
-                    .checked_add(instructions[nth_instruction].bytes.len() as u32)
-                    .expect("too many instructions");
-
                 any_modified |= self_modified;
+                log::debug!("4. any_modified: {}", any_modified);
             }
 
+            log::debug!("loop position {}", position);
             if !any_modified {
+                log::debug!("break");
                 break;
             }
         }
@@ -414,7 +423,7 @@ impl ProgramBlobBuilder {
             //         }
             for (nth_instruction, (mut parsed, entry)) in parsed.into_iter().zip(instructions.into_iter()).enumerate() {
                 let mut kind_check = false;
-                if let Some(inst) = entry.instruction {
+                if let InstructionOrBytes::Instruction(inst) = entry.instruction {
                     kind_check = parsed.kind != inst;
                 }
 
