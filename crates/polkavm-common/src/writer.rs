@@ -278,7 +278,7 @@ impl ProgramBlobBuilder {
                     *target = position.wrapping_add((target_nth_instruction as i32 - nth_instruction as i32) as u32);
                     target_nth_instruction
                 });
-                entry.bytes = InstructionBuffer::new(position, entry.minimum_size, inst.clone());
+                entry.bytes = InstructionBuffer::new(position, entry.minimum_size, *inst);
             }
 
             entry.position = position;
@@ -292,24 +292,23 @@ impl ProgramBlobBuilder {
             for nth_instruction in 0..instructions.len() {
                 let mut self_modified = mutate(&mut instructions[nth_instruction].position, position);
 
-                    if let Some(target_nth_instruction) = instructions[nth_instruction].target_nth_instruction {
-                        let new_target = instructions[target_nth_instruction].position;
-                        let minimum_size = instructions[nth_instruction].minimum_size;
+                if let Some(target_nth_instruction) = instructions[nth_instruction].target_nth_instruction {
+                    let new_target = instructions[target_nth_instruction].position;
+                    let minimum_size = instructions[nth_instruction].minimum_size;
 
-                        if let InstructionOrBytes::Instruction(ref mut inst) = instructions[nth_instruction].instruction {
-                            let old_target = inst.target_mut().unwrap();
-                            self_modified |= mutate(old_target, new_target);
+                    if let InstructionOrBytes::Instruction(ref mut inst) = instructions[nth_instruction].instruction {
+                        let old_target = inst.target_mut().unwrap();
+                        self_modified |= mutate(old_target, new_target);
 
-                            if self_modified {
-                                instructions[nth_instruction].bytes =
-                                    InstructionBuffer::new(position, minimum_size, inst.clone());
-                            }
+                        if self_modified {
+                            instructions[nth_instruction].bytes = InstructionBuffer::new(position, minimum_size, *inst);
                         }
                     }
+                }
 
-                    position = position
-                        .checked_add(instructions[nth_instruction].bytes.len() as u32)
-                        .expect("too many instructions");
+                position = position
+                    .checked_add(instructions[nth_instruction].bytes.len() as u32)
+                    .expect("too many instructions");
 
                 any_modified |= self_modified;
             }
@@ -440,8 +439,6 @@ impl ProgramBlobBuilder {
                         &output.code[parsed.offset.0 as usize..parsed.offset.0 as usize + parsed.length as usize],
                     );
                 }
-
-
             }
         }
 
