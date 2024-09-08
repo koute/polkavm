@@ -96,11 +96,6 @@ fn main_generate() {
         let path = entry.unwrap().path();
         let name = path.file_stem().unwrap().to_string_lossy();
 
-        if !name.ends_with("_@@@") {
-            continue;
-        }
-        println!("=====> {name}");
-
         let input = std::fs::read_to_string(&path).unwrap();
         let mut input_lines = Vec::new();
         for line in input.lines() {
