@@ -280,7 +280,7 @@ pub fn assemble(code: &str) -> Result<Vec<u8>, String> {
         if let Some((is_export, line)) = line
             .strip_prefix("pub @")
             .map(|line| (true, line))
-            .or_else(|| line.strip_prefix('@').map(|line| (true, line)))
+            .or_else(|| line.strip_prefix('@').map(|line| (false, line)))
         {
             if let Some(label) = line.strip_suffix(':') {
                 if !at_block_start {
