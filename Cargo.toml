@@ -70,6 +70,7 @@ get_first = "allow"
 manual_range_contains = "allow"
 let_unit_value = "allow"
 unit_arg = "allow"
+type_complexity = "allow"
 
 # These are are 'allow' by default.
 alloc_instead_of_core = "warn"
