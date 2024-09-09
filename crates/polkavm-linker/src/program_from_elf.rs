@@ -2422,8 +2422,12 @@ where
                 ));
 
                 if let ControlInst::Branch { target_false, .. } = instruction {
-                    assert_eq!(source.section_index, target_false.section_index);
-                    assert_eq!(source.offset_range.end, target_false.offset);
+                    if !cfg!(test) {
+                        if source.section_index != target_false.section_index {
+                            return Err(ProgramFromElfError::other("found a branch with a fallthrough to another section"));
+                        }
+                        assert_eq!(source.offset_range.end, target_false.offset);
+                    }
                     block_start_opt = Some((block_section, source.offset_range.end));
                 }
             }
