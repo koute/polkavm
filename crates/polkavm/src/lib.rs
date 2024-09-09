@@ -83,6 +83,9 @@ where
     }
 }
 
+#[cfg(feature = "module-cache")]
+mod module_cache;
+
 if_compiler_is_supported! {
     mod bit_mask;
     mod compiler;

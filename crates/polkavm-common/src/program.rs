@@ -2720,6 +2720,9 @@ where
 /// A partially deserialized PolkaVM program.
 #[derive(Clone, Default)]
 pub struct ProgramBlob {
+    #[cfg(feature = "unique-id")]
+    unique_id: u64,
+
     ro_data_size: u32,
     rw_data_size: u32,
     stack_size: u32,
@@ -3287,6 +3290,9 @@ impl ProgramBlob {
     /// Creates a program blob from parts.
     pub fn from_parts(parts: ProgramParts) -> Result<Self, ProgramParseError> {
         let mut blob = ProgramBlob {
+            #[cfg(feature = "unique-id")]
+            unique_id: 0,
+
             ro_data_size: parts.ro_data_size,
             rw_data_size: parts.rw_data_size,
             stack_size: parts.stack_size,
@@ -3369,7 +3375,85 @@ impl ProgramBlob {
             }
         }
 
+        #[cfg(feature = "unique-id")]
+        {
+            static ID_COUNTER: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+            blob.unique_id = ID_COUNTER.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+        }
+
         Ok(blob)
+    }
+
+    #[cfg(feature = "unique-id")]
+    /// Returns an unique ID of the program blob.
+    ///
+    /// This is an automatically incremented counter every time a `ProgramBlob` is created.
+    pub fn unique_id(&self) -> u64 {
+        self.unique_id
+    }
+
+    /// Calculates an unique hash of the program blob.
+    pub fn unique_hash(&self, include_debug: bool) -> crate::hasher::Hash {
+        let ProgramBlob {
+            #[cfg(feature = "unique-id")]
+                unique_id: _,
+            ro_data_size,
+            rw_data_size,
+            stack_size,
+            ro_data,
+            rw_data,
+            code,
+            jump_table,
+            jump_table_entry_size,
+            bitmask,
+            import_offsets,
+            import_symbols,
+            exports,
+            debug_strings,
+            debug_line_program_ranges,
+            debug_line_programs,
+        } = self;
+
+        let mut hasher = crate::hasher::Hasher::new();
+
+        hasher.update_u32_array([
+            1_u32, // VERSION
+            *ro_data_size,
+            *rw_data_size,
+            *stack_size,
+            ro_data.len() as u32,
+            rw_data.len() as u32,
+            code.len() as u32,
+            jump_table.len() as u32,
+            u32::from(*jump_table_entry_size),
+            bitmask.len() as u32,
+            import_offsets.len() as u32,
+            import_symbols.len() as u32,
+            exports.len() as u32,
+        ]);
+
+        hasher.update(ro_data);
+        hasher.update(rw_data);
+        hasher.update(code);
+        hasher.update(jump_table);
+        hasher.update(bitmask);
+        hasher.update(import_offsets);
+        hasher.update(import_symbols);
+        hasher.update(exports);
+
+        if include_debug {
+            hasher.update_u32_array([
+                debug_strings.len() as u32,
+                debug_line_program_ranges.len() as u32,
+                debug_line_programs.len() as u32,
+            ]);
+
+            hasher.update(debug_strings);
+            hasher.update(debug_line_program_ranges);
+            hasher.update(debug_line_programs);
+        }
+
+        hasher.finalize()
     }
 
     /// Returns the contents of the read-only data section.
