@@ -102,6 +102,8 @@ pub struct Config {
     pub(crate) allow_experimental: bool,
     pub(crate) allow_dynamic_paging: bool,
     pub(crate) worker_count: usize,
+    pub(crate) cache_enabled: bool,
+    pub(crate) lru_cache_size: u32,
 }
 
 impl Default for Config {
@@ -152,6 +154,8 @@ impl Config {
             allow_experimental: false,
             allow_dynamic_paging: false,
             worker_count: 2,
+            cache_enabled: cfg!(feature = "module-cache"),
+            lru_cache_size: 0,
         }
     }
 
@@ -179,6 +183,14 @@ impl Config {
 
             if let Some(value) = env_usize("POLKAVM_WORKER_COUNT")? {
                 config.worker_count = value;
+            }
+
+            if let Some(value) = env_bool("POLKAVM_CACHE_ENABLED")? {
+                config.cache_enabled = value;
+            }
+
+            if let Some(value) = env_usize("POLKAVM_LRU_CACHE_SIZE")? {
+                config.lru_cache_size = if value > u32::MAX as usize { u32::MAX } else { value as u32 };
             }
         }
 
@@ -286,6 +298,46 @@ impl Config {
         self.allow_dynamic_paging = value;
         self
     }
+
+    /// Returns whether module caching is enabled.
+    pub fn cache_enabled(&self) -> bool {
+        self.cache_enabled
+    }
+
+    /// Sets whether module caching is enabled.
+    ///
+    /// When set to `true` calling [`Module::new`](crate::Module::new) or [`Module::from_blob`](crate::Module::from_blob)
+    /// will return an already compiled module if such already exists.
+    ///
+    /// Requires the `module-cache` compile time feature to be enabled, otherwise has no effect.
+    ///
+    /// Default: `true` if compiled with `module-cache`, `false` otherwise
+    ///
+    /// Corresponding environment variable: `POLKAVM_CACHE_ENABLED`
+    pub fn set_cache_enabled(&mut self, value: bool) -> &mut Self {
+        self.cache_enabled = value;
+        self
+    }
+
+    /// Returns the LRU cache size.
+    pub fn lru_cache_size(&self) -> u32 {
+        self.lru_cache_size
+    }
+
+    /// Sets the LRU cache size.
+    ///
+    /// Requires the `module-cache` compile time feature and caching to be enabled, otherwise has no effect.
+    ///
+    /// When the size of the LRU cache is non-zero then modules that are dropped will be added to the LRU cache,
+    /// and will be reused if a compilation of the same program is triggered.
+    ///
+    /// Default: `0`
+    ///
+    /// Corresponding environment variable: `POLKAVM_LRU_CACHE_SIZE`
+    pub fn set_lru_cache_size(&mut self, value: u32) -> &mut Self {
+        self.lru_cache_size = value;
+        self
+    }
 }
 
 /// The type of gas metering.
@@ -315,6 +367,7 @@ pub struct ModuleConfig {
     pub(crate) step_tracing: bool,
     pub(crate) dynamic_paging: bool,
     pub(crate) aux_data_size: u32,
+    cache_by_hash: bool,
 }
 
 impl Default for ModuleConfig {
@@ -333,6 +386,7 @@ impl ModuleConfig {
             step_tracing: false,
             dynamic_paging: false,
             aux_data_size: 0,
+            cache_by_hash: false,
         }
     }
 
@@ -402,5 +456,51 @@ impl ModuleConfig {
     pub fn set_strict(&mut self, is_strict: bool) -> &mut Self {
         self.is_strict = is_strict;
         self
+    }
+
+    /// Returns whether the module will be cached by hash.
+    pub fn cache_by_hash(&self) -> bool {
+        self.cache_by_hash
+    }
+
+    /// Sets whether the module will be cached by hash.
+    ///
+    /// This introduces extra overhead as every time a module compilation is triggered the hash
+    /// of the program must be calculated, and in general it is faster to recompile a module
+    /// from scratch rather than compile its hash.
+    ///
+    /// Default: `true`
+    pub fn set_cache_by_hash(&mut self, enabled: bool) -> &mut Self {
+        self.cache_by_hash = enabled;
+        self
+    }
+
+    #[cfg(feature = "module-cache")]
+    pub(crate) fn hash(&self) -> polkavm_common::hasher::Hash {
+        let &ModuleConfig {
+            page_size,
+            aux_data_size,
+            gas_metering,
+            is_strict,
+            step_tracing,
+            dynamic_paging,
+            // Deliberately ignored.
+            cache_by_hash: _,
+        } = self;
+
+        let mut hasher = polkavm_common::hasher::Hasher::new();
+        hasher.update_u32_array([
+            page_size,
+            aux_data_size,
+            match gas_metering {
+                None => 0,
+                Some(GasMeteringKind::Sync) => 1,
+                Some(GasMeteringKind::Async) => 2,
+            },
+            u32::from(is_strict),
+            u32::from(step_tracing),
+            u32::from(dynamic_paging),
+        ]);
+        hasher.finalize()
     }
 }

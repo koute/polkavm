@@ -2004,6 +2004,60 @@ fn spawn_stress_test(mut config: Config) {
     }
 }
 
+#[cfg(not(feature = "module-cache"))]
+fn module_cache(_config: Config) {}
+
+#[cfg(feature = "module-cache")]
+fn module_cache(mut config: Config) {
+    let _ = env_logger::try_init();
+    let blob = get_blob(TEST_BLOB_ELF_ZST);
+
+    config.set_worker_count(0);
+
+    config.set_cache_enabled(true);
+    config.set_lru_cache_size(0);
+    let engine_with_cache = Engine::new(&config).unwrap();
+
+    config.set_cache_enabled(true);
+    config.set_lru_cache_size(1);
+    let engine_with_lru_cache = Engine::new(&config).unwrap();
+
+    config.set_cache_enabled(false);
+    config.set_lru_cache_size(0);
+    let engine_without_cache = Engine::new(&config).unwrap();
+
+    assert!(Module::from_cache(&engine_with_cache, &Default::default(), &blob).is_none());
+    let module_with_cache_1 = Module::from_blob(&engine_with_cache, &Default::default(), blob.clone()).unwrap();
+    assert!(Module::from_cache(&engine_with_cache, &Default::default(), &blob).is_some());
+    let module_with_cache_2 = Module::from_blob(&engine_with_cache, &Default::default(), blob.clone()).unwrap();
+    assert!(Module::from_cache(&engine_with_cache, &Default::default(), &blob).is_some());
+
+    assert!(Module::from_cache(&engine_without_cache, &Default::default(), &blob).is_none());
+    let module_without_cache_1 = Module::from_blob(&engine_without_cache, &Default::default(), blob.clone()).unwrap();
+    assert!(Module::from_cache(&engine_without_cache, &Default::default(), &blob).is_none());
+    let module_without_cache_2 = Module::from_blob(&engine_without_cache, &Default::default(), blob.clone()).unwrap();
+
+    if engine_with_cache.backend() == BackendKind::Compiler {
+        assert_eq!(
+            module_with_cache_1.machine_code().unwrap().as_ptr(),
+            module_with_cache_2.machine_code().unwrap().as_ptr()
+        );
+        assert_ne!(
+            module_without_cache_1.machine_code().unwrap().as_ptr(),
+            module_without_cache_2.machine_code().unwrap().as_ptr()
+        );
+    }
+
+    core::mem::drop(module_with_cache_2);
+    assert!(Module::from_cache(&engine_with_cache, &Default::default(), &blob).is_some());
+    core::mem::drop(module_with_cache_1);
+    assert!(Module::from_cache(&engine_with_cache, &Default::default(), &blob).is_none());
+
+    assert!(Module::from_cache(&engine_with_lru_cache, &Default::default(), &blob).is_none());
+    Module::from_blob(&engine_with_lru_cache, &Default::default(), blob.clone()).unwrap();
+    assert!(Module::from_cache(&engine_with_lru_cache, &Default::default(), &blob).is_some());
+}
+
 run_tests! {
     basic_test
     fallback_hostcall_handler_works
@@ -2059,6 +2113,7 @@ run_tests! {
     gas_metering_with_implicit_trap
 
     spawn_stress_test
+    module_cache
 }
 
 macro_rules! assert_impl {
