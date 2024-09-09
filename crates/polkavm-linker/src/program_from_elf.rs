@@ -4340,6 +4340,10 @@ fn merge_consecutive_fallthrough_blocks(
         }
 
         let current_reachability = reachability_graph.for_code.get_mut(&current).unwrap();
+        if current_reachability.always_reachable {
+            continue;
+        }
+
         let referenced_by_code: BTreeSet<BlockTarget> = current_reachability
             .reachable_from
             .iter()
