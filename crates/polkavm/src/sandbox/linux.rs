@@ -19,7 +19,7 @@ use core::ffi::{c_int, c_uint};
 use core::mem::MaybeUninit;
 use core::sync::atomic::Ordering;
 use core::time::Duration;
-use linux_raw::{abort, cstr, syscall_readonly, Fd, Mmap, STDERR_FILENO, STDIN_FILENO};
+use linux_raw::{abort, cstr, syscall_readonly, Fd, Mmap};
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -127,42 +127,19 @@ struct CloneArgs {
     tls: u64,
 }
 
-/// Closes all file descriptors except the ones given.
-fn close_other_file_descriptors(preserved_fds: &[c_int]) -> Result<(), Error> {
-    let mut start_at = 0;
-    for &fd in preserved_fds {
-        if start_at == fd {
-            start_at = fd + 1;
-            continue;
-        }
-
-        if start_at > fd {
-            // Preserved file descriptors must be sorted.
-            return Err(Error::from_str("internal error: preserved file descriptors are not sorted"));
-        }
-
-        if linux_raw::sys_close_range(start_at, fd - 1, 0).is_err() {
-            return close_other_file_descriptors_legacy(preserved_fds);
-        }
-
-        start_at = fd + 1;
+/// Closes all file descriptors in a given range.
+fn close_fd_range(first_fd: c_int, last_fd: c_int) -> Result<(), Error> {
+    // Fast path for new kernels.
+    if linux_raw::sys_close_range(first_fd, last_fd, 0).is_ok() {
+        return Ok(());
     }
 
-    if linux_raw::sys_close_range(start_at, c_int::MAX, 0).is_err() {
-        return close_other_file_descriptors_legacy(preserved_fds);
-    }
-
-    Ok(())
-}
-
-/// Closes all file descriptors except the ones given.
-///
-/// For compatibility with old versions of Linux.
-fn close_other_file_descriptors_legacy(preserved_fds: &[c_int]) -> Result<(), Error> {
+    // Slow path for old kernels.
     let dirfd = linux_raw::sys_open(
         cstr!("/proc/self/fd"),
         linux_raw::O_RDONLY | linux_raw::O_DIRECTORY | linux_raw::O_CLOEXEC,
     )?;
+
     for dirent in linux_raw::readdir(dirfd.borrow()) {
         let dirent = dirent?;
         let name = dirent.d_name();
@@ -173,15 +150,15 @@ fn close_other_file_descriptors_legacy(preserved_fds: &[c_int]) -> Result<(), Er
         let name = core::str::from_utf8(name)
             .ok()
             .ok_or_else(|| Error::from_str("entry in '/proc/self/fd' is not valid utf-8"))?;
+
         let fd: c_int = name
             .parse()
             .ok()
             .ok_or_else(|| Error::from_str("entry in '/proc/self/fd' is not a number"))?;
-        if fd == dirfd.raw() || preserved_fds.iter().any(|&pfd| pfd == fd) {
-            continue;
-        }
 
-        Fd::from_raw_unchecked(fd).close()?;
+        if fd != dirfd.raw() && fd >= first_fd && fd <= last_fd {
+            Fd::from_raw_unchecked(fd).close()?;
+        }
     }
 
     dirfd.close()?;
@@ -647,7 +624,17 @@ fn prepare_memory() -> Result<(Fd, Mmap), Error> {
     Ok((memfd, vmctx))
 }
 
-unsafe fn child_main(zygote_memfd: Fd, child_socket: Fd, uid_map: &str, gid_map: &str, logging_pipe: Option<Fd>) -> Result<(), Error> {
+struct ChildFds {
+    zygote: Fd,
+    socket: Fd,
+    vmctx: Fd,
+    shm: Fd,
+    mem: Fd,
+    lifetime_pipe: Fd,
+    logging_pipe: Option<Fd>,
+}
+
+unsafe fn child_main(uid_map: &str, gid_map: &str, fds: ChildFds) -> Result<(), Error> {
     // Change the name of the process.
     linux_raw::sys_prctl_set_name(b"polkavm-sandbox\0")?;
 
@@ -674,44 +661,82 @@ unsafe fn child_main(zygote_memfd: Fd, child_socket: Fd, uid_map: &str, gid_map:
         proc_self.close()?;
     }
 
-    // This should never happen in practice, but can in theory if the user closes stdin or stderr manually.
-    // TODO: Actually support this?
-    for fd in [zygote_memfd.raw(), child_socket.raw()]
-        .into_iter()
-        .chain(logging_pipe.as_ref().map(|fd| fd.raw()))
-    {
-        if fd == STDIN_FILENO {
-            return Err(Error::from_str("internal error: fd overlaps with stdin"));
-        }
+    fn move_fd_after(fd: linux_raw::Fd, min: i32) -> Result<Fd, Error> {
+        let out_fd = linux_raw::sys_fcntl_dupfd(fd.borrow(), min)?;
+        fd.close()?;
 
-        if fd == STDERR_FILENO {
-            return Err(Error::from_str("internal error: fd overlaps with stderr"));
-        }
+        Ok(out_fd)
     }
 
-    // Replace the stdin fd (which we don't need).
-    linux_raw::sys_dup3(child_socket.raw(), STDIN_FILENO, 0)?;
-    child_socket.close()?;
+    fn move_fd(fd: linux_raw::Fd, new_fd: i32, flags: u32) -> Result<Fd, Error> {
+        linux_raw::sys_dup3(fd.borrow().raw(), new_fd, flags)?;
+        fd.close()?;
 
-    // Clean up any file descriptors which might have been opened by the host process.
-    let mut fds_to_keep = [core::ffi::c_int::MAX; 3];
-    let fds_to_keep = {
-        let mut count = 1;
-        fds_to_keep[0] = STDIN_FILENO;
-        if let Some(logging_pipe) = logging_pipe {
-            linux_raw::sys_dup3(logging_pipe.raw(), STDERR_FILENO, 0)?;
-            logging_pipe.close()?;
-            fds_to_keep[count] = STDERR_FILENO;
-            count += 1;
-        }
+        Ok(linux_raw::Fd::from_raw_unchecked(new_fd))
+    }
 
-        fds_to_keep[count] = zygote_memfd.raw();
-        count += 1;
+    fn move_fd_and_leak(fd: linux_raw::Fd, new_fd: i32) -> Result<(), Error> {
+        move_fd(fd, new_fd, 0)?.leak();
+        Ok(())
+    }
 
-        fds_to_keep.sort_unstable(); // Should be a no-op.
-        &fds_to_keep[..count]
+    fn copy_fd_and_leak(fd: linux_raw::FdRef, new_fd: i32) -> Result<(), Error> {
+        linux_raw::sys_dup3(fd.raw(), new_fd, 0)
+    }
+
+    // Create a dummy FD.
+    //
+    // WARNING: This CANNOT be a pipe!
+    //
+    // If the logger is disabled then the child process will unconditionally write
+    // to this FD. Unfortunately writing to a closed pipe generates a SIGPIPE signal,
+    // and normally that'd be fine since we ignore SIGPIPE in the child, however when
+    // running under ptrace this will also stop the process and return a "trapped"
+    // status to the host, even if the SIGPIPE would normally be ignored!
+    //
+    // So we just make a unix socket here instead to side step this problem.
+    let (_, fd_dummy) = linux_raw::sys_socketpair(linux_raw::AF_UNIX, linux_raw::SOCK_SEQPACKET | linux_raw::SOCK_CLOEXEC, 0)?;
+
+    pub use polkavm_common::zygote;
+
+    const FD_ZYGOTE: i32 = zygote::LAST_USED_FD + 1;
+    const LAST_USED_FD: i32 = FD_ZYGOTE;
+    const NEXT_FREE_FD: i32 = FD_ZYGOTE + 1;
+
+    // Make sure no FD we need uses any FD number in range 0..LAST_USED_FD.
+    let fd_zygote = move_fd_after(fds.zygote, NEXT_FREE_FD)?;
+    let fd_socket = move_fd_after(fds.socket, NEXT_FREE_FD)?;
+    let fd_vmctx = move_fd_after(fds.vmctx, NEXT_FREE_FD)?;
+    let fd_shm = move_fd_after(fds.shm, NEXT_FREE_FD)?;
+    let fd_mem = move_fd_after(fds.mem, NEXT_FREE_FD)?;
+    let fd_lifetime_pipe = move_fd_after(fds.lifetime_pipe, NEXT_FREE_FD)?;
+    let fd_dummy = move_fd_after(fd_dummy, NEXT_FREE_FD)?;
+    let fd_logging_pipe = if let Some(fd_logging_pipe) = fds.logging_pipe {
+        Some(move_fd_after(fd_logging_pipe, NEXT_FREE_FD)?)
+    } else {
+        None
     };
-    close_other_file_descriptors(fds_to_keep)?;
+
+    close_fd_range(0, LAST_USED_FD)?;
+
+    // Move all of the FDs to their hardcoded numbers.
+    move_fd_and_leak(fd_socket, zygote::FD_SOCKET)?;
+    move_fd_and_leak(fd_vmctx, zygote::FD_VMCTX)?;
+    move_fd_and_leak(fd_shm, zygote::FD_SHM)?;
+    move_fd_and_leak(fd_mem, zygote::FD_MEM)?;
+    move_fd_and_leak(fd_lifetime_pipe, zygote::FD_LIFETIME_PIPE)?;
+    if let Some(fd_logging_pipe) = fd_logging_pipe {
+        move_fd_and_leak(fd_dummy, zygote::FD_DUMMY_STDIN)?;
+        copy_fd_and_leak(fd_logging_pipe.borrow(), zygote::FD_LOGGER_STDOUT)?;
+        move_fd_and_leak(fd_logging_pipe, zygote::FD_LOGGER_STDERR)?;
+    } else {
+        copy_fd_and_leak(fd_dummy.borrow(), zygote::FD_DUMMY_STDIN)?;
+        copy_fd_and_leak(fd_dummy.borrow(), zygote::FD_LOGGER_STDOUT)?;
+        move_fd_and_leak(fd_dummy, zygote::FD_LOGGER_STDERR)?;
+    }
+
+    let fd_zygote = move_fd(fd_zygote, FD_ZYGOTE, linux_raw::O_CLOEXEC)?;
+    close_fd_range(NEXT_FREE_FD, c_int::MAX)?;
 
     if !cfg!(polkavm_dev_debug_zygote) {
         // Hide the host filesystem.
@@ -757,7 +782,7 @@ unsafe fn child_main(zygote_memfd: Fd, child_socket: Fd, uid_map: &str, gid_map:
     let child_argv: [*const u8; 2] = [b"polkavm-zygote\0".as_ptr(), core::ptr::null()];
     let child_envp: [*const u8; 1] = [core::ptr::null()];
     linux_raw::sys_execveat(
-        Some(zygote_memfd.borrow()),
+        Some(fd_zygote.borrow()),
         cstr!(""),
         &child_argv,
         &child_envp,
@@ -1181,9 +1206,22 @@ impl super::Sandbox for Sandbox {
 
     fn spawn(global: &Self::GlobalState, config: &SandboxConfig) -> Result<Self, Error> {
         let sigset = Sigmask::block_all_signals()?;
-        let (vmctx_memfd, vmctx_mmap) = prepare_vmctx()?;
         let (socket, child_socket) = linux_raw::sys_socketpair(linux_raw::AF_UNIX, linux_raw::SOCK_SEQPACKET | linux_raw::SOCK_CLOEXEC, 0)?;
         let (lifetime_pipe_host, lifetime_pipe_child) = linux_raw::sys_pipe2(linux_raw::O_CLOEXEC)?;
+        let (logger_rx, logger_tx) = if config.enable_logger {
+            let (rx, tx) = linux_raw::sys_pipe2(linux_raw::O_CLOEXEC)?;
+            (Some(rx), Some(tx))
+        } else {
+            (None, None)
+        };
+        // TODO: If not using userfaultfd then don't mmap all of this immediately.
+        let (memory_memfd, memory_mmap) = prepare_memory()?;
+
+        let (vmctx_memfd, vmctx_mmap) = prepare_vmctx()?;
+        let vmctx = unsafe { &*vmctx_mmap.as_ptr().cast::<VmCtx>() };
+        vmctx.init.logging_enabled.store(config.enable_logger, Ordering::Relaxed);
+        vmctx.init.uffd_available.store(global.uffd_available, Ordering::Relaxed);
+        vmctx.init.sandbox_disabled.store(cfg!(polkavm_dev_debug_zygote), Ordering::Relaxed);
 
         let sandbox_flags = if !cfg!(polkavm_dev_debug_zygote) {
             u64::from(
@@ -1217,13 +1255,6 @@ impl super::Sandbox for Sandbox {
         let uid_map = format!("0 {} 1\n", uid);
         let gid_map = format!("0 {} 1\n", gid);
 
-        let (logger_rx, logger_tx) = if config.enable_logger {
-            let (rx, tx) = linux_raw::sys_pipe2(linux_raw::O_CLOEXEC)?;
-            (Some(rx), Some(tx))
-        } else {
-            (None, None)
-        };
-
         // Fork a new process.
         let mut child_pid =
             unsafe { linux_raw::syscall!(linux_raw::SYS_clone3, core::ptr::addr_of!(args), core::mem::size_of::<CloneArgs>()) };
@@ -1248,11 +1279,17 @@ impl super::Sandbox for Sandbox {
 
             unsafe {
                 match child_main(
-                    linux_raw::Fd::from_raw_unchecked(global.zygote_memfd.raw()),
-                    child_socket,
                     &uid_map,
                     &gid_map,
-                    logger_tx,
+                    ChildFds {
+                        zygote: linux_raw::Fd::from_raw_unchecked(global.zygote_memfd.raw()),
+                        socket: child_socket,
+                        vmctx: vmctx_memfd,
+                        shm: linux_raw::Fd::from_raw_unchecked(global.shared_memory.fd().raw()),
+                        mem: memory_memfd,
+                        lifetime_pipe: lifetime_pipe_child,
+                        logging_pipe: logger_tx,
+                    },
                 ) {
                     Ok(()) => {
                         // This is impossible.
@@ -1266,6 +1303,14 @@ impl super::Sandbox for Sandbox {
                     }
                 }
             }
+        }
+
+        child_socket.close()?;
+        vmctx_memfd.close()?;
+        memory_memfd.close()?;
+        lifetime_pipe_child.close()?;
+        if let Some(logger_tx) = logger_tx {
+            logger_tx.close()?;
         }
 
         if let Some(logger_rx) = logger_rx {
@@ -1315,7 +1360,6 @@ impl super::Sandbox for Sandbox {
         };
 
         // We're in the parent. Restore the signal mask.
-        child_socket.close()?;
         sigset.unblock()?;
 
         fn wait_for_futex(vmctx: &VmCtx, child: &mut ChildProcess, current_state: u32, target_state: u32) -> Result<(), Error> {
@@ -1419,25 +1463,6 @@ impl super::Sandbox for Sandbox {
             });
         }
 
-        let vmctx = unsafe { &*vmctx_mmap.as_ptr().cast::<VmCtx>() };
-
-        // Send the vmctx memfd to the child process.
-        if let Err(error) = linux_raw::sendfd(socket.borrow(), vmctx_memfd.borrow()) {
-            let message = get_message(vmctx);
-            if let Some(message) = message {
-                let error = Error::from(format!("failed to initialize sandbox process: {error} (root cause: {message})"));
-                return Err(error);
-            }
-
-            return Err(error);
-        }
-        vmctx_memfd.close()?;
-
-        linux_raw::sendfd(socket.borrow(), lifetime_pipe_child.borrow())?;
-        lifetime_pipe_child.close()?;
-
-        linux_raw::sendfd(socket.borrow(), global.shared_memory.fd())?;
-
         // Wait until the child process receives the vmctx memfd.
         wait_for_futex(vmctx, &mut child, VMCTX_FUTEX_BUSY, VMCTX_FUTEX_IDLE)?;
 
@@ -1475,16 +1500,9 @@ impl super::Sandbox for Sandbox {
             }
         }
 
-        vmctx.init.uffd_available.store(global.uffd_available, Ordering::Relaxed);
-        vmctx.init.sandbox_disabled.store(cfg!(polkavm_dev_debug_zygote), Ordering::Relaxed);
-
         // Wake the child so that it finishes initialization.
         vmctx.futex.store(VMCTX_FUTEX_BUSY, Ordering::Release);
         linux_raw::sys_futex_wake_one(&vmctx.futex)?;
-
-        // TODO: If not using userfaultfd then don't mmap all of this immediately.
-        let (memory_memfd, memory_mmap) = prepare_memory()?;
-        linux_raw::sendfd(socket.borrow(), memory_memfd.borrow())?;
 
         let (iouring, userfaultfd) = if global.uffd_available {
             let iouring = linux_raw::IoUring::new(3)?;

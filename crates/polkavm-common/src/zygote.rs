@@ -73,6 +73,16 @@ define_address_table! {
     ext_fetch_idle_regs: unsafe extern "C" fn() -> !,
 }
 
+pub const FD_DUMMY_STDIN: i32 = 0;
+pub const FD_LOGGER_STDOUT: i32 = 1;
+pub const FD_LOGGER_STDERR: i32 = 2;
+pub const FD_SHM: i32 = 3;
+pub const FD_MEM: i32 = 4;
+pub const FD_SOCKET: i32 = 5;
+pub const FD_VMCTX: i32 = 6;
+pub const FD_LIFETIME_PIPE: i32 = 7;
+pub const LAST_USED_FD: i32 = FD_LIFETIME_PIPE;
+
 /// The address where the native code starts inside of the VM.
 ///
 /// This is not directly accessible by the program running inside of the VM.
@@ -151,6 +161,9 @@ pub struct VmInit {
 
     /// Whether sandboxing is disabled.
     pub sandbox_disabled: AtomicBool,
+
+    /// Whether the logger is enabled.
+    pub logging_enabled: AtomicBool,
 
     pub idle_regs: JmpBuf,
 }
@@ -368,6 +381,7 @@ impl VmCtx {
                 vvar_length: AtomicU64::new(0),
                 uffd_available: AtomicBool::new(false),
                 sandbox_disabled: AtomicBool::new(false),
+                logging_enabled: AtomicBool::new(false),
                 idle_regs: JmpBuf {
                     rip: AtomicU64::new(0),
                     rbx: AtomicU64::new(0),
