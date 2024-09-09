@@ -2534,13 +2534,13 @@ fn garbage_collect_reachability(all_blocks: &[BasicBlock<AnyTarget, BlockTarget>
     let mut queue_code = VecSet::new();
     let mut queue_data = VecSet::new();
     for (block_target, reachability) in &reachability_graph.for_code {
-        if reachability.always_reachable {
+        if reachability.always_reachable_or_exported() {
             queue_code.push(*block_target);
         }
     }
 
     for (data_target, reachability) in &reachability_graph.for_data {
-        if reachability.always_reachable {
+        if reachability.always_reachable_or_exported() {
             queue_data.push(*data_target);
         }
     }
@@ -2863,6 +2863,7 @@ fn perform_nop_elimination(all_blocks: &mut [BasicBlock<AnyTarget, BlockTarget>]
 fn perform_inlining(
     all_blocks: &mut [BasicBlock<AnyTarget, BlockTarget>],
     reachability_graph: &mut ReachabilityGraph,
+    exports: &mut [Export],
     optimize_queue: Option<&mut VecSet<BlockTarget>>,
     inline_history: &mut HashSet<(BlockTarget, BlockTarget)>,
     inline_threshold: usize,
@@ -2978,8 +2979,22 @@ fn perform_inlining(
         return false;
     }
 
-    match all_blocks[current.index()].next.instruction {
+    let block = &all_blocks[current.index()];
+    match block.next.instruction {
         ControlInst::Jump { target } => {
+            if all_blocks[current.index()].ops.is_empty() {
+                let reachability = reachability_graph.for_code.get_mut(&current).unwrap();
+                if !reachability.exports.is_empty() {
+                    let export_indexes = core::mem::take(&mut reachability.exports);
+                    for &export_index in &export_indexes {
+                        exports[export_index].location = all_blocks[target.index()].source.begin();
+                    }
+                    reachability_graph.for_code.get_mut(&target).unwrap().exports.extend(export_indexes);
+                    remove_code_if_globally_unreachable(all_blocks, reachability_graph, optimize_queue, current);
+                    return true;
+                }
+            }
+
             if should_inline(all_blocks, reachability_graph, current, target, inline_threshold) && inline_history.insert((current, target))
             {
                 inline(all_blocks, reachability_graph, optimize_queue, current, target);
@@ -4123,6 +4138,7 @@ fn optimize_program<H>(
     imports: &[Import],
     all_blocks: &mut [BasicBlock<AnyTarget, BlockTarget>],
     reachability_graph: &mut ReachabilityGraph,
+    exports: &mut [Export],
 ) where
     H: object::read::elf::FileHeader<Endian = object::LittleEndian>,
 {
@@ -4196,6 +4212,7 @@ fn optimize_program<H>(
         perform_inlining(
             all_blocks,
             reachability_graph,
+            exports,
             Some(&mut optimize_queue),
             &mut inline_history,
             config.inline_threshold,
@@ -4242,6 +4259,7 @@ fn optimize_program<H>(
             modified |= perform_inlining(
                 all_blocks,
                 reachability_graph,
+                exports,
                 None,
                 &mut inline_history,
                 config.inline_threshold,
@@ -4376,7 +4394,7 @@ fn merge_consecutive_fallthrough_blocks(
         }
 
         let current_reachability = reachability_graph.for_code.get_mut(&current).unwrap();
-        if current_reachability.always_reachable {
+        if current_reachability.always_reachable_or_exported() {
             continue;
         }
 
@@ -5058,6 +5076,7 @@ struct Reachability {
     referenced_by_data: BTreeSet<SectionIndex>,
     always_reachable: bool,
     always_dynamically_reachable: bool,
+    exports: Vec<usize>,
 }
 
 impl Reachability {
@@ -5068,6 +5087,7 @@ impl Reachability {
             && self.address_taken_in.is_empty()
             && self.reachable_from.len() == 1
             && self.reachable_from.contains(&block_target)
+            && self.exports.is_empty()
     }
 
     fn is_unreachable(&self) -> bool {
@@ -5076,10 +5096,15 @@ impl Reachability {
             && self.referenced_by_data.is_empty()
             && !self.always_reachable
             && !self.always_dynamically_reachable
+            && self.exports.is_empty()
     }
 
     fn is_dynamically_reachable(&self) -> bool {
         !self.address_taken_in.is_empty() || !self.referenced_by_data.is_empty() || self.always_dynamically_reachable
+    }
+
+    fn always_reachable_or_exported(&self) -> bool {
+        self.always_reachable || !self.exports.is_empty()
     }
 }
 
@@ -5157,12 +5182,12 @@ fn calculate_reachability(
             .push(relocation);
     }
 
-    for export in exports {
+    for (export_index, export) in exports.iter().enumerate() {
         let Some(&block_target) = section_to_block.get(&export.location) else {
             return Err(ProgramFromElfError::other("export points to a non-block"));
         };
 
-        graph.for_code.entry(block_target).or_default().always_reachable = true;
+        graph.for_code.entry(block_target).or_default().exports.push(export_index);
         block_queue.push(block_target);
     }
 
@@ -7159,7 +7184,7 @@ where
             extract_exports(&elf, &relocations, section)
         })
         .collect::<Result<Vec<_>, _>>()?;
-    let exports: Vec<_> = exports.into_iter().flatten().collect();
+    let mut exports: Vec<_> = exports.into_iter().flatten().collect();
 
     let mut instructions = Vec::new();
     let mut imports = Vec::new();
@@ -7230,7 +7255,7 @@ where
     let mut regspill_size = 0;
     if config.optimize {
         reachability_graph = calculate_reachability(&section_to_block, &all_blocks, &data_sections_set, &exports, &relocations)?;
-        optimize_program(&config, &elf, &imports, &mut all_blocks, &mut reachability_graph);
+        optimize_program(&config, &elf, &imports, &mut all_blocks, &mut reachability_graph, &mut exports);
         used_blocks = collect_used_blocks(&all_blocks, &reachability_graph);
         spill_fake_registers(
             section_regspill,
@@ -7666,16 +7691,18 @@ where
         }
     }
 
-    for export in exports {
-        let &block_target = section_to_block
-            .get(&export.location)
-            .expect("internal error: export metadata has a non-block target location");
+    let mut export_count = 0;
+    for current in used_blocks {
+        for &export_index in &reachability_graph.for_code.get(&current).unwrap().exports {
+            let export = &exports[export_index];
+            let jump_target = jump_target_for_block[current.index()]
+                .expect("internal error: export metadata points to a block without a jump target assigned");
 
-        let jump_target = jump_target_for_block[block_target.index()]
-            .expect("internal error: export metadata points to a block without a jump target assigned");
-
-        builder.add_export_by_basic_block(jump_target.static_target, &export.metadata.symbol);
+            builder.add_export_by_basic_block(jump_target.static_target, &export.metadata.symbol);
+            export_count += 1;
+        }
     }
+    assert_eq!(export_count, exports.len());
 
     let mut locations_for_instruction: Vec<Option<Arc<[Location]>>> = Vec::with_capacity(code.len());
     let mut raw_code = Vec::with_capacity(code.len());
