@@ -517,6 +517,7 @@ pub use crate::arch_bindings::{
     SA_RESTORER,
     SA_SIGINFO,
     SECCOMP_RET_ALLOW,
+    SECCOMP_RET_ERRNO,
     SECCOMP_RET_KILL_THREAD,
     SECCOMP_SET_MODE_FILTER,
     SIG_BLOCK,
@@ -1000,6 +1001,8 @@ macro_rules! bpf {
     (@op $labels:expr, $nth_instruction:expr, return $value:expr) => { $crate::sock_filter { code: $crate::BPF_RET | $crate::BPF_K, jt: 0, jf: 0, k: $value } };
     (@op $labels:expr, $nth_instruction:expr, seccomp_allow) => { $crate::bpf!(@op $labels, $nth_instruction, return $crate::SECCOMP_RET_ALLOW) };
     (@op $labels:expr, $nth_instruction:expr, seccomp_kill_thread) => { $crate::bpf!(@op $labels, $nth_instruction, return $crate::SECCOMP_RET_KILL_THREAD) };
+    (@op $labels:expr, $nth_instruction:expr, seccomp_return_error($errno:expr)) => { $crate::bpf!(@op $labels, $nth_instruction, return $crate::SECCOMP_RET_ERRNO | { let errno: u16 = $errno; errno as u32 }) };
+    (@op $labels:expr, $nth_instruction:expr, seccomp_return_eperm) => { $crate::bpf!(@op $labels, $nth_instruction, seccomp_return_error($crate::EPERM as u16)) };
     (@op $labels:expr, $nth_instruction:expr, a = syscall_nr) => { $crate::bpf!(@op $labels, $nth_instruction, a = *abs[0]) };
     (@op $labels:expr, $nth_instruction:expr, a = syscall_arg[$nth_arg:expr]) => { $crate::bpf!(@op $labels, $nth_instruction, a = *abs[16 + $nth_arg * 8]) };
 
