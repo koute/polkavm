@@ -676,7 +676,7 @@ unsafe fn initialize(mut stack: *mut usize) {
             (if a == linux_raw::SYS_rt_sigreturn => jump @1),
             (if a == linux_raw::SYS_sched_yield => jump @1),
             (if a == linux_raw::SYS_exit => jump @1),
-            (seccomp_kill_thread),
+            (seccomp_return_eperm),
 
             // SYS_write
             ([3]: a = syscall_arg[0]),
@@ -699,7 +699,7 @@ unsafe fn initialize(mut stack: *mut usize) {
             (if a != linux_raw::PROT_EXEC => jump @0),
             (seccomp_allow),
 
-            ([0]: seccomp_kill_thread),
+            ([0]: seccomp_return_eperm),
             ([1]: seccomp_allow),
         };
 
