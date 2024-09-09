@@ -38,6 +38,39 @@ enum Reg {
     E2 = 15,
 }
 
+impl From<polkavm_common::program::Reg> for Reg {
+    fn from(reg: polkavm_common::program::Reg) -> Reg {
+        use polkavm_common::program::Reg as R;
+        match reg {
+            R::RA => Reg::RA,
+            R::SP => Reg::SP,
+            R::T0 => Reg::T0,
+            R::T1 => Reg::T1,
+            R::T2 => Reg::T2,
+            R::S0 => Reg::S0,
+            R::S1 => Reg::S1,
+            R::A0 => Reg::A0,
+            R::A1 => Reg::A1,
+            R::A2 => Reg::A2,
+            R::A3 => Reg::A3,
+            R::A4 => Reg::A4,
+            R::A5 => Reg::A5,
+        }
+    }
+}
+
+impl From<polkavm_common::program::RawReg> for Reg {
+    fn from(reg: polkavm_common::program::RawReg) -> Reg {
+        reg.get().into()
+    }
+}
+
+impl From<polkavm_common::program::RawReg> for RegImm {
+    fn from(reg: polkavm_common::program::RawReg) -> RegImm {
+        RegImm::Reg(reg.get().into())
+    }
+}
+
 impl Reg {
     pub const fn from_usize(value: usize) -> Option<Reg> {
         match value {
@@ -348,6 +381,12 @@ impl core::fmt::Display for SectionTarget {
 impl core::fmt::Debug for SectionTarget {
     fn fmt(&self, fmt: &mut core::fmt::Formatter) -> core::fmt::Result {
         write!(fmt, "<{}+{}>", self.section_index, self.offset)
+    }
+}
+
+impl From<SectionTarget> for SectionIndex {
+    fn from(target: SectionTarget) -> Self {
+        target.section_index
     }
 }
 
@@ -908,6 +947,18 @@ enum InstExt<BasicT, ControlT> {
 impl<BasicT, ControlT> InstExt<BasicT, ControlT> {
     fn nop() -> Self {
         InstExt::Basic(BasicInst::Nop)
+    }
+}
+
+impl<BasicT, ControlT> From<BasicInst<BasicT>> for InstExt<BasicT, ControlT> {
+    fn from(inst: BasicInst<BasicT>) -> Self {
+        InstExt::Basic(inst)
+    }
+}
+
+impl<BasicT, ControlT> From<ControlInst<ControlT>> for InstExt<BasicT, ControlT> {
+    fn from(inst: ControlInst<ControlT>) -> Self {
+        InstExt::Control(inst)
     }
 }
 
@@ -2341,11 +2392,16 @@ fn split_code_into_basic_blocks<H>(
 where
     H: object::read::elf::FileHeader<Endian = object::LittleEndian>,
 {
+    #[cfg(test)]
+    let _ = elf;
+
     let mut blocks: Vec<BasicBlock<SectionTarget, SectionTarget>> = Vec::new();
     let mut current_block: Vec<(SourceStack, BasicInst<SectionTarget>)> = Vec::new();
     let mut block_start_opt = None;
     let mut last_source_in_block = None;
     for (source, op) in instructions {
+        // TODO: This panics because we use a dummy ELF in tests; fix it.
+        #[cfg(not(test))]
         log::trace!(
             "Instruction at {source} (0x{:x}): {op:?}",
             elf.section_by_index(source.section_index).original_address() + source.offset_range.start
@@ -4335,6 +4391,448 @@ fn optimize_program<H>(
         "Optimizing the program took {} brute force iteration(s)",
         opt_brute_force_iterations - 1
     );
+}
+
+#[cfg(test)]
+mod test {
+    use super::*;
+    use polkavm::Reg;
+
+    struct ProgramBuilder {
+        current_section: SectionIndex,
+        next_free_section: SectionIndex,
+        next_offset_for_section: HashMap<SectionIndex, u64>,
+        instructions: Vec<(Source, InstExt<SectionTarget, SectionTarget>)>,
+        exports: Vec<Export>,
+    }
+
+    struct TestProgram {
+        disassembly: String,
+        instance: polkavm::RawInstance,
+    }
+
+    impl ProgramBuilder {
+        fn new() -> Self {
+            ProgramBuilder {
+                current_section: SectionIndex::new(0),
+                next_free_section: SectionIndex::new(0),
+                next_offset_for_section: HashMap::default(),
+                instructions: Vec::new(),
+                exports: Vec::new(),
+            }
+        }
+
+        fn from_assembly(assembly: &str) -> Self {
+            let mut b = Self::new();
+            b.append_assembly(assembly);
+            b
+        }
+
+        fn add_export(&mut self, name: impl AsRef<[u8]>, input_regs: u8, output_regs: u8, location: SectionTarget) {
+            self.exports.push(Export {
+                location,
+                metadata: ExternMetadata {
+                    index: None,
+                    symbol: name.as_ref().to_owned(),
+                    input_regs,
+                    output_regs,
+                },
+            })
+        }
+
+        fn add_section(&mut self) -> SectionTarget {
+            let index = self.next_free_section;
+            self.next_offset_for_section.insert(index, 0);
+            self.next_free_section = SectionIndex::new(index.raw() + 1);
+            SectionTarget {
+                section_index: index,
+                offset: 0,
+            }
+        }
+
+        fn switch_section(&mut self, section_index: impl Into<SectionIndex>) {
+            self.current_section = section_index.into();
+        }
+
+        fn current_source(&self) -> Source {
+            let next_offset = self.next_offset_for_section.get(&self.current_section).copied().unwrap_or(0);
+            Source {
+                section_index: self.current_section,
+                offset_range: (next_offset..next_offset + 4).into(),
+            }
+        }
+
+        fn push(&mut self, inst: impl Into<InstExt<SectionTarget, SectionTarget>>) -> SectionTarget {
+            let source = self.current_source();
+            *self.next_offset_for_section.get_mut(&self.current_section).unwrap() += 4;
+            self.instructions.push((source, inst.into()));
+            source.begin()
+        }
+
+        fn append_assembly(&mut self, assembly: &str) {
+            let raw_blob = polkavm_common::assembler::assemble(assembly).unwrap();
+            let blob = ProgramBlob::parse(raw_blob.into()).unwrap();
+            let mut program_counter_to_section_target = HashMap::new();
+            let mut program_counter_to_instruction_index = HashMap::new();
+            let mut in_new_block = true;
+            for instruction in blob.instructions() {
+                if in_new_block {
+                    let block = self.add_section();
+                    self.switch_section(block);
+                    program_counter_to_section_target.insert(instruction.offset, block);
+                    in_new_block = false;
+                }
+
+                program_counter_to_instruction_index.insert(instruction.offset, self.instructions.len());
+                self.push(BasicInst::Nop);
+
+                if instruction.kind.starts_new_basic_block() {
+                    in_new_block = true;
+                }
+            }
+
+            for instruction in blob.instructions() {
+                let out = &mut self.instructions[*program_counter_to_instruction_index.get(&instruction.offset).unwrap()].1;
+                match instruction.kind {
+                    Instruction::fallthrough => {
+                        let target = *program_counter_to_section_target.get(&instruction.next_offset()).unwrap();
+                        *out = ControlInst::Jump { target }.into();
+                    }
+                    Instruction::jump(target) => {
+                        let target = *program_counter_to_section_target.get(&polkavm::ProgramCounter(target)).unwrap();
+                        *out = ControlInst::Jump { target }.into();
+                    }
+                    Instruction::load_imm(dst, imm) => {
+                        *out = BasicInst::LoadImmediate {
+                            dst: dst.into(),
+                            imm: imm as i32,
+                        }
+                        .into();
+                    }
+                    Instruction::add_imm(dst, src, imm) => {
+                        *out = BasicInst::AnyAny {
+                            kind: AnyAnyKind::Add,
+                            dst: dst.into(),
+                            src1: src.into(),
+                            src2: imm.into(),
+                        }
+                        .into();
+                    }
+                    Instruction::add(dst, src1, src2) => {
+                        *out = BasicInst::AnyAny {
+                            kind: AnyAnyKind::Add,
+                            dst: dst.into(),
+                            src1: src1.into(),
+                            src2: src2.into(),
+                        }
+                        .into();
+                    }
+                    Instruction::branch_less_unsigned_imm(src1, src2, target) => {
+                        let target_true = *program_counter_to_section_target.get(&polkavm::ProgramCounter(target)).unwrap();
+                        let target_false = *program_counter_to_section_target.get(&instruction.next_offset()).unwrap();
+                        *out = ControlInst::Branch {
+                            kind: BranchKind::LessUnsigned,
+                            src1: src1.into(),
+                            src2: src2.into(),
+                            target_true,
+                            target_false,
+                        }
+                        .into();
+                    }
+                    Instruction::jump_indirect(base, 0) => {
+                        *out = ControlInst::JumpIndirect {
+                            base: base.into(),
+                            offset: 0,
+                        }
+                        .into();
+                    }
+                    _ => unimplemented!("{instruction:?}"),
+                }
+            }
+
+            for export in blob.exports() {
+                let input_regs = 1;
+                let output_regs = 1;
+                let target = program_counter_to_section_target.get(&export.program_counter()).unwrap();
+                self.add_export(export.symbol().as_bytes(), input_regs, output_regs, *target);
+            }
+        }
+
+        fn build(&self, config: Config) -> TestProgram {
+            let elf: Elf<object::elf::FileHeader32<object::endian::LittleEndian>> = Elf::default();
+            let data_sections_set = HashSet::default();
+            let code_sections_set: HashSet<_> = self.next_offset_for_section.keys().copied().collect();
+            let relocations = BTreeMap::default();
+            let imports = [];
+            let mut exports = self.exports.clone();
+
+            // TODO: Refactor the main code so that we don't have to copy-paste this here.
+            let all_jump_targets = harvest_all_jump_targets(
+                &elf,
+                &data_sections_set,
+                &code_sections_set,
+                &self.instructions,
+                &relocations,
+                &exports,
+            )
+            .unwrap();
+
+            let all_blocks = split_code_into_basic_blocks(&elf, &all_jump_targets, self.instructions.clone()).unwrap();
+            let mut section_to_block = build_section_to_block_map(&all_blocks).unwrap();
+            let mut all_blocks = resolve_basic_block_references(&data_sections_set, &section_to_block, &all_blocks).unwrap();
+            let mut reachability_graph =
+                calculate_reachability(&section_to_block, &all_blocks, &data_sections_set, &exports, &relocations).unwrap();
+            if config.optimize {
+                optimize_program(&config, &elf, &imports, &mut all_blocks, &mut reachability_graph, &mut exports);
+            }
+            let mut used_blocks = collect_used_blocks(&all_blocks, &reachability_graph);
+
+            if config.optimize {
+                used_blocks = add_missing_fallthrough_blocks(&mut all_blocks, &mut reachability_graph, used_blocks);
+                merge_consecutive_fallthrough_blocks(&mut all_blocks, &mut reachability_graph, &mut section_to_block, &mut used_blocks);
+                replace_immediates_with_registers(&mut all_blocks, &imports, &used_blocks);
+            }
+
+            let expected_reachability_graph =
+                calculate_reachability(&section_to_block, &all_blocks, &data_sections_set, &exports, &relocations).unwrap();
+            assert!(reachability_graph == expected_reachability_graph);
+
+            let used_imports = HashSet::new();
+            let base_address_for_section = HashMap::new();
+            let section_got = self.next_free_section;
+            let target_to_got_offset = HashMap::new();
+
+            let (jump_table, jump_target_for_block) = build_jump_table(all_blocks.len(), &used_blocks, &reachability_graph);
+            let code = emit_code(
+                &imports,
+                &base_address_for_section,
+                section_got,
+                &target_to_got_offset,
+                &all_blocks,
+                &used_blocks,
+                &used_imports,
+                &jump_target_for_block,
+                true,
+            )
+            .unwrap();
+
+            let mut builder = ProgramBlobBuilder::new();
+
+            let mut export_count = 0;
+            for current in used_blocks {
+                for &export_index in &reachability_graph.for_code.get(&current).unwrap().exports {
+                    let export = &exports[export_index];
+                    let jump_target = jump_target_for_block[current.index()]
+                        .expect("internal error: export metadata points to a block without a jump target assigned");
+
+                    builder.add_export_by_basic_block(jump_target.static_target, &export.metadata.symbol);
+                    export_count += 1;
+                }
+            }
+            assert_eq!(export_count, exports.len());
+
+            let mut raw_code = Vec::with_capacity(code.len());
+            for (_, inst) in code {
+                raw_code.push(inst);
+            }
+
+            builder.set_code(&raw_code, &jump_table);
+
+            let blob = ProgramBlob::parse(builder.to_vec().into()).unwrap();
+            let mut disassembler = polkavm_disassembler::Disassembler::new(&blob, polkavm_disassembler::DisassemblyFormat::Guest).unwrap();
+            disassembler.emit_header(false);
+            disassembler.show_offsets(false);
+            let mut buf = Vec::new();
+            disassembler.disassemble_into(&mut buf).unwrap();
+            let disassembly = String::from_utf8(buf).unwrap();
+
+            let mut config = polkavm::Config::from_env().unwrap();
+            config.set_backend(Some(polkavm::BackendKind::Interpreter));
+            let engine = polkavm::Engine::new(&config).unwrap();
+            let mut module_config = polkavm::ModuleConfig::default();
+            module_config.set_gas_metering(Some(polkavm::GasMeteringKind::Sync));
+            let module = polkavm::Module::from_blob(&engine, &module_config, blob).unwrap();
+            let mut instance = module.instantiate().unwrap();
+            instance.set_gas(10000);
+            instance.set_reg(polkavm::Reg::RA, polkavm::RETURN_TO_HOST);
+            let pc = module.exports().find(|export| export.symbol() == "main").unwrap().program_counter();
+            instance.set_next_program_counter(pc);
+
+            TestProgram { disassembly, instance }
+        }
+
+        fn test_optimize(
+            &self,
+            mut run: impl FnMut(&mut polkavm::RawInstance),
+            mut check: impl FnMut(&mut polkavm::RawInstance, &mut polkavm::RawInstance),
+            expected_disassembly: &str,
+        ) {
+            let mut unopt = self.build(Config {
+                optimize: false,
+                ..Config::default()
+            });
+            let mut opt = self.build(Config {
+                optimize: true,
+                ..Config::default()
+            });
+
+            log::info!("Unoptimized disassembly:\n{}", unopt.disassembly);
+            log::info!("Optimized disassembly:\n{}", opt.disassembly);
+
+            run(&mut unopt.instance);
+            run(&mut opt.instance);
+
+            check(&mut opt.instance, &mut unopt.instance);
+
+            fn normalize(s: &str) -> String {
+                let mut out = String::new();
+                for line in s.trim().lines() {
+                    if !line.trim().starts_with('@') {
+                        out.push_str("    ");
+                    }
+                    out.push_str(line.trim());
+                    out.push('\n');
+                }
+                out
+            }
+
+            let actual_normalized = normalize(&opt.disassembly);
+            let expected_normalized = normalize(expected_disassembly);
+            if actual_normalized != expected_normalized {
+                use core::fmt::Write;
+                let mut output_actual = String::new();
+                let mut output_expected = String::new();
+                for diff in diff::lines(&actual_normalized, &expected_normalized) {
+                    match diff {
+                        diff::Result::Left(line) => {
+                            writeln!(&mut output_actual, "{}", yansi::Paint::red(line)).unwrap();
+                        }
+                        diff::Result::Both(line, _) => {
+                            writeln!(&mut output_actual, "{}", line).unwrap();
+                            writeln!(&mut output_expected, "{}", line).unwrap();
+                        }
+                        diff::Result::Right(line) => {
+                            writeln!(&mut output_expected, "{}", line).unwrap();
+                        }
+                    }
+                }
+
+                {
+                    use std::io::Write;
+                    let stderr = std::io::stderr();
+                    let mut stderr = stderr.lock();
+
+                    writeln!(&mut stderr, "Optimization test failed!\n").unwrap();
+                    writeln!(&mut stderr, "Expected optimized:").unwrap();
+                    writeln!(&mut stderr, "{output_expected}").unwrap();
+                    writeln!(&mut stderr, "Actual optimized:").unwrap();
+                    writeln!(&mut stderr, "{output_actual}").unwrap();
+                }
+
+                panic!("optimized program is not what we've expected")
+            }
+        }
+
+        fn test_optimize_oneshot(
+            assembly: &str,
+            expected_disassembly: &str,
+            run: impl FnMut(&mut polkavm::RawInstance),
+            check: impl FnMut(&mut polkavm::RawInstance, &mut polkavm::RawInstance),
+        ) {
+            let _ = env_logger::try_init();
+            let b = ProgramBuilder::from_assembly(assembly);
+            b.test_optimize(run, check, expected_disassembly);
+        }
+    }
+
+    fn expect_finished(i: &mut polkavm::RawInstance) {
+        assert!(matches!(i.run().unwrap(), polkavm::InterruptKind::Finished));
+    }
+
+    fn expect_regs(regs: impl IntoIterator<Item = (Reg, u32)> + Clone) -> impl FnMut(&mut polkavm::RawInstance, &mut polkavm::RawInstance) {
+        move |a: &mut polkavm::RawInstance, b: &mut polkavm::RawInstance| {
+            for (reg, value) in regs.clone() {
+                assert_eq!(b.reg(reg), value);
+                assert_eq!(a.reg(reg), b.reg(reg));
+            }
+        }
+    }
+
+    #[test]
+    fn test_optimize_01_empty_block_elimination() {
+        ProgramBuilder::test_optimize_oneshot(
+            "
+            pub @main:
+                jump @loop
+            @before_loop:
+                jump @loop
+            @loop:
+                a0 = a0 + 0x1
+                jump @before_loop if a0 <u 10
+                ret
+            ",
+            "
+            @0 [export #0: 'main']
+                a0 = a0 + 0x1
+                jump @0 if a0 <u 10
+            @1
+                ret
+            ",
+            expect_finished,
+            expect_regs([(Reg::A0, 10)]),
+        )
+    }
+
+    #[test]
+    fn test_optimize_02_simple_constant_propagation() {
+        ProgramBuilder::test_optimize_oneshot(
+            "
+            pub @main:
+                a1 = 1
+            @loop:
+                a0 = a0 + a1
+                jump @loop if a0 <u 10
+                ret
+            ",
+            "
+            @0 [export #0: 'main']
+                a1 = 0x1
+                fallthrough
+            @1
+                a0 = a0 + 0x1
+                jump @1 if a0 <u 10
+            @2
+                ret
+            ",
+            expect_finished,
+            expect_regs([(Reg::A0, 10), (Reg::A1, 1)]),
+        )
+    }
+
+    #[test]
+    fn test_optimize_03_simple_dead_code_elimination() {
+        ProgramBuilder::test_optimize_oneshot(
+            "
+            pub @main:
+                a1 = a1 + 100
+                a1 = 8
+                a2 = a2 + 0
+                a0 = a0 + 1
+                jump @main if a0 <u 10
+                ret
+            ",
+            "
+            @0 [export #0: 'main']
+                a1 = 0x8
+                a0 = a0 + 0x1
+                jump @0 if a0 <u 10
+            @1
+                ret
+            ",
+            expect_finished,
+            expect_regs([(Reg::A0, 10), (Reg::A1, 8)]),
+        )
+    }
 }
 
 fn collect_used_blocks(all_blocks: &[BasicBlock<AnyTarget, BlockTarget>], reachability_graph: &ReachabilityGraph) -> Vec<BlockTarget> {

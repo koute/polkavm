@@ -42,6 +42,7 @@ polkavm-linux-raw         = { version = "0.11.0", path = "crates/polkavm-linux-r
 
 blake3 = { version = "1.5.4", default-features = false }
 clap = "4.4.6"
+diff = "0.1.13"
 env_logger = { version = "0.10.0", default-features = false }
 gimli = { version = "0.28.0", default-features = false }
 hashbrown = { version = "0.14.1", default-features = false }
@@ -59,6 +60,7 @@ schnellru = { version = "0.2.3" }
 serde = { version = "1.0.203", features = ["derive"] }
 serde_json = { version = "1.0.117" }
 syn = "2.0.25"
+yansi = "0.5.1"
 
 [workspace.lints.rust]
 unexpected_cfgs = { level = "warn", check-cfg = ['cfg(kani)', 'cfg(polkavm_dev_debug_zygote)'] }
