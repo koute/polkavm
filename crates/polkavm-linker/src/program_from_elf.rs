@@ -4405,7 +4405,11 @@ fn merge_consecutive_fallthrough_blocks(
             remove_if_data_is_globally_unreachable(all_blocks, reachability_graph, None, section_index);
         }
 
-        assert!(!reachability_graph.is_code_reachable(current));
+        assert!(
+            !reachability_graph.is_code_reachable(current),
+            "block {current:?} still reachable: {:#?}",
+            reachability_graph.for_code.get(&current)
+        );
         removed.insert(current);
     }
 
