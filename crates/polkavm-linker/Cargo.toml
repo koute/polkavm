@@ -19,7 +19,12 @@ hashbrown = { workspace = true, features = ["raw"] }
 regalloc2 = "0.9.3"
 
 [dev-dependencies]
+diff = { workspace = true }
+env_logger = { workspace = true }
+polkavm = { workspace = true }
+polkavm-disassembler = { workspace = true }
 proptest = { workspace = true }
+yansi = { workspace = true }
 
 [lints]
 workspace = true

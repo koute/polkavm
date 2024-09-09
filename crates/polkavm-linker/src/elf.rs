@@ -12,6 +12,11 @@ type ElfSectionIndex = object::read::SectionIndex;
 pub struct SectionIndex(usize);
 
 impl SectionIndex {
+    #[cfg(test)]
+    pub fn new(value: usize) -> Self {
+        SectionIndex(value)
+    }
+
     pub fn raw(self) -> usize {
         self.0
     }
@@ -134,7 +139,23 @@ where
     sections: Vec<Section<'data>>,
     section_index_by_name: HashMap<String, Vec<SectionIndex>>,
     section_index_map: HashMap<ElfSectionIndex, SectionIndex>,
-    raw_elf: ElfFile<'data, H>,
+    // TODO: Always have a dummy ELF file for testing?
+    raw_elf: Option<ElfFile<'data, H>>,
+}
+
+#[cfg(test)]
+impl<'data, H> Default for Elf<'data, H>
+where
+    H: object::read::elf::FileHeader,
+{
+    fn default() -> Self {
+        Elf {
+            sections: Default::default(),
+            section_index_by_name: Default::default(),
+            section_index_map: Default::default(),
+            raw_elf: Default::default(),
+        }
+    }
 }
 
 impl<'data, H> Elf<'data, H>
@@ -213,12 +234,14 @@ where
             sections,
             section_index_by_name,
             section_index_map,
-            raw_elf: elf,
+            raw_elf: Some(elf),
         })
     }
 
     pub fn symbol_by_index(&self, symbol_index: object::SymbolIndex) -> Result<Symbol<H>, object::Error> {
         self.raw_elf
+            .as_ref()
+            .unwrap()
             .symbol_by_index(symbol_index)
             .map(|elf_symbol| Symbol::new(self, elf_symbol))
     }
@@ -242,7 +265,11 @@ where
     }
 
     pub fn symbols<'r>(&'r self) -> impl Iterator<Item = Symbol<'data, 'r, H>> + 'r {
-        self.raw_elf.symbols().map(|elf_symbol| Symbol::new(self, elf_symbol))
+        self.raw_elf
+            .as_ref()
+            .unwrap()
+            .symbols()
+            .map(|elf_symbol| Symbol::new(self, elf_symbol))
     }
 
     pub fn add_empty_data_section(&mut self, name: &str) -> SectionIndex {
@@ -280,12 +307,12 @@ where
     pub fn relocations<'r>(&'r self, section: &Section) -> impl Iterator<Item = (u64, object::read::Relocation)> + 'r {
         section
             .raw_section_index
-            .and_then(move |index| self.raw_elf.section_by_index(index).ok())
+            .and_then(move |index| self.raw_elf.as_ref().unwrap().section_by_index(index).ok())
             .into_iter()
             .flat_map(|raw_section| raw_section.relocations())
     }
 
     pub fn is_64(&self) -> bool {
-        self.raw_elf.is_64()
+        self.raw_elf.as_ref().map_or(false, |elf| elf.is_64())
     }
 }

@@ -268,6 +268,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7c74b8349d32d297c9134b8c88677813a227df8f779daa29bfc29c183fe3dca6"
 
 [[package]]
+name = "diff"
+version = "0.1.13"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "56254986775e3233ffa9c4d7d3faaf6d36a2c09d30b20687e9f88bc8bafc16c8"
+
+[[package]]
 name = "doom-host"
 version = "0.1.0"
 dependencies = [
@@ -614,14 +620,19 @@ dependencies = [
 name = "polkavm-linker"
 version = "0.11.0"
 dependencies = [
+ "diff",
+ "env_logger",
  "gimli",
  "hashbrown 0.14.1",
  "log",
  "object",
+ "polkavm",
  "polkavm-common",
+ "polkavm-disassembler",
  "proptest",
  "regalloc2",
  "rustc-demangle",
+ "yansi",
 ]
 
 [[package]]
@@ -1230,6 +1241,12 @@ name = "windows_x86_64_msvc"
 version = "0.52.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "32b752e52a2da0ddfbdbcc6fceadfeede4c939ed16d13e648833a61dfb611ed8"
+
+[[package]]
+name = "yansi"
+version = "0.5.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "09041cd90cf85f7f8b2df60c646f853b7f535ce68f85244eb6731cf89fa498ec"
 
 [[package]]
 name = "zerocopy"
