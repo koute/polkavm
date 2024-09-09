@@ -3526,7 +3526,15 @@ enum RegValue {
     CodeAddress(BlockTarget),
     DataAddress(SectionTarget),
     Constant(i32),
-    Unknown { unique: u64, bits_used: u32 },
+    OutputReg {
+        reg: Reg,
+        source_block: BlockTarget,
+        bits_used: u32,
+    },
+    Unknown {
+        unique: u64,
+        bits_used: u32,
+    },
 }
 
 impl RegValue {
@@ -3549,20 +3557,30 @@ impl RegValue {
         match self {
             RegValue::InputReg(..) | RegValue::CodeAddress(..) | RegValue::DataAddress(..) => !0,
             RegValue::Constant(value) => value as u32,
-            RegValue::Unknown { bits_used, .. } => bits_used,
+            RegValue::Unknown { bits_used, .. } | RegValue::OutputReg { bits_used, .. } => bits_used,
         }
     }
 }
 
-#[derive(Clone)]
+#[derive(Clone, PartialEq, Eq)]
 struct BlockRegs {
     regs: [RegValue; Reg::ALL.len()],
 }
 
 impl BlockRegs {
-    fn new(source_block: BlockTarget) -> Self {
+    fn new_input(source_block: BlockTarget) -> Self {
         BlockRegs {
             regs: Reg::ALL.map(|reg| RegValue::InputReg(reg, source_block)),
+        }
+    }
+
+    fn new_output(source_block: BlockTarget) -> Self {
+        BlockRegs {
+            regs: Reg::ALL.map(|reg| RegValue::OutputReg {
+                reg,
+                source_block,
+                bits_used: u32::MAX,
+            }),
         }
     }
 
@@ -3922,167 +3940,183 @@ fn perform_constant_propagation<H>(
     imports: &[Import],
     elf: &Elf<H>,
     all_blocks: &mut [BasicBlock<AnyTarget, BlockTarget>],
-    regs_for_block: &mut [BlockRegs],
+    input_regs_for_block: &mut [BlockRegs],
+    output_regs_for_block: &mut [BlockRegs],
     unknown_counter: &mut u64,
     reachability_graph: &mut ReachabilityGraph,
     mut optimize_queue: Option<&mut VecSet<BlockTarget>>,
-    mut current: BlockTarget,
+    current: BlockTarget,
 ) -> bool
 where
     H: object::read::elf::FileHeader<Endian = object::LittleEndian>,
 {
-    let mut regs = regs_for_block[current.index()].clone();
+    let Some(reachability) = reachability_graph.for_code.get(&current) else {
+        return false;
+    };
+
+    if reachability.is_unreachable() {
+        return false;
+    }
+
     let mut modified = false;
-    let mut seen = HashSet::new();
-    loop {
-        if !seen.insert(current) {
-            // Prevent an infinite loop.
-            break;
-        }
+    if !reachability.is_dynamically_reachable()
+        && !reachability.always_reachable_or_exported()
+        && !reachability.reachable_from.is_empty()
+        && reachability.reachable_from.len() < 64
+    {
+        for reg in Reg::ALL {
+            let mut common_value_opt = None;
+            for &source in &reachability.reachable_from {
+                let value = output_regs_for_block[source.index()].get_reg(reg);
+                if value == RegValue::InputReg(reg, current) {
+                    continue;
+                }
 
-        if !reachability_graph.is_code_reachable(current) {
-            break;
-        }
+                if let Some(common_value) = common_value_opt {
+                    if common_value == value {
+                        continue;
+                    }
 
-        let mut references = BTreeSet::new();
-        let mut modified_this_block = false;
-        for nth_instruction in 0..all_blocks[current.index()].ops.len() {
-            let mut instruction = all_blocks[current.index()].ops[nth_instruction].1;
-            if instruction.is_nop() {
-                continue;
+                    common_value_opt = None;
+                    break;
+                } else {
+                    common_value_opt = Some(value);
+                }
             }
 
-            while let Some(new_instruction) = regs.simplify_instruction(instruction) {
-                if !modified_this_block {
-                    references = gather_references(&all_blocks[current.index()]);
-                    modified_this_block = true;
+            if let Some(value) = common_value_opt {
+                let old_value = input_regs_for_block[current.index()].get_reg(reg);
+                if value != old_value {
+                    input_regs_for_block[current.index()].set_reg(reg, value);
                     modified = true;
                 }
-
-                instruction = new_instruction;
-                all_blocks[current.index()].ops[nth_instruction].1 = new_instruction;
             }
+        }
+    }
 
-            if let BasicInst::LoadAbsolute { kind, dst, target } = instruction {
-                let section = elf.section_by_index(target.section_index);
-                if section.is_allocated() && !section.is_writable() {
-                    let value = match kind {
-                        LoadKind::U64 => section
-                            .data()
-                            .get(target.offset as usize..target.offset as usize + 8)
-                            .map(|xs| u64::from_le_bytes([xs[0], xs[1], xs[2], xs[3], xs[4], xs[5], xs[6], xs[7]]))
-                            .map(|_| todo!("64bit support")),
-                        LoadKind::U32 => section
-                            .data()
-                            .get(target.offset as usize..target.offset as usize + 4)
-                            .map(|xs| u32::from_le_bytes([xs[0], xs[1], xs[2], xs[3]]) as i32),
-                        LoadKind::I32 => section
-                            .data()
-                            .get(target.offset as usize..target.offset as usize + 4)
-                            .map(|xs| i32::from_le_bytes([xs[0], xs[1], xs[2], xs[3]])),
-                        LoadKind::U16 => section
-                            .data()
-                            .get(target.offset as usize..target.offset as usize + 2)
-                            .map(|xs| u32::from(u16::from_le_bytes([xs[0], xs[1]])) as i32),
-                        LoadKind::I16 => section
-                            .data()
-                            .get(target.offset as usize..target.offset as usize + 2)
-                            .map(|xs| i32::from(i16::from_le_bytes([xs[0], xs[1]]))),
-                        LoadKind::I8 => section.data().get(target.offset as usize).map(|&x| i32::from(x as i8)),
-                        LoadKind::U8 => section.data().get(target.offset as usize).map(|&x| u32::from(x) as i32),
-                    };
-
-                    if let Some(imm) = value {
-                        if !modified_this_block {
-                            references = gather_references(&all_blocks[current.index()]);
-                            modified_this_block = true;
-                            modified = true;
-                        }
-
-                        instruction = BasicInst::LoadImmediate { dst, imm };
-                        all_blocks[current.index()].ops[nth_instruction].1 = instruction;
-                    }
-                }
-            }
-
-            regs.set_reg_from_instruction(imports, unknown_counter, instruction);
+    let mut regs = input_regs_for_block[current.index()].clone();
+    let mut references = BTreeSet::new();
+    let mut modified_this_block = false;
+    for nth_instruction in 0..all_blocks[current.index()].ops.len() {
+        let mut instruction = all_blocks[current.index()].ops[nth_instruction].1;
+        if instruction.is_nop() {
+            continue;
         }
 
-        while let Some(new_instruction) = regs.simplify_control_instruction(all_blocks[current.index()].next.instruction) {
-            log::trace!(
-                "Simplifying end of {current:?}: {:?} -> {:?}",
-                all_blocks[current.index()].next.instruction,
-                new_instruction
-            );
-
+        while let Some(new_instruction) = regs.simplify_instruction(instruction) {
             if !modified_this_block {
                 references = gather_references(&all_blocks[current.index()]);
                 modified_this_block = true;
                 modified = true;
             }
 
-            all_blocks[current.index()].next.instruction = new_instruction;
+            instruction = new_instruction;
+            all_blocks[current.index()].ops[nth_instruction].1 = new_instruction;
         }
 
-        if modified_this_block {
-            update_references(all_blocks, reachability_graph, optimize_queue.as_deref_mut(), current, references);
-            if !reachability_graph.is_code_reachable(current) {
-                break;
-            }
+        if let BasicInst::LoadAbsolute { kind, dst, target } = instruction {
+            let section = elf.section_by_index(target.section_index);
+            if section.is_allocated() && !section.is_writable() {
+                let value = match kind {
+                    LoadKind::U64 => section
+                        .data()
+                        .get(target.offset as usize..target.offset as usize + 8)
+                        .map(|xs| u64::from_le_bytes([xs[0], xs[1], xs[2], xs[3], xs[4], xs[5], xs[6], xs[7]]))
+                        .map(|_| todo!("64bit support")),
+                    LoadKind::U32 => section
+                        .data()
+                        .get(target.offset as usize..target.offset as usize + 4)
+                        .map(|xs| u32::from_le_bytes([xs[0], xs[1], xs[2], xs[3]]) as i32),
+                    LoadKind::I32 => section
+                        .data()
+                        .get(target.offset as usize..target.offset as usize + 4)
+                        .map(|xs| i32::from_le_bytes([xs[0], xs[1], xs[2], xs[3]])),
+                    LoadKind::U16 => section
+                        .data()
+                        .get(target.offset as usize..target.offset as usize + 2)
+                        .map(|xs| u32::from(u16::from_le_bytes([xs[0], xs[1]])) as i32),
+                    LoadKind::I16 => section
+                        .data()
+                        .get(target.offset as usize..target.offset as usize + 2)
+                        .map(|xs| i32::from(i16::from_le_bytes([xs[0], xs[1]]))),
+                    LoadKind::I8 => section.data().get(target.offset as usize).map(|&x| i32::from(x as i8)),
+                    LoadKind::U8 => section.data().get(target.offset as usize).map(|&x| u32::from(x) as i32),
+                };
 
+                if let Some(imm) = value {
+                    if !modified_this_block {
+                        references = gather_references(&all_blocks[current.index()]);
+                        modified_this_block = true;
+                        modified = true;
+                    }
+
+                    instruction = BasicInst::LoadImmediate { dst, imm };
+                    all_blocks[current.index()].ops[nth_instruction].1 = instruction;
+                }
+            }
+        }
+
+        regs.set_reg_from_instruction(imports, unknown_counter, instruction);
+    }
+
+    for reg in Reg::ALL {
+        if let RegValue::Unknown { bits_used, .. } = regs.get_reg(reg) {
+            regs.set_reg(
+                reg,
+                RegValue::OutputReg {
+                    reg,
+                    source_block: current,
+                    bits_used,
+                },
+            )
+        }
+    }
+
+    let output_regs_modified = output_regs_for_block[current.index()] != regs;
+    if output_regs_modified {
+        output_regs_for_block[current.index()] = regs.clone();
+        modified = true;
+    }
+
+    while let Some(new_instruction) = regs.simplify_control_instruction(all_blocks[current.index()].next.instruction) {
+        log::trace!(
+            "Simplifying end of {current:?}: {:?} -> {:?}",
+            all_blocks[current.index()].next.instruction,
+            new_instruction
+        );
+
+        if !modified_this_block {
+            references = gather_references(&all_blocks[current.index()]);
+            modified_this_block = true;
+            modified = true;
+        }
+
+        all_blocks[current.index()].next.instruction = new_instruction;
+    }
+
+    if modified_this_block {
+        update_references(all_blocks, reachability_graph, optimize_queue.as_deref_mut(), current, references);
+        if reachability_graph.is_code_reachable(current) {
             if let Some(ref mut optimize_queue) = optimize_queue {
                 add_to_optimize_queue(all_blocks, reachability_graph, optimize_queue, current);
             }
         }
+    }
 
-        match all_blocks[current.index()].next.instruction {
-            ControlInst::Jump { target }
-                if current != target && reachability_graph.for_code.get(&target).unwrap().is_only_reachable_from(current) =>
-            {
-                current = target;
-                regs_for_block[current.index()] = regs.clone();
-                continue;
+    if let Some(ref mut optimize_queue) = optimize_queue {
+        if output_regs_modified {
+            match all_blocks[current.index()].next.instruction {
+                ControlInst::Jump { target } => add_to_optimize_queue(all_blocks, reachability_graph, optimize_queue, target),
+                ControlInst::Branch {
+                    target_true, target_false, ..
+                } => {
+                    add_to_optimize_queue(all_blocks, reachability_graph, optimize_queue, target_true);
+                    add_to_optimize_queue(all_blocks, reachability_graph, optimize_queue, target_false);
+                }
+                ControlInst::Call { .. } | ControlInst::CallIndirect { .. } => unreachable!(),
+                _ => {}
             }
-            ControlInst::Branch {
-                target_true, target_false, ..
-            } => {
-                let true_only_reachable_from_here = current != target_true
-                    && reachability_graph
-                        .for_code
-                        .get(&target_true)
-                        .unwrap()
-                        .is_only_reachable_from(current);
-
-                let false_only_reachable_from_here = current != target_false
-                    && reachability_graph
-                        .for_code
-                        .get(&target_false)
-                        .unwrap()
-                        .is_only_reachable_from(current);
-
-                if true_only_reachable_from_here {
-                    regs_for_block[target_true.index()] = regs.clone();
-                }
-
-                if false_only_reachable_from_here {
-                    regs_for_block[target_false.index()] = regs.clone();
-                }
-
-                if true_only_reachable_from_here {
-                    current = target_true;
-                    continue;
-                }
-
-                if false_only_reachable_from_here {
-                    current = target_false;
-                    continue;
-                }
-            }
-            ControlInst::Call { .. } | ControlInst::CallIndirect { .. } => unreachable!(),
-            _ => {}
         }
-
-        break;
     }
 
     modified
@@ -4189,9 +4223,11 @@ fn optimize_program<H>(
     optimize_queue.vec.reverse();
 
     let mut unknown_counter = 0;
-    let mut regs_for_block = Vec::with_capacity(all_blocks.len());
+    let mut input_regs_for_block = Vec::with_capacity(all_blocks.len());
+    let mut output_regs_for_block = Vec::with_capacity(all_blocks.len());
     for current in (0..all_blocks.len()).map(BlockTarget::from_raw) {
-        regs_for_block.push(BlockRegs::new(current))
+        input_regs_for_block.push(BlockRegs::new_input(current));
+        output_regs_for_block.push(BlockRegs::new_output(current));
     }
 
     let mut registers_needed_for_block = Vec::with_capacity(all_blocks.len());
@@ -4231,7 +4267,8 @@ fn optimize_program<H>(
             imports,
             elf,
             all_blocks,
-            &mut regs_for_block,
+            &mut input_regs_for_block,
+            &mut output_regs_for_block,
             &mut unknown_counter,
             reachability_graph,
             Some(&mut optimize_queue),
@@ -4278,7 +4315,8 @@ fn optimize_program<H>(
                 imports,
                 elf,
                 all_blocks,
-                &mut regs_for_block,
+                &mut input_regs_for_block,
+                &mut output_regs_for_block,
                 &mut unknown_counter,
                 reachability_graph,
                 None,
