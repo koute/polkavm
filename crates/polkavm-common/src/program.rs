@@ -1529,13 +1529,13 @@ impl core::fmt::Display for Instruction {
 }
 
 impl Instruction {
-    pub fn display(self, format: &'_ InstructionFormat) -> impl core::fmt::Display + '_ {
-        struct Inner<'a> {
+    pub fn display<'a>(self, format: &'a InstructionFormat<'a>) -> impl core::fmt::Display + 'a {
+        struct Inner<'a, 'b> {
             instruction: Instruction,
-            format: &'a InstructionFormat,
+            format: &'a InstructionFormat<'b>,
         }
 
-        impl<'a> core::fmt::Display for Inner<'a> {
+        impl<'a, 'b> core::fmt::Display for Inner<'a, 'b> {
             fn fmt(&self, fmt: &mut core::fmt::Formatter) -> core::fmt::Result {
                 self.instruction.visit(&mut InstructionFormatter { format: self.format, fmt })
             }
@@ -1642,17 +1642,18 @@ pub const MAX_INSTRUCTION_LENGTH: usize = 2 + MAX_VARINT_LENGTH * 2;
 
 #[derive(Default)]
 #[non_exhaustive]
-pub struct InstructionFormat {
+pub struct InstructionFormat<'a> {
     pub prefer_non_abi_reg_names: bool,
     pub prefer_unaliased: bool,
+    pub jump_target_formatter: Option<&'a dyn Fn(u32, &mut core::fmt::Formatter) -> core::fmt::Result>,
 }
 
-struct InstructionFormatter<'a, 'b> {
-    format: &'a InstructionFormat,
+struct InstructionFormatter<'a, 'b, 'c> {
+    format: &'a InstructionFormat<'c>,
     fmt: &'a mut core::fmt::Formatter<'b>,
 }
 
-impl<'a, 'b> InstructionFormatter<'a, 'b> {
+impl<'a, 'b, 'c> InstructionFormatter<'a, 'b, 'c> {
     fn format_reg(&self, reg: RawReg) -> &'static str {
         if self.format.prefer_non_abi_reg_names {
             reg.get().name_non_abi()
@@ -1660,15 +1661,30 @@ impl<'a, 'b> InstructionFormatter<'a, 'b> {
             reg.get().name()
         }
     }
+
+    fn format_jump(&self, imm: u32) -> impl core::fmt::Display + 'a {
+        struct Formatter<'a>(Option<&'a dyn Fn(u32, &mut core::fmt::Formatter) -> core::fmt::Result>, u32);
+        impl<'a> core::fmt::Display for Formatter<'a> {
+            fn fmt(&self, fmt: &mut core::fmt::Formatter) -> core::fmt::Result {
+                if let Some(f) = self.0 {
+                    f(self.1, fmt)
+                } else {
+                    write!(fmt, "{}", self.1)
+                }
+            }
+        }
+
+        Formatter(self.format.jump_target_formatter, imm)
+    }
 }
 
-impl<'a, 'b> core::fmt::Write for InstructionFormatter<'a, 'b> {
+impl<'a, 'b, 'c> core::fmt::Write for InstructionFormatter<'a, 'b, 'c> {
     fn write_str(&mut self, s: &str) -> Result<(), core::fmt::Error> {
         self.fmt.write_str(s)
     }
 }
 
-impl<'a, 'b> InstructionVisitor for InstructionFormatter<'a, 'b> {
+impl<'a, 'b, 'c> InstructionVisitor for InstructionFormatter<'a, 'b, 'c> {
     type ReturnTy = core::fmt::Result;
 
     fn trap(&mut self) -> Self::ReturnTy {
@@ -2403,95 +2419,113 @@ impl<'a, 'b> InstructionVisitor for InstructionFormatter<'a, 'b> {
     fn branch_less_unsigned(&mut self, s1: RawReg, s2: RawReg, imm: u32) -> Self::ReturnTy {
         let s1 = self.format_reg(s1);
         let s2 = self.format_reg(s2);
+        let imm = self.format_jump(imm);
         write!(self, "jump {} if {} <u {}", imm, s1, s2)
     }
 
     fn branch_less_signed(&mut self, s1: RawReg, s2: RawReg, imm: u32) -> Self::ReturnTy {
         let s1 = self.format_reg(s1);
         let s2 = self.format_reg(s2);
+        let imm = self.format_jump(imm);
         write!(self, "jump {} if {} <s {}", imm, s1, s2)
     }
 
     fn branch_less_unsigned_imm(&mut self, s1: RawReg, s2: u32, imm: u32) -> Self::ReturnTy {
         let s1 = self.format_reg(s1);
+        let imm = self.format_jump(imm);
         write!(self, "jump {} if {} <u {}", imm, s1, s2)
     }
 
     fn branch_less_signed_imm(&mut self, s1: RawReg, s2: u32, imm: u32) -> Self::ReturnTy {
         let s1 = self.format_reg(s1);
+        let imm = self.format_jump(imm);
         write!(self, "jump {} if {} <s {}", imm, s1, s2)
     }
 
     fn branch_greater_or_equal_unsigned(&mut self, s1: RawReg, s2: RawReg, imm: u32) -> Self::ReturnTy {
         let s1 = self.format_reg(s1);
         let s2 = self.format_reg(s2);
+        let imm = self.format_jump(imm);
         write!(self, "jump {} if {} >=u {}", imm, s1, s2)
     }
 
     fn branch_greater_or_equal_signed(&mut self, s1: RawReg, s2: RawReg, imm: u32) -> Self::ReturnTy {
         let s1 = self.format_reg(s1);
         let s2 = self.format_reg(s2);
+        let imm = self.format_jump(imm);
         write!(self, "jump {} if {} >=s {}", imm, s1, s2)
     }
 
     fn branch_greater_or_equal_unsigned_imm(&mut self, s1: RawReg, s2: u32, imm: u32) -> Self::ReturnTy {
         let s1 = self.format_reg(s1);
+        let imm = self.format_jump(imm);
         write!(self, "jump {} if {} >=u {}", imm, s1, s2)
     }
 
     fn branch_greater_or_equal_signed_imm(&mut self, s1: RawReg, s2: u32, imm: u32) -> Self::ReturnTy {
         let s1 = self.format_reg(s1);
+        let imm = self.format_jump(imm);
         write!(self, "jump {} if {} >=s {}", imm, s1, s2)
     }
 
     fn branch_eq(&mut self, s1: RawReg, s2: RawReg, imm: u32) -> Self::ReturnTy {
         let s1 = self.format_reg(s1);
         let s2 = self.format_reg(s2);
+        let imm = self.format_jump(imm);
         write!(self, "jump {} if {} == {}", imm, s1, s2)
     }
 
     fn branch_not_eq(&mut self, s1: RawReg, s2: RawReg, imm: u32) -> Self::ReturnTy {
         let s1 = self.format_reg(s1);
         let s2 = self.format_reg(s2);
+        let imm = self.format_jump(imm);
         write!(self, "jump {} if {} != {}", imm, s1, s2)
     }
 
     fn branch_eq_imm(&mut self, s1: RawReg, s2: u32, imm: u32) -> Self::ReturnTy {
         let s1 = self.format_reg(s1);
+        let imm = self.format_jump(imm);
         write!(self, "jump {} if {} == {}", imm, s1, s2)
     }
 
     fn branch_not_eq_imm(&mut self, s1: RawReg, s2: u32, imm: u32) -> Self::ReturnTy {
         let s1 = self.format_reg(s1);
+        let imm = self.format_jump(imm);
         write!(self, "jump {} if {} != {}", imm, s1, s2)
     }
 
     fn branch_less_or_equal_unsigned_imm(&mut self, s1: RawReg, s2: u32, imm: u32) -> Self::ReturnTy {
         let s1 = self.format_reg(s1);
+        let imm = self.format_jump(imm);
         write!(self, "jump {} if {} <=u {}", imm, s1, s2)
     }
 
     fn branch_less_or_equal_signed_imm(&mut self, s1: RawReg, s2: u32, imm: u32) -> Self::ReturnTy {
         let s1 = self.format_reg(s1);
+        let imm = self.format_jump(imm);
         write!(self, "jump {} if {} <=s {}", imm, s1, s2)
     }
 
     fn branch_greater_unsigned_imm(&mut self, s1: RawReg, s2: u32, imm: u32) -> Self::ReturnTy {
         let s1 = self.format_reg(s1);
+        let imm = self.format_jump(imm);
         write!(self, "jump {} if {} >u {}", imm, s1, s2)
     }
 
     fn branch_greater_signed_imm(&mut self, s1: RawReg, s2: u32, imm: u32) -> Self::ReturnTy {
         let s1 = self.format_reg(s1);
+        let imm = self.format_jump(imm);
         write!(self, "jump {} if {} >s {}", imm, s1, s2)
     }
 
     fn jump(&mut self, target: u32) -> Self::ReturnTy {
+        let target = self.format_jump(target);
         write!(self, "jump {}", target)
     }
 
     fn load_imm_and_jump(&mut self, ra: RawReg, value: u32, target: u32) -> Self::ReturnTy {
         let ra = self.format_reg(ra);
+        let target = self.format_jump(target);
         write!(self, "{ra} = {value}, jump {target}")
     }
 

@@ -229,6 +229,7 @@ fn main_generate() {
         disassembler.show_raw_bytes(true);
         disassembler.prefer_non_abi_reg_names(true);
         disassembler.prefer_unaliased(true);
+        disassembler.prefer_offset_jump_targets(true);
         disassembler.emit_header(false);
         disassembler.emit_exports(false);
 
