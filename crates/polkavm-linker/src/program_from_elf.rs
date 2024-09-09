@@ -2529,11 +2529,7 @@ fn build_section_to_block_map(
 ) -> Result<HashMap<SectionTarget, BlockTarget>, ProgramFromElfError> {
     let mut section_to_block = HashMap::new();
     for (block_index, block) in blocks.iter().enumerate() {
-        let section_target = SectionTarget {
-            section_index: block.source.section_index,
-            offset: block.source.offset_range.start,
-        };
-
+        let section_target = block.source.begin();
         let block_target = BlockTarget::from_raw(block_index);
         if section_to_block.insert(section_target, block_target).is_some() {
             return Err(ProgramFromElfError::other("found two or more basic blocks with the same location"));
