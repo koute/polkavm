@@ -1718,12 +1718,21 @@ fn convert_instruction(
                 RegImmKind::ShiftArithmeticRight64 => AnyAnyKind::ShiftArithmeticRight64,
             };
 
-            emit(InstExt::Basic(BasicInst::AnyAny {
-                kind,
-                dst,
-                src1: src,
-                src2: (imm as u32).into(),
-            }));
+            if matches!(src, RegImm::Imm(0)) {
+                // The optimizer can take care of this later, but doing it early here is more efficient.
+                emit(InstExt::Basic(BasicInst::LoadImmediate {
+                    dst,
+                    imm: OperationKind::from(kind).apply_const(0, imm),
+                }));
+            } else {
+                emit(InstExt::Basic(BasicInst::AnyAny {
+                    kind,
+                    dst,
+                    src1: src,
+                    src2: (imm as u32).into(),
+                }));
+            }
+
             Ok(())
         }
         Inst::RegReg { kind, dst, src1, src2 } => {
