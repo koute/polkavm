@@ -877,6 +877,18 @@ impl<T> ControlInst<T> {
         }
     }
 
+    fn fallthrough_target(&self) -> Option<T>
+    where
+        T: Copy,
+    {
+        match self {
+            ControlInst::Jump { .. } | ControlInst::JumpIndirect { .. } | ControlInst::Unimplemented => None,
+            ControlInst::Branch { target_false: target, .. }
+            | ControlInst::Call { target_return: target, .. }
+            | ControlInst::CallIndirect { target_return: target, .. } => Some(*target),
+        }
+    }
+
     fn fallthrough_target_mut(&mut self) -> Option<&mut T> {
         match self {
             ControlInst::Jump { .. } | ControlInst::JumpIndirect { .. } | ControlInst::Unimplemented => None,
@@ -2938,6 +2950,13 @@ fn perform_inlining(
         // Don't inline if it's an infinite loop.
         if target == current || is_infinite_loop(all_blocks, target) {
             return false;
+        }
+
+        if let Some(fallthrough_target) = all_blocks[target.index()].next.instruction.fallthrough_target() {
+            if fallthrough_target.index() == target.index() + 1 {
+                // Do not inline if we'd need to inject a new fallthrough basic block.
+                return false;
+            }
         }
 
         // Inline if the target block is small enough.
