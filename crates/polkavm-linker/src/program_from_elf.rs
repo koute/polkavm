@@ -876,6 +876,15 @@ impl<T> ControlInst<T> {
             ControlInst::JumpIndirect { .. } | ControlInst::Unimplemented => [None, None],
         }
     }
+
+    fn fallthrough_target_mut(&mut self) -> Option<&mut T> {
+        match self {
+            ControlInst::Jump { .. } | ControlInst::JumpIndirect { .. } | ControlInst::Unimplemented => None,
+            ControlInst::Branch { target_false: target, .. }
+            | ControlInst::Call { target_return: target, .. }
+            | ControlInst::CallIndirect { target_return: target, .. } => Some(target),
+        }
+    }
 }
 
 #[derive(Copy, Clone, Debug)]
@@ -4279,38 +4288,42 @@ fn add_missing_fallthrough_blocks(
             continue;
         }
 
-        let references = gather_references(&all_blocks[current.index()]);
-        let new_fallthrough_target = BlockTarget::from_raw(all_blocks.len());
-        let old_fallthrough_target = match &mut all_blocks[current.index()].next.instruction {
-            ControlInst::Jump { .. } | ControlInst::JumpIndirect { .. } | ControlInst::Unimplemented => continue,
-            ControlInst::Branch { target_false: target, .. }
-            | ControlInst::Call { target_return: target, .. }
-            | ControlInst::CallIndirect { target_return: target, .. } => core::mem::replace(target, new_fallthrough_target),
+        let Some(target) = all_blocks[current.index()].next.instruction.fallthrough_target_mut().copied() else {
+            continue;
         };
 
+        let inline_target = target != current
+            && all_blocks[target.index()].ops.is_empty()
+            && all_blocks[target.index()].next.instruction.fallthrough_target_mut().is_none();
+
+        let new_block_index = BlockTarget::from_raw(all_blocks.len());
         all_blocks.push(BasicBlock {
-            target: new_fallthrough_target,
+            target: new_block_index,
             source: all_blocks[current.index()].source,
             ops: Default::default(),
-            next: EndOfBlock {
-                source: all_blocks[current.index()].next.source.clone(),
-                instruction: ControlInst::Jump {
-                    target: old_fallthrough_target,
-                },
+            next: if inline_target {
+                all_blocks[target.index()].next.clone()
+            } else {
+                EndOfBlock {
+                    source: all_blocks[current.index()].next.source.clone(),
+                    instruction: ControlInst::Jump { target },
+                }
             },
         });
 
+        new_used_blocks.push(new_block_index);
+
         reachability_graph
             .for_code
-            .get_mut(&old_fallthrough_target)
-            .unwrap()
-            .reachable_from
-            .insert(new_fallthrough_target);
+            .entry(new_block_index)
+            .or_insert(Reachability::default())
+            .always_reachable = true;
+        update_references(all_blocks, reachability_graph, None, new_block_index, Default::default());
+        reachability_graph.for_code.get_mut(&new_block_index).unwrap().always_reachable = false;
 
-        reachability_graph.for_code.insert(new_fallthrough_target, Reachability::default());
+        let references = gather_references(&all_blocks[current.index()]);
+        *all_blocks[current.index()].next.instruction.fallthrough_target_mut().unwrap() = new_block_index;
         update_references(all_blocks, reachability_graph, None, current, references);
-
-        new_used_blocks.push(new_fallthrough_target);
     }
 
     new_used_blocks
