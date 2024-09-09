@@ -712,6 +712,8 @@ impl<T> BasicInst<T> {
             .is_none();
 
         if is_special_instruction {
+            assert_eq!(length, 0);
+
             let BasicInst::Ecalli { nth_import } = *self else { unreachable!() };
             let import = &imports[nth_import];
 
