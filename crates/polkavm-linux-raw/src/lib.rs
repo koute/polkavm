@@ -105,6 +105,7 @@ pub use crate::arch_bindings::{
     __NR_ioctl as SYS_ioctl,
     __NR_kill as SYS_kill,
     __NR_lseek as SYS_lseek,
+    __NR_nanosleep as SYS_nanosleep,
     __NR_madvise as SYS_madvise,
     __NR_memfd_create as SYS_memfd_create,
     __NR_mmap as SYS_mmap,
@@ -2097,6 +2098,27 @@ pub fn sys_clock_gettime(clock_id: u32) -> Result<Duration, Error> {
 
     let duration = Duration::new(output.tv_sec as u64, output.tv_nsec as u32);
     Ok(duration)
+}
+
+pub fn sys_nanosleep(duration: Duration) -> Result<Option<Duration>, Error> {
+    let duration = timespec {
+        tv_sec: duration.as_secs() as i64,
+        tv_nsec: u64::from(duration.subsec_nanos()) as i64,
+    };
+
+    let mut remaining = timespec { tv_sec: 0, tv_nsec: 0 };
+    let result = unsafe { syscall_readonly!(SYS_nanosleep, core::ptr::addr_of!(duration), core::ptr::addr_of_mut!(remaining)) };
+    let error = Error::from_syscall("nanosleep", result);
+    if let Err(error) = error {
+        if error.errno() == EINTR {
+            let remaining = Duration::new(remaining.tv_sec as u64, remaining.tv_nsec as u32);
+            Ok(Some(remaining))
+        } else {
+            Err(error)
+        }
+    } else {
+        Ok(None)
+    }
 }
 
 pub fn sys_waitid(which: u32, pid: pid_t, info: &mut siginfo_t, options: u32, usage: Option<&mut rusage>) -> Result<(), Error> {
