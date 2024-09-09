@@ -118,8 +118,10 @@ pub struct Disassembler<'a> {
     show_raw_bytes: bool,
     prefer_non_abi_reg_names: bool,
     prefer_unaliased: bool,
+    prefer_offset_jump_targets: bool,
     emit_header: bool,
     emit_exports: bool,
+    show_offsets: bool,
 }
 
 impl<'a> Disassembler<'a> {
@@ -138,8 +140,10 @@ impl<'a> Disassembler<'a> {
             show_raw_bytes: false,
             prefer_non_abi_reg_names: false,
             prefer_unaliased: false,
+            prefer_offset_jump_targets: false,
             emit_header: true,
             emit_exports: true,
+            show_offsets: true,
         })
     }
 
@@ -155,12 +159,20 @@ impl<'a> Disassembler<'a> {
         self.prefer_unaliased = value;
     }
 
+    pub fn prefer_offset_jump_targets(&mut self, value: bool) {
+        self.prefer_offset_jump_targets = value;
+    }
+
     pub fn emit_header(&mut self, value: bool) {
         self.emit_header = value;
     }
 
     pub fn emit_exports(&mut self, value: bool) {
         self.emit_exports = value;
+    }
+
+    pub fn show_offsets(&mut self, value: bool) {
+        self.show_offsets = value;
     }
 
     pub fn display_gas(&mut self) -> Result<(), polkavm::Error> {
@@ -196,8 +208,22 @@ impl<'a> Disassembler<'a> {
 
     pub fn disassemble_into(&self, mut writer: impl Write) -> Result<(), polkavm::Error> {
         let mut instructions = Vec::new();
-        for instruction in self.blob.instructions() {
-            instructions.push(instruction);
+        let mut instruction_offset_to_basic_block = HashMap::new();
+        {
+            let mut basic_block_counter = 0;
+            let mut basic_block_started = true;
+            for instruction in self.blob.instructions() {
+                if basic_block_started {
+                    instruction_offset_to_basic_block.insert(instruction.offset, basic_block_counter);
+                    basic_block_started = false;
+                }
+
+                if instruction.starts_new_basic_block() {
+                    basic_block_started = true;
+                    basic_block_counter += 1;
+                }
+                instructions.push(instruction);
+            }
         }
 
         let mut exports_for_code_offset = HashMap::new();
@@ -217,11 +243,17 @@ impl<'a> Disassembler<'a> {
         }
 
         macro_rules! w {
+            (@no_newline $($arg:tt)*) => {{
+                if let Err(error) = write!(&mut writer, $($arg)*) {
+                    return Err(format!("failed to write to output: {error}").into());
+                }
+            }};
+
             ($($arg:tt)*) => {{
                 if let Err(error) = writeln!(&mut writer, $($arg)*) {
                     return Err(format!("failed to write to output: {error}").into());
                 }
-            }}
+            }};
         }
 
         if self.emit_header {
@@ -267,9 +299,21 @@ impl<'a> Disassembler<'a> {
             buf
         };
 
+        let prefer_offset_jump_targets = self.prefer_offset_jump_targets;
         let mut disassembly_format = polkavm_common::program::InstructionFormat::default();
         disassembly_format.prefer_non_abi_reg_names = self.prefer_non_abi_reg_names;
         disassembly_format.prefer_unaliased = self.prefer_unaliased;
+
+        let jump_target_formatter = |target: u32, fmt: &mut core::fmt::Formatter| {
+            if prefer_offset_jump_targets {
+                write!(fmt, "{}", target)
+            } else if let Some(basic_block_index) = instruction_offset_to_basic_block.get(&polkavm::ProgramCounter(target)) {
+                write!(fmt, "@{basic_block_index}")
+            } else {
+                write!(fmt, "{}", target)
+            }
+        };
+        disassembly_format.jump_target_formatter = Some(&jump_target_formatter);
 
         let mut fmt = AssemblyFormatter::default();
         let mut last_line_program_entry = None;
@@ -346,10 +390,14 @@ impl<'a> Disassembler<'a> {
             if pending_label {
                 pending_label = false;
                 if !matches!(self.format, DisassemblyFormat::DiffFriendly) {
+                    if self.show_offsets {
+                        w!(@no_newline "      : ");
+                    }
+
                     if self.show_raw_bytes {
-                        w!("      : {:24} {}", "", format_jump_target(offset, basic_block_counter))
+                        w!("{:24} {}", "", format_jump_target(offset, basic_block_counter))
                     } else {
-                        w!("      : {}", format_jump_target(offset, basic_block_counter))
+                        w!("{}", format_jump_target(offset, basic_block_counter))
                     }
                 } else {
                     w!("    {}", format_jump_target(offset, basic_block_counter))
@@ -377,11 +425,14 @@ impl<'a> Disassembler<'a> {
 
                 w!("    {}", string);
             } else if matches!(self.format, DisassemblyFormat::Guest | DisassemblyFormat::GuestAndNative) {
+                if self.show_offsets {
+                    w!(@no_newline "{offset:6}: ");
+                }
                 if self.show_raw_bytes {
                     let raw_bytes = raw_bytes.iter().map(|byte| format!("{byte:02x}")).collect::<Vec<_>>().join(" ");
-                    w!("{offset:6}: {raw_bytes:24} {instruction_s}")
+                    w!("{raw_bytes:24} {instruction_s}")
                 } else {
-                    w!("{offset:6}: {instruction_s}")
+                    w!("{instruction_s}")
                 }
             }
 
