@@ -1613,8 +1613,8 @@ pub fn sys_fcntl(fd: FdRef, cmd: u32, arg: u32) -> Result<i32, Error> {
     Ok(result as i32)
 }
 
-pub fn sys_fcntl_dupfd(fd: FdRef, arg: u32) -> Result<Fd, Error> {
-    let fd = sys_fcntl(fd, F_DUPFD, arg)?;
+pub fn sys_fcntl_dupfd(fd: FdRef, min: c_int) -> Result<Fd, Error> {
+    let fd = sys_fcntl(fd, F_DUPFD, min as u32)?;
     Ok(Fd::from_raw_unchecked(fd))
 }
 
