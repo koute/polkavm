@@ -156,27 +156,30 @@ impl Config {
     }
 
     /// Creates a new default configuration and seeds it from the environment variables.
-    #[cfg(feature = "std")]
     pub fn from_env() -> Result<Self, Error> {
         let mut config = Self::new();
-        if let Some(value) = std::env::var_os("POLKAVM_BACKEND") {
-            config.backend = BackendKind::from_os_str(&value)?;
-        }
 
-        if let Some(value) = std::env::var_os("POLKAVM_SANDBOX") {
-            config.sandbox = SandboxKind::from_os_str(&value)?;
-        }
+        #[cfg(feature = "std")]
+        {
+            if let Some(value) = std::env::var_os("POLKAVM_BACKEND") {
+                config.backend = BackendKind::from_os_str(&value)?;
+            }
 
-        if let Some(value) = env_bool("POLKAVM_CROSSCHECK")? {
-            config.crosscheck = value;
-        }
+            if let Some(value) = std::env::var_os("POLKAVM_SANDBOX") {
+                config.sandbox = SandboxKind::from_os_str(&value)?;
+            }
 
-        if let Some(value) = env_bool("POLKAVM_ALLOW_EXPERIMENTAL")? {
-            config.allow_experimental = value;
-        }
+            if let Some(value) = env_bool("POLKAVM_CROSSCHECK")? {
+                config.crosscheck = value;
+            }
 
-        if let Some(value) = env_usize("POLKAVM_WORKER_COUNT")? {
-            config.worker_count = value;
+            if let Some(value) = env_bool("POLKAVM_ALLOW_EXPERIMENTAL")? {
+                config.allow_experimental = value;
+            }
+
+            if let Some(value) = env_usize("POLKAVM_WORKER_COUNT")? {
+                config.worker_count = value;
+            }
         }
 
         Ok(config)
