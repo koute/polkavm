@@ -143,6 +143,11 @@ impl Engine {
             allow_dynamic_paging: config.allow_dynamic_paging(),
         })
     }
+
+    /// Returns the backend used by the engine.
+    pub fn backend(&self) -> BackendKind {
+        self.selected_backend
+    }
 }
 
 if_compiler_is_supported! {
