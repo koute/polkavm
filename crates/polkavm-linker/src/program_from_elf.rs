@@ -4385,6 +4385,7 @@ mod test {
     use polkavm::Reg;
 
     struct ProgramBuilder {
+        data_section: SectionIndex,
         current_section: SectionIndex,
         next_free_section: SectionIndex,
         next_offset_for_section: HashMap<SectionIndex, u64>,
@@ -4400,8 +4401,9 @@ mod test {
     impl ProgramBuilder {
         fn new() -> Self {
             ProgramBuilder {
-                current_section: SectionIndex::new(0),
-                next_free_section: SectionIndex::new(0),
+                data_section: SectionIndex::new(0),
+                current_section: SectionIndex::new(1),
+                next_free_section: SectionIndex::new(1),
                 next_offset_for_section: HashMap::default(),
                 instructions: Vec::new(),
                 exports: Vec::new(),
@@ -4513,11 +4515,15 @@ mod test {
                         }
                         .into();
                     }
-                    Instruction::branch_less_unsigned_imm(src1, src2, target) => {
+                    Instruction::branch_less_unsigned_imm(src1, src2, target) | Instruction::branch_eq_imm(src1, src2, target) => {
                         let target_true = *program_counter_to_section_target.get(&polkavm::ProgramCounter(target)).unwrap();
                         let target_false = *program_counter_to_section_target.get(&instruction.next_offset()).unwrap();
                         *out = ControlInst::Branch {
-                            kind: BranchKind::LessUnsigned,
+                            kind: match instruction.kind {
+                                Instruction::branch_less_unsigned_imm(..) => BranchKind::LessUnsigned,
+                                Instruction::branch_eq_imm(..) => BranchKind::Eq,
+                                _ => unreachable!(),
+                            },
                             src1: src1.into(),
                             src2: src2.into(),
                             target_true,
@@ -4529,6 +4535,29 @@ mod test {
                         *out = ControlInst::JumpIndirect {
                             base: base.into(),
                             offset: 0,
+                        }
+                        .into();
+                    }
+                    Instruction::trap => {
+                        *out = ControlInst::Unimplemented.into();
+                    }
+                    Instruction::store_u32(src, address) => {
+                        *out = BasicInst::StoreAbsolute {
+                            kind: StoreKind::U32,
+                            src: src.into(),
+                            target: SectionTarget {
+                                section_index: self.data_section,
+                                offset: u64::from(address),
+                            },
+                        }
+                        .into();
+                    }
+                    Instruction::store_indirect_u32(src, base, offset) => {
+                        *out = BasicInst::StoreIndirect {
+                            kind: StoreKind::U32,
+                            src: src.into(),
+                            base: base.into(),
+                            offset: offset as i32,
                         }
                         .into();
                     }
@@ -4546,7 +4575,7 @@ mod test {
 
         fn build(&self, config: Config) -> TestProgram {
             let elf: Elf<object::elf::FileHeader32<object::endian::LittleEndian>> = Elf::default();
-            let data_sections_set = HashSet::default();
+            let data_sections_set: HashSet<_> = core::iter::once(self.data_section).collect();
             let code_sections_set: HashSet<_> = self.next_offset_for_section.keys().copied().collect();
             let relocations = BTreeMap::default();
             let imports = [];
@@ -4584,7 +4613,8 @@ mod test {
             assert!(reachability_graph == expected_reachability_graph);
 
             let used_imports = HashSet::new();
-            let base_address_for_section = HashMap::new();
+            let mut base_address_for_section = HashMap::new();
+            base_address_for_section.insert(self.data_section, 0);
             let section_got = self.next_free_section;
             let target_to_got_offset = HashMap::new();
 
@@ -4623,6 +4653,7 @@ mod test {
             }
 
             builder.set_code(&raw_code, &jump_table);
+            builder.set_rw_data_size(1);
 
             let blob = ProgramBlob::parse(builder.to_vec().into()).unwrap();
             let mut disassembler = polkavm_disassembler::Disassembler::new(&blob, polkavm_disassembler::DisassemblyFormat::Guest).unwrap();
