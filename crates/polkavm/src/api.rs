@@ -537,7 +537,7 @@ impl Module {
     }
 
     /// Fetches a cached module for the given `blob`.
-    #[cfg_attr(not(feature = "module_cache"), allow(unused_variables))]
+    #[cfg_attr(not(feature = "module-cache"), allow(unused_variables))]
     pub fn from_cache(engine: &Engine, config: &ModuleConfig, blob: &ProgramBlob) -> Option<Self> {
         #[cfg(feature = "module-cache")]
         {
