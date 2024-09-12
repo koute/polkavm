@@ -75,3 +75,15 @@ jobs:
       run: cd crates/polkavm-zygote && rustup component add rustfmt
     - name: Run rustfmt
       run: ./ci/jobs/rustfmt.sh
+  pallet-revive-tests:
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v4
+    - name: Enable unprivileged userfaultfd
+      run: echo "1" | sudo tee /proc/sys/vm/unprivileged_userfaultfd
+    - name: Install LLD
+      run: sudo apt-get install -y lld
+    - name: Install target -- riscv32em-unknown-none-elf
+      run: ./ci/jobs/detect-or-install-riscv-toolchain.sh
+    - name: Build and test
+      run: ./ci/jobs/build-and-test-pallet-revive.sh

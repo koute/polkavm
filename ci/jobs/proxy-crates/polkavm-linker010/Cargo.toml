@@ -1,0 +1,7 @@
+[package]
+name = "polkavm-linker"
+version = "0.10.0"
+edition = "2021"
+
+[dependencies]
+polkavm-linker = { path = "../../../../crates/polkavm-linker" }

@@ -27,5 +27,7 @@ esac
 ./ci/jobs/clippy.sh
 ./ci/jobs/rustfmt.sh
 
+./ci/jobs/build-and-test-pallet-revive.sh
+
 echo "----------------------------------------"
 echo "All tests finished!"
