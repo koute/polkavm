@@ -44,3 +44,6 @@ module-cache = ["dep:schnellru", "polkavm-common/blake3"]
 # This is required on non-Linux systems to use the recompiler. On Linux it is unnecessary.
 # This sandbox is EXPERIMENTAL and is not meant for production use.
 generic-sandbox = []
+
+# Internal feature for testing. DO NOT USE.
+export-internals-for-testing = []
