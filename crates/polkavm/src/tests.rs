@@ -15,6 +15,8 @@ use polkavm_common::program::Reg::*;
 use polkavm_common::utils::align_to_next_page_u32;
 use polkavm_common::writer::ProgramBlobBuilder;
 
+use paste::paste;
+
 fn get_native_page_size() -> usize {
     if_compiler_is_supported! {
         { crate::sandbox::get_native_page_size() } else { 4096 }
@@ -24,77 +26,88 @@ fn get_native_page_size() -> usize {
 macro_rules! run_tests {
     ($($test_name:ident)+) => {
         if_compiler_is_supported! {
-            mod compiler {
-                #[cfg(target_os = "linux")]
-                mod linux {
-                    $(
-                        #[test]
-                        fn $test_name() {
-                            let mut config = crate::Config::default();
-                            config.set_worker_count(1);
-                            config.set_backend(Some(crate::BackendKind::Compiler));
-                            config.set_sandbox(Some(crate::SandboxKind::Linux));
-                            super::super::$test_name(config);
-                        }
-                    )+
-                }
-
-                #[cfg(target_os = "linux")]
-                mod linux_tracing {
-                    $(
-                        #[test]
-                        fn $test_name() {
-                            let mut config = crate::Config::default();
-                            config.set_backend(Some(crate::BackendKind::Compiler));
-                            config.set_sandbox(Some(crate::SandboxKind::Linux));
-                            config.set_allow_experimental(true);
-                            config.set_crosscheck(true);
-                            super::super::$test_name(config);
-                        }
-                    )+
-                }
-
-                #[cfg(feature = "generic-sandbox")]
-                mod generic {
-                    $(
-                        #[test]
-                        fn $test_name() {
-                            let mut config = crate::Config::default();
-                            config.set_backend(Some(crate::BackendKind::Compiler));
-                            config.set_sandbox(Some(crate::SandboxKind::Generic));
-                            config.set_allow_experimental(true);
-                            super::super::$test_name(config);
-                        }
-                    )+
-                }
-
-                #[cfg(feature = "generic-sandbox")]
-                mod generic_tracing {
-                    $(
-                        #[test]
-                        fn $test_name() {
-                            let mut config = crate::Config::default();
-                            config.set_backend(Some(crate::BackendKind::Compiler));
-                            config.set_sandbox(Some(crate::SandboxKind::Generic));
-                            config.set_allow_experimental(true);
-                            config.set_crosscheck(true);
-                            super::super::$test_name(config);
-                        }
-                    )+
-                }
-            }
-        }
-
-        mod interpreter {
             $(
-                #[test]
-                fn $test_name() {
-                    let mut config = crate::Config::default();
-                    config.set_backend(Some(crate::BackendKind::Interpreter));
-                    super::$test_name(config);
+                paste! {
+                    #[cfg(target_os = "linux")]
+                    #[test]
+                    fn [<compiler_linux_ $test_name>]() {
+                        let mut config = crate::Config::default();
+                        config.set_worker_count(1);
+                        config.set_backend(Some(crate::BackendKind::Compiler));
+                        config.set_sandbox(Some(crate::SandboxKind::Linux));
+                        $test_name(config);
+                    }
+
+                    #[cfg(target_os = "linux")]
+                    #[test]
+                    fn [<tracing_linux_ $test_name>]() {
+                        let mut config = crate::Config::default();
+                        config.set_backend(Some(crate::BackendKind::Compiler));
+                        config.set_sandbox(Some(crate::SandboxKind::Linux));
+                        config.set_allow_experimental(true);
+                        config.set_crosscheck(true);
+                        $test_name(config);
+                    }
+
+                    #[cfg(feature = "generic-sandbox")]
+                    #[test]
+                    fn [<compiler_generic_ $test_name>]() {
+                        let mut config = crate::Config::default();
+                        config.set_backend(Some(crate::BackendKind::Compiler));
+                        config.set_sandbox(Some(crate::SandboxKind::Generic));
+                        config.set_allow_experimental(true);
+                        $test_name(config);
+                    }
+
+                    #[cfg(feature = "generic-sandbox")]
+                    #[test]
+                    fn [<tracing_generic_ $test_name>]() {
+                        let mut config = crate::Config::default();
+                        config.set_backend(Some(crate::BackendKind::Compiler));
+                        config.set_sandbox(Some(crate::SandboxKind::Generic));
+                        config.set_allow_experimental(true);
+                        config.set_crosscheck(true);
+                        $test_name(config);
+                    }
                 }
             )+
         }
+
+        $(
+            paste! {
+                #[test]
+                fn [<interpreter_ $test_name>]() {
+                    let mut config = crate::Config::default();
+                    config.set_backend(Some(crate::BackendKind::Interpreter));
+                    $test_name(config);
+                }
+            }
+        )+
+    }
+}
+
+macro_rules! run_test_blob_tests {
+    ($($test_name:ident)+) => {
+        paste! {
+            run_tests! {
+                $([<optimized_ $test_name>])+
+            }
+        }
+
+        $(
+            paste! {
+                fn [<optimized_ $test_name>](config: Config) {
+                    $test_name(config, true)
+                }
+
+                #[test]
+                fn [<interpreter_unoptimized_ $test_name>]() {
+                    let mut config = crate::Config::default();
+                    config.set_backend(Some(crate::BackendKind::Interpreter));
+                    $test_name(config, false);
+                }
+            }
+        )+
     }
 }
 
@@ -1068,6 +1081,14 @@ fn decompress_zstd(mut bytes: &[u8]) -> Vec<u8> {
 static BLOB_MAP: Mutex<Option<BTreeMap<&'static [u8], ProgramBlob>>> = Mutex::new(None);
 
 fn get_blob(elf: &'static [u8]) -> ProgramBlob {
+    get_blob_impl(true, elf)
+}
+
+fn get_blob_unoptimized(elf: &'static [u8]) -> ProgramBlob {
+    get_blob_impl(false, elf)
+}
+
+fn get_blob_impl(optimize: bool, elf: &'static [u8]) -> ProgramBlob {
     let mut blob_map = BLOB_MAP.lock();
     let blob_map = blob_map.get_or_insert_with(BTreeMap::new);
     blob_map
@@ -1075,7 +1096,10 @@ fn get_blob(elf: &'static [u8]) -> ProgramBlob {
         .or_insert_with(|| {
             // This is slow, so cache it.
             let elf = decompress_zstd(elf);
-            let bytes = polkavm_linker::program_from_elf(Default::default(), &elf).unwrap();
+            let mut config = polkavm_linker::Config::default();
+            config.set_optimize(optimize);
+
+            let bytes = polkavm_linker::program_from_elf(config, &elf).unwrap();
             ProgramBlob::parse(bytes.into()).unwrap()
         })
         .clone()
@@ -1453,9 +1477,13 @@ struct TestInstance {
 const TEST_BLOB_ELF_ZST: &[u8] = include_bytes!("../../../test-data/test-blob.elf.zst");
 
 impl TestInstance {
-    fn new(config: &Config) -> Self {
+    fn new(config: &Config, optimize: bool) -> Self {
         let _ = env_logger::try_init();
-        let blob = get_blob(TEST_BLOB_ELF_ZST);
+        let blob = if optimize {
+            get_blob(TEST_BLOB_ELF_ZST)
+        } else {
+            get_blob_unoptimized(TEST_BLOB_ELF_ZST)
+        };
 
         let engine = Engine::new(config).unwrap();
         let module = Module::from_blob(&engine, &Default::default(), blob).unwrap();
@@ -1503,15 +1531,15 @@ impl TestInstance {
     }
 }
 
-fn test_blob_basic_test(config: Config) {
-    let mut i = TestInstance::new(&config);
+fn test_blob_basic_test(config: Config, optimize: bool) {
+    let mut i = TestInstance::new(&config, optimize);
     assert_eq!(i.call::<(), u32>("push_one_to_global_vec", ()).unwrap(), 1);
     assert_eq!(i.call::<(), u32>("push_one_to_global_vec", ()).unwrap(), 2);
     assert_eq!(i.call::<(), u32>("push_one_to_global_vec", ()).unwrap(), 3);
 }
 
-fn test_blob_atomic_fetch_add(config: Config) {
-    let mut i = TestInstance::new(&config);
+fn test_blob_atomic_fetch_add(config: Config, optimize: bool) {
+    let mut i = TestInstance::new(&config, optimize);
     assert_eq!(i.call::<(u32,), u32>("atomic_fetch_add", (1,)).unwrap(), 0);
     assert_eq!(i.call::<(u32,), u32>("atomic_fetch_add", (1,)).unwrap(), 1);
     assert_eq!(i.call::<(u32,), u32>("atomic_fetch_add", (1,)).unwrap(), 2);
@@ -1521,14 +1549,14 @@ fn test_blob_atomic_fetch_add(config: Config) {
     assert_eq!(i.call::<(u32,), u32>("atomic_fetch_add", (0,)).unwrap(), 5);
 }
 
-fn test_blob_atomic_fetch_swap(config: Config) {
-    let mut i = TestInstance::new(&config);
+fn test_blob_atomic_fetch_swap(config: Config, optimize: bool) {
+    let mut i = TestInstance::new(&config, optimize);
     assert_eq!(i.call::<(u32,), u32>("atomic_fetch_swap", (10,)).unwrap(), 0);
     assert_eq!(i.call::<(u32,), u32>("atomic_fetch_swap", (100,)).unwrap(), 10);
     assert_eq!(i.call::<(u32,), u32>("atomic_fetch_swap", (1000,)).unwrap(), 100);
 }
 
-fn test_blob_atomic_fetch_minmax(config: Config) {
+fn test_blob_atomic_fetch_minmax(config: Config, optimize: bool) {
     use core::cmp::{max, min};
 
     fn maxu(a: i32, b: i32) -> i32 {
@@ -1547,7 +1575,7 @@ fn test_blob_atomic_fetch_minmax(config: Config) {
         ("atomic_fetch_min_unsigned", minu),
     ];
 
-    let mut i = TestInstance::new(&config);
+    let mut i = TestInstance::new(&config, optimize);
     for (name, cb) in list {
         for a in [-10, 0, 10] {
             for b in [-10, 0, 10] {
@@ -1560,35 +1588,37 @@ fn test_blob_atomic_fetch_minmax(config: Config) {
     }
 }
 
-fn test_blob_hostcall(config: Config) {
-    let mut i = TestInstance::new(&config);
+fn test_blob_hostcall(config: Config, optimize: bool) {
+    let mut i = TestInstance::new(&config, optimize);
     assert_eq!(i.call::<(u32,), u32>("test_multiply_by_6", (10,)).unwrap(), 60);
 }
 
-fn test_blob_define_abi(config: Config) {
-    let mut i = TestInstance::new(&config);
+fn test_blob_define_abi(config: Config, optimize: bool) {
+    let mut i = TestInstance::new(&config, optimize);
     assert!(i.call::<(), ()>("test_define_abi", ()).is_ok());
 }
 
-fn test_blob_input_registers(config: Config) {
-    let mut i = TestInstance::new(&config);
+fn test_blob_input_registers(config: Config, optimize: bool) {
+    let mut i = TestInstance::new(&config, optimize);
     assert!(i.call::<(), ()>("test_input_registers", ()).is_ok());
 }
 
-fn test_blob_call_sbrk_from_guest(config: Config) {
-    test_blob_call_sbrk_impl(config, |i, size| i.call::<(u32,), u32>("call_sbrk", (size,)).unwrap())
+fn test_blob_call_sbrk_from_guest(config: Config, optimize: bool) {
+    test_blob_call_sbrk_impl(config, optimize, |i, size| i.call::<(u32,), u32>("call_sbrk", (size,)).unwrap())
 }
 
-fn test_blob_call_sbrk_from_host_instance(config: Config) {
-    test_blob_call_sbrk_impl(config, |i, size| i.instance.sbrk(size).unwrap().unwrap_or(0))
+fn test_blob_call_sbrk_from_host_instance(config: Config, optimize: bool) {
+    test_blob_call_sbrk_impl(config, optimize, |i, size| i.instance.sbrk(size).unwrap().unwrap_or(0))
 }
 
-fn test_blob_call_sbrk_from_host_function(config: Config) {
-    test_blob_call_sbrk_impl(config, |i, size| i.call::<(u32,), u32>("call_sbrk_indirectly", (size,)).unwrap())
+fn test_blob_call_sbrk_from_host_function(config: Config, optimize: bool) {
+    test_blob_call_sbrk_impl(config, optimize, |i, size| {
+        i.call::<(u32,), u32>("call_sbrk_indirectly", (size,)).unwrap()
+    })
 }
 
-fn test_blob_program_memory_can_be_reused_and_cleared(config: Config) {
-    let mut i = TestInstance::new(&config);
+fn test_blob_program_memory_can_be_reused_and_cleared(config: Config, optimize: bool) {
+    let mut i = TestInstance::new(&config, optimize);
     let address = i.call::<(), u32>("get_global_address", ()).unwrap();
 
     assert_eq!(i.instance.read_memory(address, 4).unwrap(), [0x00, 0x00, 0x00, 0x00]);
@@ -1606,8 +1636,8 @@ fn test_blob_program_memory_can_be_reused_and_cleared(config: Config) {
     assert_eq!(i.instance.read_memory(address, 4).unwrap(), [0x01, 0x00, 0x00, 0x00]);
 }
 
-fn test_blob_out_of_bounds_memory_access_generates_a_trap(config: Config) {
-    let mut i = TestInstance::new(&config);
+fn test_blob_out_of_bounds_memory_access_generates_a_trap(config: Config, optimize: bool) {
+    let mut i = TestInstance::new(&config, optimize);
     let address = i.call::<(), u32>("get_global_address", ()).unwrap();
     assert_eq!(i.call::<(u32,), u32>("read_u32", (address,)).unwrap(), 0);
     i.call::<(), ()>("increment_global", ()).unwrap();
@@ -1619,8 +1649,8 @@ fn test_blob_out_of_bounds_memory_access_generates_a_trap(config: Config) {
     assert_eq!(i.call::<(u32,), u32>("read_u32", (address,)).unwrap(), 2);
 }
 
-fn test_blob_call_sbrk_impl(config: Config, mut call_sbrk: impl FnMut(&mut TestInstance, u32) -> u32) {
-    let mut i = TestInstance::new(&config);
+fn test_blob_call_sbrk_impl(config: Config, optimize: bool, mut call_sbrk: impl FnMut(&mut TestInstance, u32) -> u32) {
+    let mut i = TestInstance::new(&config, optimize);
     let memory_map = i.module.memory_map().clone();
     let heap_base = memory_map.heap_base();
     let page_size = memory_map.page_size();
@@ -2092,6 +2122,18 @@ run_tests! {
     aux_data_works
     access_memory_from_host
 
+    basic_gas_metering_sync
+    basic_gas_metering_async
+    consume_gas_in_host_function_sync
+    consume_gas_in_host_function_async
+    gas_metering_with_more_than_one_basic_block
+    gas_metering_with_implicit_trap
+
+    spawn_stress_test
+    module_cache
+}
+
+run_test_blob_tests! {
     test_blob_basic_test
     test_blob_atomic_fetch_add
     test_blob_atomic_fetch_swap
@@ -2104,16 +2146,6 @@ run_tests! {
     test_blob_call_sbrk_from_host_function
     test_blob_program_memory_can_be_reused_and_cleared
     test_blob_out_of_bounds_memory_access_generates_a_trap
-
-    basic_gas_metering_sync
-    basic_gas_metering_async
-    consume_gas_in_host_function_sync
-    consume_gas_in_host_function_async
-    gas_metering_with_more_than_one_basic_block
-    gas_metering_with_implicit_trap
-
-    spawn_stress_test
-    module_cache
 }
 
 macro_rules! assert_impl {

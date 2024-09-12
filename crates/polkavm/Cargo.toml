@@ -27,6 +27,7 @@ env_logger = { workspace = true }
 polkavm-linker = { workspace = true }
 image = { workspace = true, features = ["tga"] }
 ruzstd = { workspace = true }
+paste = { workspace = true }
 
 [lints]
 workspace = true
