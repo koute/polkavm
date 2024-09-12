@@ -3034,7 +3034,7 @@ fn perform_inlining(
     let block = &all_blocks[current.index()];
     match block.next.instruction {
         ControlInst::Jump { target } => {
-            if all_blocks[current.index()].ops.is_empty() {
+            if all_blocks[current.index()].ops.is_empty() && inline_history.insert((current, target)) {
                 let reachability = reachability_graph.for_code.get_mut(&current).unwrap();
                 if !reachability.exports.is_empty() {
                     let export_indexes = core::mem::take(&mut reachability.exports);
