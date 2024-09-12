@@ -381,7 +381,11 @@ where
         C::BitMask::index(C::to_bin_index::<true>(size))
     }
 
-    fn insert_free_node(&mut self, offset: C::Size, size: C::Size) -> u32 {
+    fn insert_free_node(&mut self, offset: C::Size, size: C::Size) -> Option<u32> {
+        if size == C::Size::from(0) {
+            return None;
+        }
+
         // Get the bin index; round down to make sure the node's size is at least as big as what the bin expects.
         let bin = Self::size_to_bin_round_down(size);
 
@@ -412,7 +416,7 @@ where
         }
 
         self.first_unallocated_for_bin[bin.index()] = new_node;
-        new_node
+        Some(new_node)
     }
 
     fn remove_node(&mut self, node: u32) {
@@ -483,12 +487,10 @@ where
         // Remove the node from the bin's free node list.
         self.remove_first_free_node(node, bin);
 
+        // If we haven't allocated all of the free space then add what's remaining back for later use.
         let offset = self.nodes[node as usize].offset;
         let remaining_free_pages = original_size - size;
-        if remaining_free_pages > C::Size::from(0) {
-            // We haven't allocated all of the free space; add what's remaining back for later use.
-            let new_free_node = self.insert_free_node(offset + size, remaining_free_pages);
-
+        if let Some(new_free_node) = self.insert_free_node(offset + size, remaining_free_pages) {
             // Link the nodes together so that we can later merge them.
             let next_by_address = replace(&mut self.nodes[node as usize].next_by_address, new_free_node);
             if let Some(next) = self.nodes.get_mut(next_by_address as usize) {
@@ -546,14 +548,17 @@ where
         self.unused_node_slots.push(node);
 
         let new_node = self.insert_free_node(offset, size);
-        if next_by_address != EMPTY {
-            self.nodes[new_node as usize].next_by_address = next_by_address;
-            self.nodes[next_by_address as usize].prev_by_address = new_node;
-        }
+        debug_assert!(new_node.is_some());
+        if let Some(new_node) = new_node {
+            if next_by_address != EMPTY {
+                self.nodes[new_node as usize].next_by_address = next_by_address;
+                self.nodes[next_by_address as usize].prev_by_address = new_node;
+            }
 
-        if prev_by_address != EMPTY {
-            self.nodes[new_node as usize].prev_by_address = prev_by_address;
-            self.nodes[prev_by_address as usize].next_by_address = new_node;
+            if prev_by_address != EMPTY {
+                self.nodes[new_node as usize].prev_by_address = prev_by_address;
+                self.nodes[prev_by_address as usize].next_by_address = new_node;
+            }
         }
     }
 }
@@ -640,5 +645,22 @@ pub mod tests {
         assert!(allocator.free(a0));
         assert_eq!(allocator.alloc(6000001), None);
         assert_eq!(allocator.alloc(u64::MAX), None);
+    }
+
+    #[test]
+    fn test_zero_max_size_allocator_only_gives_out_zero_sized_allocations() {
+        let mut allocator = TestAllocator::<TestConfig64>::new(0);
+        assert!(allocator.alloc(1).is_none());
+        assert!(allocator.alloc(0).is_some());
+    }
+
+    #[test]
+    fn test_allocator_after_using_up_all_free_space() {
+        let mut allocator = TestAllocator::<TestConfig64>::new(3);
+        assert!(allocator.alloc(1).is_some());
+        assert!(allocator.alloc(1).is_some());
+        assert!(allocator.alloc(1).is_some());
+        assert!(allocator.alloc(1).is_none());
+        assert!(allocator.alloc(0).is_some());
     }
 }
