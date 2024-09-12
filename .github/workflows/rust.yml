@@ -87,3 +87,11 @@ jobs:
       run: ./ci/jobs/detect-or-install-riscv-toolchain.sh
     - name: Build and test
       run: ./ci/jobs/build-and-test-pallet-revive.sh
+  fuzz:
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v4
+    - name: Install cargo fuzz
+      run: cargo install cargo-fuzz
+    - name: Fuzz
+      run: ./ci/jobs/fuzz.sh
