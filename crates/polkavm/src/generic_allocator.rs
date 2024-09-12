@@ -523,7 +523,7 @@ where
 
                 self.remove_node(prev_by_address);
 
-                assert_eq!(self.nodes[prev_by_address as usize].next_by_address, node);
+                debug_assert_eq!(self.nodes[prev_by_address as usize].next_by_address, node);
                 self.nodes[node as usize].prev_by_address = self.nodes[prev_by_address as usize].prev_by_address;
             }
         }
@@ -536,7 +536,7 @@ where
 
                 self.remove_node(next_by_address);
 
-                assert_eq!(self.nodes[next_by_address as usize].prev_by_address, node);
+                debug_assert_eq!(self.nodes[next_by_address as usize].prev_by_address, node);
                 self.nodes[node as usize].next_by_address = self.nodes[next_by_address as usize].next_by_address;
             }
         }
