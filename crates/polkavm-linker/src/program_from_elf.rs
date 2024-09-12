@@ -3269,7 +3269,7 @@ fn perform_dead_code_elimination(
         }
     }
 
-    let initial_registers_needed = match all_blocks[block_target.index()].next.instruction {
+    let registers_needed_for_next_block = match all_blocks[block_target.index()].next.instruction {
         // If it's going to trap then it's not going to need any of the register values.
         ControlInst::Unimplemented => RegMask::empty(),
         // If it's a jump then we'll need whatever registers the jump target needs.
@@ -3283,34 +3283,24 @@ fn perform_dead_code_elimination(
     };
 
     let mut modified = false;
-    let registers_needed = perform_dead_code_elimination_on_block(
+    let registers_needed_for_this_block = perform_dead_code_elimination_on_block(
         config,
         imports,
         all_blocks,
         reachability_graph,
         optimize_queue.as_deref_mut(),
         &mut modified,
-        initial_registers_needed,
+        registers_needed_for_next_block,
         block_target,
     );
 
-    registers_needed_for_block[block_target.index()] = registers_needed;
-
-    for previous_block in previous_blocks {
-        if !reachability_graph.is_code_reachable(previous_block) {
-            continue;
+    if registers_needed_for_block[block_target.index()] != registers_needed_for_this_block {
+        registers_needed_for_block[block_target.index()] = registers_needed_for_this_block;
+        if let Some(ref mut optimize_queue) = optimize_queue {
+            for previous_block in previous_blocks {
+                add_to_optimize_queue(all_blocks, reachability_graph, optimize_queue, previous_block);
+            }
         }
-
-        perform_dead_code_elimination_on_block(
-            config,
-            imports,
-            all_blocks,
-            reachability_graph,
-            optimize_queue.as_deref_mut(),
-            &mut modified,
-            registers_needed,
-            previous_block,
-        );
     }
 
     modified
