@@ -4692,9 +4692,10 @@ mod test {
                 out
             }
 
+            let is_todo = expected_disassembly.trim() == "TODO";
             let actual_normalized = normalize(&opt.disassembly);
             let expected_normalized = normalize(expected_disassembly);
-            if actual_normalized != expected_normalized {
+            if actual_normalized != expected_normalized && !is_todo {
                 use core::fmt::Write;
                 let mut output_actual = String::new();
                 let mut output_expected = String::new();
@@ -4726,6 +4727,10 @@ mod test {
                 }
 
                 panic!("optimized program is not what we've expected")
+            }
+
+            if is_todo {
+                todo!();
             }
         }
 
