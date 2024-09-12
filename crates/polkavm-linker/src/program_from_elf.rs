@@ -7826,6 +7826,19 @@ where
             reachability.always_dynamically_reachable = true;
         }
 
+        for (export_index, export) in exports.iter().enumerate() {
+            let Some(&block_target) = section_to_block.get(&export.location) else {
+                return Err(ProgramFromElfError::other("export points to a non-block"));
+            };
+
+            reachability_graph
+                .for_code
+                .entry(block_target)
+                .or_default()
+                .exports
+                .push(export_index);
+        }
+
         used_blocks = (0..all_blocks.len()).map(BlockTarget::from_raw).collect();
         spill_fake_registers(
             section_regspill,
