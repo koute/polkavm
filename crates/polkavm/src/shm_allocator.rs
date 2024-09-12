@@ -28,7 +28,7 @@ struct ShmAllocatorState {
 pub struct ShmAllocator(Arc<ShmAllocatorState>);
 
 pub struct ShmAllocation {
-    allocation: GenericAllocation,
+    allocation: GenericAllocation<u32>,
     allocator: ShmAllocator,
 }
 
@@ -95,6 +95,7 @@ impl ShmAllocation {
         (self.allocation.size() << self.allocator.0.page_shift) as usize
     }
 
+    #[allow(dead_code)]
     pub fn is_empty(&self) -> bool {
         self.len() == 0
     }
