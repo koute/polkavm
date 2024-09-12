@@ -391,10 +391,21 @@ where
         let min_bin = Self::size_to_bin_round_up(size);
 
         // Find a bin with enough free space and allocate a node there.
-        let bin = self.bins_with_free_space.find_first(min_bin)?;
-        let node = self.first_unallocated_for_bin[bin.index()];
-        let original_size = replace(&mut self.nodes[node as usize].size, size);
+        let (bin, node) = if let Some(bin) = self.bins_with_free_space.find_first(min_bin) {
+            (bin, self.first_unallocated_for_bin[bin.index()])
+        } else {
+            // No such bin exists; let's try rounding down and see if maybe we can find an oversized region in the previous bin.
+            let bin = self.bins_with_free_space.find_first(Self::size_to_bin_round_down(size))?;
+            let node = self.first_unallocated_for_bin[bin.index()];
 
+            if self.nodes[node as usize].size < size {
+                return None;
+            }
+
+            (bin, node)
+        };
+
+        let original_size = replace(&mut self.nodes[node as usize].size, size);
         debug_assert!(original_size >= size);
         debug_assert!(!self.nodes[node as usize].is_allocated);
         self.nodes[node as usize].is_allocated = true;
