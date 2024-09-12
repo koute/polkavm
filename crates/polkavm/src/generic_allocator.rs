@@ -383,6 +383,10 @@ where
             return Some(GenericAllocation::EMPTY);
         }
 
+        if size > C::MAX_ALLOCATION_SIZE {
+            return None;
+        }
+
         // Calculate the minimum bin to fit this allocation; round up in case the size doesn't match the bin size exactly.
         let min_bin = Self::size_to_bin_round_up(size);
 
@@ -391,6 +395,7 @@ where
         let node = self.first_unallocated_for_bin[bin.index()];
         let original_size = replace(&mut self.nodes[node as usize].size, size);
 
+        debug_assert!(original_size >= size);
         debug_assert!(!self.nodes[node as usize].is_allocated);
         self.nodes[node as usize].is_allocated = true;
 
