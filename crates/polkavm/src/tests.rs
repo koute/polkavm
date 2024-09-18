@@ -1469,6 +1469,41 @@ fn access_memory_from_host(config: Config) {
     assert!(instance.zero_memory(0xffffffff, 0).is_ok());
 }
 
+fn sbrk_knob_works(config: Config) {
+    let _ = env_logger::try_init();
+    let engine = Engine::new(&config).unwrap();
+    let page_size = get_native_page_size() as u32;
+    let mut builder = ProgramBlobBuilder::new();
+    builder.add_export_by_basic_block(0, b"main");
+    builder.set_code(&[asm::sbrk(Reg::A0, Reg::A0), asm::ret()], &[]);
+
+    let blob = ProgramBlob::parse(builder.into_vec().into()).unwrap();
+
+    for sbrk_allowed in [true, false] {
+        let mut module_config: ModuleConfig = ModuleConfig::new();
+        module_config.set_page_size(page_size);
+        module_config.set_allow_sbrk(sbrk_allowed);
+        module_config.set_gas_metering(Some(GasMeteringKind::Sync));
+        let module = Module::from_blob(&engine, &module_config, blob.clone()).unwrap();
+
+        let mut instance = module.instantiate().unwrap();
+        instance.set_reg(Reg::A0, 0);
+        instance.set_reg(Reg::RA, crate::RETURN_TO_HOST);
+
+        instance.set_gas(5);
+        instance.set_next_program_counter(ProgramCounter(0));
+
+        if sbrk_allowed {
+            match_interrupt!(instance.run().unwrap(), InterruptKind::Finished);
+            assert_eq!(instance.gas(), 3);
+        } else {
+            match_interrupt!(instance.run().unwrap(), InterruptKind::Trap);
+            assert_eq!(instance.program_counter(), Some(ProgramCounter(0)));
+            assert_eq!(instance.gas(), 4);
+        }
+    }
+}
+
 struct TestInstance {
     module: crate::Module,
     instance: crate::Instance,
@@ -2121,6 +2156,7 @@ run_tests! {
     implicit_trap_after_fallthrough
     aux_data_works
     access_memory_from_host
+    sbrk_knob_works
 
     basic_gas_metering_sync
     basic_gas_metering_async

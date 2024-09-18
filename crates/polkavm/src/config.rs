@@ -367,6 +367,7 @@ pub struct ModuleConfig {
     pub(crate) step_tracing: bool,
     pub(crate) dynamic_paging: bool,
     pub(crate) aux_data_size: u32,
+    pub(crate) allow_sbrk: bool,
     cache_by_hash: bool,
 }
 
@@ -386,6 +387,7 @@ impl ModuleConfig {
             step_tracing: false,
             dynamic_paging: false,
             aux_data_size: 0,
+            allow_sbrk: true,
             cache_by_hash: false,
         }
     }
@@ -458,6 +460,18 @@ impl ModuleConfig {
         self
     }
 
+    ///
+    /// Sets whether sbrk instruction is allowed.
+    ///
+    /// When enabled sbrk instruction is not allowed it will lead to a trap, otherwise
+    /// sbrk instruction is emulated.
+    ///
+    /// Default: `true`
+    pub fn set_allow_sbrk(&mut self, enabled: bool) -> &mut Self {
+        self.allow_sbrk = enabled;
+        self
+    }
+
     /// Returns whether the module will be cached by hash.
     pub fn cache_by_hash(&self) -> bool {
         self.cache_by_hash
@@ -484,6 +498,7 @@ impl ModuleConfig {
             is_strict,
             step_tracing,
             dynamic_paging,
+            allow_sbrk,
             // Deliberately ignored.
             cache_by_hash: _,
         } = self;

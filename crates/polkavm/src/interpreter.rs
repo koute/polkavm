@@ -13,7 +13,7 @@ use core::mem::MaybeUninit;
 use core::num::NonZeroU32;
 use polkavm_common::abi::VM_ADDR_RETURN_TO_HOST;
 use polkavm_common::operation::*;
-use polkavm_common::program::{asm, InstructionVisitor, RawReg, Reg};
+use polkavm_common::program::{asm, Instruction, InstructionVisitor, RawReg, Reg};
 use polkavm_common::utils::{align_to_next_page_usize, byte_slice_init, slice_assume_init_mut};
 
 type Target = usize;
@@ -689,7 +689,11 @@ impl InterpretedInstance {
         let mut is_first = true;
         let mut is_properly_terminated = false;
         let mut last_program_counter = program_counter;
-        while let Some(instruction) = instructions.next() {
+        while let Some(mut instruction) = instructions.next() {
+            if !self.module.allow_sbrk() && matches!(instruction.kind, Instruction::sbrk(_, _)) {
+                instruction.kind = Instruction::trap;
+            }
+
             self.compiled_offset_for_block
                 .insert(instruction.offset.0, Self::pack_target(self.compiled_handlers.len(), is_first));
 
