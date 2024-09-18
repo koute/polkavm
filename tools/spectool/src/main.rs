@@ -80,6 +80,26 @@ fn extract_chunks(base_address: u32, slice: &[u8]) -> Vec<MemoryChunk> {
     output
 }
 
+#[derive(Default)]
+struct PrePost {
+    gas: Option<i64>,
+    regs: [Option<u32>; 13],
+}
+
+fn parse_pre_post(line: &str, output: &mut PrePost) {
+    let line = line.trim();
+    let index = line.find('=').expect("invalid 'pre' / 'post' directive: no '=' found");
+    let lhs = line[..index].trim();
+    let rhs = line[index + 1..].trim();
+    if lhs == "gas" {
+        output.gas = Some(rhs.parse::<i64>().expect("invalid 'pre' / 'post' directive: failed to parse rhs"));
+    } else {
+        let lhs = polkavm_common::utils::parse_reg(lhs).expect("invalid 'pre' / 'post' directive: failed to parse lhs");
+        let rhs = polkavm_common::utils::parse_imm(rhs).expect("invalid 'pre' / 'post' directive: failed to parse rhs");
+        output.regs[lhs as usize] = Some(rhs as u32);
+    }
+}
+
 fn main_generate() {
     let mut tests = Vec::new();
 
@@ -89,34 +109,34 @@ fn main_generate() {
     let engine = Engine::new(&config).unwrap();
     let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("spec");
     let mut found_errors = false;
-    for entry in std::fs::read_dir(root.join("src")).unwrap() {
-        let mut initial_regs = [0; 13];
-        let mut initial_gas = 10000;
 
+    for entry in std::fs::read_dir(root.join("src")).unwrap() {
         let path = entry.unwrap().path();
         let name = path.file_stem().unwrap().to_string_lossy();
+
+        let mut pre = PrePost::default();
+        let mut post = PrePost::default();
 
         let input = std::fs::read_to_string(&path).unwrap();
         let mut input_lines = Vec::new();
         for line in input.lines() {
             if let Some(line) = line.strip_prefix("pre:") {
-                let line = line.trim();
-                let index = line.find('=').expect("invalid 'pre' directive: no '=' found");
-                let lhs = line[..index].trim();
-                let rhs = line[index + 1..].trim();
-                if lhs == "gas" {
-                    initial_gas = rhs.parse::<i64>().expect("invalid 'pre' directive: failed to parse rhs");
-                } else {
-                    let lhs = polkavm_common::utils::parse_reg(lhs).expect("invalid 'pre' directive: failed to parse lhs");
-                    let rhs = polkavm_common::utils::parse_imm(rhs).expect("invalid 'pre' directive: failed to parse rhs");
-                    initial_regs[lhs as usize] = rhs as u32;
-                }
+                parse_pre_post(line, &mut pre);
+                input_lines.push(""); // Insert dummy line to not mess up the line count.
+                continue;
+            }
+
+            if let Some(line) = line.strip_prefix("post:") {
+                parse_pre_post(line, &mut post);
                 input_lines.push(""); // Insert dummy line to not mess up the line count.
                 continue;
             }
 
             input_lines.push(line);
         }
+
+        let initial_gas = pre.gas.unwrap_or(10000);
+        let initial_regs = pre.regs.map(|value| value.unwrap_or(0));
 
         let input = input_lines.join("\n");
         let blob = match assemble(&input) {
@@ -224,6 +244,29 @@ fn main_generate() {
         }
 
         let expected_gas = instance.gas();
+
+        let mut found_post_check_errors = false;
+
+        for ((final_value, reg), required_value) in expected_regs.iter().zip(Reg::ALL).zip(post.regs.iter()) {
+            if let Some(required_value) = required_value {
+                if final_value != required_value {
+                    eprintln!("{path:?}: unexpected {reg}: {final_value} (expected: {required_value})");
+                    found_post_check_errors = true;
+                }
+            }
+        }
+
+        if let Some(post_gas) = post.gas {
+            if expected_gas != post_gas {
+                eprintln!("{path:?}: unexpected gas: {expected_gas} (expected: {post_gas})");
+                found_post_check_errors = true;
+            }
+        }
+
+        if found_post_check_errors {
+            found_errors = true;
+            continue;
+        }
 
         let mut disassembler = polkavm_disassembler::Disassembler::new(&blob, polkavm_disassembler::DisassemblyFormat::Guest).unwrap();
         disassembler.show_raw_bytes(true);
