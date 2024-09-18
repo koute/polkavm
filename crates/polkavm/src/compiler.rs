@@ -84,6 +84,7 @@ where
     step_label: Label,
     trap_label: Label,
     invalid_jump_label: Label,
+    allow_sbrk: bool,
 
     _phantom: PhantomData<S>,
 }
@@ -217,6 +218,7 @@ where
             gas_metering_stub_offsets,
             gas_cost_for_basic_block,
             code_length,
+            allow_sbrk: config.allow_sbrk,
             _phantom: PhantomData,
         };
 
@@ -665,10 +667,14 @@ where
 
     #[inline(always)]
     fn sbrk(&mut self, code_offset: u32, args_length: u32, d: RawReg, s: RawReg) -> Self::ReturnTy {
-        self.before_instruction(code_offset);
-        self.gas_visitor.sbrk(d, s);
-        ArchVisitor(self).sbrk(d, s);
-        self.after_instruction::<false>(code_offset, args_length);
+        if self.allow_sbrk {
+            self.before_instruction(code_offset);
+            self.gas_visitor.sbrk(d, s);
+            ArchVisitor(self).sbrk(d, s);
+            self.after_instruction::<false>(code_offset, args_length);
+        } else {
+            self.trap(code_offset, args_length)
+        }
     }
 
     #[inline(always)]

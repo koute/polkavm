@@ -216,6 +216,7 @@ pub(crate) struct ModulePrivate {
     dynamic_paging: bool,
     page_size_mask: u32,
     page_shift: u32,
+    allow_sbrk: bool,
     #[cfg(feature = "module-cache")]
     pub(crate) module_key: Option<ModuleKey>,
 }
@@ -288,6 +289,10 @@ impl Module {
 
     pub(crate) fn gas_metering(&self) -> Option<GasMeteringKind> {
         self.state().gas_metering
+    }
+
+    pub(crate) fn allow_sbrk(&self) -> bool {
+        self.state().allow_sbrk
     }
 
     pub(crate) fn is_multiple_of_page_size(&self, value: u32) -> bool {
@@ -520,6 +525,7 @@ impl Module {
             is_strict: config.is_strict,
             step_tracing: config.step_tracing,
             dynamic_paging: config.dynamic_paging,
+            allow_sbrk: config.allow_sbrk,
             crosscheck: engine.crosscheck,
             page_size_mask,
             page_shift,
