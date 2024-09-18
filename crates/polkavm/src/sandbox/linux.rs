@@ -34,6 +34,7 @@ use crate::{Gas, InterruptKind, ProgramCounter, RegValue, Segfault};
 
 pub struct GlobalState {
     shared_memory: ShmAllocator,
+    is_sandboxing_enabled: bool,
     uffd_available: bool,
     zygote_memfd: Fd,
 }
@@ -43,6 +44,11 @@ const UFFD_REQUIRED_FEATURES: u64 =
 
 impl GlobalState {
     pub fn new(config: &Config) -> Result<Self, Error> {
+        let is_sandboxing_enabled = GlobalState::is_sandboxing_supported()?;
+        if !is_sandboxing_enabled  {
+            return Err(Error::from_str("Sandboxing is not supported on your system. You can enable set_allow_insecure/POLKAVM_ALLOW_INSECURE to run with reduced sandboxing, if you know what you're doing"));
+        }
+
         let uffd_available = config.allow_dynamic_paging;
         if uffd_available {
             let userfaultfd = linux_raw::sys_userfaultfd(linux_raw::O_CLOEXEC).map_err(|error| {
@@ -79,11 +85,76 @@ impl GlobalState {
         let zygote_memfd = prepare_zygote()?;
         Ok(GlobalState {
             shared_memory: ShmAllocator::new()?,
+            is_sandboxing_enabled,
             uffd_available,
             zygote_memfd,
         })
     }
+
+    fn is_sandboxing_supported() -> Result<bool, Error> {
+        let sigset = Sigmask::block_all_signals()?;
+
+        let mut pidfd: c_int = -1;
+        let args = CloneArgs {
+            flags: linux_raw::CLONE_CLEAR_SIGHAND | u64::from(linux_raw::CLONE_PIDFD) | u64::from(SANDBOX_FLAGS),
+            pidfd: &mut pidfd,
+            child_tid: 0,
+            parent_tid: 0,
+            exit_signal: 0,
+            stack: 0,
+            stack_size: 0,
+            tls: 0,
+        };
+
+        // Fork a new process.
+        let mut child_pid = unsafe { linux_raw::syscall!(linux_raw::SYS_clone3, core::ptr::addr_of!(args), core::mem::size_of::<CloneArgs>()) };
+
+        if child_pid < 0 {
+            // Fallback for Linux versions older than 5.5.
+            child_pid = unsafe { linux_raw::syscall!(linux_raw::SYS_clone, SANDBOX_FLAGS, 0, 0, 0, 0) };
+            if child_pid < 0 {
+                return Ok(false);
+            }
+        }
+        if child_pid == 0 {
+            // We're in the child process.
+            core::mem::forget(sigset);
+            let status = if linux_raw::sys_sethostname("localhost").is_ok() { 1 } else { 0 };
+            let _ = linux_raw::sys_exit(status);
+            linux_raw::abort();
+        } else {
+            // We're in the host process.
+            sigset.unblock()?;
+            let mut child = ChildProcess {
+                pid: child_pid as c_int,
+                pidfd: if pidfd < 0 { None } else { Some(Fd::from_raw_unchecked(pidfd)) },
+            };
+            // The __WALL here is needed since we're not specifying an exit signal
+            // when cloning the child process, so we'd get an ECHILD error without this flag.
+            //
+            // (And we're not using __WCLONE since that doesn't work for children which ran execve.)
+            // Added non_blocking flag 'WNOHANG'
+            let flags = linux_raw::WEXITED | linux_raw::__WALL | linux_raw::WNOHANG;
+            child.waitid(flags)?;
+            loop {
+                // wait for process to exit
+                match child.check_status(true)?{
+                    ChildStatus::Running => continue,
+                    ChildStatus::Exited(status) => if status == 0 { return Ok(false); } else { return Ok(true); },
+                    _ => return Ok(false)
+                };
+            }
+        }
+    }
 }
+
+const SANDBOX_FLAGS: u32 = linux_raw::CLONE_NEWCGROUP
+    | linux_raw::CLONE_NEWIPC
+    | linux_raw::CLONE_NEWNET
+    | linux_raw::CLONE_NEWNS
+    | linux_raw::CLONE_NEWPID
+    | linux_raw::CLONE_NEWUSER
+    | linux_raw::CLONE_NEWUTS;
 
 pub struct SandboxConfig {
     enable_logger: bool,
@@ -1224,15 +1295,7 @@ impl super::Sandbox for Sandbox {
         vmctx.init.sandbox_disabled.store(cfg!(polkavm_dev_debug_zygote), Ordering::Relaxed);
 
         let sandbox_flags = if !cfg!(polkavm_dev_debug_zygote) {
-            u64::from(
-                linux_raw::CLONE_NEWCGROUP
-                    | linux_raw::CLONE_NEWIPC
-                    | linux_raw::CLONE_NEWNET
-                    | linux_raw::CLONE_NEWNS
-                    | linux_raw::CLONE_NEWPID
-                    | linux_raw::CLONE_NEWUSER
-                    | linux_raw::CLONE_NEWUTS,
-            )
+            u64::from(SANDBOX_FLAGS)
         } else {
             0
         };
@@ -1407,7 +1470,7 @@ impl super::Sandbox for Sandbox {
         }
 
         #[cfg(debug_assertions)]
-        if cfg!(polkavm_dev_debug_zygote) {
+        if cfg!(polkavm_dev_debug_zygote) || !global.is_sandboxing_enabled {
             use core::fmt::Write;
             std::thread::sleep(Duration::from_millis(200));
 
