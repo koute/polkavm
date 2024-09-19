@@ -1,5 +1,10 @@
+pre: gas = 10000
+
 %rw_data_size = 2
 %rw_data = 81 82
 
 pub @main:
     a0 = i16 [0x20000]
+
+post: a0 = -32127
+post: gas = 9998

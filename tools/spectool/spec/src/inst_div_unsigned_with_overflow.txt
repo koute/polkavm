@@ -4,3 +4,6 @@ pre: a2 = 0x1234
 
 pub @main:
     a2 = a0 /u a1
+
+post: a2 = 0
+post: gas = 9998

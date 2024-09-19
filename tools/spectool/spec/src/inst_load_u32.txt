@@ -1,5 +1,9 @@
 %rw_data_size = 4
 %rw_data = 12 34 56 78
+pre: gas = 10000
 
 pub @main:
     a0 = u32 [0x20000]
+
+post: a0 = 0x78563412
+post: gas = 9998
