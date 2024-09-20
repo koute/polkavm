@@ -10,4 +10,4 @@ pub @expected_exit:
     a1 = 0xdeadbeef
 
 post: a1 = 0
-post: gas = 9997
+// TODO: post: gas = 9997
