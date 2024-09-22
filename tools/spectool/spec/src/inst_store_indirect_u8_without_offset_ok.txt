@@ -1,3 +1,5 @@
+pre: gas = 10000
+
 pre: a0 = 0x20000
 pre: a1 = 0x12345678
 
@@ -5,3 +7,5 @@ pre: a1 = 0x12345678
 
 pub @main:
     u8 [a0] = a1
+
+post: gas = 9998

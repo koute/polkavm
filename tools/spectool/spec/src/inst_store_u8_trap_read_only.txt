@@ -1,7 +1,10 @@
 pre: a0 = 0x12345678
+pre: gas = 10000
 
 %ro_data_size = 1
 
 pub @main:
 pub @expected_exit:
     u8 [0x10000] = a0
+
+post: gas = 9998
