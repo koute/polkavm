@@ -1,5 +1,6 @@
 use crate::program::{Instruction, Reg};
 use crate::utils::{parse_imm, parse_reg};
+use crate::writer::{InstructionOrBytes, RawInstruction};
 use alloc::borrow::ToOwned;
 use alloc::collections::BTreeMap;
 use alloc::format;
@@ -68,6 +69,22 @@ fn parse_load_imm_and_jump_indirect_with_tmp(line: &str) -> Option<(Reg, Reg, i3
             return None;
         }
         Some((dst, base, value, 0))
+    }
+}
+
+/// Parses an offset with an explicitly required sign, e.g., `+10` or `-10`.
+pub fn parse_explicitly_signed_offset(text: &str) -> Option<i32> {
+    let text = text.trim();
+    if text.starts_with('+') || text.starts_with('-') {
+        let (sign, text) = text.split_at(1);
+        let parsed_value = parse_imm(text)?;
+        if sign == "-" {
+            Some(-parsed_value)
+        } else {
+            Some(parsed_value)
+        }
+    } else {
+        None
     }
 }
 
@@ -155,13 +172,18 @@ fn parse_condition(text: &str) -> Option<Condition> {
 }
 
 pub fn assemble(code: &str) -> Result<Vec<u8>, String> {
+    enum TargetKind {
+        Label(String),
+        Offset(i32),
+    }
+
     enum MaybeInstruction {
         Instruction(Instruction),
         Jump(String),
         Branch(String, ConditionKind, Reg, Reg),
         BranchImm(String, ConditionKind, Reg, i32),
         LoadLabelAddress(Reg, String),
-        LoadImmAndJump(Reg, i32, String),
+        LoadImmAndJump(Reg, i32, TargetKind),
     }
 
     impl MaybeInstruction {
@@ -379,7 +401,9 @@ pub fn assemble(code: &str) -> Result<Vec<u8>, String> {
                     if let Some(value) = parse_imm(&rhs[..index]) {
                         if let Some(line) = rhs[index + 1..].trim().strip_prefix("jump") {
                             if let Some(label) = line.trim().strip_prefix('@') {
-                                emit_and_continue!(MaybeInstruction::LoadImmAndJump(dst, value, label.to_owned()));
+                                emit_and_continue!(MaybeInstruction::LoadImmAndJump(dst, value, TargetKind::Label(label.to_owned())));
+                            } else if let Some(offset) = parse_explicitly_signed_offset(line) {
+                                emit_and_continue!(MaybeInstruction::LoadImmAndJump(dst, value, TargetKind::Offset(offset)));
                             }
                             if let Some((base, offset)) = parse_indirect_memory_access(line) {
                                 let instruction =
@@ -686,12 +710,12 @@ pub fn assemble(code: &str) -> Result<Vec<u8>, String> {
         return Err(format!("cannot parse line {nth_line}: \"{original_line}\""));
     }
 
-    let mut code = Vec::new();
+    let mut code: Vec<InstructionOrBytes> = Vec::new();
     let mut jump_table = Vec::new();
     for instruction in instructions {
         match instruction {
             MaybeInstruction::Instruction(instruction) => {
-                code.push(instruction);
+                code.push(instruction.into());
             }
             MaybeInstruction::LoadLabelAddress(dst, label) => {
                 let Some(&target_index) = label_to_index.get(&*label) else {
@@ -699,23 +723,25 @@ pub fn assemble(code: &str) -> Result<Vec<u8>, String> {
                 };
 
                 jump_table.push(target_index);
-                code.push(Instruction::load_imm(
-                    dst.into(),
-                    (jump_table.len() as u32) * crate::abi::VM_CODE_ADDRESS_ALIGNMENT,
-                ));
+                code.push(Instruction::load_imm(dst.into(), (jump_table.len() as u32) * crate::abi::VM_CODE_ADDRESS_ALIGNMENT).into());
             }
-            MaybeInstruction::LoadImmAndJump(dst, value, label) => {
-                let Some(&target_index) = label_to_index.get(&*label) else {
-                    return Err(format!("label is not defined: \"{label}\""));
-                };
-
-                code.push(Instruction::load_imm_and_jump(dst.into(), value as u32, target_index));
-            }
+            MaybeInstruction::LoadImmAndJump(dst, value, target) => match target {
+                TargetKind::Label(label) => {
+                    let Some(&target_index) = label_to_index.get(&*label) else {
+                        return Err(format!("label is not defined: \"{label}\""));
+                    };
+                    code.push(Instruction::load_imm_and_jump(dst.into(), value as u32, target_index).into());
+                }
+                TargetKind::Offset(offset) => {
+                    let instruction = Instruction::load_imm_and_jump(dst.into(), value as u32, offset as u32);
+                    code.push(RawInstruction::from((0, 2, instruction)).into());
+                }
+            },
             MaybeInstruction::Jump(label) => {
                 let Some(&target_index) = label_to_index.get(&*label) else {
                     return Err(format!("label is not defined: \"{label}\""));
                 };
-                code.push(Instruction::jump(target_index));
+                code.push(Instruction::jump(target_index).into());
             }
             MaybeInstruction::Branch(label, kind, lhs, rhs) => {
                 let Some(&target_index) = label_to_index.get(&*label) else {
@@ -737,7 +763,7 @@ pub fn assemble(code: &str) -> Result<Vec<u8>, String> {
                     ConditionKind::GreaterSigned => Instruction::branch_less_signed(rhs, lhs, target_index),
                     ConditionKind::GreaterUnsigned => Instruction::branch_less_unsigned(rhs, lhs, target_index),
                 };
-                code.push(instruction);
+                code.push(instruction.into());
             }
             MaybeInstruction::BranchImm(label, kind, lhs, rhs) => {
                 let Some(&target_index) = label_to_index.get(&*label) else {
@@ -758,7 +784,7 @@ pub fn assemble(code: &str) -> Result<Vec<u8>, String> {
                     ConditionKind::GreaterSigned => Instruction::branch_greater_signed_imm(lhs, rhs, target_index),
                     ConditionKind::GreaterUnsigned => Instruction::branch_greater_unsigned_imm(lhs, rhs, target_index),
                 };
-                code.push(instruction);
+                code.push(instruction.into());
             }
         };
     }
