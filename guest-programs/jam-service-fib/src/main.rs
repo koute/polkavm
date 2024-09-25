@@ -1,6 +1,21 @@
 #![no_std]
 #![no_main]
 
+extern crate alloc;
+
+use alloc::vec::Vec;
+use simplealloc::SimpleAlloc;
+
+#[global_allocator]
+static ALLOCATOR: SimpleAlloc<4096> = SimpleAlloc::new();
+
+#[panic_handler]
+fn panic(_info: &core::panic::PanicInfo) -> ! {
+    unsafe {
+        core::arch::asm!("unimp", options(noreturn));
+    }
+}
+
 #[polkavm_derive::polkavm_import]
 extern "C" {
     #[polkavm_import(index = 0)]
@@ -59,11 +74,13 @@ extern "C" {
     pub fn sha2_256(data: *const u8, data_len: u32, hash_ptr: *mut u8) -> u32;
 }
 
-fn is_authorized() -> bool {
-    true
+#[polkavm_derive::polkavm_export]
+extern "C" fn is_authorized_ext() -> u32 {
+    0
 }
 
-fn refine() -> [u8; 12] {
+#[polkavm_derive::polkavm_export]
+extern "C" fn refine_ext() -> u32 {
     let mut buffer = [0u8; 12];
     let result = unsafe { import(0, buffer.as_mut_ptr(), buffer.len() as u32) };
 
@@ -73,13 +90,11 @@ fn refine() -> [u8; 12] {
         let fib_n_minus_1 = u32::from_le_bytes(buffer[8..12].try_into().unwrap());
 
         let new_fib_n = fib_n + fib_n_minus_1;
-
-        let new_buffer = [
-            (n + 1).to_le_bytes(),
-            new_fib_n.to_le_bytes(),
-            fib_n.to_le_bytes(),
-        ]
-        .concat();
+        let new_buffer: Vec<u8> = [(n + 1).to_le_bytes(), new_fib_n.to_le_bytes(), fib_n.to_le_bytes()]
+            .iter()
+            .flat_map(|array| array.iter())
+            .copied()
+            .collect();
 
         buffer.copy_from_slice(&new_buffer);
     } else {
@@ -90,25 +105,22 @@ fn refine() -> [u8; 12] {
         export(buffer.as_mut_ptr(), buffer.len() as u32);
     }
 
-    buffer
+    0
 }
 
-fn accumulate() -> [u8; 12] {
-    let mut buffer = [0u8; 12];
+#[polkavm_derive::polkavm_export]
+extern "C" fn accumulate_ext() -> u32 {
+    let buffer = [0u8; 12];
     let key = [0u8; 1];
 
     unsafe {
         write(key.as_ptr(), 1, buffer.as_ptr(), buffer.len() as u32);
     }
 
-    buffer
+    0
 }
 
-fn on_transfer() -> bool {
-    true
+#[polkavm_derive::polkavm_export]
+extern "C" fn on_transfer_ext() -> u32 {
+    0
 }
-
-// TODO: (1) Get toolchain instructions sufficient to get above Rust compiled into PVM with
-// (a) ecalli 16/17/3 in place of import/export (refine) + write (accumulate)
-// (b) entrypoints 0/5/10/15 going into is_authorized/refine/accumulate/on_transfer
-// (2) get polkatool to output .pvm byte code with (1b) streamlined

@@ -62,6 +62,12 @@ enum Args {
         /// The input files.
         inputs: Vec<PathBuf>,
     },
+
+    /// Builds JAM-ready polkavm file
+    JAMService {
+        /// The input file.
+        input: PathBuf,
+    },
 }
 
 macro_rules! bail {
@@ -90,6 +96,7 @@ fn main() {
         } => main_disassemble(input, format, display_gas, show_raw_bytes, output),
         Args::Assemble { input, output } => main_assemble(input, output),
         Args::Stats { inputs } => main_stats(inputs),
+        Args::JAMService { input } => main_jam_service(input),
     };
 
     if let Err(error) = result {
@@ -230,6 +237,33 @@ fn main_assemble(input_path: PathBuf, output_path: PathBuf) -> Result<(), String
     if let Err(error) = std::fs::write(&output_path, blob) {
         bail!("failed to write to {output_path:?}: {error}");
     }
+
+    Ok(())
+}
+
+fn main_jam_service(input_path: PathBuf) -> Result<(), String> {
+    if !input_path.exists() {
+        bail!("File does not exist: {input_path:?}");
+    }
+
+    use std::fs;
+
+    let mut config = polkavm_linker::Config::default();
+    config.set_strip(true);
+    config.set_dispatch_table(vec![
+        b"is_authorized_ext".into(),
+        b"refine_ext".into(),
+        b"accumulate_ext".into(),
+        b"on_transfer_ext".into(),
+    ]);
+
+    let elf = fs::read(input_path).map_err(|err| format!("Failed to read ELF file: {}", err))?;
+    let raw_blob =
+        polkavm_linker::program_from_elf(config, elf.as_ref()).map_err(|err| format!("Failed to create program from ELF: {}", err))?;
+    let parts =
+        polkavm_linker::ProgramParts::from_bytes(raw_blob.into()).map_err(|err| format!("Failed to parse program parts: {}", err))?;
+
+    fs::write("jam_service.pvm", &parts.code_and_jump_table).map_err(|err| format!("Failed to write jam_service.pvm: {}", err))?;
 
     Ok(())
 }

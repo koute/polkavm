@@ -14,6 +14,7 @@ resolver = "2"
 members = [
     # Examples:
     "example-hello-world",
+    "jam-service-fib",
 
     # Benchmarks:
     "bench-minimal",

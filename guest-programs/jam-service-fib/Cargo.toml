@@ -1,3 +1,5 @@
+cargo-features = ["edition2024"]
+
 [package]
 name = "jam-service-fib"
 version = "0.1.0"
@@ -7,12 +9,9 @@ publish = false
 [lib]
 name = "fib"
 path = "src/main.rs"
-crate-type = ["cdylib"]
-
-[[bin]]
-name = "jam-service-fib"
-path = "src/main.rs"
+crate-type = ["staticlib", "rlib"]
 
 [dependencies]
 polkavm-derive = { path = "../../crates/polkavm-derive" }
 simplealloc = { path = "../../crates/simplealloc" }
+

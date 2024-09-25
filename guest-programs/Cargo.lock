@@ -60,6 +60,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "jam-service-fib"
+version = "0.1.0"
+dependencies = [
+ "polkavm-derive",
+ "simplealloc",
+]
+
+[[package]]
 name = "mos6502"
 version = "0.1.0"
 source = "git+https://github.com/koute/pinky.git?rev=5a9d4ff5f22731191cffd7d6202a1d144aacd740#5a9d4ff5f22731191cffd7d6202a1d144aacd740"
