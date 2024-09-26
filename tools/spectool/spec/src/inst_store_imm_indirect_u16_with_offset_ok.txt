@@ -1,6 +1,9 @@
 pre: a0 = 0x20EFE
+pre: gas = 10000
 
 %rw_data_size = 2
 
 pub @main:
     u16 [a0 + 256] = 0x1234
+
+post: gas = 9998

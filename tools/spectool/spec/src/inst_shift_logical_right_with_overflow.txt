@@ -3,3 +3,6 @@ pre: a1 = 33
 
 pub @main:
     a2 = a0 >> a1
+
+post: a2 = 0x4000003A
+post: gas = 9998

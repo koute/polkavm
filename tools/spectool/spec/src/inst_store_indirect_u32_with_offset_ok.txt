@@ -1,7 +1,10 @@
 pre: a0 = 0x20000
 pre: a1 = 0x12345678
+pre: gas = 10000
 
 %rw_data_size = 1
 
 pub @main:
     u32 [a0 + 10] = a1
+
+post: gas = 9998

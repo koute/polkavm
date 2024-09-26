@@ -1,2 +1,6 @@
+pre: gas = 10000
+
 pub @main:
     fallthrough
+
+// TODO: post: gas = 9998
