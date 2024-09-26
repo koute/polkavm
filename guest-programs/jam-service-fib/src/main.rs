@@ -75,12 +75,12 @@ extern "C" {
 }
 
 #[polkavm_derive::polkavm_export]
-extern "C" fn is_authorized_ext() -> u32 {
+extern "C" fn is_authorized() -> u32 {
     0
 }
 
 #[polkavm_derive::polkavm_export]
-extern "C" fn refine_ext() -> u32 {
+extern "C" fn refine() -> u32 {
     let mut buffer = [0u8; 12];
     let result = unsafe { import(0, buffer.as_mut_ptr(), buffer.len() as u32) };
 
@@ -109,7 +109,7 @@ extern "C" fn refine_ext() -> u32 {
 }
 
 #[polkavm_derive::polkavm_export]
-extern "C" fn accumulate_ext() -> u32 {
+extern "C" fn accumulate() -> u32 {
     let buffer = [0u8; 12];
     let key = [0u8; 1];
 
@@ -121,6 +121,6 @@ extern "C" fn accumulate_ext() -> u32 {
 }
 
 #[polkavm_derive::polkavm_export]
-extern "C" fn on_transfer_ext() -> u32 {
+extern "C" fn on_transfer() -> u32 {
     0
 }

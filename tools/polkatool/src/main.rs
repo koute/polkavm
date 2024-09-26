@@ -65,8 +65,16 @@ enum Args {
 
     /// Builds JAM-ready polkavm file
     JAMService {
-        /// The input file.
+        /// The input file (compiled Rust)
         input: PathBuf,
+
+        /// The output file (JAM-Ready)
+        #[clap(short = 'o', long)]
+        output: Option<PathBuf>,
+
+        /// The raw code blob (can be disassembled with cargo run -p polkatool disassemble --show-raw-bytes {..})
+        #[clap(short = 'd', long)]
+        dump: Option<PathBuf>,
     },
 }
 
@@ -96,7 +104,7 @@ fn main() {
         } => main_disassemble(input, format, display_gas, show_raw_bytes, output),
         Args::Assemble { input, output } => main_assemble(input, output),
         Args::Stats { inputs } => main_stats(inputs),
-        Args::JAMService { input } => main_jam_service(input),
+        Args::JAMService { input, output, dump } => main_jam_service(input, output, dump),
     };
 
     if let Err(error) = result {
@@ -241,9 +249,9 @@ fn main_assemble(input_path: PathBuf, output_path: PathBuf) -> Result<(), String
     Ok(())
 }
 
-fn main_jam_service(input_path: PathBuf) -> Result<(), String> {
+fn main_jam_service(input_path: PathBuf, output_path: Option<PathBuf>, dump_path: Option<PathBuf>) -> Result<(), String> {
     if !input_path.exists() {
-        bail!("File does not exist: {input_path:?}");
+        return Err(format!("File does not exist: {:?}", input_path));
     }
 
     use std::fs;
@@ -251,19 +259,32 @@ fn main_jam_service(input_path: PathBuf) -> Result<(), String> {
     let mut config = polkavm_linker::Config::default();
     config.set_strip(true);
     config.set_dispatch_table(vec![
-        b"is_authorized_ext".into(),
-        b"refine_ext".into(),
-        b"accumulate_ext".into(),
-        b"on_transfer_ext".into(),
+        b"is_authorized".into(),
+        b"refine".into(),
+        b"accumulate".into(),
+        b"on_transfer".into(),
     ]);
 
-    let elf = fs::read(input_path).map_err(|err| format!("Failed to read ELF file: {}", err))?;
+    let elf = fs::read(&input_path).map_err(|err| format!("Failed to read ELF file: {}", err))?;
     let raw_blob =
         polkavm_linker::program_from_elf(config, elf.as_ref()).map_err(|err| format!("Failed to create program from ELF: {}", err))?;
-    let parts =
-        polkavm_linker::ProgramParts::from_bytes(raw_blob.into()).map_err(|err| format!("Failed to parse program parts: {}", err))?;
+    let parts = polkavm_linker::ProgramParts::from_bytes(raw_blob.clone().into())
+        .map_err(|err| format!("Failed to parse program parts: {}", err))?;
 
-    fs::write("jam_service.pvm", &parts.code_and_jump_table).map_err(|err| format!("Failed to write jam_service.pvm: {}", err))?;
+    match output_path {
+        Some(output_path) => {
+            println!("Writing JAM-ready code blob {:?}", output_path);
+            fs::write(&output_path, &parts.code_and_jump_table).map_err(|err| format!("Failed to write output: {}", err))?;
+        }
+        None => {}
+    }
 
+    match dump_path {
+        Some(dump_path) => {
+            println!("Writing raw code {:?}", dump_path);
+            fs::write(dump_path, &raw_blob).unwrap();
+        }
+        None => {}
+    }
     Ok(())
 }
