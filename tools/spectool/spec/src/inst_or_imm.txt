@@ -1,4 +1,8 @@
 pre: a0 = 0b101
+pre: gas = 10000
 
 pub @main:
     a2 = a0 | 0b011
+
+post: a2 = 0b111
+post: gas = 9998

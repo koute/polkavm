@@ -1,3 +1,7 @@
+pre: gas = 10000
+
 pub @main:
 pub @expected_exit:
     jump [a0]
+
+post: gas = 9999

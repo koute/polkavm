@@ -1,2 +1,7 @@
+pre: gas = 10000
+
 pub @main:
     a0 = 100 if a3 == 0
+
+post: a0 = 100
+post: gas = 9998

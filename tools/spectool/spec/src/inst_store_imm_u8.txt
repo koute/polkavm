@@ -1,4 +1,8 @@
+pre: gas = 10000
+
 %rw_data_size = 1
 
 pub @main:
     u8 [0x20000] = 0x12
+
+post: gas = 9998

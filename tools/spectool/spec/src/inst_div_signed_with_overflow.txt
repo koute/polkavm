@@ -3,3 +3,6 @@ pre: a1 = 0xffffffff
 
 pub @main:
     a2 = a0 /s a1
+
+post: a2 = 0x80000000
+post: gas = 9998

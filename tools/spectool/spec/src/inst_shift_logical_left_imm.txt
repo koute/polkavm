@@ -1,4 +1,8 @@
 pre: a0 = 0x80000075
+pre: gas = 10000
 
 pub @main:
     a2 = a0 << 3
+
+post: a2 = 0x3a8
+post: gas = 9998

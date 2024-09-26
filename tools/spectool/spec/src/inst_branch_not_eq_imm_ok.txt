@@ -1,6 +1,11 @@
+pre: gas = 10000
+
 pub @main:
     a0 = 1234
     jump @target if a0 != 1235
     trap
 @target:
     a0 = 0xdeadbeef
+
+post: a0 = 0xdeadbeef
+post: gas = 9996

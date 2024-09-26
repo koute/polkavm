@@ -1,5 +1,8 @@
 pre: ra = 0xffff0000
+pre: gas = 10000
 
 pub @main:
 pub @expected_exit:
     ret
+
+post: gas = 9999

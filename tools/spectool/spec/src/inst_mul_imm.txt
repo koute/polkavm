@@ -1,4 +1,8 @@
 pre: a0 = 3
+pre: gas = 10000
 
 pub @main:
     a2 = a0 * 7
+
+post: a2 = 21
+post: gas = 9998
