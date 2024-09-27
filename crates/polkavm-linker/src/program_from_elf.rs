@@ -3573,11 +3573,11 @@ enum RegValue {
     OutputReg {
         reg: Reg,
         source_block: BlockTarget,
-        bits_used: u32,
+        bits_used: u64,
     },
     Unknown {
         unique: u64,
-        bits_used: u32,
+        bits_used: u64,
     },
 }
 
@@ -3597,10 +3597,10 @@ impl RegValue {
         }
     }
 
-    fn bits_used(self) -> u32 {
+    fn bits_used(self) -> u64 {
         match self {
             RegValue::InputReg(..) | RegValue::CodeAddress(..) | RegValue::DataAddress(..) => !0,
-            RegValue::Constant(value) => value as u32,
+            RegValue::Constant(value) => value as u64,
             RegValue::Unknown { bits_used, .. } | RegValue::OutputReg { bits_used, .. } => bits_used,
         }
     }
@@ -3623,7 +3623,7 @@ impl BlockRegs {
             regs: Reg::ALL.map(|reg| RegValue::OutputReg {
                 reg,
                 source_block,
-                bits_used: u32::MAX,
+                bits_used: u64::from(u32::MAX),
             }),
         }
     }
@@ -3839,7 +3839,7 @@ impl BlockRegs {
         None
     }
 
-    fn set_reg_unknown(&mut self, dst: Reg, unknown_counter: &mut u64, bits_used: u32) {
+    fn set_reg_unknown(&mut self, dst: Reg, unknown_counter: &mut u64, bits_used: u64) {
         if bits_used == 0 {
             self.set_reg(dst, RegValue::Constant(0));
             return;
@@ -3960,7 +3960,7 @@ impl BlockRegs {
             | BasicInst::LoadIndirect {
                 kind: LoadKind::U8, dst, ..
             } => {
-                self.set_reg_unknown(dst, unknown_counter, u32::from(u8::MAX));
+                self.set_reg_unknown(dst, unknown_counter, u64::from(u8::MAX));
             }
             BasicInst::LoadAbsolute {
                 kind: LoadKind::U16, dst, ..
@@ -3968,7 +3968,7 @@ impl BlockRegs {
             | BasicInst::LoadIndirect {
                 kind: LoadKind::U16, dst, ..
             } => {
-                self.set_reg_unknown(dst, unknown_counter, u32::from(u16::MAX));
+                self.set_reg_unknown(dst, unknown_counter, u64::from(u16::MAX));
             }
             _ => {
                 for dst in instruction.dst_mask(imports) {
