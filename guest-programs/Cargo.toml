@@ -23,3 +23,7 @@ members = [
     # Tests
     "test-blob",
 ]
+
+[workspace.lints.rust]
+unexpected-cfgs = "allow"
+static_mut_refs = "allow"

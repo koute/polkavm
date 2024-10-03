@@ -7,3 +7,6 @@ publish = false
 [dependencies]
 polkavm-derive = { path = "../../crates/polkavm-derive" }
 simplealloc = { path = "../../crates/simplealloc" }
+
+[lints]
+workspace = true
