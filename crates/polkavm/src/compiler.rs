@@ -4,11 +4,14 @@ use std::sync::Arc;
 
 use polkavm_assembler::{Assembler, Label};
 use polkavm_common::abi::VM_CODE_ADDRESS_ALIGNMENT;
-use polkavm_common::program::{InstructionVisitor, Instructions, JumpTable, ParsedInstruction, ProgramCounter, ProgramExport, RawReg};
+use polkavm_common::program::{
+    is_jump_target_valid, InstructionVisitor, Instructions, JumpTable, ParsedInstruction, ProgramCounter, ProgramExport, RawReg,
+};
 use polkavm_common::zygote::VM_COMPILER_MAXIMUM_INSTRUCTION_LENGTH;
 
 use crate::error::Error;
 
+use crate::api::RuntimeInstructionSet;
 use crate::config::{GasMeteringKind, ModuleConfig, SandboxKind};
 use crate::gas::GasVisitor;
 use crate::mutex::Mutex;
@@ -35,6 +38,10 @@ mod amd64;
 /// generate a page fault without even trying to jump there, leaving the original value of the instruction
 /// pointer alone, which is exactly what we want.
 pub const JUMP_TABLE_INVALID_ADDRESS: usize = 0xfa6f29540376ba8a;
+
+const CONTINUE_BASIC_BLOCK: usize = 0;
+const END_BASIC_BLOCK: usize = 1;
+const END_BASIC_BLOCK_INVALID: usize = 2;
 
 struct CachePerCompilation {
     assembler: Assembler,
@@ -84,7 +91,7 @@ where
     step_label: Label,
     trap_label: Label,
     invalid_jump_label: Label,
-    allow_sbrk: bool,
+    instruction_set: RuntimeInstructionSet,
 
     _phantom: PhantomData<S>,
 }
@@ -121,6 +128,7 @@ where
     pub(crate) fn new(
         cache: &CompilerCache,
         config: &'a ModuleConfig,
+        instruction_set: RuntimeInstructionSet,
         jump_table: JumpTable<'a>,
         code: &'a [u8],
         bitmask: &'a [u8],
@@ -218,7 +226,7 @@ where
             gas_metering_stub_offsets,
             gas_cost_for_basic_block,
             code_length,
-            allow_sbrk: config.allow_sbrk,
+            instruction_set,
             _phantom: PhantomData,
         };
 
@@ -234,9 +242,13 @@ where
         visitor
             .program_counter_to_machine_code_offset_list
             .push((ProgramCounter(0), visitor.asm.len() as u32));
-        visitor.force_start_new_basic_block(0);
 
+        visitor.force_start_new_basic_block(0, visitor.is_jump_target_valid(0));
         Ok((visitor, address_space))
+    }
+
+    fn is_jump_target_valid(&self, offset: u32) -> bool {
+        is_jump_target_valid(self.instruction_set, self.code, self.bitmask, offset)
     }
 
     pub(crate) fn finish_compilation(
@@ -248,20 +260,6 @@ where
     where
         S: Sandbox,
     {
-        let is_properly_terminated = Instructions::new(self.code, self.bitmask, 0)
-            .next_back()
-            .map_or(false, |instruction| {
-                let opcode = instruction.opcode();
-                opcode.starts_new_basic_block() && opcode != polkavm_common::program::Opcode::fallthrough
-            });
-
-        if !is_properly_terminated {
-            // Finish with a trap in case the code doesn't end with a basic block terminator.
-            log::trace!("Adding an implicit trap to the last block...");
-            use polkavm_common::program::ParsingVisitor;
-            self.trap(self.code_length, 0);
-        }
-
         log::trace!("Finishing compilation...");
         let invalid_code_offset_address = self.asm.origin() + self.asm.len() as u64;
         self.emit_trap_epilogue();
@@ -383,15 +381,17 @@ where
     }
 
     #[inline(always)]
-    fn force_start_new_basic_block(&mut self, program_counter: u32) {
+    fn force_start_new_basic_block(&mut self, program_counter: u32, is_valid_jump_target: bool) {
         log::trace!("Starting new basic block at: {program_counter}");
-        if let Some(label) = self.program_counter_to_label.get(program_counter) {
-            log::trace!("Label: {label} -> {program_counter} -> {:08x}", self.asm.current_address());
-            self.asm.define_label(label);
-        } else {
-            let label = self.asm.create_label();
-            log::trace!("Label: {label} -> {program_counter} -> {:08x}", self.asm.current_address());
-            self.program_counter_to_label.insert(program_counter, label);
+        if is_valid_jump_target {
+            if let Some(label) = self.program_counter_to_label.get(program_counter) {
+                log::trace!("Label: {label} -> {program_counter} -> {:08x}", self.asm.current_address());
+                self.asm.define_label(label);
+            } else {
+                let label = self.asm.create_label();
+                log::trace!("Label: {label} -> {program_counter} -> {:08x}", self.asm.current_address());
+                self.program_counter_to_label.insert(program_counter, label);
+            }
         }
 
         if self.step_tracing {
@@ -410,7 +410,9 @@ where
         }
     }
 
-    fn after_instruction<const IS_BASIC_BLOCK_TERMINATOR: bool>(&mut self, program_counter: u32, args_length: u32) {
+    fn after_instruction<const KIND: usize>(&mut self, program_counter: u32, args_length: u32) {
+        assert!(KIND == CONTINUE_BASIC_BLOCK || KIND == END_BASIC_BLOCK || KIND == END_BASIC_BLOCK_INVALID);
+
         if cfg!(debug_assertions) && !self.step_tracing {
             let offset = self.program_counter_to_machine_code_offset_list.last().unwrap().1 as usize;
             let instruction_length = self.asm.len() - offset;
@@ -423,13 +425,15 @@ where
         self.program_counter_to_machine_code_offset_list
             .push((ProgramCounter(next_program_counter), self.asm.len() as u32));
 
-        if IS_BASIC_BLOCK_TERMINATOR {
+        if KIND == END_BASIC_BLOCK || KIND == END_BASIC_BLOCK_INVALID {
             if self.gas_metering.is_some() {
                 let cost = self.gas_visitor.take_block_cost().unwrap();
                 self.gas_cost_for_basic_block.push(cost);
             }
 
-            self.force_start_new_basic_block(next_program_counter);
+            let can_jump_into_new_basic_block = KIND != END_BASIC_BLOCK_INVALID && (next_program_counter as usize) < self.code.len();
+            debug_assert_eq!(self.is_jump_target_valid(next_program_counter), can_jump_into_new_basic_block);
+            self.force_start_new_basic_block(next_program_counter, can_jump_into_new_basic_block);
         } else if self.step_tracing {
             self.step(next_program_counter);
         }
@@ -441,6 +445,7 @@ where
         ArchVisitor(self).trace_execution(program_counter);
     }
 
+    #[cold]
     fn current_instruction(&self, program_counter: u32) -> impl core::fmt::Display {
         struct MaybeInstruction(Option<ParsedInstruction>);
         impl core::fmt::Display for MaybeInstruction {
@@ -452,7 +457,8 @@ where
                 }
             }
         }
-        MaybeInstruction(Instructions::new(self.code, self.bitmask, program_counter).next())
+
+        MaybeInstruction(Instructions::new_bounded(self.instruction_set, self.code, self.bitmask, program_counter).next())
     }
 
     #[cold]
@@ -646,7 +652,7 @@ where
         self.before_instruction(code_offset);
         self.gas_visitor.trap();
         ArchVisitor(self).invalid(code_offset);
-        self.after_instruction::<true>(code_offset, args_length);
+        self.after_instruction::<END_BASIC_BLOCK_INVALID>(code_offset, args_length);
     }
 
     #[inline(always)]
@@ -654,7 +660,7 @@ where
         self.before_instruction(code_offset);
         self.gas_visitor.trap();
         ArchVisitor(self).trap(code_offset);
-        self.after_instruction::<true>(code_offset, args_length);
+        self.after_instruction::<END_BASIC_BLOCK>(code_offset, args_length);
     }
 
     #[inline(always)]
@@ -662,19 +668,15 @@ where
         self.before_instruction(code_offset);
         self.gas_visitor.fallthrough();
         ArchVisitor(self).fallthrough();
-        self.after_instruction::<true>(code_offset, args_length);
+        self.after_instruction::<END_BASIC_BLOCK>(code_offset, args_length);
     }
 
     #[inline(always)]
     fn sbrk(&mut self, code_offset: u32, args_length: u32, d: RawReg, s: RawReg) -> Self::ReturnTy {
-        if self.allow_sbrk {
-            self.before_instruction(code_offset);
-            self.gas_visitor.sbrk(d, s);
-            ArchVisitor(self).sbrk(d, s);
-            self.after_instruction::<false>(code_offset, args_length);
-        } else {
-            self.trap(code_offset, args_length)
-        }
+        self.before_instruction(code_offset);
+        self.gas_visitor.sbrk(d, s);
+        ArchVisitor(self).sbrk(d, s);
+        self.after_instruction::<CONTINUE_BASIC_BLOCK>(code_offset, args_length);
     }
 
     #[inline(always)]
@@ -682,7 +684,7 @@ where
         self.before_instruction(code_offset);
         self.gas_visitor.ecalli(imm);
         ArchVisitor(self).ecalli(code_offset, args_length, imm);
-        self.after_instruction::<false>(code_offset, args_length);
+        self.after_instruction::<CONTINUE_BASIC_BLOCK>(code_offset, args_length);
     }
 
     #[inline(always)]
@@ -690,7 +692,7 @@ where
         self.before_instruction(code_offset);
         self.gas_visitor.set_less_than_unsigned(d, s1, s2);
         ArchVisitor(self).set_less_than_unsigned(d, s1, s2);
-        self.after_instruction::<false>(code_offset, args_length);
+        self.after_instruction::<CONTINUE_BASIC_BLOCK>(code_offset, args_length);
     }
 
     #[inline(always)]
@@ -698,7 +700,7 @@ where
         self.before_instruction(code_offset);
         self.gas_visitor.set_less_than_signed(d, s1, s2);
         ArchVisitor(self).set_less_than_signed(d, s1, s2);
-        self.after_instruction::<false>(code_offset, args_length);
+        self.after_instruction::<CONTINUE_BASIC_BLOCK>(code_offset, args_length);
     }
 
     #[inline(always)]
@@ -706,7 +708,7 @@ where
         self.before_instruction(code_offset);
         self.gas_visitor.shift_logical_right(d, s1, s2);
         ArchVisitor(self).shift_logical_right(d, s1, s2);
-        self.after_instruction::<false>(code_offset, args_length);
+        self.after_instruction::<CONTINUE_BASIC_BLOCK>(code_offset, args_length);
     }
 
     #[inline(always)]
@@ -714,7 +716,7 @@ where
         self.before_instruction(code_offset);
         self.gas_visitor.shift_arithmetic_right(d, s1, s2);
         ArchVisitor(self).shift_arithmetic_right(d, s1, s2);
-        self.after_instruction::<false>(code_offset, args_length);
+        self.after_instruction::<CONTINUE_BASIC_BLOCK>(code_offset, args_length);
     }
 
     #[inline(always)]
@@ -722,7 +724,7 @@ where
         self.before_instruction(code_offset);
         self.gas_visitor.shift_logical_left(d, s1, s2);
         ArchVisitor(self).shift_logical_left(d, s1, s2);
-        self.after_instruction::<false>(code_offset, args_length);
+        self.after_instruction::<CONTINUE_BASIC_BLOCK>(code_offset, args_length);
     }
 
     #[inline(always)]
@@ -730,7 +732,7 @@ where
         self.before_instruction(code_offset);
         self.gas_visitor.xor(d, s1, s2);
         ArchVisitor(self).xor(d, s1, s2);
-        self.after_instruction::<false>(code_offset, args_length);
+        self.after_instruction::<CONTINUE_BASIC_BLOCK>(code_offset, args_length);
     }
 
     #[inline(always)]
@@ -738,7 +740,7 @@ where
         self.before_instruction(code_offset);
         self.gas_visitor.and(d, s1, s2);
         ArchVisitor(self).and(d, s1, s2);
-        self.after_instruction::<false>(code_offset, args_length);
+        self.after_instruction::<CONTINUE_BASIC_BLOCK>(code_offset, args_length);
     }
 
     #[inline(always)]
@@ -746,7 +748,7 @@ where
         self.before_instruction(code_offset);
         self.gas_visitor.or(d, s1, s2);
         ArchVisitor(self).or(d, s1, s2);
-        self.after_instruction::<false>(code_offset, args_length);
+        self.after_instruction::<CONTINUE_BASIC_BLOCK>(code_offset, args_length);
     }
 
     #[inline(always)]
@@ -754,7 +756,7 @@ where
         self.before_instruction(code_offset);
         self.gas_visitor.add(d, s1, s2);
         ArchVisitor(self).add(d, s1, s2);
-        self.after_instruction::<false>(code_offset, args_length);
+        self.after_instruction::<CONTINUE_BASIC_BLOCK>(code_offset, args_length);
     }
 
     #[inline(always)]
@@ -762,7 +764,7 @@ where
         self.before_instruction(code_offset);
         self.gas_visitor.sub(d, s1, s2);
         ArchVisitor(self).sub(d, s1, s2);
-        self.after_instruction::<false>(code_offset, args_length);
+        self.after_instruction::<CONTINUE_BASIC_BLOCK>(code_offset, args_length);
     }
 
     #[inline(always)]
@@ -770,7 +772,7 @@ where
         self.before_instruction(code_offset);
         self.gas_visitor.mul(d, s1, s2);
         ArchVisitor(self).mul(d, s1, s2);
-        self.after_instruction::<false>(code_offset, args_length);
+        self.after_instruction::<CONTINUE_BASIC_BLOCK>(code_offset, args_length);
     }
 
     #[inline(always)]
@@ -778,7 +780,7 @@ where
         self.before_instruction(code_offset);
         self.gas_visitor.mul_upper_signed_signed(d, s1, s2);
         ArchVisitor(self).mul_upper_signed_signed(d, s1, s2);
-        self.after_instruction::<false>(code_offset, args_length);
+        self.after_instruction::<CONTINUE_BASIC_BLOCK>(code_offset, args_length);
     }
 
     #[inline(always)]
@@ -786,7 +788,7 @@ where
         self.before_instruction(code_offset);
         self.gas_visitor.mul_upper_unsigned_unsigned(d, s1, s2);
         ArchVisitor(self).mul_upper_unsigned_unsigned(d, s1, s2);
-        self.after_instruction::<false>(code_offset, args_length);
+        self.after_instruction::<CONTINUE_BASIC_BLOCK>(code_offset, args_length);
     }
 
     #[inline(always)]
@@ -794,7 +796,7 @@ where
         self.before_instruction(code_offset);
         self.gas_visitor.mul_upper_signed_unsigned(d, s1, s2);
         ArchVisitor(self).mul_upper_signed_unsigned(d, s1, s2);
-        self.after_instruction::<false>(code_offset, args_length);
+        self.after_instruction::<CONTINUE_BASIC_BLOCK>(code_offset, args_length);
     }
 
     #[inline(always)]
@@ -802,7 +804,7 @@ where
         self.before_instruction(code_offset);
         self.gas_visitor.div_unsigned(d, s1, s2);
         ArchVisitor(self).div_unsigned(d, s1, s2);
-        self.after_instruction::<false>(code_offset, args_length);
+        self.after_instruction::<CONTINUE_BASIC_BLOCK>(code_offset, args_length);
     }
 
     #[inline(always)]
@@ -810,7 +812,7 @@ where
         self.before_instruction(code_offset);
         self.gas_visitor.div_signed(d, s1, s2);
         ArchVisitor(self).div_signed(d, s1, s2);
-        self.after_instruction::<false>(code_offset, args_length);
+        self.after_instruction::<CONTINUE_BASIC_BLOCK>(code_offset, args_length);
     }
 
     #[inline(always)]
@@ -818,7 +820,7 @@ where
         self.before_instruction(code_offset);
         self.gas_visitor.rem_unsigned(d, s1, s2);
         ArchVisitor(self).rem_unsigned(d, s1, s2);
-        self.after_instruction::<false>(code_offset, args_length);
+        self.after_instruction::<CONTINUE_BASIC_BLOCK>(code_offset, args_length);
     }
 
     #[inline(always)]
@@ -826,7 +828,7 @@ where
         self.before_instruction(code_offset);
         self.gas_visitor.rem_signed(d, s1, s2);
         ArchVisitor(self).rem_signed(d, s1, s2);
-        self.after_instruction::<false>(code_offset, args_length);
+        self.after_instruction::<CONTINUE_BASIC_BLOCK>(code_offset, args_length);
     }
 
     #[inline(always)]
@@ -834,7 +836,7 @@ where
         self.before_instruction(code_offset);
         self.gas_visitor.mul_imm(d, s1, s2);
         ArchVisitor(self).mul_imm(d, s1, s2);
-        self.after_instruction::<false>(code_offset, args_length);
+        self.after_instruction::<CONTINUE_BASIC_BLOCK>(code_offset, args_length);
     }
 
     #[inline(always)]
@@ -842,7 +844,7 @@ where
         self.before_instruction(code_offset);
         self.gas_visitor.mul_upper_signed_signed_imm(d, s1, s2);
         ArchVisitor(self).mul_upper_signed_signed_imm(d, s1, s2);
-        self.after_instruction::<false>(code_offset, args_length);
+        self.after_instruction::<CONTINUE_BASIC_BLOCK>(code_offset, args_length);
     }
 
     #[inline(always)]
@@ -850,7 +852,7 @@ where
         self.before_instruction(code_offset);
         self.gas_visitor.mul_upper_unsigned_unsigned_imm(d, s1, s2);
         ArchVisitor(self).mul_upper_unsigned_unsigned_imm(d, s1, s2);
-        self.after_instruction::<false>(code_offset, args_length);
+        self.after_instruction::<CONTINUE_BASIC_BLOCK>(code_offset, args_length);
     }
 
     #[inline(always)]
@@ -858,7 +860,7 @@ where
         self.before_instruction(code_offset);
         self.gas_visitor.set_less_than_unsigned_imm(d, s1, s2);
         ArchVisitor(self).set_less_than_unsigned_imm(d, s1, s2);
-        self.after_instruction::<false>(code_offset, args_length);
+        self.after_instruction::<CONTINUE_BASIC_BLOCK>(code_offset, args_length);
     }
 
     #[inline(always)]
@@ -866,7 +868,7 @@ where
         self.before_instruction(code_offset);
         self.gas_visitor.set_less_than_signed_imm(d, s1, s2);
         ArchVisitor(self).set_less_than_signed_imm(d, s1, s2);
-        self.after_instruction::<false>(code_offset, args_length);
+        self.after_instruction::<CONTINUE_BASIC_BLOCK>(code_offset, args_length);
     }
 
     #[inline(always)]
@@ -874,7 +876,7 @@ where
         self.before_instruction(code_offset);
         self.gas_visitor.set_greater_than_unsigned_imm(d, s1, s2);
         ArchVisitor(self).set_greater_than_unsigned_imm(d, s1, s2);
-        self.after_instruction::<false>(code_offset, args_length);
+        self.after_instruction::<CONTINUE_BASIC_BLOCK>(code_offset, args_length);
     }
 
     #[inline(always)]
@@ -882,7 +884,7 @@ where
         self.before_instruction(code_offset);
         self.gas_visitor.set_greater_than_signed_imm(d, s1, s2);
         ArchVisitor(self).set_greater_than_signed_imm(d, s1, s2);
-        self.after_instruction::<false>(code_offset, args_length);
+        self.after_instruction::<CONTINUE_BASIC_BLOCK>(code_offset, args_length);
     }
 
     #[inline(always)]
@@ -890,7 +892,7 @@ where
         self.before_instruction(code_offset);
         self.gas_visitor.shift_logical_right_imm(d, s1, s2);
         ArchVisitor(self).shift_logical_right_imm(d, s1, s2);
-        self.after_instruction::<false>(code_offset, args_length);
+        self.after_instruction::<CONTINUE_BASIC_BLOCK>(code_offset, args_length);
     }
 
     #[inline(always)]
@@ -898,7 +900,7 @@ where
         self.before_instruction(code_offset);
         self.gas_visitor.shift_arithmetic_right_imm(d, s1, s2);
         ArchVisitor(self).shift_arithmetic_right_imm(d, s1, s2);
-        self.after_instruction::<false>(code_offset, args_length);
+        self.after_instruction::<CONTINUE_BASIC_BLOCK>(code_offset, args_length);
     }
 
     #[inline(always)]
@@ -906,7 +908,7 @@ where
         self.before_instruction(code_offset);
         self.gas_visitor.shift_logical_left_imm(d, s1, s2);
         ArchVisitor(self).shift_logical_left_imm(d, s1, s2);
-        self.after_instruction::<false>(code_offset, args_length);
+        self.after_instruction::<CONTINUE_BASIC_BLOCK>(code_offset, args_length);
     }
 
     #[inline(always)]
@@ -914,7 +916,7 @@ where
         self.before_instruction(code_offset);
         self.gas_visitor.shift_logical_right_imm_alt(d, s2, s1);
         ArchVisitor(self).shift_logical_right_imm_alt(d, s2, s1);
-        self.after_instruction::<false>(code_offset, args_length);
+        self.after_instruction::<CONTINUE_BASIC_BLOCK>(code_offset, args_length);
     }
 
     #[inline(always)]
@@ -922,7 +924,7 @@ where
         self.before_instruction(code_offset);
         self.gas_visitor.shift_arithmetic_right_imm_alt(d, s2, s1);
         ArchVisitor(self).shift_arithmetic_right_imm_alt(d, s2, s1);
-        self.after_instruction::<false>(code_offset, args_length);
+        self.after_instruction::<CONTINUE_BASIC_BLOCK>(code_offset, args_length);
     }
 
     #[inline(always)]
@@ -930,7 +932,7 @@ where
         self.before_instruction(code_offset);
         self.gas_visitor.shift_logical_left_imm_alt(d, s2, s1);
         ArchVisitor(self).shift_logical_left_imm_alt(d, s2, s1);
-        self.after_instruction::<false>(code_offset, args_length);
+        self.after_instruction::<CONTINUE_BASIC_BLOCK>(code_offset, args_length);
     }
 
     #[inline(always)]
@@ -938,7 +940,7 @@ where
         self.before_instruction(code_offset);
         self.gas_visitor.or_imm(d, s, imm);
         ArchVisitor(self).or_imm(d, s, imm);
-        self.after_instruction::<false>(code_offset, args_length);
+        self.after_instruction::<CONTINUE_BASIC_BLOCK>(code_offset, args_length);
     }
 
     #[inline(always)]
@@ -946,7 +948,7 @@ where
         self.before_instruction(code_offset);
         self.gas_visitor.and_imm(d, s, imm);
         ArchVisitor(self).and_imm(d, s, imm);
-        self.after_instruction::<false>(code_offset, args_length);
+        self.after_instruction::<CONTINUE_BASIC_BLOCK>(code_offset, args_length);
     }
 
     #[inline(always)]
@@ -954,7 +956,7 @@ where
         self.before_instruction(code_offset);
         self.gas_visitor.xor_imm(d, s, imm);
         ArchVisitor(self).xor_imm(d, s, imm);
-        self.after_instruction::<false>(code_offset, args_length);
+        self.after_instruction::<CONTINUE_BASIC_BLOCK>(code_offset, args_length);
     }
 
     #[inline(always)]
@@ -962,7 +964,7 @@ where
         self.before_instruction(code_offset);
         self.gas_visitor.move_reg(d, s);
         ArchVisitor(self).move_reg(d, s);
-        self.after_instruction::<false>(code_offset, args_length);
+        self.after_instruction::<CONTINUE_BASIC_BLOCK>(code_offset, args_length);
     }
 
     #[inline(always)]
@@ -970,7 +972,7 @@ where
         self.before_instruction(code_offset);
         self.gas_visitor.cmov_if_zero(d, s, c);
         ArchVisitor(self).cmov_if_zero(d, s, c);
-        self.after_instruction::<false>(code_offset, args_length);
+        self.after_instruction::<CONTINUE_BASIC_BLOCK>(code_offset, args_length);
     }
 
     #[inline(always)]
@@ -978,7 +980,7 @@ where
         self.before_instruction(code_offset);
         self.gas_visitor.cmov_if_not_zero(d, s, c);
         ArchVisitor(self).cmov_if_not_zero(d, s, c);
-        self.after_instruction::<false>(code_offset, args_length);
+        self.after_instruction::<CONTINUE_BASIC_BLOCK>(code_offset, args_length);
     }
 
     #[inline(always)]
@@ -986,7 +988,7 @@ where
         self.before_instruction(code_offset);
         self.gas_visitor.cmov_if_zero_imm(d, c, s);
         ArchVisitor(self).cmov_if_zero_imm(d, c, s);
-        self.after_instruction::<false>(code_offset, args_length);
+        self.after_instruction::<CONTINUE_BASIC_BLOCK>(code_offset, args_length);
     }
 
     #[inline(always)]
@@ -994,7 +996,7 @@ where
         self.before_instruction(code_offset);
         self.gas_visitor.cmov_if_not_zero_imm(d, c, s);
         ArchVisitor(self).cmov_if_not_zero_imm(d, c, s);
-        self.after_instruction::<false>(code_offset, args_length);
+        self.after_instruction::<CONTINUE_BASIC_BLOCK>(code_offset, args_length);
     }
 
     #[inline(always)]
@@ -1002,7 +1004,7 @@ where
         self.before_instruction(code_offset);
         self.gas_visitor.add_imm(d, s, imm);
         ArchVisitor(self).add_imm(d, s, imm);
-        self.after_instruction::<false>(code_offset, args_length);
+        self.after_instruction::<CONTINUE_BASIC_BLOCK>(code_offset, args_length);
     }
 
     #[inline(always)]
@@ -1010,7 +1012,7 @@ where
         self.before_instruction(code_offset);
         self.gas_visitor.negate_and_add_imm(d, s1, s2);
         ArchVisitor(self).negate_and_add_imm(d, s1, s2);
-        self.after_instruction::<false>(code_offset, args_length);
+        self.after_instruction::<CONTINUE_BASIC_BLOCK>(code_offset, args_length);
     }
 
     #[inline(always)]
@@ -1018,7 +1020,7 @@ where
         self.before_instruction(code_offset);
         self.gas_visitor.store_imm_indirect_u8(base, offset, value);
         ArchVisitor(self).store_imm_indirect_u8(base, offset, value);
-        self.after_instruction::<false>(code_offset, args_length);
+        self.after_instruction::<CONTINUE_BASIC_BLOCK>(code_offset, args_length);
     }
 
     #[inline(always)]
@@ -1026,7 +1028,7 @@ where
         self.before_instruction(code_offset);
         self.gas_visitor.store_imm_indirect_u16(base, offset, value);
         ArchVisitor(self).store_imm_indirect_u16(base, offset, value);
-        self.after_instruction::<false>(code_offset, args_length);
+        self.after_instruction::<CONTINUE_BASIC_BLOCK>(code_offset, args_length);
     }
 
     #[inline(always)]
@@ -1034,7 +1036,7 @@ where
         self.before_instruction(code_offset);
         self.gas_visitor.store_imm_indirect_u32(base, offset, value);
         ArchVisitor(self).store_imm_indirect_u32(base, offset, value);
-        self.after_instruction::<false>(code_offset, args_length);
+        self.after_instruction::<CONTINUE_BASIC_BLOCK>(code_offset, args_length);
     }
 
     #[inline(always)]
@@ -1042,7 +1044,7 @@ where
         self.before_instruction(code_offset);
         self.gas_visitor.store_indirect_u8(src, base, offset);
         ArchVisitor(self).store_indirect_u8(src, base, offset);
-        self.after_instruction::<false>(code_offset, args_length);
+        self.after_instruction::<CONTINUE_BASIC_BLOCK>(code_offset, args_length);
     }
 
     #[inline(always)]
@@ -1050,7 +1052,7 @@ where
         self.before_instruction(code_offset);
         self.gas_visitor.store_indirect_u16(src, base, offset);
         ArchVisitor(self).store_indirect_u16(src, base, offset);
-        self.after_instruction::<false>(code_offset, args_length);
+        self.after_instruction::<CONTINUE_BASIC_BLOCK>(code_offset, args_length);
     }
 
     #[inline(always)]
@@ -1058,7 +1060,7 @@ where
         self.before_instruction(code_offset);
         self.gas_visitor.store_indirect_u32(src, base, offset);
         ArchVisitor(self).store_indirect_u32(src, base, offset);
-        self.after_instruction::<false>(code_offset, args_length);
+        self.after_instruction::<CONTINUE_BASIC_BLOCK>(code_offset, args_length);
     }
 
     #[inline(always)]
@@ -1066,7 +1068,7 @@ where
         self.before_instruction(code_offset);
         self.gas_visitor.store_imm_u8(value, offset);
         ArchVisitor(self).store_imm_u8(value, offset);
-        self.after_instruction::<false>(code_offset, args_length);
+        self.after_instruction::<CONTINUE_BASIC_BLOCK>(code_offset, args_length);
     }
 
     #[inline(always)]
@@ -1074,7 +1076,7 @@ where
         self.before_instruction(code_offset);
         self.gas_visitor.store_imm_u16(value, offset);
         ArchVisitor(self).store_imm_u16(value, offset);
-        self.after_instruction::<false>(code_offset, args_length);
+        self.after_instruction::<CONTINUE_BASIC_BLOCK>(code_offset, args_length);
     }
 
     #[inline(always)]
@@ -1082,7 +1084,7 @@ where
         self.before_instruction(code_offset);
         self.gas_visitor.store_imm_u32(value, offset);
         ArchVisitor(self).store_imm_u32(value, offset);
-        self.after_instruction::<false>(code_offset, args_length);
+        self.after_instruction::<CONTINUE_BASIC_BLOCK>(code_offset, args_length);
     }
 
     #[inline(always)]
@@ -1090,7 +1092,7 @@ where
         self.before_instruction(code_offset);
         self.gas_visitor.store_u8(src, offset);
         ArchVisitor(self).store_u8(src, offset);
-        self.after_instruction::<false>(code_offset, args_length);
+        self.after_instruction::<CONTINUE_BASIC_BLOCK>(code_offset, args_length);
     }
 
     #[inline(always)]
@@ -1098,7 +1100,7 @@ where
         self.before_instruction(code_offset);
         self.gas_visitor.store_u16(src, offset);
         ArchVisitor(self).store_u16(src, offset);
-        self.after_instruction::<false>(code_offset, args_length);
+        self.after_instruction::<CONTINUE_BASIC_BLOCK>(code_offset, args_length);
     }
 
     #[inline(always)]
@@ -1106,7 +1108,7 @@ where
         self.before_instruction(code_offset);
         self.gas_visitor.store_u32(src, offset);
         ArchVisitor(self).store_u32(src, offset);
-        self.after_instruction::<false>(code_offset, args_length);
+        self.after_instruction::<CONTINUE_BASIC_BLOCK>(code_offset, args_length);
     }
 
     #[inline(always)]
@@ -1114,7 +1116,7 @@ where
         self.before_instruction(code_offset);
         self.gas_visitor.load_indirect_u8(dst, base, offset);
         ArchVisitor(self).load_indirect_u8(dst, base, offset);
-        self.after_instruction::<false>(code_offset, args_length);
+        self.after_instruction::<CONTINUE_BASIC_BLOCK>(code_offset, args_length);
     }
 
     #[inline(always)]
@@ -1122,7 +1124,7 @@ where
         self.before_instruction(code_offset);
         self.gas_visitor.load_indirect_i8(dst, base, offset);
         ArchVisitor(self).load_indirect_i8(dst, base, offset);
-        self.after_instruction::<false>(code_offset, args_length);
+        self.after_instruction::<CONTINUE_BASIC_BLOCK>(code_offset, args_length);
     }
 
     #[inline(always)]
@@ -1130,7 +1132,7 @@ where
         self.before_instruction(code_offset);
         self.gas_visitor.load_indirect_u16(dst, base, offset);
         ArchVisitor(self).load_indirect_u16(dst, base, offset);
-        self.after_instruction::<false>(code_offset, args_length);
+        self.after_instruction::<CONTINUE_BASIC_BLOCK>(code_offset, args_length);
     }
 
     #[inline(always)]
@@ -1138,7 +1140,7 @@ where
         self.before_instruction(code_offset);
         self.gas_visitor.load_indirect_i16(dst, base, offset);
         ArchVisitor(self).load_indirect_i16(dst, base, offset);
-        self.after_instruction::<false>(code_offset, args_length);
+        self.after_instruction::<CONTINUE_BASIC_BLOCK>(code_offset, args_length);
     }
 
     #[inline(always)]
@@ -1146,7 +1148,7 @@ where
         self.before_instruction(code_offset);
         self.gas_visitor.load_indirect_u32(dst, base, offset);
         ArchVisitor(self).load_indirect_u32(dst, base, offset);
-        self.after_instruction::<false>(code_offset, args_length);
+        self.after_instruction::<CONTINUE_BASIC_BLOCK>(code_offset, args_length);
     }
 
     #[inline(always)]
@@ -1154,7 +1156,7 @@ where
         self.before_instruction(code_offset);
         self.gas_visitor.load_u8(dst, offset);
         ArchVisitor(self).load_u8(dst, offset);
-        self.after_instruction::<false>(code_offset, args_length);
+        self.after_instruction::<CONTINUE_BASIC_BLOCK>(code_offset, args_length);
     }
 
     #[inline(always)]
@@ -1162,7 +1164,7 @@ where
         self.before_instruction(code_offset);
         self.gas_visitor.load_i8(dst, offset);
         ArchVisitor(self).load_i8(dst, offset);
-        self.after_instruction::<false>(code_offset, args_length);
+        self.after_instruction::<CONTINUE_BASIC_BLOCK>(code_offset, args_length);
     }
 
     #[inline(always)]
@@ -1170,7 +1172,7 @@ where
         self.before_instruction(code_offset);
         self.gas_visitor.load_u16(dst, offset);
         ArchVisitor(self).load_u16(dst, offset);
-        self.after_instruction::<false>(code_offset, args_length);
+        self.after_instruction::<CONTINUE_BASIC_BLOCK>(code_offset, args_length);
     }
 
     #[inline(always)]
@@ -1178,7 +1180,7 @@ where
         self.before_instruction(code_offset);
         self.gas_visitor.load_i16(dst, offset);
         ArchVisitor(self).load_i16(dst, offset);
-        self.after_instruction::<false>(code_offset, args_length);
+        self.after_instruction::<CONTINUE_BASIC_BLOCK>(code_offset, args_length);
     }
 
     #[inline(always)]
@@ -1186,7 +1188,7 @@ where
         self.before_instruction(code_offset);
         self.gas_visitor.load_u32(dst, offset);
         ArchVisitor(self).load_u32(dst, offset);
-        self.after_instruction::<false>(code_offset, args_length);
+        self.after_instruction::<CONTINUE_BASIC_BLOCK>(code_offset, args_length);
     }
 
     #[inline(always)]
@@ -1194,7 +1196,7 @@ where
         self.before_instruction(code_offset);
         self.gas_visitor.branch_less_unsigned(s1, s2, imm);
         ArchVisitor(self).branch_less_unsigned(s1, s2, imm);
-        self.after_instruction::<true>(code_offset, args_length);
+        self.after_instruction::<END_BASIC_BLOCK>(code_offset, args_length);
     }
 
     #[inline(always)]
@@ -1202,7 +1204,7 @@ where
         self.before_instruction(code_offset);
         self.gas_visitor.branch_less_signed(s1, s2, imm);
         ArchVisitor(self).branch_less_signed(s1, s2, imm);
-        self.after_instruction::<true>(code_offset, args_length);
+        self.after_instruction::<END_BASIC_BLOCK>(code_offset, args_length);
     }
 
     #[inline(always)]
@@ -1210,7 +1212,7 @@ where
         self.before_instruction(code_offset);
         self.gas_visitor.branch_greater_or_equal_unsigned(s1, s2, imm);
         ArchVisitor(self).branch_greater_or_equal_unsigned(s1, s2, imm);
-        self.after_instruction::<true>(code_offset, args_length);
+        self.after_instruction::<END_BASIC_BLOCK>(code_offset, args_length);
     }
 
     #[inline(always)]
@@ -1218,7 +1220,7 @@ where
         self.before_instruction(code_offset);
         self.gas_visitor.branch_greater_or_equal_signed(s1, s2, imm);
         ArchVisitor(self).branch_greater_or_equal_signed(s1, s2, imm);
-        self.after_instruction::<true>(code_offset, args_length);
+        self.after_instruction::<END_BASIC_BLOCK>(code_offset, args_length);
     }
 
     #[inline(always)]
@@ -1226,7 +1228,7 @@ where
         self.before_instruction(code_offset);
         self.gas_visitor.branch_eq(s1, s2, imm);
         ArchVisitor(self).branch_eq(s1, s2, imm);
-        self.after_instruction::<true>(code_offset, args_length);
+        self.after_instruction::<END_BASIC_BLOCK>(code_offset, args_length);
     }
 
     #[inline(always)]
@@ -1234,7 +1236,7 @@ where
         self.before_instruction(code_offset);
         self.gas_visitor.branch_not_eq(s1, s2, imm);
         ArchVisitor(self).branch_not_eq(s1, s2, imm);
-        self.after_instruction::<true>(code_offset, args_length);
+        self.after_instruction::<END_BASIC_BLOCK>(code_offset, args_length);
     }
 
     #[inline(always)]
@@ -1242,7 +1244,7 @@ where
         self.before_instruction(code_offset);
         self.gas_visitor.branch_eq_imm(s1, s2, imm);
         ArchVisitor(self).branch_eq_imm(s1, s2, imm);
-        self.after_instruction::<true>(code_offset, args_length);
+        self.after_instruction::<END_BASIC_BLOCK>(code_offset, args_length);
     }
 
     #[inline(always)]
@@ -1250,7 +1252,7 @@ where
         self.before_instruction(code_offset);
         self.gas_visitor.branch_not_eq_imm(s1, s2, imm);
         ArchVisitor(self).branch_not_eq_imm(s1, s2, imm);
-        self.after_instruction::<true>(code_offset, args_length);
+        self.after_instruction::<END_BASIC_BLOCK>(code_offset, args_length);
     }
 
     #[inline(always)]
@@ -1258,7 +1260,7 @@ where
         self.before_instruction(code_offset);
         self.gas_visitor.branch_less_unsigned_imm(s1, s2, imm);
         ArchVisitor(self).branch_less_unsigned_imm(s1, s2, imm);
-        self.after_instruction::<true>(code_offset, args_length);
+        self.after_instruction::<END_BASIC_BLOCK>(code_offset, args_length);
     }
 
     #[inline(always)]
@@ -1266,7 +1268,7 @@ where
         self.before_instruction(code_offset);
         self.gas_visitor.branch_less_signed_imm(s1, s2, imm);
         ArchVisitor(self).branch_less_signed_imm(s1, s2, imm);
-        self.after_instruction::<true>(code_offset, args_length);
+        self.after_instruction::<END_BASIC_BLOCK>(code_offset, args_length);
     }
 
     #[inline(always)]
@@ -1281,7 +1283,7 @@ where
         self.before_instruction(code_offset);
         self.gas_visitor.branch_greater_or_equal_unsigned_imm(s1, s2, imm);
         ArchVisitor(self).branch_greater_or_equal_unsigned_imm(s1, s2, imm);
-        self.after_instruction::<true>(code_offset, args_length);
+        self.after_instruction::<END_BASIC_BLOCK>(code_offset, args_length);
     }
 
     #[inline(always)]
@@ -1289,7 +1291,7 @@ where
         self.before_instruction(code_offset);
         self.gas_visitor.branch_greater_or_equal_signed_imm(s1, s2, imm);
         ArchVisitor(self).branch_greater_or_equal_signed_imm(s1, s2, imm);
-        self.after_instruction::<true>(code_offset, args_length);
+        self.after_instruction::<END_BASIC_BLOCK>(code_offset, args_length);
     }
 
     #[inline(always)]
@@ -1297,7 +1299,7 @@ where
         self.before_instruction(code_offset);
         self.gas_visitor.branch_less_or_equal_unsigned_imm(s1, s2, imm);
         ArchVisitor(self).branch_less_or_equal_unsigned_imm(s1, s2, imm);
-        self.after_instruction::<true>(code_offset, args_length);
+        self.after_instruction::<END_BASIC_BLOCK>(code_offset, args_length);
     }
 
     #[inline(always)]
@@ -1305,7 +1307,7 @@ where
         self.before_instruction(code_offset);
         self.gas_visitor.branch_less_or_equal_signed_imm(s1, s2, imm);
         ArchVisitor(self).branch_less_or_equal_signed_imm(s1, s2, imm);
-        self.after_instruction::<true>(code_offset, args_length);
+        self.after_instruction::<END_BASIC_BLOCK>(code_offset, args_length);
     }
 
     #[inline(always)]
@@ -1313,7 +1315,7 @@ where
         self.before_instruction(code_offset);
         self.gas_visitor.branch_greater_unsigned_imm(s1, s2, imm);
         ArchVisitor(self).branch_greater_unsigned_imm(s1, s2, imm);
-        self.after_instruction::<true>(code_offset, args_length);
+        self.after_instruction::<END_BASIC_BLOCK>(code_offset, args_length);
     }
 
     #[inline(always)]
@@ -1321,7 +1323,7 @@ where
         self.before_instruction(code_offset);
         self.gas_visitor.branch_greater_signed_imm(s1, s2, imm);
         ArchVisitor(self).branch_greater_signed_imm(s1, s2, imm);
-        self.after_instruction::<true>(code_offset, args_length);
+        self.after_instruction::<END_BASIC_BLOCK>(code_offset, args_length);
     }
 
     #[inline(always)]
@@ -1329,7 +1331,7 @@ where
         self.before_instruction(code_offset);
         self.gas_visitor.load_imm(dst, value);
         ArchVisitor(self).load_imm(dst, value);
-        self.after_instruction::<false>(code_offset, args_length);
+        self.after_instruction::<CONTINUE_BASIC_BLOCK>(code_offset, args_length);
     }
 
     #[inline(always)]
@@ -1337,7 +1339,7 @@ where
         self.before_instruction(code_offset);
         self.gas_visitor.load_imm_and_jump(ra, value, target);
         ArchVisitor(self).load_imm_and_jump(ra, value, target);
-        self.after_instruction::<true>(code_offset, args_length);
+        self.after_instruction::<END_BASIC_BLOCK>(code_offset, args_length);
     }
 
     #[inline(always)]
@@ -1353,7 +1355,7 @@ where
         self.before_instruction(code_offset);
         self.gas_visitor.load_imm_and_jump_indirect(ra, base, value, offset);
         ArchVisitor(self).load_imm_and_jump_indirect(ra, base, value, offset);
-        self.after_instruction::<true>(code_offset, args_length);
+        self.after_instruction::<END_BASIC_BLOCK>(code_offset, args_length);
     }
 
     #[inline(always)]
@@ -1361,7 +1363,7 @@ where
         self.before_instruction(code_offset);
         self.gas_visitor.jump(target);
         ArchVisitor(self).jump(target);
-        self.after_instruction::<true>(code_offset, args_length);
+        self.after_instruction::<END_BASIC_BLOCK>(code_offset, args_length);
     }
 
     #[inline(always)]
@@ -1369,7 +1371,7 @@ where
         self.before_instruction(code_offset);
         self.gas_visitor.jump_indirect(base, offset);
         ArchVisitor(self).jump_indirect(base, offset);
-        self.after_instruction::<true>(code_offset, args_length);
+        self.after_instruction::<END_BASIC_BLOCK>(code_offset, args_length);
     }
 }
 

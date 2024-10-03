@@ -787,7 +787,11 @@ fn assert_assembler(input: &str, expected_output: &str) {
 
     let blob = assemble(input).expect("failed to assemble");
     let program = crate::program::ProgramBlob::parse(blob.into()).unwrap();
-    let output: Vec<_> = program.instructions().map(|inst| inst.kind.to_string()).collect();
+    let output: Vec<_> = program
+        .instructions(crate::program::DefaultInstructionSet::default())
+        .take_while(|inst| (inst.offset.0 as usize) < program.code().len())
+        .map(|inst| inst.kind.to_string())
+        .collect();
     let output = output.join("\n");
     assert_eq!(output, expected_output_clean);
 }

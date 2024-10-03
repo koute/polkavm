@@ -1,4 +1,4 @@
-use polkavm_common::program::{InstructionVisitor, Instructions, RawReg};
+use polkavm_common::program::{InstructionSet, InstructionVisitor, Instructions, RawReg};
 
 // TODO: Come up with a better cost model.
 #[derive(Default)]
@@ -22,6 +22,11 @@ impl GasVisitor {
 
 impl InstructionVisitor for GasVisitor {
     type ReturnTy = ();
+
+    #[cold]
+    fn invalid(&mut self) -> Self::ReturnTy {
+        self.trap();
+    }
 
     #[inline(always)]
     fn trap(&mut self) -> Self::ReturnTy {
@@ -695,7 +700,10 @@ impl InstructionVisitor for GasVisitor {
     }
 }
 
-pub fn calculate_for_block(mut instructions: Instructions) -> (u32, bool) {
+pub fn calculate_for_block<I>(mut instructions: Instructions<I>) -> (u32, bool)
+where
+    I: InstructionSet,
+{
     let mut visitor = GasVisitor::default();
     while instructions.visit(&mut visitor).is_some() {
         if let Some(cost) = visitor.last_block_cost {

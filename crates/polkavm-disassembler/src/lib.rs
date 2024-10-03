@@ -1,6 +1,6 @@
 use std::{collections::HashMap, io::Write};
 
-use polkavm_common::program::{ProgramBlob, ProgramCounter};
+use polkavm_common::program::{DefaultInstructionSet, ProgramBlob, ProgramCounter};
 
 #[derive(Copy, Clone, Debug, clap::ValueEnum)]
 pub enum DisassemblyFormat {
@@ -189,7 +189,7 @@ impl<'a> Disassembler<'a> {
 
         let mut in_new_block = true;
         let mut gas_cost_map = HashMap::new();
-        for instruction in self.blob.instructions() {
+        for instruction in self.blob.instructions(DefaultInstructionSet::default()) {
             if in_new_block {
                 in_new_block = false;
                 if let Some(cost) = module.calculate_gas_cost_for(instruction.offset) {
@@ -212,7 +212,7 @@ impl<'a> Disassembler<'a> {
         {
             let mut basic_block_counter = 0;
             let mut basic_block_started = true;
-            for instruction in self.blob.instructions() {
+            for instruction in self.blob.instructions(DefaultInstructionSet::default()) {
                 if basic_block_started {
                     instruction_offset_to_basic_block.insert(instruction.offset, basic_block_counter);
                     basic_block_started = false;
@@ -322,7 +322,7 @@ impl<'a> Disassembler<'a> {
         let mut pending_label = true;
         for (nth_instruction, instruction) in instructions.iter().copied().enumerate() {
             let offset = instruction.offset;
-            let length = instruction.length;
+            let length = core::cmp::min(instruction.next_offset.0, self.blob.code().len() as u32) - offset.0;
             let instruction = instruction.kind;
             let raw_bytes = &self.blob.code()[offset.0 as usize..offset.0 as usize + length as usize];
 
