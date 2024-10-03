@@ -6,3 +6,6 @@ publish = false
 
 [dependencies]
 polkavm-derive = { path = "../../crates/polkavm-derive" }
+
+[lints]
+workspace = true

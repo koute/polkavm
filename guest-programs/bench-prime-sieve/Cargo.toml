@@ -19,3 +19,6 @@ polkavm-derive = { path = "../../crates/polkavm-derive" }
 simplealloc = { path = "../../crates/simplealloc" }
 helper-macros = { path = "helper-macros" }
 softfloat = "1.0.0"
+
+[lints]
+workspace = true

@@ -17,3 +17,6 @@ path = "src/main.rs"
 polkavm-derive = { path = "../../crates/polkavm-derive" }
 simplealloc = { path = "../../crates/simplealloc" }
 nes = { git = "https://github.com/koute/pinky.git", rev = "5a9d4ff5f22731191cffd7d6202a1d144aacd740", default-features = false, features = ["softfloat"] }
+
+[lints]
+workspace = true
