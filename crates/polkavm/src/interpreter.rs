@@ -554,22 +554,14 @@ impl InterpretedInstance {
             || log::log_enabled!(target: "polkavm::interpreter", log::Level::Debug)
             || cfg!(test)
         {
-            if !self.step_tracing {
-                Ok(self.run_impl::<true, false>())
-            } else {
-                Ok(self.run_impl::<true, true>())
-            }
+            Ok(self.run_impl::<true>())
         } else {
-            if !self.step_tracing {
-                Ok(self.run_impl::<false, false>())
-            } else {
-                Ok(self.run_impl::<false, true>())
-            }
+            Ok(self.run_impl::<false>())
         }
     }
 
     #[inline(never)]
-    fn run_impl<const DEBUG: bool, const STEP_TRACING: bool>(&mut self) -> InterruptKind {
+    fn run_impl<const DEBUG: bool>(&mut self) -> InterruptKind {
         if !self.module.is_dynamic_paging() {
             self.basic_memory.mark_dirty();
         }
@@ -756,7 +748,7 @@ impl InterpretedInstance {
             #[cfg(debug_assertions)]
             let original_length = self.compiled_handlers.len();
 
-            instruction.visit(&mut Compiler::<DEBUG, false> {
+            instruction.visit(&mut Compiler::<DEBUG> {
                 program_counter: instruction.offset,
                 next_program_counter: instruction.next_offset,
                 compiled_handlers: &mut self.compiled_handlers,
@@ -2742,7 +2734,7 @@ define_interpreter! {
     }
 }
 
-struct Compiler<'a, const DEBUG: bool, const STEP_TRACING: bool> {
+struct Compiler<'a, const DEBUG: bool> {
     program_counter: ProgramCounter,
     next_program_counter: ProgramCounter,
     compiled_handlers: &'a mut Vec<Handler>,
@@ -2750,13 +2742,13 @@ struct Compiler<'a, const DEBUG: bool, const STEP_TRACING: bool> {
     module: &'a Module,
 }
 
-impl<'a, const DEBUG: bool, const STEP_TRACING: bool> Compiler<'a, DEBUG, STEP_TRACING> {
+impl<'a, const DEBUG: bool> Compiler<'a, DEBUG> {
     fn next_program_counter(&self) -> ProgramCounter {
         self.next_program_counter
     }
 }
 
-impl<'a, const DEBUG: bool, const STEP_TRACING: bool> InstructionVisitor for Compiler<'a, DEBUG, STEP_TRACING> {
+impl<'a, const DEBUG: bool> InstructionVisitor for Compiler<'a, DEBUG> {
     type ReturnTy = ();
 
     #[cold]
