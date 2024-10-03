@@ -29,6 +29,13 @@ test = false
 doc = false
 bench = false
 
+[[bin]]
+name = "fuzz_interpreter"
+path = "fuzz_targets/fuzz_interpreter.rs"
+test = false
+doc = false
+bench = false
+
 [workspace]
 resolver = "2"
 members = ["."]
