@@ -1493,6 +1493,7 @@ fn sbrk_knob_works(config: Config) {
         instance.set_gas(5);
         instance.set_next_program_counter(ProgramCounter(0));
 
+        #[allow(clippy::branches_sharing_code)]
         if sbrk_allowed {
             match_interrupt!(instance.run().unwrap(), InterruptKind::Finished);
             assert_eq!(instance.gas(), 3);
