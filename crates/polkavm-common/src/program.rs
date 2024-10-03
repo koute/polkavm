@@ -178,7 +178,7 @@ impl<T> VisitorHelper<T> {
     where
         T: ParsingVisitor,
     {
-        let (next_offset, args_length) = parse_bitmask_slow(bitmask, instruction_offset)?;
+        let (next_offset, args_length) = parse_bitmask_slow(bitmask, code.len(), instruction_offset)?;
         let chunk_length = core::cmp::min(16, args_length + 1);
         let chunk = code.get(instruction_offset..instruction_offset + chunk_length)?;
         let opcode = chunk[0];
@@ -207,10 +207,16 @@ impl<T> VisitorHelper<T> {
     where
         T: ParsingVisitor,
     {
-        if let Some((next_offset, args_length)) = parse_bitmask_fast(bitmask, instruction_offset) {
-            debug_assert!(args_length <= BITMASK_MAX as usize);
-            if let Some(chunk) = code.get(instruction_offset..instruction_offset + 32) {
-                assert!(chunk.len() >= 32);
+        #[cfg(debug_assertions)]
+        if code.len() % 8 == 0 {
+            debug_assert_eq!(bitmask.len() * 8, code.len());
+        } else {
+            debug_assert_eq!(bitmask.len() * 8, code.len() / 8 * 8 + 8);
+        }
+
+        if let Some(chunk) = code.get(instruction_offset..instruction_offset + 32) {
+            if let Some((next_offset, args_length)) = parse_bitmask_fast(bitmask, instruction_offset) {
+                debug_assert!(args_length <= BITMASK_MAX as usize);
                 let opcode = chunk[0];
 
                 // NOTE: This should produce the same assembly as the unsafe `read_unaligned`.
@@ -3035,7 +3041,7 @@ impl<'a> Iterator for JumpTableIter<'a> {
 const BITMASK_MAX: u32 = 24;
 
 #[cfg_attr(not(debug_assertions), inline(always))]
-fn parse_bitmask_slow(bitmask: &[u8], mut offset: usize) -> Option<(usize, usize)> {
+fn parse_bitmask_slow(bitmask: &[u8], code_length: usize, mut offset: usize) -> Option<(usize, usize)> {
     if bitmask.is_empty() {
         return None;
     }
@@ -3043,6 +3049,19 @@ fn parse_bitmask_slow(bitmask: &[u8], mut offset: usize) -> Option<(usize, usize
     offset += 1;
     let mut args_length = 0;
     while let Some(&byte) = bitmask.get(offset >> 3) {
+        let mut byte = byte;
+        if (offset >> 3) + 1 == bitmask.len() && code_length % 8 != 0 {
+            // We're at the last byte of bitmask, so we need to force the padding bytes to be `1`s.
+            //
+            // We wouldn't have to do this if we'd let the padding bytes to be `1` in the first place,
+            // but alas, the Graypaper requires them to be `0`s so we need to do this extra work here.
+            let padding_bits = bitmask.len() * 8 - code_length;
+            debug_assert!(padding_bits > 0 && padding_bits < 8);
+
+            let extra_bits = ((0b10000000_u8 as i8) >> (padding_bits - 1)) as u8;
+            byte |= extra_bits;
+        }
+
         let shift = offset & 7;
         let mask = byte >> shift;
         let length = if mask == 0 {
@@ -3088,7 +3107,7 @@ fn test_parse_bitmask() {
     #[track_caller]
     fn parse_both(bitmask: &[u8], offset: usize) -> Option<(usize, usize)> {
         let result_fast = parse_bitmask_fast(bitmask, offset);
-        let result_slow = parse_bitmask_slow(bitmask, offset);
+        let result_slow = parse_bitmask_slow(bitmask, bitmask.len() * 8, offset);
         assert_eq!(result_fast, result_slow);
 
         result_fast
@@ -3398,14 +3417,24 @@ impl ProgramBlob {
             blob.bitmask = reader.read_slice_as_bytes(bitmask_length)?;
 
             let mut expected_bitmask_length = blob.code.len() / 8;
-            if blob.code.len() % 8 != 0 {
-                expected_bitmask_length += 1;
-            }
+            let is_bitmask_padded = blob.code.len() % 8 != 0;
+            expected_bitmask_length += usize::from(is_bitmask_padded);
 
             if blob.bitmask.len() != expected_bitmask_length {
                 return Err(ProgramParseError(ProgramParseErrorKind::Other(
                     "the bitmask length doesn't match the code length",
                 )));
+            }
+
+            if is_bitmask_padded {
+                let last_byte = *blob.bitmask.last().unwrap();
+                let padding_bits = blob.bitmask.len() * 8 - blob.code.len();
+                let padding_mask = ((0b10000000_u8 as i8) >> (padding_bits - 1)) as u8;
+                if last_byte & padding_mask != 0 {
+                    return Err(ProgramParseError(ProgramParseErrorKind::Other(
+                        "the bitmask is padded with non-zero bits",
+                    )));
+                }
             }
         }
 

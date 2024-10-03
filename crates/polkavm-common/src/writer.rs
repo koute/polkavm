@@ -306,7 +306,7 @@ impl ProgramBlobBuilder {
 
             fn finish(mut self) -> Vec<u8> {
                 while self.bits > 0 {
-                    self.push(true);
+                    self.push(false);
                 }
                 self.bytes
             }
