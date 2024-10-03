@@ -1,5 +1,7 @@
 use polkavm_common::abi::{MemoryMapBuilder, VM_CODE_ADDRESS_ALIGNMENT, VM_MAX_PAGE_SIZE, VM_MIN_PAGE_SIZE};
-use polkavm_common::program::{self, FrameKind, Instruction, LineProgramOp, ProgramBlob, ProgramCounter, ProgramSymbol};
+use polkavm_common::program::{
+    self, FrameKind, Instruction, InstructionSet, LineProgramOp, Opcode, ProgramBlob, ProgramCounter, ProgramSymbol,
+};
 use polkavm_common::utils::{align_to_next_page_u32, align_to_next_page_u64};
 use polkavm_common::varint;
 use polkavm_common::writer::{ProgramBlobBuilder, Writer};
@@ -4463,7 +4465,7 @@ mod test {
             let mut program_counter_to_section_target = HashMap::new();
             let mut program_counter_to_instruction_index = HashMap::new();
             let mut in_new_block = true;
-            for instruction in blob.instructions() {
+            for instruction in blob.instructions(Bitness::B32) {
                 if in_new_block {
                     let block = self.add_section();
                     self.switch_section(block);
@@ -4479,11 +4481,11 @@ mod test {
                 }
             }
 
-            for instruction in blob.instructions() {
+            for instruction in blob.instructions(Bitness::B32) {
                 let out = &mut self.instructions[*program_counter_to_instruction_index.get(&instruction.offset).unwrap()].1;
                 match instruction.kind {
                     Instruction::fallthrough => {
-                        let target = *program_counter_to_section_target.get(&instruction.next_offset()).unwrap();
+                        let target = *program_counter_to_section_target.get(&instruction.next_offset).unwrap();
                         *out = ControlInst::Jump { target }.into();
                     }
                     Instruction::jump(target) => {
@@ -4517,7 +4519,7 @@ mod test {
                     }
                     Instruction::branch_less_unsigned_imm(src1, src2, target) | Instruction::branch_eq_imm(src1, src2, target) => {
                         let target_true = *program_counter_to_section_target.get(&polkavm::ProgramCounter(target)).unwrap();
-                        let target_false = *program_counter_to_section_target.get(&instruction.next_offset()).unwrap();
+                        let target_false = *program_counter_to_section_target.get(&instruction.next_offset).unwrap();
                         *out = ControlInst::Branch {
                             kind: match instruction.kind {
                                 Instruction::branch_less_unsigned_imm(..) => BranchKind::LessUnsigned,
@@ -6579,6 +6581,15 @@ enum Bitness {
     B64,
 }
 
+impl InstructionSet for Bitness {
+    fn opcode_from_u8(self, byte: u8) -> Option<Opcode> {
+        match self {
+            Bitness::B32 => polkavm_common::program::ISA32_V1.opcode_from_u8(byte),
+            Bitness::B64 => polkavm_common::program::ISA64_V1.opcode_from_u8(byte),
+        }
+    }
+}
+
 impl From<Bitness> for u64 {
     fn from(value: Bitness) -> Self {
         match value {
@@ -8351,8 +8362,8 @@ where
     if !config.strip {
         let blob = ProgramBlob::parse(builder.to_vec().into())?;
         offsets = blob
-            .instructions()
-            .map(|instruction| (instruction.offset, instruction.next_offset()))
+            .instructions(bitness)
+            .map(|instruction| (instruction.offset, instruction.next_offset))
             .collect();
         assert_eq!(offsets.len(), locations_for_instruction.len());
 

@@ -335,14 +335,25 @@ impl ProgramBlobBuilder {
             // Sanity check.
             let mut parsed = Vec::new();
             let mut offsets = alloc::collections::BTreeSet::new();
-            for instruction in crate::program::Instructions::new(&output.code, &output.bitmask, 0) {
+            for instruction in crate::program::Instructions::new_unbounded(
+                crate::program::DefaultInstructionSet::default(),
+                &output.code,
+                &output.bitmask,
+                0,
+            ) {
+                if instruction.offset.0 as usize == output.code.len() {
+                    // Implicit trap.
+                    debug_assert!(matches!(instruction.kind, Instruction::invalid));
+                    break;
+                }
                 parsed.push(instruction);
                 offsets.insert(instruction.offset);
             }
 
             assert_eq!(parsed.len(), instructions.len());
             for (nth_instruction, (mut parsed, entry)) in parsed.into_iter().zip(instructions.into_iter()).enumerate() {
-                if parsed.kind != entry.instruction || entry.position != parsed.offset.0 || u32::from(entry.bytes.length) != parsed.length {
+                let parsed_length = parsed.next_offset.0 - parsed.offset.0;
+                if parsed.kind != entry.instruction || entry.position != parsed.offset.0 || u32::from(entry.bytes.length) != parsed_length {
                     panic!(
                         concat!(
                             "Broken serialization for instruction #{}:\n",
@@ -364,8 +375,8 @@ impl ProgramBlobBuilder {
                         &entry.bytes.bytes[..entry.bytes.length as usize],
                         parsed.kind,
                         parsed.offset.0,
-                        parsed.length,
-                        &output.code[parsed.offset.0 as usize..parsed.offset.0 as usize + parsed.length as usize],
+                        parsed_length,
+                        &output.code[parsed.offset.0 as usize..parsed.offset.0 as usize + parsed_length as usize],
                     );
                 }
 

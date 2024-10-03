@@ -21,6 +21,7 @@ logging = ["dep:log"]
 regmap = ["dep:polkavm-assembler"]
 blake3 = ["dep:blake3"]
 unique-id = []
+export-internals-for-testing = []
 
 [dev-dependencies]
 proptest = { workspace = true }

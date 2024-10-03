@@ -154,14 +154,14 @@ fn load_blob(input: &Path) -> Result<ProgramBlob, String> {
 fn main_stats(inputs: Vec<PathBuf>) -> Result<(), String> {
     let mut map = HashMap::new();
     for opcode in 0..=255 {
-        if let Some(opcode) = Opcode::from_u8(opcode) {
+        if let Some(opcode) = Opcode::from_u8_any(opcode) {
             map.insert(opcode, 0);
         }
     }
 
     for input in inputs {
         let blob = load_blob(&input)?;
-        for instruction in blob.instructions() {
+        for instruction in blob.instructions(polkavm_common::program::DefaultInstructionSet::default()) {
             *map.get_mut(&instruction.opcode()).unwrap() += 1;
         }
     }

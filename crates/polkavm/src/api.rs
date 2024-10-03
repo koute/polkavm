@@ -4,8 +4,10 @@ use alloc::sync::Arc;
 use alloc::vec::Vec;
 
 use polkavm_common::abi::{MemoryMap, MemoryMapBuilder, VM_ADDR_RETURN_TO_HOST};
-use polkavm_common::program::{FrameKind, Imports, Reg};
-use polkavm_common::program::{Instructions, JumpTable, ProgramBlob};
+use polkavm_common::program::{
+    build_static_dispatch_table, FrameKind, ISA32_V1_NoSbrk, Imports, InstructionSet, Instructions, JumpTable, Opcode, ProgramBlob, Reg,
+    ISA32_V1,
+};
 use polkavm_common::utils::{ArcBytes, AsUninitSliceMut};
 
 use crate::config::{BackendKind, Config, GasMeteringKind, ModuleConfig, SandboxKind};
@@ -62,6 +64,21 @@ impl<T> IntoResult<T> for T {
 }
 
 pub type RegValue = u32;
+
+#[derive(Copy, Clone)]
+pub struct RuntimeInstructionSet {
+    allow_sbrk: bool,
+}
+
+impl InstructionSet for RuntimeInstructionSet {
+    fn opcode_from_u8(self, byte: u8) -> Option<Opcode> {
+        if self.allow_sbrk {
+            ISA32_V1.opcode_from_u8(byte)
+        } else {
+            ISA32_V1_NoSbrk.opcode_from_u8(byte)
+        }
+    }
+}
 
 pub struct Engine {
     selected_backend: BackendKind,
@@ -216,7 +233,7 @@ pub(crate) struct ModulePrivate {
     dynamic_paging: bool,
     page_size_mask: u32,
     page_shift: u32,
-    allow_sbrk: bool,
+    instruction_set: RuntimeInstructionSet,
     #[cfg(feature = "module-cache")]
     pub(crate) module_key: Option<ModuleKey>,
 }
@@ -275,8 +292,22 @@ impl Module {
         self.state().blob.code().len() as u32
     }
 
-    pub(crate) fn instructions_at(&self, offset: ProgramCounter) -> Option<Instructions> {
-        self.state().blob.instructions_at(offset)
+    pub(crate) fn instructions_bounded_at(&self, offset: ProgramCounter) -> Instructions<RuntimeInstructionSet> {
+        self.state().blob.instructions_bounded_at(self.state().instruction_set, offset)
+    }
+
+    pub(crate) fn is_jump_target_valid(&self, offset: ProgramCounter) -> bool {
+        self.state().blob.is_jump_target_valid(self.state().instruction_set, offset)
+    }
+
+    pub(crate) fn find_start_of_basic_block(&self, offset: ProgramCounter) -> Option<ProgramCounter> {
+        polkavm_common::program::find_start_of_basic_block(
+            self.state().instruction_set,
+            self.state().blob.code(),
+            self.state().blob.bitmask(),
+            offset.0,
+        )
+        .map(ProgramCounter)
     }
 
     pub(crate) fn jump_table(&self) -> JumpTable {
@@ -289,10 +320,6 @@ impl Module {
 
     pub(crate) fn gas_metering(&self) -> Option<GasMeteringKind> {
         self.state().gas_metering
-    }
-
-    pub(crate) fn allow_sbrk(&self) -> bool {
-        self.state().allow_sbrk
     }
 
     pub(crate) fn is_multiple_of_page_size(&self, value: u32) -> bool {
@@ -398,13 +425,18 @@ impl Module {
             aux_data_size: config.aux_data_size(),
         };
 
+        let instruction_set = RuntimeInstructionSet {
+            allow_sbrk: config.allow_sbrk,
+        };
+
         #[allow(unused_macros)]
         macro_rules! compile_module {
             ($sandbox_kind:ident, $visitor_name:ident, $module_kind:ident) => {{
                 type VisitorTy<'a> = crate::compiler::CompilerVisitor<'a, $sandbox_kind>;
-                let (visitor, aux) = crate::compiler::CompilerVisitor::<$sandbox_kind>::new(
+                let (mut visitor, aux) = crate::compiler::CompilerVisitor::<$sandbox_kind>::new(
                     &engine.state.compiler_cache,
                     config,
+                    instruction_set,
                     blob.jump_table(),
                     blob.code(),
                     blob.bitmask(),
@@ -414,8 +446,18 @@ impl Module {
                     init,
                 )?;
 
-                let run = polkavm_common::program::prepare_visitor!($visitor_name, VisitorTy<'a>);
-                let visitor = run(&blob, visitor);
+                if config.allow_sbrk {
+                    blob.visit(
+                        build_static_dispatch_table!($visitor_name, ISA32_V1, VisitorTy<'a>),
+                        &mut visitor,
+                    );
+                } else {
+                    blob.visit(
+                        build_static_dispatch_table!($visitor_name, ISA32_V1_NoSbrk, VisitorTy<'a>),
+                        &mut visitor,
+                    );
+                }
+
                 let global = $sandbox_kind::downcast_global_state(engine.state.sandbox_global.as_ref().unwrap());
                 let module = visitor.finish_compilation(global, &engine.state.compiler_cache, aux)?;
                 Some(CompiledModuleKind::$module_kind(module))
@@ -525,7 +567,7 @@ impl Module {
             is_strict: config.is_strict,
             step_tracing: config.step_tracing,
             dynamic_paging: config.dynamic_paging,
-            allow_sbrk: config.allow_sbrk,
+            instruction_set,
             crosscheck: engine.crosscheck,
             page_size_mask,
             page_shift,
@@ -696,8 +738,12 @@ impl Module {
     /// Will return `None` if the given `code_offset` is invalid.
     /// Mostly only useful for debugging.
     pub fn calculate_gas_cost_for(&self, code_offset: ProgramCounter) -> Option<Gas> {
-        let instructions = self.instructions_at(code_offset)?;
-        Some(i64::from(crate::gas::calculate_for_block(instructions).0))
+        if !self.is_jump_target_valid(code_offset) {
+            return None;
+        }
+
+        let gas = crate::gas::calculate_for_block(self.instructions_bounded_at(code_offset));
+        Some(i64::from(gas.0))
     }
 
     pub(crate) fn debug_print_location(&self, log_level: log::Level, pc: ProgramCounter) {
