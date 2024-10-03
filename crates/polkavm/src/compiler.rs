@@ -290,7 +290,7 @@ where
             native_jump_table[jump_table_length..].fill(JUMP_TABLE_INVALID_ADDRESS); // Fill in the padding, since the size is page-aligned.
 
             for (jump_table_index, code_offset) in self.jump_table.iter().enumerate() {
-                let mut address = 0;
+                let mut address = JUMP_TABLE_INVALID_ADDRESS;
                 if let Some(label) = self.program_counter_to_label.get(code_offset.0) {
                     if let Some(native_code_offset) = self.asm.get_label_origin_offset(label) {
                         address = native_code_origin.checked_add_signed(native_code_offset as i64).expect("overflow") as usize;
