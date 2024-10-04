@@ -1,7 +1,7 @@
-pre: a1 = 0xdeadbeef
+pre: a1 = 100
 
 pub @main:
     a0 = a1 if a3 == 0
 
-post: a0 = 0xdeadbeef
+post: a0 = 100
 post: gas = 9998

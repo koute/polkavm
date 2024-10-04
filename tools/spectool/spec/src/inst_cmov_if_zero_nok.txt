@@ -1,4 +1,4 @@
-pre: a1 = 0xdeadbeef
+pre: a1 = 100
 pre: a3 = 1
 pre: gas = 10000
 
