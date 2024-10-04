@@ -2,7 +2,6 @@ pre: gas = 10000
 
 pub @main:
     a0 = @target
-pub @expected_exit:
     tmp = a0, a0 = 1234, jump [tmp + 1]
     trap
 @target:
@@ -10,4 +9,5 @@ pub @expected_exit:
 
 post: a0 = 1234
 post: a2 = 0
-// TODO: post: gas = 9998
+post: gas = 9998
+post: pc = @main[1]
