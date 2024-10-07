@@ -392,6 +392,10 @@ impl From<SectionTarget> for SectionIndex {
     }
 }
 
+fn i32_to_i64(x: i32) -> i64 {
+    i64::from(x)
+}
+
 fn extract_delimited<'a>(str: &mut &'a str, prefix: &str, suffix: &str) -> Option<(&'a str, &'a str)> {
     let original = *str;
     let start_of_prefix = str.find(prefix)?;
@@ -479,6 +483,14 @@ impl SectionTarget {
         SectionTarget {
             section_index: self.section_index,
             offset: u64::from(cb(offset as i32) as u32),
+        }
+    }
+
+    fn map_offset_i64(self, cb: impl FnOnce(i64) -> i64) -> Self {
+        let offset = self.offset as i64;
+        SectionTarget {
+            section_index: self.section_index,
+            offset: cb(offset) as u64,
         }
     }
 }
@@ -1796,7 +1808,10 @@ fn convert_instruction(
                 // The optimizer can take care of this later, but doing it early here is more efficient.
                 emit(InstExt::Basic(BasicInst::LoadImmediate {
                     dst,
-                    imm: OperationKind::from(kind).apply_const(0, imm),
+                    imm: OperationKind::from(kind)
+                        .apply_const(0, i32_to_i64(imm))
+                        .try_into()
+                        .expect("load immediate overflow"),
                 }));
             } else {
                 emit(InstExt::Basic(BasicInst::AnyAny {
@@ -3463,34 +3478,98 @@ impl From<BranchKind> for OperationKind {
 }
 
 impl OperationKind {
-    fn apply_const(self, lhs: i32, rhs: i32) -> i32 {
+    fn apply_const(self, lhs: i64, rhs: i64) -> i64 {
         use polkavm_common::operation::*;
         #[allow(clippy::unnecessary_cast)]
         match self {
-            Self::Add => lhs.wrapping_add(rhs),
-            Self::Sub => lhs.wrapping_sub(rhs),
-            Self::And => lhs & rhs,
-            Self::Or => lhs | rhs,
-            Self::Xor => lhs ^ rhs,
-            Self::SetLessThanUnsigned => i32::from((lhs as u32) < (rhs as u32)),
-            Self::SetLessThanSigned => i32::from((lhs as i32) < (rhs as i32)),
-            Self::ShiftLogicalLeft => ((lhs as u32).wrapping_shl(rhs as u32)) as i32,
-            Self::ShiftLogicalRight => ((lhs as u32).wrapping_shr(rhs as u32)) as i32,
-            Self::ShiftArithmeticRight => (lhs as i32).wrapping_shr(rhs as u32),
+            Self::Add => {
+                let lhs: i32 = lhs.try_into().expect("add operand overflow");
+                let rhs: i32 = rhs.try_into().expect("add operand overflow");
+                i32_to_i64(lhs.wrapping_add(rhs))
+            }
+            Self::Sub => {
+                let lhs: i32 = lhs.try_into().expect("sub operand overflow");
+                let rhs: i32 = rhs.try_into().expect("sub operand overflow");
+                i32_to_i64(lhs.wrapping_sub(rhs))
+            }
+            Self::And => {
+                let lhs: i32 = lhs.try_into().expect("and operand overflow");
+                let rhs: i32 = rhs.try_into().expect("and operand overflow");
+                i32_to_i64(lhs & rhs)
+            }
+            Self::Or => {
+                let lhs: i32 = lhs.try_into().expect("or operand overflow");
+                let rhs: i32 = rhs.try_into().expect("or operand overflow");
+                i32_to_i64(lhs | rhs)
+            }
+            Self::Xor => {
+                let lhs: i32 = lhs.try_into().expect("xor operand overflow");
+                let rhs: i32 = rhs.try_into().expect("xor operand overflow");
+                i32_to_i64(lhs ^ rhs)
+            }
+            Self::SetLessThanUnsigned => i64::from((lhs as u64) < (rhs as u64)),
+            Self::SetLessThanSigned => i64::from((lhs as i64) < (rhs as i64)),
+            Self::ShiftLogicalLeft => {
+                let lhs: i32 = lhs.try_into().expect("shl operand overflow");
+                let rhs: i32 = rhs.try_into().expect("shl operand overflow");
+                i32_to_i64((lhs as u32).wrapping_shl(rhs as u32) as i32)
+            }
+            Self::ShiftLogicalRight => {
+                let lhs: i32 = lhs.try_into().expect("shr operand overflow");
+                let rhs: i32 = rhs.try_into().expect("shr operand overflow");
+                i32_to_i64((lhs as u32).wrapping_shr(rhs as u32) as i32)
+            }
+            Self::ShiftArithmeticRight => {
+                let lhs: i32 = lhs.try_into().expect("sha operand overflow");
+                let rhs: i32 = rhs.try_into().expect("sha operand overflow");
+                i32_to_i64((lhs as i32).wrapping_shr(rhs as u32))
+            }
 
-            Self::Mul => (lhs as i32).wrapping_mul(rhs as i32),
-            Self::MulUpperSignedSigned => mulh(lhs, rhs),
-            Self::MulUpperSignedUnsigned => mulhsu(lhs, rhs as u32),
-            Self::MulUpperUnsignedUnsigned => mulhu(lhs as u32, rhs as u32) as i32,
-            Self::Div => div(lhs, rhs),
-            Self::DivUnsigned => divu(lhs as u32, rhs as u32) as i32,
-            Self::Rem => rem(lhs, rhs),
-            Self::RemUnsigned => remu(lhs as u32, rhs as u32) as i32,
+            Self::Mul => {
+                let lhs: i32 = lhs.try_into().expect("mul operand overflow");
+                let rhs: i32 = rhs.try_into().expect("mul operand overflow");
+                i32_to_i64((lhs as i32).wrapping_mul(rhs as i32))
+            }
+            Self::MulUpperSignedSigned => {
+                let lhs: i32 = lhs.try_into().expect("mulh operand overflow");
+                let rhs: i32 = rhs.try_into().expect("mulh operand overflow");
+                i32_to_i64(mulh(lhs, rhs))
+            }
+            Self::MulUpperSignedUnsigned => {
+                let lhs: i32 = lhs.try_into().expect("mulhsu operand overflow");
+                let rhs: i32 = rhs.try_into().expect("mulhsu operand overflow");
+                i32_to_i64(mulhsu(lhs, rhs as u32))
+            }
+            Self::MulUpperUnsignedUnsigned => {
+                let lhs: i32 = lhs.try_into().expect("mulhu operand overflow");
+                let rhs: i32 = rhs.try_into().expect("mulhu operand overflow");
+                i32_to_i64(mulhu(lhs as u32, rhs as u32) as i32)
+            }
+            Self::Div => {
+                let lhs: i32 = lhs.try_into().expect("div operand overflow");
+                let rhs: i32 = rhs.try_into().expect("div operand overflow");
+                i32_to_i64(div(lhs, rhs))
+            }
+            Self::DivUnsigned => {
+                let lhs: i32 = lhs.try_into().expect("divu operand overflow");
+                let rhs: i32 = rhs.try_into().expect("divu operand overflow");
+                i32_to_i64(divu(lhs as u32, rhs as u32) as i32)
+            }
+            Self::Rem => {
+                let lhs: i32 = lhs.try_into().expect("rem operand overflow");
+                let rhs: i32 = rhs.try_into().expect("rem operand overflow");
+                i32_to_i64(rem(lhs, rhs))
+            }
+            Self::RemUnsigned => {
+                let lhs: i32 = lhs.try_into().expect("remu operand overflow");
+                let rhs: i32 = rhs.try_into().expect("remu operand overflow");
+                i32_to_i64(remu(lhs as u32, rhs as u32) as i32)
+            }
 
-            Self::Eq => i32::from(lhs == rhs),
-            Self::NotEq => i32::from(lhs != rhs),
-            Self::SetGreaterOrEqualUnsigned => i32::from((lhs as u32) >= (rhs as u32)),
-            Self::SetGreaterOrEqualSigned => i32::from((lhs as i32) >= (rhs as i32)),
+            Self::Eq => i64::from(lhs == rhs),
+            Self::NotEq => i64::from(lhs != rhs),
+            Self::SetGreaterOrEqualUnsigned => i64::from((lhs as u64) >= (rhs as u64)),
+            Self::SetGreaterOrEqualSigned => i64::from((lhs as i64) >= (rhs as i64)),
 
             _ => todo!("64bit support"),
         }
@@ -3506,7 +3585,7 @@ impl OperationKind {
                 C(self.apply_const(lhs, rhs))
             },
             (O::Add | O::Sub, RegValue::DataAddress(lhs), C(rhs)) => {
-                RegValue::DataAddress(lhs.map_offset_i32(|lhs| self.apply_const(lhs, rhs)))
+                RegValue::DataAddress(lhs.map_offset_i64(|lhs| self.apply_const(lhs, rhs)))
             }
 
             // (x == x) = 1
@@ -3569,15 +3648,15 @@ enum RegValue {
     InputReg(Reg, BlockTarget),
     CodeAddress(BlockTarget),
     DataAddress(SectionTarget),
-    Constant(i32),
+    Constant(i64),
     OutputReg {
         reg: Reg,
         source_block: BlockTarget,
-        bits_used: u32,
+        bits_used: u64,
     },
     Unknown {
         unique: u64,
-        bits_used: u32,
+        bits_used: u64,
     },
 }
 
@@ -3592,15 +3671,18 @@ impl RegValue {
                 dst,
                 target: AnyTarget::Data(target),
             }),
-            RegValue::Constant(imm) => Some(BasicInst::LoadImmediate { dst, imm }),
+            RegValue::Constant(imm) => {
+                let imm = i32::try_from(imm).expect("load immediate operand overflow");
+                Some(BasicInst::LoadImmediate { dst, imm })
+            }
             _ => None,
         }
     }
 
-    fn bits_used(self) -> u32 {
+    fn bits_used(self) -> u64 {
         match self {
-            RegValue::InputReg(..) | RegValue::CodeAddress(..) | RegValue::DataAddress(..) => !0,
-            RegValue::Constant(value) => value as u32,
+            RegValue::InputReg(..) | RegValue::CodeAddress(..) | RegValue::DataAddress(..) => u64::from(u32::MAX),
+            RegValue::Constant(value) => u64::from(value as u32),
             RegValue::Unknown { bits_used, .. } | RegValue::OutputReg { bits_used, .. } => bits_used,
         }
     }
@@ -3623,14 +3705,14 @@ impl BlockRegs {
             regs: Reg::ALL.map(|reg| RegValue::OutputReg {
                 reg,
                 source_block,
-                bits_used: u32::MAX,
+                bits_used: u64::from(u32::MAX),
             }),
         }
     }
 
     fn get_reg(&self, reg: impl Into<RegImm>) -> RegValue {
         match reg.into() {
-            RegImm::Imm(imm) => RegValue::Constant(imm as i32),
+            RegImm::Imm(imm) => RegValue::Constant(i32_to_i64(imm as i32)),
             RegImm::Reg(reg) => self.regs[reg as usize],
         }
     }
@@ -3829,7 +3911,7 @@ impl BlockRegs {
                 }
             }
             BasicInst::LoadImmediate { dst, imm } => {
-                if self.get_reg(dst) == RegValue::Constant(imm) {
+                if self.get_reg(dst) == RegValue::Constant(i32_to_i64(imm)) {
                     return Some(BasicInst::Nop);
                 }
             }
@@ -3839,7 +3921,7 @@ impl BlockRegs {
         None
     }
 
-    fn set_reg_unknown(&mut self, dst: Reg, unknown_counter: &mut u64, bits_used: u32) {
+    fn set_reg_unknown(&mut self, dst: Reg, unknown_counter: &mut u64, bits_used: u64) {
         if bits_used == 0 {
             self.set_reg(dst, RegValue::Constant(0));
             return;
@@ -3858,7 +3940,7 @@ impl BlockRegs {
     fn set_reg_from_instruction(&mut self, imports: &[Import], unknown_counter: &mut u64, instruction: BasicInst<AnyTarget>) {
         match instruction {
             BasicInst::LoadImmediate { dst, imm } => {
-                self.set_reg(dst, RegValue::Constant(imm));
+                self.set_reg(dst, RegValue::Constant(i32_to_i64(imm)));
             }
             BasicInst::LoadAddress {
                 dst,
@@ -3960,7 +4042,7 @@ impl BlockRegs {
             | BasicInst::LoadIndirect {
                 kind: LoadKind::U8, dst, ..
             } => {
-                self.set_reg_unknown(dst, unknown_counter, u32::from(u8::MAX));
+                self.set_reg_unknown(dst, unknown_counter, u64::from(u8::MAX));
             }
             BasicInst::LoadAbsolute {
                 kind: LoadKind::U16, dst, ..
@@ -3968,11 +4050,11 @@ impl BlockRegs {
             | BasicInst::LoadIndirect {
                 kind: LoadKind::U16, dst, ..
             } => {
-                self.set_reg_unknown(dst, unknown_counter, u32::from(u16::MAX));
+                self.set_reg_unknown(dst, unknown_counter, u64::from(u16::MAX));
             }
             _ => {
                 for dst in instruction.dst_mask(imports) {
-                    self.set_reg_unknown(dst, unknown_counter, !0);
+                    self.set_reg_unknown(dst, unknown_counter, u64::from(u32::MAX));
                 }
             }
         }
@@ -6401,7 +6483,11 @@ fn emit_code(
                             if is_optimized {
                                 unreachable!("internal error: instruction with only constant operands: {op:?}")
                             } else {
-                                I::load_imm(dst, OperationKind::from(kind).apply_const(src1 as i32, src2 as i32) as u32)
+                                let imm: u32 = OperationKind::from(kind)
+                                    .apply_const(i32_to_i64(src1 as i32), i32_to_i64(src2 as i32))
+                                    .try_into()
+                                    .expect("load immediate overflow");
+                                I::load_imm(dst, imm)
                             }
                         }
                     }
@@ -6552,7 +6638,7 @@ fn emit_code(
                         if is_optimized {
                             unreachable!("internal error: branch with only constant operands")
                         } else {
-                            match OperationKind::from(kind).apply_const(src1 as i32, src2 as i32) {
+                            match OperationKind::from(kind).apply_const(i32_to_i64(src1 as i32), i32_to_i64(src2 as i32)) {
                                 1 => unconditional_jump(target_true),
                                 0 => {
                                     assert!(can_fallthrough_to_next_block.contains(block_target));
