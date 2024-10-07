@@ -20,6 +20,10 @@ enum Args {
         #[clap(short = 's', long)]
         strip: bool,
 
+        /// Will disable optimizations.
+        #[clap(long)]
+        disable_optimizations: bool,
+
         /// Will only run if the output file doesn't exist, or the input is newer.
         #[clap(long)]
         run_only_if_newer: bool,
@@ -79,8 +83,9 @@ fn main() {
             output,
             input,
             strip,
+            disable_optimizations,
             run_only_if_newer,
-        } => main_link(input, output, strip, run_only_if_newer),
+        } => main_link(input, output, strip, disable_optimizations, run_only_if_newer),
         Args::Disassemble {
             output,
             format,
@@ -98,7 +103,7 @@ fn main() {
     }
 }
 
-fn main_link(input: PathBuf, output: PathBuf, strip: bool, run_only_if_newer: bool) -> Result<(), String> {
+fn main_link(input: PathBuf, output: PathBuf, strip: bool, disable_optimizations: bool, run_only_if_newer: bool) -> Result<(), String> {
     if run_only_if_newer {
         if let Ok(output_mtime) = std::fs::metadata(&output).and_then(|m| m.modified()) {
             if let Ok(input_mtime) = std::fs::metadata(&input).and_then(|m| m.modified()) {
@@ -111,6 +116,7 @@ fn main_link(input: PathBuf, output: PathBuf, strip: bool, run_only_if_newer: bo
 
     let mut config = polkavm_linker::Config::default();
     config.set_strip(strip);
+    config.set_optimize(!disable_optimizations);
 
     let data = match std::fs::read(&input) {
         Ok(data) => data,
