@@ -104,6 +104,7 @@ dependencies = [
  "arbitrary",
  "libfuzzer-sys",
  "polkavm",
+ "polkavm-common",
 ]
 
 [[package]]

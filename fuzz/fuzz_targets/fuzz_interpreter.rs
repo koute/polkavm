@@ -1,11 +1,11 @@
 #![no_main]
 
 use libfuzzer_sys::fuzz_target;
+use polkavm::Engine;
 use polkavm::InterruptKind;
 use polkavm::ModuleConfig;
-use polkavm::ProgramBlob;
 use polkavm::ProgramCounter;
-use polkavm::{ArcBytes, Engine};
+use polkavm_common::program::ProgramBlob;
 
 fn harness(data: &[u8]) {
     // configure the polkavm engine
@@ -21,15 +21,12 @@ fn harness(data: &[u8]) {
     module_config.set_step_tracing(true);
 
     // create a polkavm program blob (eventually to be filled with the fuzzed data)
-    let blob = ProgramBlob::default();
+    let mut fuzzed_blob = ProgramBlob::default();
 
     let bitmask = vec![0xff; data.len() / 8 + 1];
 
-    let fuzzed_blob = ProgramBlob {
-        code: data.into(),
-        bitmask: bitmask.into(),
-        ..blob
-    };
+    fuzzed_blob.set_code(data.into());
+    fuzzed_blob.set_bitmask(bitmask.into());
 
     // create a polkavm module from the engine, module config, and program blob
     let module = polkavm::Module::from_blob(&engine, &module_config, fuzzed_blob).unwrap();
