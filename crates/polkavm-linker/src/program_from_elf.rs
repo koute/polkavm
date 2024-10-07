@@ -1271,7 +1271,9 @@ where
             };
 
             // Ignore the address as written; we'll just use the relocations instead.
-            if let Err(error) = b.read_u32() {
+            let error = if elf.is_64() { b.read_u64().err() } else { b.read_u32().err() };
+
+            if let Some(error) = error {
                 return Err(ProgramFromElfError::other(format!("failed to parse export metadata: {}", error)));
             }
 
@@ -1281,14 +1283,20 @@ where
                 )));
             };
 
-            let RelocationKind::Abs {
-                target,
-                size: RelocationSize::U32,
-            } = relocation
-            else {
-                return Err(ProgramFromElfError::other(format!(
-                    "found an export with an unexpected relocation at {location}: {relocation:?}"
-                )));
+            let target = match relocation {
+                RelocationKind::Abs {
+                    target,
+                    size: RelocationSize::U64,
+                } if elf.is_64() => target,
+                RelocationKind::Abs {
+                    target,
+                    size: RelocationSize::U32,
+                } if !elf.is_64() => target,
+                _ => {
+                    return Err(ProgramFromElfError::other(format!(
+                        "found an export with an unexpected relocation at {location}: {relocation:?}"
+                    )));
+                }
             };
 
             parse_extern_metadata(elf, relocations, *target)?
@@ -1300,7 +1308,9 @@ where
         };
 
         // Ignore the address as written; we'll just use the relocations instead.
-        if let Err(error) = b.read_u32() {
+        let error = if elf.is_64() { b.read_u64().err() } else { b.read_u32().err() };
+
+        if let Some(error) = error {
             return Err(ProgramFromElfError::other(format!("failed to parse export metadata: {}", error)));
         }
 
@@ -1310,14 +1320,20 @@ where
             )));
         };
 
-        let RelocationKind::Abs {
-            target,
-            size: RelocationSize::U32,
-        } = relocation
-        else {
-            return Err(ProgramFromElfError::other(format!(
-                "found an export with an unexpected relocation at {location}: {relocation:?}"
-            )));
+        let target = match relocation {
+            RelocationKind::Abs {
+                target,
+                size: RelocationSize::U64,
+            } if elf.is_64() => target,
+            RelocationKind::Abs {
+                target,
+                size: RelocationSize::U32,
+            } if !elf.is_64() => target,
+            _ => {
+                return Err(ProgramFromElfError::other(format!(
+                    "found an export with an unexpected relocation at {location}: {relocation:?}"
+                )));
+            }
         };
 
         exports.push(Export {
@@ -2244,14 +2260,15 @@ where
 
         if crate::riscv::R(raw_inst).unpack() == (crate::riscv::OPCODE_CUSTOM_0, FUNC3_ECALLI, 0, RReg::Zero, RReg::Zero, RReg::Zero) {
             let initial_offset = relative_offset as u64;
+            let pointer_size = if elf.is_64() { 8 } else { 4 };
 
-            // `ret` can be 2 bytes long, so 4 + 4 + 2 = 10
-            if relative_offset + 10 > text.len() {
+            // `ret` can be 2 bytes long, so (on 32-bit): 4 (ecalli) + 4 (pointer) + 2 (ret) = 10
+            if relative_offset + pointer_size + 6 > text.len() {
                 return Err(ProgramFromElfError::other("truncated ecalli instruction"));
             }
 
             let target_location = current_location.add(4);
-            relative_offset += 8;
+            relative_offset += 4 + pointer_size;
 
             let Some(relocation) = relocations.get(&target_location) else {
                 return Err(ProgramFromElfError::other(format!(
@@ -2259,14 +2276,20 @@ where
                 )));
             };
 
-            let RelocationKind::Abs {
-                target: metadata_location,
-                size: RelocationSize::U32,
-            } = relocation
-            else {
-                return Err(ProgramFromElfError::other(format!(
-                    "found an external call with an unexpected relocation at {current_location}"
-                )));
+            let metadata_location = match relocation {
+                RelocationKind::Abs {
+                    target,
+                    size: RelocationSize::U64,
+                } if elf.is_64() => target,
+                RelocationKind::Abs {
+                    target,
+                    size: RelocationSize::U32,
+                } if !elf.is_64() => target,
+                _ => {
+                    return Err(ProgramFromElfError::other(format!(
+                        "found an external call with an unexpected relocation at {current_location}: {relocation:?}"
+                    )));
+                }
             };
 
             let metadata = parse_extern_metadata(elf, relocations, *metadata_location)?;
@@ -7136,6 +7159,17 @@ where
                     },
                 );
             }
+            (object::RelocationKind::Absolute, _)
+                if relocation.encoding() == object::RelocationEncoding::Generic && relocation.size() == 64 =>
+            {
+                data_relocations.insert(
+                    current_location,
+                    RelocationKind::Abs {
+                        target,
+                        size: RelocationSize::U64,
+                    },
+                );
+            }
             (_, object::RelocationFlags::Elf { r_type: reloc_kind }) => {
                 // https://github.com/riscv-non-isa/riscv-elf-psabi-doc/releases
                 match reloc_kind {
@@ -7718,8 +7752,8 @@ pub fn program_from_elf(config: Config, data: &[u8]) -> Result<Vec<u8>, ProgramF
     match Elf::<object::elf::FileHeader32<object::endian::LittleEndian>>::parse(data) {
         Ok(elf) => program_from_elf_internal(config, elf),
         Err(ProgramFromElfError(ProgramFromElfErrorKind::FailedToParseElf(e))) if e.to_string() == "Unsupported ELF header" => {
-            let _elf = Elf::<object::elf::FileHeader64<object::endian::LittleEndian>>::parse(data)?;
-            Err(ProgramFromElfError::other("64bit isn't fully supported yet"))
+            let elf = Elf::<object::elf::FileHeader64<object::endian::LittleEndian>>::parse(data)?;
+            program_from_elf_internal(config, elf)
         }
         Err(e) => Err(e),
     }
