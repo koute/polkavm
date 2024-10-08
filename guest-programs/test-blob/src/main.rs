@@ -56,7 +56,7 @@ extern "C" fn read_u32(address: u32) -> u32 {
 }
 
 #[polkavm_derive::polkavm_export]
-extern "C" fn atomic_fetch_add(value: u32) -> u32 {
+extern "C" fn atomic_fetch_add(value: usize) -> usize {
     unsafe {
         let output;
         core::arch::asm!(
@@ -69,7 +69,7 @@ extern "C" fn atomic_fetch_add(value: u32) -> u32 {
 }
 
 #[polkavm_derive::polkavm_export]
-extern "C" fn atomic_fetch_swap(value: u32) -> u32 {
+extern "C" fn atomic_fetch_swap(value: usize) -> usize {
     unsafe {
         let output;
         core::arch::asm!(
@@ -82,7 +82,7 @@ extern "C" fn atomic_fetch_swap(value: u32) -> u32 {
 }
 
 #[polkavm_derive::polkavm_export]
-extern "C" fn atomic_fetch_max_signed(value: i32) -> i32 {
+extern "C" fn atomic_fetch_max_signed(value: isize) -> isize {
     unsafe {
         let output;
         core::arch::asm!(
@@ -95,7 +95,7 @@ extern "C" fn atomic_fetch_max_signed(value: i32) -> i32 {
 }
 
 #[polkavm_derive::polkavm_export]
-extern "C" fn atomic_fetch_min_signed(value: i32) -> i32 {
+extern "C" fn atomic_fetch_min_signed(value: isize) -> isize {
     unsafe {
         let output;
         core::arch::asm!(
@@ -108,7 +108,7 @@ extern "C" fn atomic_fetch_min_signed(value: i32) -> i32 {
 }
 
 #[polkavm_derive::polkavm_export]
-extern "C" fn atomic_fetch_max_unsigned(value: u32) -> u32 {
+extern "C" fn atomic_fetch_max_unsigned(value: usize) -> usize {
     unsafe {
         let output;
         core::arch::asm!(
@@ -121,7 +121,7 @@ extern "C" fn atomic_fetch_max_unsigned(value: u32) -> u32 {
 }
 
 #[polkavm_derive::polkavm_export]
-extern "C" fn atomic_fetch_min_unsigned(value: u32) -> u32 {
+extern "C" fn atomic_fetch_min_unsigned(value: usize) -> usize {
     unsafe {
         let output;
         core::arch::asm!(
@@ -177,6 +177,7 @@ extern "C" fn test_multiply_by_6(value: u32) -> u32 {
 #[polkavm_derive::polkavm_define_abi(allow_extra_input_registers)]
 mod test_abi {}
 
+#[cfg(target_pointer_width = "32")]
 impl test_abi::FromHost for f32 {
     type Regs = (u32,);
     fn from_host((a0,): Self::Regs) -> Self {
@@ -184,11 +185,29 @@ impl test_abi::FromHost for f32 {
     }
 }
 
+#[cfg(target_pointer_width = "32")]
 impl test_abi::IntoHost for f32 {
     type Regs = (u32,);
     type Destructor = ();
     fn into_host(value: f32) -> (Self::Regs, Self::Destructor) {
         ((value.to_bits(),), ())
+    }
+}
+
+#[cfg(target_pointer_width = "64")]
+impl test_abi::FromHost for f32 {
+    type Regs = (u64,);
+    fn from_host((a0,): Self::Regs) -> Self {
+        f32::from_bits(a0 as u32)
+    }
+}
+
+#[cfg(target_pointer_width = "64")]
+impl test_abi::IntoHost for f32 {
+    type Regs = (u64,);
+    type Destructor = ();
+    fn into_host(value: f32) -> (Self::Regs, Self::Destructor) {
+        ((u64::from(value.to_bits()),), ())
     }
 }
 
