@@ -3594,7 +3594,8 @@ impl OperationKind {
             Self::SetGreaterOrEqualUnsigned => i64::from((lhs as u64) >= (rhs as u64)),
             Self::SetGreaterOrEqualSigned => i64::from((lhs as i64) >= (rhs as i64)),
 
-            _ => todo!("64bit support"),
+            Self::Add64 => lhs.wrapping_add(rhs),
+            _ => todo!("unimplemented 64-bit operation: {self:?}"),
         }
     }
 
