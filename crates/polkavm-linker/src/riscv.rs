@@ -96,13 +96,13 @@ impl LoadKind {
     #[inline(always)]
     const fn decode(value: u32, rv64: bool) -> Option<Self> {
         match value & 0b111 {
-            0b000 => Some(LoadKind::I8),
-            0b001 => Some(LoadKind::I16),
-            0b010 => Some(LoadKind::U32),
-            0b100 => Some(LoadKind::U8),
-            0b101 => Some(LoadKind::U16),
-            0b110 if rv64 => Some(LoadKind::I32),
-            0b011 if rv64 => Some(LoadKind::U64),
+            0b000 => Some(LoadKind::I8),          // LB
+            0b001 => Some(LoadKind::I16),         // LH
+            0b010 => Some(LoadKind::I32),         // LW
+            0b100 => Some(LoadKind::U8),          // LBU
+            0b101 => Some(LoadKind::U16),         // LBH
+            0b110 if rv64 => Some(LoadKind::U32), // LWU
+            0b011 if rv64 => Some(LoadKind::U64), // LD
             _ => None,
         }
     }
@@ -576,7 +576,7 @@ impl Inst {
             }),
             // C.LW expands to lw rd′, offset[6:2](rs1′)
             (0b00, 0b010) => Some(Inst::Load {
-                kind: if rv64 { LoadKind::I32 } else { LoadKind::U32 },
+                kind: LoadKind::I32,
                 dst: Reg::decode_compressed(op >> 2),
                 base: Reg::decode_compressed(op >> 7),
                 offset: (bits(3, 5, op, 10) | bits(2, 2, op, 6) | bits(6, 6, op, 5)) as i32,
@@ -764,7 +764,7 @@ impl Inst {
             (0b10, 0b010) => match Reg::decode(op >> 7) {
                 Reg::Zero => None,
                 rd => Some(Inst::Load {
-                    kind: xlen!(LoadKind, U32, I32),
+                    kind: LoadKind::I32,
                     dst: rd,
                     base: Reg::SP,
                     offset: (bits(5, 5, op, 12) | bits(2, 4, op, 4) | bits(6, 7, op, 2)) as i32,
@@ -1059,14 +1059,13 @@ impl Inst {
                 let release = ((op >> 25) & 1) != 0;
                 let acquire = ((op >> 26) & 1) != 0;
                 let funct3 = (op >> 12) & 0b111;
-                let is_word = match funct3 {
-                    0b011 if rv64 => false,
-                    0b010 if rv64 => true,
+                let is_64_bit = match funct3 {
+                    0b011 if rv64 => true,
                     0b010 => false,
                     _ => return None,
                 };
 
-                match (kind, is_word) {
+                match (kind, is_64_bit) {
                     (0b00010, true) if src2 == Reg::Zero => Some(Inst::LoadReserved64 {
                         acquire,
                         release,
@@ -1094,7 +1093,7 @@ impl Inst {
                         src: src2,
                     }),
                     _ => {
-                        let kind = match (kind, is_word) {
+                        let kind = match (kind, is_64_bit) {
                             (0b00000, true) => AtomicKind::Add64,
                             (0b00001, true) => AtomicKind::Swap64,
                             (0b00100, true) => AtomicKind::Xor64,
@@ -1643,7 +1642,7 @@ mod test_decode_compressed {
         assert_eq!(
             Inst::decode_compressed(op, false),
             Some(Inst::Load {
-                kind: LoadKind::U32,
+                kind: LoadKind::I32,
                 dst: Reg::decode_compressed(0b111),
                 base: Reg::decode_compressed(0b010),
                 offset: 0b1101000
@@ -2212,7 +2211,7 @@ mod test_decode_compressed {
         assert_eq!(
             Inst::decode_compressed(op, false),
             Some(Inst::Load {
-                kind: LoadKind::U32,
+                kind: LoadKind::I32,
                 dst: Reg::A2,
                 base: Reg::SP,
                 offset: 0b10101000

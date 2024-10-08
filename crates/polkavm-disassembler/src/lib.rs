@@ -522,9 +522,9 @@ mod tests {
         builder.set_code(
             &[
                 asm::store_imm_u32(memory_map.rw_data_address(), 0x12345678),
-                asm::add(S0, A0, A1),
+                asm::add_32(S0, A0, A1),
                 asm::ecalli(0),
-                asm::add(A0, A0, S0),
+                asm::add_32(A0, A0, S0),
                 asm::ret(),
             ],
             &[],

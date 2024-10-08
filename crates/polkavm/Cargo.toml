@@ -29,6 +29,7 @@ polkavm-linker = { workspace = true }
 image = { workspace = true, features = ["tga"] }
 ruzstd = { workspace = true }
 paste = { workspace = true }
+nes = { git = "https://github.com/koute/pinky.git", rev = "5a9d4ff5f22731191cffd7d6202a1d144aacd740", default-features = false, features = ["softfloat"] }
 
 [lints]
 workspace = true

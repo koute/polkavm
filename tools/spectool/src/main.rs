@@ -51,14 +51,14 @@ struct MemoryChunk {
 #[serde(rename_all = "kebab-case")]
 struct TestcaseJson {
     name: String,
-    initial_regs: [u32; 13],
+    initial_regs: [u64; 13],
     initial_pc: u32,
     initial_page_map: Vec<Page>,
     initial_memory: Vec<MemoryChunk>,
     initial_gas: i64,
     program: Vec<u8>,
     expected_status: String,
-    expected_regs: Vec<u32>,
+    expected_regs: Vec<u64>,
     expected_pc: u32,
     expected_memory: Vec<MemoryChunk>,
     expected_gas: i64,
@@ -83,7 +83,7 @@ fn extract_chunks(base_address: u32, slice: &[u8]) -> Vec<MemoryChunk> {
 #[derive(Default)]
 struct PrePost {
     gas: Option<i64>,
-    regs: [Option<u32>; 13],
+    regs: [Option<u64>; 13],
     pc: Option<(String, u32)>,
 }
 
@@ -118,7 +118,7 @@ fn parse_pre_post(line: &str, output: &mut PrePost) {
     } else {
         let lhs = polkavm_common::utils::parse_reg(lhs).expect("invalid 'pre' / 'post' directive: failed to parse lhs");
         let rhs = polkavm_common::utils::parse_imm(rhs).expect("invalid 'pre' / 'post' directive: failed to parse rhs");
-        output.regs[lhs as usize] = Some(rhs as u32);
+        output.regs[lhs as usize] = Some(i64::from(rhs) as u64);
     }
 }
 

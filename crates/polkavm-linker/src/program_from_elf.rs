@@ -38,6 +38,7 @@ enum Reg {
     E0 = 13,
     E1 = 14,
     E2 = 15,
+    E3 = 16,
 }
 
 impl From<polkavm_common::program::Reg> for Reg {
@@ -116,6 +117,7 @@ impl Reg {
             E0 => "e0",
             E1 => "e1",
             E2 => "e2",
+            E3 => "e3",
         }
     }
 
@@ -124,16 +126,17 @@ impl Reg {
             Reg::E0 => Some(0),
             Reg::E1 => Some(1),
             Reg::E2 => Some(2),
+            Reg::E3 => Some(3),
             _ => None,
         }
     }
 
-    const ALL: [Reg; 16] = {
+    const ALL: [Reg; 17] = {
         use Reg::*;
-        [RA, SP, T0, T1, T2, S0, S1, A0, A1, A2, A3, A4, A5, E0, E1, E2]
+        [RA, SP, T0, T1, T2, S0, S1, A0, A1, A2, A3, A4, A5, E0, E1, E2, E3]
     };
 
-    const FAKE: [Reg; 3] = { [Reg::E0, Reg::E1, Reg::E2] };
+    const FAKE: [Reg; 4] = { [Reg::E0, Reg::E1, Reg::E2, Reg::E3] };
     const INPUT_REGS: [Reg; 9] = [Reg::A0, Reg::A1, Reg::A2, Reg::A3, Reg::A4, Reg::A5, Reg::T0, Reg::T1, Reg::T2];
     const OUTPUT_REGS: [Reg; 2] = [Reg::A0, Reg::A1];
 }
@@ -1995,7 +1998,7 @@ fn convert_instruction(
             };
 
             emit(InstExt::Basic(BasicInst::LoadIndirect {
-                kind: if rv64 { LoadKind::I32 } else { LoadKind::U32 },
+                kind: LoadKind::I32,
                 dst,
                 base: src,
                 offset: 0,
@@ -2085,7 +2088,47 @@ fn convert_instruction(
                 ));
             };
 
-            let operand = cast_reg_non_zero(operand)?;
+            let is_64_bit = match kind {
+                AtomicKind::Swap
+                | AtomicKind::Add
+                | AtomicKind::And
+                | AtomicKind::Or
+                | AtomicKind::Xor
+                | AtomicKind::MaxSigned
+                | AtomicKind::MinSigned
+                | AtomicKind::MaxUnsigned
+                | AtomicKind::MinUnsigned => false,
+
+                AtomicKind::Swap64
+                | AtomicKind::Add64
+                | AtomicKind::MaxSigned64
+                | AtomicKind::MinSigned64
+                | AtomicKind::MaxUnsigned64
+                | AtomicKind::MinUnsigned64
+                | AtomicKind::And64
+                | AtomicKind::Or64
+                | AtomicKind::Xor64 => true,
+            };
+
+            let mut operand = cast_reg_non_zero(operand)?;
+            if rv64 && !is_64_bit {
+                // Zero-extend the operand to ignore any bits that might be there.
+                if let Some(src) = operand {
+                    emit(InstExt::Basic(BasicInst::AnyAny {
+                        kind: AnyAnyKind::ShiftLogicalLeft64,
+                        dst: Reg::E3,
+                        src1: RegImm::Reg(src),
+                        src2: RegImm::Imm(32),
+                    }));
+                    emit(InstExt::Basic(BasicInst::AnyAny {
+                        kind: AnyAnyKind::ShiftArithmeticRight64,
+                        dst: Reg::E3,
+                        src1: RegImm::Reg(Reg::E3),
+                        src2: RegImm::Imm(32),
+                    }));
+                }
+                operand = Some(Reg::E3);
+            }
             let operand_regimm = operand.map_or(RegImm::Imm(0), RegImm::Reg);
             let (old_value, new_value, output) = match cast_reg_non_zero(old_value)? {
                 None => (Reg::E0, Reg::E0, None),
@@ -2094,7 +2137,7 @@ fn convert_instruction(
             };
 
             emit(InstExt::Basic(BasicInst::LoadIndirect {
-                kind: LoadKind::U32,
+                kind: if is_64_bit { LoadKind::U64 } else { LoadKind::I32 },
                 dst: old_value,
                 base: addr,
                 offset: 0,
@@ -2209,7 +2252,7 @@ fn convert_instruction(
             }
 
             emit(InstExt::Basic(BasicInst::StoreIndirect {
-                kind: StoreKind::U32,
+                kind: if is_64_bit { StoreKind::U64 } else { StoreKind::U32 },
                 src: new_value.into(),
                 base: addr,
                 offset: 0,
@@ -3633,7 +3676,23 @@ impl OperationKind {
             Self::SetGreaterOrEqualSigned => i64::from((lhs as i64) >= (rhs as i64)),
 
             Self::Add64 => lhs.wrapping_add(rhs),
-            _ => todo!("unimplemented 64-bit operation: {self:?}"),
+            Self::Sub64 => lhs.wrapping_sub(rhs),
+            Self::And64 => lhs & rhs,
+            Self::Or64 => lhs | rhs,
+            Self::Xor64 => lhs ^ rhs,
+            Self::SetLessThanUnsigned64 => i64::from((lhs as u64) < (rhs as u64)),
+            Self::SetLessThanSigned64 => i64::from((lhs as i64) < (rhs as i64)),
+            Self::ShiftLogicalLeft64 => (lhs as u64).wrapping_shl(rhs as u32) as i64,
+            Self::ShiftLogicalRight64 => (lhs as u64).wrapping_shr(rhs as u32) as i64,
+            Self::ShiftArithmeticRight64 => lhs.wrapping_shr(rhs as u32),
+            Self::Mul64 => lhs.wrapping_mul(rhs),
+            Self::MulUpperSignedSigned64 => todo!(),
+            Self::MulUpperSignedUnsigned64 => todo!(),
+            Self::MulUpperUnsignedUnsigned64 => todo!(),
+            Self::Div64 => todo!(),
+            Self::DivUnsigned64 => todo!(),
+            Self::Rem64 => todo!(),
+            Self::RemUnsigned64 => todo!(),
         }
     }
 
@@ -4663,7 +4722,7 @@ mod test {
                         }
                         .into();
                     }
-                    Instruction::add_imm(dst, src, imm) => {
+                    Instruction::add_imm_32(dst, src, imm) => {
                         *out = BasicInst::AnyAny {
                             kind: AnyAnyKind::Add,
                             dst: dst.into(),
@@ -4672,7 +4731,7 @@ mod test {
                         }
                         .into();
                     }
-                    Instruction::add(dst, src1, src2) => {
+                    Instruction::add_32(dst, src1, src2) => {
                         *out = BasicInst::AnyAny {
                             kind: AnyAnyKind::Add,
                             dst: dst.into(),
@@ -4795,6 +4854,7 @@ mod test {
                 &used_imports,
                 &jump_target_for_block,
                 true,
+                false,
             )
             .unwrap();
 
@@ -4937,7 +4997,7 @@ mod test {
         assert!(matches!(i.run().unwrap(), polkavm::InterruptKind::Finished));
     }
 
-    fn expect_regs(regs: impl IntoIterator<Item = (Reg, u32)> + Clone) -> impl FnMut(&mut polkavm::RawInstance, &mut polkavm::RawInstance) {
+    fn expect_regs(regs: impl IntoIterator<Item = (Reg, u64)> + Clone) -> impl FnMut(&mut polkavm::RawInstance, &mut polkavm::RawInstance) {
         move |a: &mut polkavm::RawInstance, b: &mut polkavm::RawInstance| {
             for (reg, value) in regs.clone() {
                 assert_eq!(b.reg(reg), value);
@@ -5205,6 +5265,7 @@ fn spill_fake_registers(
     imports: &[Import],
     used_blocks: &[BlockTarget],
     regspill_size: &mut usize,
+    is_64_bit: bool,
 ) {
     struct RegAllocBlock<'a> {
         instructions: &'a [Vec<regalloc2::Operand>],
@@ -5453,16 +5514,18 @@ fn spill_fake_registers(
                 // Advance the iterator so that we can use `continue` later.
                 edits.next();
 
+                let reg_size = if is_64_bit { 8 } else { 4 };
+
                 let src_reg = src.as_reg();
                 let dst_reg = dst.as_reg();
                 let new_instruction = match (dst_reg, src_reg) {
                     (Some(dst_reg), None) => {
                         let dst_reg = Reg::from_usize(dst_reg.hw_enc()).unwrap();
                         let src_slot = src.as_stack().unwrap();
-                        let offset = src_slot.index() * 4;
-                        *regspill_size = core::cmp::max(*regspill_size, offset + 4);
+                        let offset = src_slot.index() * reg_size;
+                        *regspill_size = core::cmp::max(*regspill_size, offset + reg_size);
                         BasicInst::LoadAbsolute {
-                            kind: LoadKind::U32,
+                            kind: if is_64_bit { LoadKind::U64 } else { LoadKind::I32 },
                             dst: dst_reg,
                             target: SectionTarget {
                                 section_index: section_regspill,
@@ -5473,10 +5536,10 @@ fn spill_fake_registers(
                     (None, Some(src_reg)) => {
                         let src_reg = Reg::from_usize(src_reg.hw_enc()).unwrap();
                         let dst_slot = dst.as_stack().unwrap();
-                        let offset = dst_slot.index() * 4;
-                        *regspill_size = core::cmp::max(*regspill_size, offset + 4);
+                        let offset = dst_slot.index() * reg_size;
+                        *regspill_size = core::cmp::max(*regspill_size, offset + reg_size);
                         BasicInst::StoreAbsolute {
-                            kind: StoreKind::U32,
+                            kind: if is_64_bit { StoreKind::U64 } else { StoreKind::U32 },
                             src: src_reg.into(),
                             target: SectionTarget {
                                 section_index: section_regspill,
@@ -5490,6 +5553,7 @@ fn spill_fake_registers(
                         if src_reg == dst_reg {
                             continue;
                         }
+
                         BasicInst::MoveReg {
                             dst: dst_reg,
                             src: src_reg,
@@ -6252,6 +6316,7 @@ fn emit_code(
     used_imports: &HashSet<usize>,
     jump_target_for_block: &[Option<JumpTarget>],
     is_optimized: bool,
+    is_64_bit: bool,
 ) -> Result<Vec<(SourceStack, Instruction)>, ProgramFromElfError> {
     use polkavm_common::program::Reg as PReg;
     fn conv_reg(reg: Reg) -> polkavm_common::program::RawReg {
@@ -6269,7 +6334,7 @@ fn emit_code(
             Reg::A3 => PReg::A3,
             Reg::A4 => PReg::A4,
             Reg::A5 => PReg::A5,
-            Reg::E0 | Reg::E1 | Reg::E2 => {
+            Reg::E0 | Reg::E1 | Reg::E2 | Reg::E3 => {
                 unreachable!("internal error: temporary register was not spilled into memory");
             }
         }
@@ -6450,7 +6515,11 @@ fn emit_code(
                     };
 
                     let value = get_data_address(target)?;
-                    Instruction::load_u32(conv_reg(dst), value)
+                    if is_64_bit {
+                        Instruction::load_u64(conv_reg(dst), value)
+                    } else {
+                        Instruction::load_i32(conv_reg(dst), value)
+                    }
                 }
                 BasicInst::RegReg { kind, dst, src1, src2 } => {
                     use RegRegKind as K;
@@ -6459,14 +6528,14 @@ fn emit_code(
                         kind = kind,
                         {
                             K::MulUpperSignedUnsigned => mul_upper_signed_unsigned,
-                            K::MulUpperSignedUnsigned64 => mul_upper_signed_unsigned_64,
-                            K::Div => div_signed,
+                            K::MulUpperSignedUnsigned64 => mul_upper_signed_unsigned,
+                            K::Div => div_signed_32,
                             K::Div64 => div_signed_64,
-                            K::DivUnsigned => div_unsigned,
+                            K::DivUnsigned => div_unsigned_32,
                             K::DivUnsigned64 => div_unsigned_64,
-                            K::Rem => rem_signed,
+                            K::Rem => rem_signed_32,
                             K::Rem64 => rem_signed_64,
-                            K::RemUnsigned => rem_unsigned,
+                            K::RemUnsigned => rem_unsigned_32,
                             K::RemUnsigned64 => rem_unsigned_64,
                         }
                     }
@@ -6482,96 +6551,90 @@ fn emit_code(
                                 args = (dst, conv_reg(src1), conv_reg(src2)),
                                 kind = kind,
                                 {
-                                    K::Add => add,
+                                    K::Add => add_32,
                                     K::Add64 => add_64,
-                                    K::Sub => sub,
+                                    K::Sub => sub_32,
                                     K::Sub64 => sub_64,
-                                    K::ShiftLogicalLeft => shift_logical_left,
+                                    K::ShiftLogicalLeft => shift_logical_left_32,
                                     K::ShiftLogicalLeft64 => shift_logical_left_64,
                                     K::SetLessThanSigned => set_less_than_signed,
-                                    K::SetLessThanSigned64 => set_less_than_signed_64,
+                                    K::SetLessThanSigned64 => set_less_than_signed,
                                     K::SetLessThanUnsigned => set_less_than_unsigned,
-                                    K::SetLessThanUnsigned64 => set_less_than_unsigned_64,
+                                    K::SetLessThanUnsigned64 => set_less_than_unsigned,
                                     K::Xor => xor,
-                                    K::Xor64 => xor_64,
-                                    K::ShiftLogicalRight => shift_logical_right,
+                                    K::Xor64 => xor,
+                                    K::ShiftLogicalRight => shift_logical_right_32,
                                     K::ShiftLogicalRight64 => shift_logical_right_64,
-                                    K::ShiftArithmeticRight => shift_arithmetic_right,
+                                    K::ShiftArithmeticRight => shift_arithmetic_right_32,
                                     K::ShiftArithmeticRight64 => shift_arithmetic_right_64,
                                     K::Or => or,
-                                    K::Or64 => or_64,
+                                    K::Or64 => or,
                                     K::And => and,
-                                    K::And64 => and_64,
-                                    K::Mul => mul,
+                                    K::And64 => and,
+                                    K::Mul => mul_32,
                                     K::Mul64 => mul_64,
                                     K::MulUpperSignedSigned => mul_upper_signed_signed,
-                                    K::MulUpperSignedSigned64 => mul_upper_signed_signed_64,
+                                    K::MulUpperSignedSigned64 => mul_upper_signed_signed,
                                     K::MulUpperUnsignedUnsigned => mul_upper_unsigned_unsigned,
-                                    K::MulUpperUnsignedUnsigned64 => mul_upper_unsigned_unsigned_64,
+                                    K::MulUpperUnsignedUnsigned64 => mul_upper_unsigned_unsigned,
                                 }
                             }
                         }
                         (RegImm::Reg(src1), RegImm::Imm(src2)) => {
                             let src1 = conv_reg(src1);
                             match kind {
-                                K::Add => I::add_imm(dst, src1, src2),
-                                K::Add64 => I::add_64_imm(dst, src1, src2),
-                                K::Sub => I::add_imm(dst, src1, (-(src2 as i32)) as u32),
-                                K::Sub64 => I::add_64_imm(dst, src1, (-(src2 as i32)) as u32),
-                                K::ShiftLogicalLeft => I::shift_logical_left_imm(dst, src1, src2),
-                                K::ShiftLogicalLeft64 => I::shift_logical_left_64_imm(dst, src1, src2),
+                                K::Add => I::add_imm_32(dst, src1, src2),
+                                K::Add64 => I::add_imm_64(dst, src1, src2),
+                                K::Sub => I::add_imm_32(dst, src1, (-(src2 as i32)) as u32),
+                                K::Sub64 => I::add_imm_64(dst, src1, (-(src2 as i32)) as u32),
+                                K::ShiftLogicalLeft => I::shift_logical_left_imm_32(dst, src1, src2),
+                                K::ShiftLogicalLeft64 => I::shift_logical_left_imm_64(dst, src1, src2),
                                 K::SetLessThanSigned => I::set_less_than_signed_imm(dst, src1, src2),
-                                K::SetLessThanSigned64 => I::set_less_than_signed_64_imm(dst, src1, src2),
+                                K::SetLessThanSigned64 => I::set_less_than_signed_imm(dst, src1, src2),
                                 K::SetLessThanUnsigned => I::set_less_than_unsigned_imm(dst, src1, src2),
-                                K::SetLessThanUnsigned64 => I::set_less_than_unsigned_64_imm(dst, src1, src2),
-                                K::Xor => I::xor_imm(dst, src1, src2),
-                                K::Xor64 => I::xor_64_imm(dst, src1, src2),
-                                K::ShiftLogicalRight => I::shift_logical_right_imm(dst, src1, src2),
-                                K::ShiftLogicalRight64 => I::shift_logical_right_64_imm(dst, src1, src2),
-                                K::ShiftArithmeticRight => I::shift_arithmetic_right_imm(dst, src1, src2),
-                                K::ShiftArithmeticRight64 => I::shift_arithmetic_right_64_imm(dst, src1, src2),
-                                K::Or => I::or_imm(dst, src1, src2),
-                                K::Or64 => I::or_64_imm(dst, src1, src2),
-                                K::And => I::and_imm(dst, src1, src2),
-                                K::And64 => I::and_64_imm(dst, src1, src2),
-                                K::Mul => I::mul_imm(dst, src1, src2),
-                                K::Mul64 => I::mul_imm(dst, src1, src2),
+                                K::SetLessThanUnsigned64 => I::set_less_than_unsigned_imm(dst, src1, src2),
+                                K::Xor | K::Xor64 => I::xor_imm(dst, src1, src2),
+                                K::ShiftLogicalRight => I::shift_logical_right_imm_32(dst, src1, src2),
+                                K::ShiftLogicalRight64 => I::shift_logical_right_imm_64(dst, src1, src2),
+                                K::ShiftArithmeticRight => I::shift_arithmetic_right_imm_32(dst, src1, src2),
+                                K::ShiftArithmeticRight64 => I::shift_arithmetic_right_imm_64(dst, src1, src2),
+                                K::Or | K::Or64 => I::or_imm(dst, src1, src2),
+                                K::And | K::And64 => I::and_imm(dst, src1, src2),
+                                K::Mul => I::mul_imm_32(dst, src1, src2),
+                                K::Mul64 => I::mul_imm_64(dst, src1, src2),
                                 K::MulUpperSignedSigned => I::mul_upper_signed_signed_imm(dst, src1, src2),
-                                K::MulUpperSignedSigned64 => I::mul_upper_signed_signed_imm_64(dst, src1, src2),
+                                K::MulUpperSignedSigned64 => I::mul_upper_signed_signed_imm(dst, src1, src2),
                                 K::MulUpperUnsignedUnsigned => I::mul_upper_unsigned_unsigned_imm(dst, src1, src2),
-                                K::MulUpperUnsignedUnsigned64 => I::mul_upper_unsigned_unsigned_imm_64(dst, src1, src2),
+                                K::MulUpperUnsignedUnsigned64 => I::mul_upper_unsigned_unsigned_imm(dst, src1, src2),
                             }
                         }
                         (RegImm::Imm(src1), RegImm::Reg(src2)) => {
                             let src2 = conv_reg(src2);
                             match kind {
-                                K::Add => I::add_imm(dst, src2, src1),
-                                K::Add64 => I::add_64_imm(dst, src2, src1),
-                                K::Xor => I::xor_imm(dst, src2, src1),
-                                K::Xor64 => I::xor_64_imm(dst, src2, src1),
-                                K::Or => I::or_imm(dst, src2, src1),
-                                K::Or64 => I::or_64_imm(dst, src2, src1),
-                                K::And => I::and_imm(dst, src2, src1),
-                                K::And64 => I::and_64_imm(dst, src2, src1),
-                                K::Mul => I::mul_imm(dst, src2, src1),
-                                K::Mul64 => I::mul_imm(dst, src2, src1),
+                                K::Add => I::add_imm_32(dst, src2, src1),
+                                K::Add64 => I::add_imm_64(dst, src2, src1),
+                                K::Xor | K::Xor64 => I::xor_imm(dst, src2, src1),
+                                K::Or | K::Or64 => I::or_imm(dst, src2, src1),
+                                K::And | K::And64 => I::and_imm(dst, src2, src1),
+                                K::Mul => I::mul_imm_32(dst, src2, src1),
+                                K::Mul64 => I::mul_imm_64(dst, src2, src1),
                                 K::MulUpperSignedSigned => I::mul_upper_signed_signed_imm(dst, src2, src1),
-                                K::MulUpperSignedSigned64 => I::mul_upper_signed_signed_imm_64(dst, src2, src1),
+                                K::MulUpperSignedSigned64 => I::mul_upper_signed_signed_imm(dst, src2, src1),
                                 K::MulUpperUnsignedUnsigned => I::mul_upper_unsigned_unsigned_imm(dst, src2, src1),
-                                K::MulUpperUnsignedUnsigned64 => I::mul_upper_unsigned_unsigned_imm_64(dst, src2, src1),
+                                K::MulUpperUnsignedUnsigned64 => I::mul_upper_unsigned_unsigned_imm(dst, src2, src1),
 
-                                K::Sub => I::negate_and_add_imm(dst, src2, src1),
-                                K::Sub64 => I::negate_and_add_imm(dst, src2, src1),
-                                K::ShiftLogicalLeft => I::shift_logical_left_imm_alt(dst, src2, src1),
-                                K::ShiftLogicalLeft64 => I::shift_logical_left_64_imm_alt(dst, src2, src1),
+                                K::Sub => I::negate_and_add_imm_32(dst, src2, src1),
+                                K::Sub64 => I::negate_and_add_imm_64(dst, src2, src1),
+                                K::ShiftLogicalLeft => I::shift_logical_left_imm_alt_32(dst, src2, src1),
+                                K::ShiftLogicalLeft64 => I::shift_logical_left_imm_alt_64(dst, src2, src1),
                                 K::SetLessThanSigned => I::set_greater_than_signed_imm(dst, src2, src1),
-                                K::SetLessThanSigned64 => I::set_greater_than_signed_64_imm(dst, src2, src1),
+                                K::SetLessThanSigned64 => I::set_greater_than_signed_imm(dst, src2, src1),
                                 K::SetLessThanUnsigned => I::set_greater_than_unsigned_imm(dst, src2, src1),
-                                K::SetLessThanUnsigned64 => I::set_greater_than_unsigned_64_imm(dst, src2, src1),
-                                K::ShiftLogicalRight => I::shift_logical_right_imm_alt(dst, src2, src1),
-                                K::ShiftLogicalRight64 => I::shift_logical_right_imm_alt(dst, src2, src1),
-                                K::ShiftArithmeticRight => I::shift_arithmetic_right_imm_alt(dst, src2, src1),
-                                K::ShiftArithmeticRight64 => I::shift_arithmetic_right_64_imm_alt(dst, src2, src1),
+                                K::SetLessThanUnsigned64 => I::set_greater_than_unsigned_imm(dst, src2, src1),
+                                K::ShiftLogicalRight => I::shift_logical_right_imm_alt_32(dst, src2, src1),
+                                K::ShiftLogicalRight64 => I::shift_logical_right_imm_alt_64(dst, src2, src1),
+                                K::ShiftArithmeticRight => I::shift_arithmetic_right_imm_alt_32(dst, src2, src1),
+                                K::ShiftArithmeticRight64 => I::shift_arithmetic_right_imm_alt_64(dst, src2, src1),
                             }
                         }
                         (RegImm::Imm(src1), RegImm::Imm(src2)) => {
@@ -7648,7 +7711,7 @@ where
                     (base, InstExt::Basic(BasicInst::LoadAddressIndirect { dst, target }))
                 }
                 Inst::Load {
-                    kind: LoadKind::U32,
+                    kind: LoadKind::I32,
                     base,
                     dst,
                     ..
@@ -8040,6 +8103,7 @@ where
             &imports,
             &used_blocks,
             &mut regspill_size,
+            elf.is_64(),
         );
         used_blocks = add_missing_fallthrough_blocks(&mut all_blocks, &mut reachability_graph, used_blocks);
         merge_consecutive_fallthrough_blocks(&mut all_blocks, &mut reachability_graph, &mut section_to_block, &mut used_blocks);
@@ -8091,6 +8155,7 @@ where
             &imports,
             &used_blocks,
             &mut regspill_size,
+            elf.is_64(),
         );
     }
 
@@ -8207,6 +8272,7 @@ where
         &used_imports,
         &jump_target_for_block,
         config.optimize,
+        elf.is_64(),
     )?;
 
     {

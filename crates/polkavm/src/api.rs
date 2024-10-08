@@ -63,7 +63,7 @@ impl<T> IntoResult<T> for T {
     }
 }
 
-pub type RegValue = u32;
+pub type RegValue = u64;
 
 #[derive(Copy, Clone)]
 pub struct RuntimeInstructionSet {
@@ -657,7 +657,7 @@ impl Module {
 
     /// The default stack pointer for the module.
     pub fn default_sp(&self) -> RegValue {
-        self.memory_map().stack_address_high()
+        u64::from(self.memory_map().stack_address_high())
     }
 
     /// Returns the module's exports.
@@ -1277,7 +1277,7 @@ impl RawInstance {
 
         self.clear_regs();
         self.set_reg(Reg::SP, self.module.default_sp());
-        self.set_reg(Reg::RA, VM_ADDR_RETURN_TO_HOST);
+        self.set_reg(Reg::RA, u64::from(VM_ADDR_RETURN_TO_HOST));
         self.set_next_program_counter(pc);
 
         for (reg, &value) in Reg::ARG_REGS.into_iter().zip(args) {
@@ -1296,7 +1296,7 @@ impl RawInstance {
     {
         let mut regs = [0; Reg::ARG_REGS.len()];
         let mut input_count = 0;
-        args._set(|value| {
+        args._set(self.module().blob().is_64_bit(), |value| {
             assert!(input_count <= Reg::ARG_REGS.len(), "too many arguments");
             regs[input_count] = value;
             input_count += 1;
@@ -1313,7 +1313,7 @@ impl RawInstance {
         FnResult: crate::linker::FuncResult,
     {
         let mut output_count = 0;
-        FnResult::_get(|| {
+        FnResult::_get(self.module().blob().is_64_bit(), || {
             let value = access_backend!(self.backend, |backend| backend.reg(Reg::ARG_REGS[output_count]));
             output_count += 1;
             value

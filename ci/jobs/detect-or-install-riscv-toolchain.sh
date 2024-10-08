@@ -3,7 +3,7 @@
 set -euo pipefail
 
 case "$OSTYPE" in
-  linux*)
+  *)
     if [[ "$(rustup toolchain list)" =~ "riscv32em-nightly-2024-01-05-r0-x86_64-unknown-linux-gnu" ]]; then
         export RV32E_TOOLCHAIN="riscv32em-nightly-2024-01-05-r0-x86_64-unknown-linux-gnu"
     else

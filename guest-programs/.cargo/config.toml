@@ -7,3 +7,10 @@ rustflags = [
     "-C", "link-arg=--emit-relocs",
     "-C", "link-arg=--unique",
 ]
+
+[target.riscv64ema-unknown-none-elf]
+rustflags = [
+    "-C", "relocation-model=pie",
+    "-C", "link-arg=--emit-relocs",
+    "-C", "link-arg=--unique",
+]

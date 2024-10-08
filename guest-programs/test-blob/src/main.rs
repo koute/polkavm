@@ -232,3 +232,48 @@ fn test_input_registers() {
         2 * 3 * 5 * 7 * 11 * 13 * 17 * 19 * 23
     );
 }
+
+#[polkavm_derive::polkavm_export]
+extern "C" fn add_u32(a0: u32, a1: u32) -> u32 {
+    a0.wrapping_add(a1)
+}
+
+#[cfg(target_pointer_width = "64")]
+#[polkavm_derive::polkavm_export]
+extern "C" fn add_u32_asm(a0: u32, a1: u32) -> u64 {
+    unsafe {
+        let output;
+        core::arch::asm!(
+            "addw a2, a1, a0",
+            in("a0") a0,
+            in("a1") a1,
+            lateout("a2") output,
+        );
+        output
+    }
+}
+
+#[polkavm_derive::polkavm_export]
+extern "C" fn add_u64(a0: u64, a1: u64) -> u64 {
+    a0.wrapping_add(a1)
+}
+
+#[polkavm_derive::polkavm_export]
+extern "C" fn load_imm_u32_msb_set() -> u32 {
+    0xfb8f5c1e
+}
+
+#[polkavm_derive::polkavm_export]
+extern "C" fn load_imm_u32_msb_unset() -> u32 {
+    0x7b8f5c1e
+}
+
+#[polkavm_derive::polkavm_export]
+extern "C" fn xor_imm_u32(a0: u32) -> u32 {
+    a0 ^ 0xfb8f5c1e
+}
+
+#[polkavm_derive::polkavm_export]
+extern "C" fn cast_u32_to_u64(a0: u32) -> u64 {
+    u64::from(a0)
+}
