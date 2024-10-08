@@ -7603,7 +7603,21 @@ where
                     src,
                     dst,
                     ..
-                } => {
+                } if !elf.is_64() => {
+                    let Some(dst) = cast_reg_non_zero(dst)? else {
+                        return Err(ProgramFromElfError::other(format!(
+                            "{lo_rel_name} with a zero destination register: 0x{lo_inst_raw:08x} in {section_name}[0x{relative_lo:08x}]"
+                        )));
+                    };
+
+                    (src, InstExt::Basic(BasicInst::LoadAddress { dst, target }))
+                }
+                Inst::RegImm {
+                    kind: RegImmKind::Add64,
+                    src,
+                    dst,
+                    ..
+                } if elf.is_64() => {
                     let Some(dst) = cast_reg_non_zero(dst)? else {
                         return Err(ProgramFromElfError::other(format!(
                             "{lo_rel_name} with a zero destination register: 0x{lo_inst_raw:08x} in {section_name}[0x{relative_lo:08x}]"
