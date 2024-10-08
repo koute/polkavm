@@ -2827,6 +2827,8 @@ pub struct ProgramBlob {
     #[cfg(feature = "unique-id")]
     unique_id: u64,
 
+    is_64_bit: bool,
+
     ro_data_size: u32,
     rw_data_size: u32,
     stack_size: u32,
@@ -3786,6 +3788,7 @@ fn test_instructions_iterator_does_not_emit_unnecessary_invalid_instructions_if_
 #[derive(Clone, Default)]
 #[non_exhaustive]
 pub struct ProgramParts {
+    pub is_64_bit: bool,
     pub ro_data_size: u32,
     pub rw_data_size: u32,
     pub stack_size: u32,
@@ -3816,13 +3819,20 @@ impl ProgramParts {
         };
 
         let blob_version = reader.read_byte()?;
-        if blob_version != BLOB_VERSION_V1 {
+        let is_64_bit = if blob_version == BLOB_VERSION_V1_32 {
+            false
+        } else if blob_version == BLOB_VERSION_V1_64 {
+            true
+        } else {
             return Err(ProgramParseError(ProgramParseErrorKind::UnsupportedVersion {
                 version: blob_version,
             }));
-        }
+        };
 
-        let mut parts = ProgramParts::default();
+        let mut parts = ProgramParts {
+            is_64_bit,
+            ..ProgramParts::default()
+        };
 
         let mut section = reader.read_byte()?;
         if section == SECTION_MEMORY_CONFIG {
@@ -3901,6 +3911,8 @@ impl ProgramBlob {
         let mut blob = ProgramBlob {
             #[cfg(feature = "unique-id")]
             unique_id: 0,
+
+            is_64_bit: parts.is_64_bit,
 
             ro_data_size: parts.ro_data_size,
             rw_data_size: parts.rw_data_size,
@@ -4011,11 +4023,17 @@ impl ProgramBlob {
         self.unique_id
     }
 
+    /// Returns whether the blob contains a 64-bit program.
+    pub fn is_64_bit(&self) -> bool {
+        self.is_64_bit
+    }
+
     /// Calculates an unique hash of the program blob.
     pub fn unique_hash(&self, include_debug: bool) -> crate::hasher::Hash {
         let ProgramBlob {
             #[cfg(feature = "unique-id")]
                 unique_id: _,
+            is_64_bit,
             ro_data_size,
             rw_data_size,
             stack_size,
@@ -4037,6 +4055,7 @@ impl ProgramBlob {
 
         hasher.update_u32_array([
             1_u32, // VERSION
+            u32::from(*is_64_bit),
             *ro_data_size,
             *rw_data_size,
             *stack_size,
@@ -4788,7 +4807,8 @@ pub const SECTION_OPT_DEBUG_LINE_PROGRAMS: u8 = 129;
 pub const SECTION_OPT_DEBUG_LINE_PROGRAM_RANGES: u8 = 130;
 pub const SECTION_END_OF_FILE: u8 = 0;
 
-pub const BLOB_VERSION_V1: u8 = 1;
+pub const BLOB_VERSION_V1_64: u8 = 0;
+pub const BLOB_VERSION_V1_32: u8 = 1;
 
 pub const VERSION_DEBUG_LINE_PROGRAM_V1: u8 = 1;
 

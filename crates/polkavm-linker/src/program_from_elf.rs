@@ -8343,7 +8343,11 @@ where
 
     log::trace!("Instruction count: {}", code.len());
 
-    let mut builder = ProgramBlobBuilder::new();
+    let mut builder = if elf.is_64() {
+        ProgramBlobBuilder::new_64bit()
+    } else {
+        ProgramBlobBuilder::new()
+    };
 
     builder.set_ro_data_size(memory_config.ro_data_size);
     builder.set_rw_data_size(memory_config.rw_data_size);

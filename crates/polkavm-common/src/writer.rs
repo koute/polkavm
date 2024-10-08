@@ -82,6 +82,7 @@ struct SerializedInstruction {
 
 #[derive(Default)]
 pub struct ProgramBlobBuilder {
+    is_64: bool,
     ro_data_size: u32,
     rw_data_size: u32,
     stack_size: u32,
@@ -107,6 +108,12 @@ struct SerializedCode {
 impl ProgramBlobBuilder {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    pub fn new_64bit() -> Self {
+        let mut builder = Self::new();
+        builder.is_64 = true;
+        builder
     }
 
     pub fn set_ro_data_size(&mut self, size: u32) {
@@ -335,12 +342,14 @@ impl ProgramBlobBuilder {
             // Sanity check.
             let mut parsed = Vec::new();
             let mut offsets = alloc::collections::BTreeSet::new();
-            for instruction in crate::program::Instructions::new_unbounded(
-                crate::program::DefaultInstructionSet::default(),
-                &output.code,
-                &output.bitmask,
-                0,
-            ) {
+
+            let parsed_instructions: Vec<_> = if self.is_64 {
+                crate::program::Instructions::new_unbounded(crate::program::ISA64_V1, &output.code, &output.bitmask, 0).collect()
+            } else {
+                crate::program::Instructions::new_unbounded(crate::program::ISA32_V1, &output.code, &output.bitmask, 0).collect()
+            };
+
+            for instruction in parsed_instructions {
                 if instruction.offset.0 as usize == output.code.len() {
                     // Implicit trap.
                     debug_assert!(matches!(instruction.kind, Instruction::invalid));
@@ -403,7 +412,11 @@ impl ProgramBlobBuilder {
         let mut writer = Writer::new(&mut output);
 
         writer.push_raw_bytes(&program::BLOB_MAGIC);
-        writer.push_byte(program::BLOB_VERSION_V1);
+        if self.is_64 {
+            writer.push_byte(program::BLOB_VERSION_V1_64);
+        } else {
+            writer.push_byte(program::BLOB_VERSION_V1_32);
+        }
 
         if self.ro_data_size > 0 || self.rw_data_size > 0 || self.stack_size > 0 {
             writer.push_section_inplace(program::SECTION_MEMORY_CONFIG, |writer| {
