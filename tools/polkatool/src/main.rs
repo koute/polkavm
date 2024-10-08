@@ -3,7 +3,7 @@
 #![allow(clippy::exit)]
 
 use clap::Parser;
-use polkavm_common::program::{Opcode, ProgramBlob};
+use polkavm_common::program::{Opcode, ProgramBlob, ISA32_V1, ISA64_V1};
 use polkavm_disassembler::DisassemblyFormat;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -167,7 +167,12 @@ fn main_stats(inputs: Vec<PathBuf>) -> Result<(), String> {
 
     for input in inputs {
         let blob = load_blob(&input)?;
-        for instruction in blob.instructions(polkavm_common::program::DefaultInstructionSet::default()) {
+        let instructions: Vec<_> = if blob.is_64_bit() {
+            blob.instructions(ISA64_V1).collect()
+        } else {
+            blob.instructions(ISA32_V1).collect()
+        };
+        for instruction in instructions {
             *map.get_mut(&instruction.opcode()).unwrap() += 1;
         }
     }
