@@ -2782,11 +2782,11 @@ impl<'a, const DEBUG: bool> InstructionVisitor for Compiler<'a, DEBUG> {
     }
 
     fn set_less_than_unsigned_64(&mut self, _d: RawReg, _s1: RawReg, _s2: RawReg) -> Self::ReturnTy {
-        self.trap()
+        todo!()
     }
 
     fn set_less_than_signed_64(&mut self, _d: RawReg, _s1: RawReg, _s2: RawReg) -> Self::ReturnTy {
-        self.trap()
+        todo!()
     }
 
     fn shift_logical_right(&mut self, d: RawReg, s1: RawReg, s2: RawReg) -> Self::ReturnTy {
@@ -2802,15 +2802,15 @@ impl<'a, const DEBUG: bool> InstructionVisitor for Compiler<'a, DEBUG> {
     }
 
     fn shift_logical_right_64(&mut self, _d: RawReg, _s1: RawReg, _s2: RawReg) -> Self::ReturnTy {
-        self.trap()
+        todo!()
     }
 
     fn shift_arithmetic_right_64(&mut self, _d: RawReg, _s1: RawReg, _s2: RawReg) -> Self::ReturnTy {
-        self.trap()
+        todo!()
     }
 
     fn shift_logical_left_64(&mut self, _d: RawReg, _s1: RawReg, _s2: RawReg) -> Self::ReturnTy {
-        self.trap()
+        todo!()
     }
 
     fn xor(&mut self, d: RawReg, s1: RawReg, s2: RawReg) -> Self::ReturnTy {
@@ -2826,15 +2826,15 @@ impl<'a, const DEBUG: bool> InstructionVisitor for Compiler<'a, DEBUG> {
     }
 
     fn xor_64(&mut self, _d: RawReg, _s1: RawReg, _s2: RawReg) -> Self::ReturnTy {
-        self.trap()
+        todo!()
     }
 
     fn and_64(&mut self, _d: RawReg, _s1: RawReg, _s2: RawReg) -> Self::ReturnTy {
-        self.trap()
+        todo!()
     }
 
     fn or_64(&mut self, _d: RawReg, _s1: RawReg, _s2: RawReg) -> Self::ReturnTy {
-        self.trap()
+        todo!()
     }
 
     fn add(&mut self, d: RawReg, s1: RawReg, s2: RawReg) -> Self::ReturnTy {
@@ -2842,7 +2842,7 @@ impl<'a, const DEBUG: bool> InstructionVisitor for Compiler<'a, DEBUG> {
     }
 
     fn add_64(&mut self, _d: RawReg, _s1: RawReg, _s2: RawReg) -> Self::ReturnTy {
-        self.trap()
+        todo!()
     }
 
     fn sub(&mut self, d: RawReg, s1: RawReg, s2: RawReg) -> Self::ReturnTy {
@@ -2850,7 +2850,7 @@ impl<'a, const DEBUG: bool> InstructionVisitor for Compiler<'a, DEBUG> {
     }
 
     fn sub_64(&mut self, _d: RawReg, _s1: RawReg, _s2: RawReg) -> Self::ReturnTy {
-        self.trap()
+        todo!()
     }
 
     fn negate_and_add_imm(&mut self, d: RawReg, s1: RawReg, s2: u32) -> Self::ReturnTy {
@@ -2862,7 +2862,7 @@ impl<'a, const DEBUG: bool> InstructionVisitor for Compiler<'a, DEBUG> {
     }
 
     fn mul_64(&mut self, _d: RawReg, _s1: RawReg, _s2: RawReg) -> Self::ReturnTy {
-        self.trap()
+        todo!()
     }
 
     fn mul_imm(&mut self, d: RawReg, s1: RawReg, s2: u32) -> Self::ReturnTy {
@@ -2870,27 +2870,27 @@ impl<'a, const DEBUG: bool> InstructionVisitor for Compiler<'a, DEBUG> {
     }
 
     fn mul_64_imm(&mut self, _d: RawReg, _s1: RawReg, _s2: u32) -> Self::ReturnTy {
-        self.trap()
+        todo!()
     }
 
     fn mul_upper_signed_signed_imm_64(&mut self, _: RawReg, _: RawReg, _: u32) -> <Self as InstructionVisitor>::ReturnTy {
-        self.trap()
+        todo!()
     }
 
     fn mul_upper_unsigned_unsigned_imm_64(&mut self, _: RawReg, _: RawReg, _: u32) -> <Self as InstructionVisitor>::ReturnTy {
-        self.trap()
+        todo!()
     }
 
     fn mul_upper_signed_signed_64(&mut self, _: RawReg, _: RawReg, _: RawReg) -> <Self as InstructionVisitor>::ReturnTy {
-        self.trap()
+        todo!()
     }
 
     fn mul_upper_unsigned_unsigned_64(&mut self, _: RawReg, _: RawReg, _: RawReg) -> <Self as InstructionVisitor>::ReturnTy {
-        self.trap()
+        todo!()
     }
 
     fn mul_upper_signed_unsigned_64(&mut self, _: RawReg, _: RawReg, _: RawReg) -> <Self as InstructionVisitor>::ReturnTy {
-        self.trap()
+        todo!()
     }
 
     fn mul_upper_signed_signed(&mut self, d: RawReg, s1: RawReg, s2: RawReg) -> Self::ReturnTy {
@@ -2930,19 +2930,19 @@ impl<'a, const DEBUG: bool> InstructionVisitor for Compiler<'a, DEBUG> {
     }
 
     fn div_unsigned_64(&mut self, _d: RawReg, _s1: RawReg, _s2: RawReg) -> Self::ReturnTy {
-        self.trap()
+        todo!()
     }
 
     fn div_signed_64(&mut self, _d: RawReg, _s1: RawReg, _s2: RawReg) -> Self::ReturnTy {
-        self.trap()
+        todo!()
     }
 
     fn rem_unsigned_64(&mut self, _d: RawReg, _s1: RawReg, _s2: RawReg) -> Self::ReturnTy {
-        self.trap()
+        todo!()
     }
 
     fn rem_signed_64(&mut self, _d: RawReg, _s1: RawReg, _s2: RawReg) -> Self::ReturnTy {
-        self.trap()
+        todo!()
     }
 
     fn set_less_than_unsigned_imm(&mut self, d: RawReg, s1: RawReg, s2: u32) -> Self::ReturnTy {
@@ -2962,19 +2962,19 @@ impl<'a, const DEBUG: bool> InstructionVisitor for Compiler<'a, DEBUG> {
     }
 
     fn set_less_than_unsigned_64_imm(&mut self, _d: RawReg, _s1: RawReg, _s2: u32) -> Self::ReturnTy {
-        self.trap()
+        todo!()
     }
 
     fn set_greater_than_unsigned_64_imm(&mut self, _d: RawReg, _s1: RawReg, _s2: u32) -> Self::ReturnTy {
-        self.trap()
+        todo!()
     }
 
     fn set_less_than_signed_64_imm(&mut self, _d: RawReg, _s1: RawReg, _s2: u32) -> Self::ReturnTy {
-        self.trap()
+        todo!()
     }
 
     fn set_greater_than_signed_64_imm(&mut self, _d: RawReg, _s1: RawReg, _s2: u32) -> Self::ReturnTy {
-        self.trap()
+        todo!()
     }
 
     fn shift_logical_right_imm(&mut self, d: RawReg, s1: RawReg, s2: u32) -> Self::ReturnTy {
@@ -3002,27 +3002,27 @@ impl<'a, const DEBUG: bool> InstructionVisitor for Compiler<'a, DEBUG> {
     }
 
     fn shift_logical_right_64_imm(&mut self, _d: RawReg, _s1: RawReg, _s2: u32) -> Self::ReturnTy {
-        self.trap()
+        todo!()
     }
 
     fn shift_logical_right_64_imm_alt(&mut self, _d: RawReg, _s2: RawReg, _s1: u32) -> Self::ReturnTy {
-        self.trap()
+        todo!()
     }
 
     fn shift_arithmetic_right_64_imm(&mut self, _d: RawReg, _s1: RawReg, _s2: u32) -> Self::ReturnTy {
-        self.trap()
+        todo!()
     }
 
     fn shift_arithmetic_right_64_imm_alt(&mut self, _d: RawReg, _s2: RawReg, _s1: u32) -> Self::ReturnTy {
-        self.trap()
+        todo!()
     }
 
     fn shift_logical_left_64_imm(&mut self, _d: RawReg, _s1: RawReg, _s2: u32) -> Self::ReturnTy {
-        self.trap()
+        todo!()
     }
 
     fn shift_logical_left_64_imm_alt(&mut self, _d: RawReg, _s2: RawReg, _s1: u32) -> Self::ReturnTy {
-        self.trap()
+        todo!()
     }
 
     fn or_imm(&mut self, d: RawReg, s1: RawReg, s2: u32) -> Self::ReturnTy {
@@ -3038,15 +3038,15 @@ impl<'a, const DEBUG: bool> InstructionVisitor for Compiler<'a, DEBUG> {
     }
 
     fn or_64_imm(&mut self, _d: RawReg, _s1: RawReg, _s2: u32) -> Self::ReturnTy {
-        self.trap()
+        todo!()
     }
 
     fn and_64_imm(&mut self, _d: RawReg, _s1: RawReg, _s2: u32) -> Self::ReturnTy {
-        self.trap()
+        todo!()
     }
 
     fn xor_64_imm(&mut self, _d: RawReg, _s1: RawReg, _s2: u32) -> Self::ReturnTy {
-        self.trap()
+        todo!()
     }
 
     fn load_imm(&mut self, dst: RawReg, imm: u32) -> Self::ReturnTy {
@@ -3074,7 +3074,7 @@ impl<'a, const DEBUG: bool> InstructionVisitor for Compiler<'a, DEBUG> {
     }
 
     fn add_64_imm(&mut self, _d: RawReg, _s1: RawReg, _s2: u32) -> Self::ReturnTy {
-        self.trap()
+        todo!()
     }
 
     fn add_imm(&mut self, d: RawReg, s1: RawReg, s2: u32) -> Self::ReturnTy {
@@ -3106,7 +3106,7 @@ impl<'a, const DEBUG: bool> InstructionVisitor for Compiler<'a, DEBUG> {
     }
 
     fn store_imm_u64(&mut self, _offset: u32, _value: u32) -> Self::ReturnTy {
-        self.trap()
+        todo!()
     }
 
     fn store_imm_indirect_u8(&mut self, base: RawReg, offset: u32, value: u32) -> Self::ReturnTy {
@@ -3134,7 +3134,7 @@ impl<'a, const DEBUG: bool> InstructionVisitor for Compiler<'a, DEBUG> {
     }
 
     fn store_imm_indirect_u64(&mut self, _base: RawReg, _offset: u32, _value: u32) -> Self::ReturnTy {
-        self.trap()
+        todo!()
     }
 
     fn store_indirect_u8(&mut self, src: RawReg, base: RawReg, offset: u32) -> Self::ReturnTy {
@@ -3162,7 +3162,7 @@ impl<'a, const DEBUG: bool> InstructionVisitor for Compiler<'a, DEBUG> {
     }
 
     fn store_indirect_u64(&mut self, _src: RawReg, _base: RawReg, _offset: u32) -> Self::ReturnTy {
-        self.trap()
+        todo!()
     }
 
     fn store_u8(&mut self, src: RawReg, offset: u32) -> Self::ReturnTy {
@@ -3190,7 +3190,7 @@ impl<'a, const DEBUG: bool> InstructionVisitor for Compiler<'a, DEBUG> {
     }
 
     fn store_u64(&mut self, _src: RawReg, _offset: u32) -> Self::ReturnTy {
-        self.trap()
+        todo!()
     }
 
     fn load_u8(&mut self, dst: RawReg, offset: u32) -> Self::ReturnTy {
@@ -3234,11 +3234,11 @@ impl<'a, const DEBUG: bool> InstructionVisitor for Compiler<'a, DEBUG> {
     }
 
     fn load_i32(&mut self, _dst: RawReg, _offset: u32) -> Self::ReturnTy {
-        self.trap()
+        todo!()
     }
 
     fn load_u64(&mut self, _dst: RawReg, _offset: u32) -> Self::ReturnTy {
-        self.trap()
+        todo!()
     }
 
     fn load_indirect_u8(&mut self, dst: RawReg, base: RawReg, offset: u32) -> Self::ReturnTy {
@@ -3282,11 +3282,11 @@ impl<'a, const DEBUG: bool> InstructionVisitor for Compiler<'a, DEBUG> {
     }
 
     fn load_indirect_i32(&mut self, _dst: RawReg, _base: RawReg, _offset: u32) -> Self::ReturnTy {
-        self.trap()
+        todo!()
     }
 
     fn load_indirect_u64(&mut self, _dst: RawReg, _base: RawReg, _offset: u32) -> Self::ReturnTy {
-        self.trap()
+        todo!()
     }
 
     fn branch_less_unsigned(&mut self, s1: RawReg, s2: RawReg, i: u32) -> Self::ReturnTy {
