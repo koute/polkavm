@@ -1,3 +1,7 @@
+[features]
+default = []
+dwarf = []
+
 [package]
 name = "polkavm-linker"
 version.workspace = true

@@ -1,7 +1,7 @@
 [build]
-target = "riscv32ema-unknown-none-elf"
+target = "riscv32emac-unknown-none-polkavm"
 
-[target.riscv32ema-unknown-none-elf]
+[target.riscv32emac-unknown-none-polkavm]
 rustflags = [
     "-C", "relocation-model=pie",
     "-C", "link-arg=--emit-relocs",
