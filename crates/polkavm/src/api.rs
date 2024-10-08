@@ -6,7 +6,7 @@ use alloc::vec::Vec;
 use polkavm_common::abi::{MemoryMap, MemoryMapBuilder, VM_ADDR_RETURN_TO_HOST};
 use polkavm_common::program::{
     build_static_dispatch_table, FrameKind, ISA32_V1_NoSbrk, Imports, InstructionSet, Instructions, JumpTable, Opcode, ProgramBlob, Reg,
-    ISA32_V1,
+    ISA32_V1, ISA64_V1,
 };
 use polkavm_common::utils::{ArcBytes, AsUninitSliceMut};
 
@@ -68,14 +68,19 @@ pub type RegValue = u32;
 #[derive(Copy, Clone)]
 pub struct RuntimeInstructionSet {
     allow_sbrk: bool,
+    is_64_bit: bool,
 }
 
 impl InstructionSet for RuntimeInstructionSet {
     fn opcode_from_u8(self, byte: u8) -> Option<Opcode> {
-        if self.allow_sbrk {
-            ISA32_V1.opcode_from_u8(byte)
+        if !self.is_64_bit {
+            if self.allow_sbrk {
+                ISA32_V1.opcode_from_u8(byte)
+            } else {
+                ISA32_V1_NoSbrk.opcode_from_u8(byte)
+            }
         } else {
-            ISA32_V1_NoSbrk.opcode_from_u8(byte)
+            ISA64_V1.opcode_from_u8(byte)
         }
     }
 }
@@ -427,6 +432,7 @@ impl Module {
 
         let instruction_set = RuntimeInstructionSet {
             allow_sbrk: config.allow_sbrk,
+            is_64_bit: blob.is_64_bit(),
         };
 
         #[allow(unused_macros)]
