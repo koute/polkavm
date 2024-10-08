@@ -927,16 +927,16 @@ impl Inst {
                     src: Reg::decode(op >> 15),
                     imm: sign_ext(op >> 20, 12),
                 }),
-                0b001 if op >> 24 == 0 => Some(Inst::RegImm {
+                0b001 if op >> 25 == 0 => Some(Inst::RegImm {
                     kind: RegImmKind::ShiftLogicalLeft,
                     dst: Reg::decode(op >> 7),
                     src: Reg::decode(op >> 15),
                     imm: bits(0, 4, op, 20) as i32,
                 }),
-                0b101 if op >> 24 == 0 || op >> 24 == 0b01000000 => {
-                    let kind = match (op & 0xfe000000) >> 24 {
-                        0b00000000 => RegImmKind::ShiftLogicalRight,
-                        0b01000000 => RegImmKind::ShiftArithmeticRight,
+                0b101 if op >> 25 == 0 || op >> 25 == 0b0100000 => {
+                    let kind = match (op & 0xfe000000) >> 25 {
+                        0b0000000 => RegImmKind::ShiftLogicalRight,
+                        0b0100000 => RegImmKind::ShiftArithmeticRight,
                         _ => return None,
                     };
 
@@ -1211,7 +1211,7 @@ impl Inst {
                             | match kind {
                                 RegImmKind::ShiftLogicalLeft => 0b001 << 12,
                                 RegImmKind::ShiftLogicalRight => 0b101 << 12,
-                                RegImmKind::ShiftArithmeticRight => (0b101 << 12) | (1 << 30),
+                                RegImmKind::ShiftArithmeticRight => (0b101 << 12) | (0b0100000 << 25),
                                 _ => unreachable!(),
                             }
                             | ((dst as u32) << 7)
@@ -1469,6 +1469,60 @@ fn test_decode_cmov() {
             src: Reg::A2,
             cond: Reg::A0
         }
+    );
+}
+
+#[test]
+fn test_decode_srliw() {
+    assert_eq!(
+        // srliw   a0,a0,0x18
+        Inst::decode(0x0185551b, true).unwrap(),
+        Inst::RegImm {
+            kind: RegImmKind::ShiftLogicalRight,
+            dst: Reg::A0,
+            src: Reg::A0,
+            imm: 0x18,
+        }
+    );
+
+    assert_eq!(
+        Inst::encode(
+            Inst::RegImm {
+                kind: RegImmKind::ShiftLogicalRight,
+                dst: Reg::A0,
+                src: Reg::A0,
+                imm: 0x18,
+            },
+            true
+        ),
+        Some(0x0185551b)
+    );
+}
+
+#[test]
+fn test_decode_sraiw() {
+    assert_eq!(
+        // sraiw   a0,a1,0xc
+        Inst::decode(0x40c5d51b, true).unwrap(),
+        Inst::RegImm {
+            kind: RegImmKind::ShiftArithmeticRight,
+            dst: Reg::A0,
+            src: Reg::A1,
+            imm: 0xc,
+        }
+    );
+
+    assert_eq!(
+        Inst::encode(
+            Inst::RegImm {
+                kind: RegImmKind::ShiftArithmeticRight,
+                dst: Reg::A0,
+                src: Reg::A1,
+                imm: 0xc,
+            },
+            true
+        ),
+        Some(0x40c5d51b)
     );
 }
 
