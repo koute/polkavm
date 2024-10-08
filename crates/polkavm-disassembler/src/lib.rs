@@ -1,6 +1,6 @@
 use std::{collections::HashMap, io::Write};
 
-use polkavm_common::program::{DefaultInstructionSet, ProgramBlob, ProgramCounter};
+use polkavm_common::program::{ParsedInstruction, ProgramBlob, ProgramCounter, ISA32_V1, ISA64_V1};
 
 #[derive(Copy, Clone, Debug, clap::ValueEnum)]
 pub enum DisassemblyFormat {
@@ -175,6 +175,14 @@ impl<'a> Disassembler<'a> {
         self.show_offsets = value;
     }
 
+    fn instructions(&self) -> Vec<ParsedInstruction> {
+        if self.blob.is_64_bit() {
+            self.blob.instructions(ISA64_V1).collect()
+        } else {
+            self.blob.instructions(ISA32_V1).collect()
+        }
+    }
+
     pub fn display_gas(&mut self) -> Result<(), polkavm::Error> {
         let mut config = polkavm::Config::from_env()?;
         config.set_worker_count(0);
@@ -189,7 +197,7 @@ impl<'a> Disassembler<'a> {
 
         let mut in_new_block = true;
         let mut gas_cost_map = HashMap::new();
-        for instruction in self.blob.instructions(DefaultInstructionSet::default()) {
+        for instruction in self.instructions() {
             if in_new_block {
                 in_new_block = false;
                 if let Some(cost) = module.calculate_gas_cost_for(instruction.offset) {
@@ -212,7 +220,7 @@ impl<'a> Disassembler<'a> {
         {
             let mut basic_block_counter = 0;
             let mut basic_block_started = true;
-            for instruction in self.blob.instructions(DefaultInstructionSet::default()) {
+            for instruction in self.instructions() {
                 if basic_block_started {
                     instruction_offset_to_basic_block.insert(instruction.offset, basic_block_counter);
                     basic_block_started = false;
