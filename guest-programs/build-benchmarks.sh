@@ -1,13 +1,7 @@
-#!/bin/bash
+#!/usr/bin/env bash
 
 set -euo pipefail
 cd -- "$(dirname -- "${BASH_SOURCE[0]}")"
-
-source ../ci/jobs/detect-or-install-riscv-toolchain.sh
-
-if [ "${RV32E_TOOLCHAIN:-}" == "" ]; then
-    echo "WARN: rv32e toolchain is missing; PolkaVM binaries won't be built!"
-fi
 
 TOOLCHAIN_VERSION="1.75.0"
 
@@ -71,17 +65,28 @@ if [ "${SOLANA_PLATFORM_TOOLS_DIR:-}" == "" ]; then
     esac
 fi
 
+build_polkavm() {
+    echo "> Building: '$1' (polkavm)"
+
+    RUSTFLAGS="$extra_flags" cargo build  \
+        -Z build-std=core,alloc \
+        --target "$PWD/riscv32emac-unknown-none-polkavm.json" \
+        -q --release --bin $1 -p $1
+
+    pushd ..
+
+    cargo run -q -p polkatool link \
+        --run-only-if-newer guest-programs/target/riscv32emac-unknown-none-polkavm/release/$1 \
+        -o guest-programs/target/riscv32emac-unknown-none-polkavm/release/$1.polkavm
+
+    popd
+}
+
 function build_benchmark() {
-    current_dir=$(pwd)
     extra_flags="${extra_flags:-}"
 
-    if [ "${RV32E_TOOLCHAIN:-}" != "" ]; then
-        echo "> Building: '$1' (polkavm)"
-        RUSTFLAGS="-C target-feature=+lui-addi-fusion,+fast-unaligned-access,+xtheadcondmov,+c -C relocation-model=pie -C link-arg=--emit-relocs -C link-arg=--unique $extra_flags" rustup run $RV32E_TOOLCHAIN cargo build -q --release --bin $1 -p $1
-        cd ..
-        cargo run -q -p polkatool link --run-only-if-newer guest-programs/target/riscv32ema-unknown-none-elf/release/$1 -o guest-programs/target/riscv32ema-unknown-none-elf/release/$1.polkavm
-        cd $current_dir
-    fi
+    # Unconditional build:
+    build_polkavm $1
 
     if [ "${BUILD_WASM}" == "1" ]; then
         echo "> Building: '$1' (wasm)"
