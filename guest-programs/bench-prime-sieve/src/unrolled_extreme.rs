@@ -11,6 +11,7 @@ use crate::{
 /// Storage structure implementing standard linear bit storage, but with a hybrid bit setting strategy:
 /// - dense resetting for small skip factors
 /// - sparse resetting for larger skip factors
+///
 /// This algorithm is functionally equivalent to [`crate::unrolled::FlagStorageUnrolledHybrid`], but we use a procedural
 /// macro to write the dense reset functions instead of relying on the compiler to do so implicitly via const-generics.
 /// Performance, as a result, is very similar. This method has a slight edge over the const-generics, and is

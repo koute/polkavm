@@ -91,6 +91,7 @@ fn reinterpret_slice_mut_u64_u8(words: &mut [u64]) -> &mut [u8] {
 /// Storage structure implementing standard linear bit storage, but with a hybrid bit setting strategy:
 /// - dense resetting for small skip factors
 /// - sparse resetting for larger skip factors
+///
 /// This algorithm was developed in collaboration with @GordonBGood, and leverages his extreme-unrolling
 /// approach combined with the elements of the dense-resetting approach in my `bit-storage-striped-hybrid`
 /// solution.

@@ -1414,9 +1414,18 @@ where
 {
     let section = elf.section_by_index(target.section_index);
     let mut b = polkavm_common::elf::Reader::from(section.data());
+
+    // Skip `sh_offset` bytes:
     let _ = b.read(target.offset as usize)?;
 
-    let version = b.read_byte()?;
+    let mut version = b.read_byte()?;
+
+    // FIXME: `.polkavm_metadata` section is padded with 0 when it starts with
+    // an import for unknown reason.
+    if version == 0 {
+        version = b.read_byte()?;
+    }
+
     if version != 1 && version != 2 {
         return Err(format!("unsupported extern metadata version: '{version}' (expected '1' or '2')"));
     }
