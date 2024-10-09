@@ -1,5 +1,6 @@
 #![no_main]
-
+#[macro_use]
+extern crate libfuzzer_sys;
 use arbitrary::Arbitrary;
 use libfuzzer_sys::fuzz_target;
 

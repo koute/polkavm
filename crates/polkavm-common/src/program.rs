@@ -4143,6 +4143,13 @@ impl ProgramBlob {
         &self.bitmask
     }
 
+    #[cfg(feature = "export-internals-for-testing")]
+    #[doc(hidden)]
+    pub fn set_bitmask(&mut self, bitmask: ArcBytes) {
+        self.bitmask = bitmask;
+    }
+
+    /// Returns the import offsets and symbols.
     pub fn imports(&self) -> Imports {
         Imports {
             offsets: &self.import_offsets,
@@ -4203,7 +4210,7 @@ impl ProgramBlob {
         }
     }
 
-    /// Visits every instrution in the program.
+    /// Visits every instruction in the program.
     #[cfg_attr(not(debug_assertions), inline(always))]
     pub fn visit<T>(&self, dispatch_table: T, visitor: &mut T::State)
     where
