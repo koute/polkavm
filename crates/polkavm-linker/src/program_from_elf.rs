@@ -1692,7 +1692,11 @@ fn convert_instruction(
 ) -> Result<(), ProgramFromElfError> {
     match instruction {
         Inst::LoadUpperImmediate { dst, value } => {
-            let Some(dst) = cast_reg_non_zero(dst)? else { return Ok(()) };
+            let Some(dst) = cast_reg_non_zero(dst)? else {
+                emit(InstExt::nop());
+                return Ok(());
+            };
+
             emit(InstExt::Basic(BasicInst::LoadImmediate { dst, imm: value as i32 }));
             Ok(())
         }
@@ -1797,7 +1801,11 @@ fn convert_instruction(
             Ok(())
         }
         Inst::RegImm { kind, dst, src, imm } => {
-            let Some(dst) = cast_reg_non_zero(dst)? else { return Ok(()) };
+            let Some(dst) = cast_reg_non_zero(dst)? else {
+                emit(InstExt::nop());
+                return Ok(());
+            };
+
             let src = cast_reg_any(src)?;
             let kind = match kind {
                 RegImmKind::Add => AnyAnyKind::Add,
@@ -1841,7 +1849,10 @@ fn convert_instruction(
             Ok(())
         }
         Inst::RegReg { kind, dst, src1, src2 } => {
-            let Some(dst) = cast_reg_non_zero(dst)? else { return Ok(()) };
+            let Some(dst) = cast_reg_non_zero(dst)? else {
+                emit(InstExt::nop());
+                return Ok(());
+            };
 
             macro_rules! anyany {
                 ($kind:ident) => {
@@ -2417,7 +2428,11 @@ where
             })?;
 
             // We need to always emit at least one instruction (even if it's a NOP) to handle potential jumps.
-            assert_ne!(output.len(), original_length, "internal error: no instructions were emitted");
+            assert_ne!(
+                output.len(),
+                original_length,
+                "internal error: no instructions were emitted for instruction {original_inst:?} in section {section_name}"
+            );
         }
     }
 
