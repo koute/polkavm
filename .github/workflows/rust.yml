@@ -50,7 +50,7 @@ jobs:
     steps:
     - uses: actions/checkout@v4
     - name: Install kani
-      run: cargo install --locked kani-verifier
+      run: cargo install --locked --version 0.55.0 kani-verifier
     - name: Setup kani
       run: cargo kani setup
     - name: Run kani
