@@ -1880,11 +1880,27 @@ fn convert_instruction(
                             src1,
                             src2,
                         },
-                        _ => {
-                            return Err(ProgramFromElfError::other(format!(
-                                "found a {:?} instruction using a zero register",
-                                kind
-                            )))
+                        (lhs, rhs) => {
+                            let lhs = lhs
+                                .map(|reg| RegValue::InputReg(reg, BlockTarget::from_raw(0)))
+                                .unwrap_or(RegValue::Constant(0));
+
+                            let rhs = rhs
+                                .map(|reg| RegValue::InputReg(reg, BlockTarget::from_raw(0)))
+                                .unwrap_or(RegValue::Constant(0));
+
+                            match OperationKind::from(RegRegKind::$kind).apply(lhs, rhs) {
+                                Some(RegValue::Constant(imm)) => {
+                                    let imm: i32 = imm.try_into().expect("immediate operand overflow");
+                                    BasicInst::LoadImmediate { dst, imm }
+                                }
+                                _ => {
+                                    return Err(ProgramFromElfError::other(format!(
+                                        "found a {:?} instruction using a zero register",
+                                        kind
+                                    )))
+                                }
+                            }
                         }
                     }
                 };
