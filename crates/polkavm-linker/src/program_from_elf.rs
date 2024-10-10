@@ -5280,11 +5280,16 @@ fn spill_fake_registers(
             continue;
         };
 
-        let end_at = start_at
-            + block.ops[start_at..]
-                .iter()
-                .take_while(|(_, instruction)| !((instruction.src_mask(imports) | instruction.dst_mask(imports)) & fake_mask).is_empty())
-                .count();
+        let end_at = {
+            let mut end_at = start_at + 1;
+            for index in start_at..block.ops.len() {
+                let instruction = block.ops[index].1;
+                if !((instruction.src_mask(imports) | instruction.dst_mask(imports)) & fake_mask).is_empty() {
+                    end_at = index + 1;
+                }
+            }
+            end_at
+        };
 
         // This block uses one or more "fake" registers which are not supported by the VM.
         //
@@ -5544,6 +5549,16 @@ fn spill_fake_registers(
             .insert(*current);
 
         block.ops.splice(start_at..end_at, buffer);
+    }
+
+    for current in used_blocks {
+        if all_blocks[current.index()]
+            .ops
+            .iter()
+            .any(|(_, instruction)| !((instruction.src_mask(imports) | instruction.dst_mask(imports)) & fake_mask).is_empty())
+        {
+            panic!("internal error: not all fake registers were removed")
+        }
     }
 }
 
