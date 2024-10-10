@@ -1815,12 +1815,10 @@ struct LineEntry {
     location: SourceCodeLocation,
 }
 
+/// Represents a DWARF section. This is not the most efficient representation,
+/// but it's invariant to any transformations that might be applied to the code.
 #[derive(Default)]
-pub(crate) struct DwarfInfo {
-    // This is not the most efficient representation, but it's invariant
-    // to any transformations that might be applied to the code.
-    pub location_map: HashMap<SectionTarget, Arc<[Location]>>,
-}
+pub(crate) struct DwarfInfo(pub HashMap<SectionTarget, Arc<[Location]>>);
 
 struct AttributeValue<R>
 where
@@ -2241,7 +2239,7 @@ where
     Ok(None)
 }
 
-pub(crate) fn load_dwarf<H>(
+pub(crate) fn load<H>(
     string_cache: &mut StringCache,
     elf: &Elf<H>,
     relocations: &BTreeMap<SectionTarget, RelocationKind>,
@@ -2329,5 +2327,5 @@ where
     };
 
     let location_map = walker.run()?;
-    Ok(DwarfInfo { location_map })
+    Ok(DwarfInfo(location_map))
 }

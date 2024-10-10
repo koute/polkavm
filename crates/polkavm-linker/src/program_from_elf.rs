@@ -8383,8 +8383,9 @@ where
     let mut location_map: HashMap<SectionTarget, Arc<[Location]>> = HashMap::new();
     if !config.strip {
         let mut string_cache = crate::utils::StringCache::default();
-        let dwarf_info = crate::dwarf::load_dwarf(&mut string_cache, &elf, &relocations)?;
-        location_map = dwarf_info.location_map;
+        if cfg!(feature = "dwarf") {
+            location_map = (crate::dwarf::load(&mut string_cache, &elf, &relocations)?).0;
+        }
 
         // If there is no DWARF info present try to use the symbol table as a fallback.
         for (source, name) in parse_function_symbols(&elf)? {
