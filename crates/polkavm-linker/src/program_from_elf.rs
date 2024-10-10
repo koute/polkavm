@@ -1569,6 +1569,12 @@ where
 {
     match relocation.target() {
         object::RelocationTarget::Absolute => {
+            if let object::RelocationFlags::Elf { r_type } = relocation.flags() {
+                if r_type == object::elf::R_RISCV_NONE {
+                    // GNU ld apparently turns R_RISCV_ALIGN and R_RISCV_RELAX into these.
+                    return Ok(None);
+                }
+            }
             // Example of such relocation:
             //   Offset     Info    Type                Sym. Value  Symbol's Name + Addend
             //   00060839  00000001 R_RISCV_32                        0
