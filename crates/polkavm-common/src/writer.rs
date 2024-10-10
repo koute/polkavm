@@ -1,4 +1,4 @@
-use crate::program::{self, Instruction, ProgramCounter, ProgramSymbol};
+use crate::program::{self, Instruction, ProgramCounter, ProgramSymbol, BLOB_LEN_RANGE};
 use alloc::boxed::Box;
 use alloc::vec::Vec;
 use core::ops::Range;
@@ -413,10 +413,11 @@ impl ProgramBlobBuilder {
 
         writer.push_raw_bytes(&program::BLOB_MAGIC);
         if self.is_64 {
-            writer.push_byte(program::BLOB_VERSION_V1_64);
+            writer.push_byte(program::BLOB_VERSION_CURRENT_64);
         } else {
-            writer.push_byte(program::BLOB_VERSION_V1_32);
+            writer.push_byte(program::BLOB_VERSION_CURRENT_32);
         }
+        writer.push_raw_bytes(&[0; BLOB_LEN_RANGE.end - BLOB_LEN_RANGE.start]);
 
         if self.ro_data_size > 0 || self.rw_data_size > 0 || self.stack_size > 0 {
             writer.push_section_inplace(program::SECTION_MEMORY_CONFIG, |writer| {
@@ -467,6 +468,10 @@ impl ProgramBlobBuilder {
         }
 
         writer.push_raw_bytes(&[program::SECTION_END_OF_FILE]);
+
+        let blob_len = (writer.len() as u64).to_le_bytes();
+        output[BLOB_LEN_RANGE].copy_from_slice(&blob_len);
+
         output
     }
 }
