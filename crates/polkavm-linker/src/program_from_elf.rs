@@ -7822,6 +7822,7 @@ where
             || name == ".data.rel.ro"
             || name.starts_with(".data.rel.ro.")
             || name == ".got"
+            || name == ".got.plt"
             || name == ".relro_padding"
         {
             if name == ".rodata" && is_writable {
