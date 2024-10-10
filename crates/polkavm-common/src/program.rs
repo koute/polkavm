@@ -3824,9 +3824,9 @@ impl ProgramParts {
 
         reader.read_slice(BLOB_LEN_RANGE.len())?;
 
-        let is_64_bit = if blob_version == BLOB_VERSION_CURRENT_32 {
+        let is_64_bit = if blob_version == BLOB_VERSION_V1_32 {
             false
-        } else if blob_version == BLOB_VERSION_CURRENT_64 {
+        } else if blob_version == BLOB_VERSION_V1_64 {
             true
         } else {
             return Err(ProgramParseError(ProgramParseErrorKind::UnsupportedVersion {
@@ -4835,10 +4835,6 @@ pub const SECTION_END_OF_FILE: u8 = 0;
 
 pub const BLOB_VERSION_V1_64: u8 = 0;
 pub const BLOB_VERSION_V1_32: u8 = 1;
-pub const BLOB_VERSION_V2_64: u8 = BLOB_VERSION_V1_64 + 2;
-pub const BLOB_VERSION_V2_32: u8 = BLOB_VERSION_V1_32 + 2;
-pub const BLOB_VERSION_CURRENT_64: u8 = BLOB_VERSION_V2_64;
-pub const BLOB_VERSION_CURRENT_32: u8 = BLOB_VERSION_V2_32;
 
 pub const VERSION_DEBUG_LINE_PROGRAM_V1: u8 = 1;
 

@@ -413,9 +413,9 @@ impl ProgramBlobBuilder {
 
         writer.push_raw_bytes(&program::BLOB_MAGIC);
         if self.is_64 {
-            writer.push_byte(program::BLOB_VERSION_CURRENT_64);
+            writer.push_byte(program::BLOB_VERSION_V1_64);
         } else {
-            writer.push_byte(program::BLOB_VERSION_CURRENT_32);
+            writer.push_byte(program::BLOB_VERSION_V1_32);
         }
         writer.push_raw_bytes(&[0; BLOB_LEN_RANGE.end - BLOB_LEN_RANGE.start]);
 
