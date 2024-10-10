@@ -3812,17 +3812,29 @@ pub struct ProgramParts {
 }
 
 impl ProgramParts {
-    fn try_header(reader: &mut Reader<ArcBytes>) -> Result<Self, ProgramParseError> {
-        let magic = reader.read_slice(BLOB_MAGIC.len())?;
-        if magic != BLOB_MAGIC {
+    pub fn blob_length(raw_blob: &[u8]) -> Option<BlobLen> {
+        let end = BLOB_LEN_OFFSET + BLOB_LEN_SIZE;
+        if raw_blob.len() < end {
+            return None;
+        }
+        Some(BlobLen::from_le_bytes(raw_blob[BLOB_LEN_OFFSET..end].try_into().unwrap()))
+    }
+
+    pub fn from_bytes(blob: ArcBytes) -> Result<Self, ProgramParseError> {
+        if !blob.starts_with(&BLOB_MAGIC) {
             return Err(ProgramParseError(ProgramParseErrorKind::Other(
                 "blob doesn't start with the expected magic bytes",
             )));
         }
 
+        let mut reader = Reader {
+            blob: &blob,
+            position: BLOB_MAGIC.len(),
+        };
+
         let blob_version = reader.read_byte()?;
 
-        reader.read_slice(BLOB_LEN_RANGE.len())?;
+        reader.read_slice(BLOB_LEN_SIZE)?;
 
         let is_64_bit = if blob_version == BLOB_VERSION_V1_32 {
             false
@@ -3834,24 +3846,10 @@ impl ProgramParts {
             }));
         };
 
-        Ok(ProgramParts {
+        let mut parts = ProgramParts {
             is_64_bit,
             ..ProgramParts::default()
-        })
-    }
-
-    pub fn blob_length(blob: ArcBytes) -> Result<u64, ProgramParseError> {
-        let mut reader = Reader::from(&blob);
-        Self::try_header(&mut reader)?;
-
-        Ok(u64::from_le_bytes(
-            blob[BLOB_LEN_RANGE].try_into().expect("BLOB_LEN_RANGE is a slice of 8 bytes; qed"),
-        ))
-    }
-
-    pub fn from_bytes(blob: ArcBytes) -> Result<Self, ProgramParseError> {
-        let mut reader = Reader::from(&blob);
-        let mut parts = Self::try_header(&mut reader)?;
+        };
 
         let mut section = reader.read_byte()?;
         if section == SECTION_MEMORY_CONFIG {
@@ -4819,8 +4817,9 @@ pub const BLOB_MAGIC: [u8; 4] = [b'P', b'V', b'M', b'\0'];
 /// By embedding this metadata into the header, program blobs stay opaque,
 /// however this information can still easily be retrieved.
 /// Found at offset 5 after the magic bytes and version number.
+pub type BlobLen = u64;
+pub const BLOB_LEN_SIZE: usize = core::mem::size_of::<BlobLen>();
 pub const BLOB_LEN_OFFSET: usize = BLOB_MAGIC.len() + 1;
-pub const BLOB_LEN_RANGE: Range<usize> = BLOB_LEN_OFFSET..BLOB_LEN_OFFSET + u64::MIN.to_le_bytes().len();
 
 pub const SECTION_MEMORY_CONFIG: u8 = 1;
 pub const SECTION_RO_DATA: u8 = 2;

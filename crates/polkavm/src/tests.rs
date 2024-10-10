@@ -10,8 +10,8 @@ use alloc::vec;
 use alloc::vec::Vec;
 
 use polkavm_common::abi::MemoryMapBuilder;
-use polkavm_common::program::Reg::*;
 use polkavm_common::program::{asm, DefaultInstructionSet};
+use polkavm_common::program::{BlobLen, Reg::*};
 use polkavm_common::utils::align_to_next_page_u32;
 use polkavm_common::writer::ProgramBlobBuilder;
 
@@ -2345,8 +2345,8 @@ fn test_basic_debug_info() {
 
 #[test]
 fn blob_len_works() {
-    const DOOM: &[u8] = include_bytes!("../../../examples/doom/roms/doom.polkavm");
-    assert_eq!(DOOM.len() as u64, ProgramParts::blob_length(DOOM.into()).unwrap());
+    const DOOM: &[u8] = include_bytes!("../../../guest-programs/output/example-hello-world.polkavm");
+    assert_eq!(Some(DOOM.len() as BlobLen), ProgramParts::blob_length(DOOM));
 }
 
 #[cfg(not(feature = "std"))]
