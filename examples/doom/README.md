@@ -14,8 +14,24 @@ cargo run --release --no-default-features
 
 ## Running on macOS
 
+Install the correct target:
+
+```bash
+rustup target add x86_64-apple-darwin      
 ```
-LIBRARY_PATH="$LIBRARY_PATH:$(brew --prefix)/lib" POLKAVM_ALLOW_INSECURE=1 POLKAVM_SANDBOX=generic POLKAVM_BACKEND=compiler cargo run --target=x86_64-apple-darwin --release
+
+Install `SDL` dependencies:
+
+```bash
+brew install SDL2
+brew install SDL2_ttf
+brew install SDL2_image
+```
+
+Run the game:
+
+```bash
+cargo run --target=x86_64-apple-darwin --release       
 ```
 
 ## Running on other operating systems
