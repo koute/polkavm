@@ -2868,6 +2868,12 @@ where
     }
 }
 
+impl<'a, T> From<&'a T> for Reader<'a, T> {
+    fn from(blob: &'a T) -> Self {
+        Self { blob, position: 0 }
+    }
+}
+
 impl<'a, T> Reader<'a, T>
 where
     T: ?Sized + AsRef<[u8]>,
@@ -3806,6 +3812,14 @@ pub struct ProgramParts {
 }
 
 impl ProgramParts {
+    pub fn blob_length(raw_blob: &[u8]) -> Option<BlobLen> {
+        let end = BLOB_LEN_OFFSET + BLOB_LEN_SIZE;
+        if raw_blob.len() < end {
+            return None;
+        }
+        Some(BlobLen::from_le_bytes(raw_blob[BLOB_LEN_OFFSET..end].try_into().unwrap()))
+    }
+
     pub fn from_bytes(blob: ArcBytes) -> Result<Self, ProgramParseError> {
         if !blob.starts_with(&BLOB_MAGIC) {
             return Err(ProgramParseError(ProgramParseErrorKind::Other(
@@ -3819,6 +3833,9 @@ impl ProgramParts {
         };
 
         let blob_version = reader.read_byte()?;
+
+        reader.read_slice(BLOB_LEN_SIZE)?;
+
         let is_64_bit = if blob_version == BLOB_VERSION_V1_32 {
             false
         } else if blob_version == BLOB_VERSION_V1_64 {
@@ -4795,6 +4812,14 @@ proptest::proptest! {
 
 /// The magic bytes with which every program blob must start with.
 pub const BLOB_MAGIC: [u8; 4] = [b'P', b'V', b'M', b'\0'];
+
+/// The blob length is the length of the blob itself encoded as an 64bit LE integer.
+/// By embedding this metadata into the header, program blobs stay opaque,
+/// however this information can still easily be retrieved.
+/// Found at offset 5 after the magic bytes and version number.
+pub type BlobLen = u64;
+pub const BLOB_LEN_SIZE: usize = core::mem::size_of::<BlobLen>();
+pub const BLOB_LEN_OFFSET: usize = BLOB_MAGIC.len() + 1;
 
 pub const SECTION_MEMORY_CONFIG: u8 = 1;
 pub const SECTION_RO_DATA: u8 = 2;

@@ -10,12 +10,13 @@ use alloc::vec;
 use alloc::vec::Vec;
 
 use polkavm_common::abi::MemoryMapBuilder;
-use polkavm_common::program::Reg::*;
 use polkavm_common::program::{asm, DefaultInstructionSet};
+use polkavm_common::program::{BlobLen, Reg::*};
 use polkavm_common::utils::align_to_next_page_u32;
 use polkavm_common::writer::ProgramBlobBuilder;
 
 use paste::paste;
+use polkavm_linker::ProgramParts;
 
 fn get_native_page_size() -> usize {
     if_compiler_is_supported! {
@@ -2340,6 +2341,12 @@ fn test_basic_debug_info() {
     assert_eq!(frame.line(), Some(line as u32 + 1));
     assert_eq!(frame.full_name().unwrap().to_string(), "read_u32");
     assert!(frame.path().unwrap().unwrap().ends_with("/guest-programs/test-blob/src/main.rs"));
+}
+
+#[test]
+fn blob_len_works() {
+    const DOOM: &[u8] = include_bytes!("../../../guest-programs/output/example-hello-world.polkavm");
+    assert_eq!(Some(DOOM.len() as BlobLen), ProgramParts::blob_length(DOOM));
 }
 
 #[cfg(not(feature = "std"))]
