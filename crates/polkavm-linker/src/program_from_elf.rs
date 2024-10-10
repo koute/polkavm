@@ -581,6 +581,10 @@ enum BasicInst<T> {
         dst: Reg,
         imm: i32,
     },
+    MoveReg {
+        dst: Reg,
+        src: Reg,
+    },
     RegReg {
         kind: RegRegKind,
         dst: Reg,
@@ -619,18 +623,7 @@ enum OpKind {
 impl<T> BasicInst<T> {
     fn is_nop(&self) -> bool {
         match self {
-            BasicInst::AnyAny {
-                kind: AnyAnyKind::Add,
-                dst,
-                src1,
-                src2,
-            } => {
-                if RegImm::Reg(*dst) == *src1 && *src2 == RegImm::Imm(0) {
-                    return true;
-                }
-
-                false
-            }
+            BasicInst::MoveReg { dst, src } => dst == src,
             BasicInst::Nop => true,
             _ => false,
         }
@@ -643,6 +636,7 @@ impl<T> BasicInst<T> {
             | BasicInst::LoadAbsolute { .. }
             | BasicInst::LoadAddress { .. }
             | BasicInst::LoadAddressIndirect { .. } => RegMask::empty(),
+            BasicInst::MoveReg { src, .. } => RegMask::from(src),
             BasicInst::StoreAbsolute { src, .. } => RegMask::from(src),
             BasicInst::LoadIndirect { base, .. } => RegMask::from(base),
             BasicInst::StoreIndirect { src, base, .. } => RegMask::from(src) | RegMask::from(base),
@@ -657,7 +651,8 @@ impl<T> BasicInst<T> {
     fn dst_mask(&self, imports: &[Import]) -> RegMask {
         match *self {
             BasicInst::Nop | BasicInst::StoreAbsolute { .. } | BasicInst::StoreIndirect { .. } => RegMask::empty(),
-            BasicInst::LoadImmediate { dst, .. }
+            BasicInst::MoveReg { dst, .. }
+            | BasicInst::LoadImmediate { dst, .. }
             | BasicInst::LoadAbsolute { dst, .. }
             | BasicInst::LoadAddress { dst, .. }
             | BasicInst::LoadAddressIndirect { dst, .. }
@@ -675,6 +670,7 @@ impl<T> BasicInst<T> {
             BasicInst::Sbrk { .. } | BasicInst::Ecalli { .. } | BasicInst::StoreAbsolute { .. } | BasicInst::StoreIndirect { .. } => true,
             BasicInst::LoadAbsolute { .. } | BasicInst::LoadIndirect { .. } => !config.elide_unnecessary_loads,
             BasicInst::Nop
+            | BasicInst::MoveReg { .. }
             | BasicInst::LoadImmediate { .. }
             | BasicInst::LoadAddress { .. }
             | BasicInst::LoadAddressIndirect { .. }
@@ -731,6 +727,10 @@ impl<T> BasicInst<T> {
                 kind,
                 src1: src1.map_register(|reg| map(reg, OpKind::Read)),
                 src2: src2.map_register(|reg| map(reg, OpKind::Read)),
+                dst: map(dst, OpKind::Write),
+            }),
+            BasicInst::MoveReg { dst, src } => Some(BasicInst::MoveReg {
+                src: map(src, OpKind::Read),
                 dst: map(dst, OpKind::Write),
             }),
             BasicInst::Cmov { kind, dst, src, cond } => Some(BasicInst::Cmov {
@@ -797,6 +797,7 @@ impl<T> BasicInst<T> {
 
     fn map_target<U, E>(self, map: impl Fn(T) -> Result<U, E>) -> Result<BasicInst<U>, E> {
         Ok(match self {
+            BasicInst::MoveReg { dst, src } => BasicInst::MoveReg { dst, src },
             BasicInst::LoadImmediate { dst, imm } => BasicInst::LoadImmediate { dst, imm },
             BasicInst::LoadAbsolute { kind, dst, target } => BasicInst::LoadAbsolute { kind, dst, target },
             BasicInst::StoreAbsolute { kind, src, target } => BasicInst::StoreAbsolute { kind, src, target },
@@ -821,6 +822,7 @@ impl<T> BasicInst<T> {
             BasicInst::LoadAbsolute { target, .. } | BasicInst::StoreAbsolute { target, .. } => (Some(*target), None),
             BasicInst::LoadAddress { target, .. } | BasicInst::LoadAddressIndirect { target, .. } => (None, Some(*target)),
             BasicInst::Nop
+            | BasicInst::MoveReg { .. }
             | BasicInst::LoadImmediate { .. }
             | BasicInst::LoadIndirect { .. }
             | BasicInst::StoreIndirect { .. }
@@ -1670,12 +1672,7 @@ fn emit_minmax(
     }));
 
     if let Some(src1) = src1 {
-        emit(InstExt::Basic(BasicInst::AnyAny {
-            kind: AnyAnyKind::Add,
-            dst,
-            src1: RegImm::Reg(src1),
-            src2: RegImm::Imm(0),
-        }));
+        emit(InstExt::Basic(BasicInst::MoveReg { dst, src: src1 }));
     } else {
         emit(InstExt::Basic(BasicInst::LoadImmediate { dst: tmp, imm: 0 }));
     }
@@ -1834,22 +1831,28 @@ fn convert_instruction(
                 RegImmKind::ShiftArithmeticRight64 => AnyAnyKind::ShiftArithmeticRight64,
             };
 
-            if matches!(src, RegImm::Imm(0)) {
-                // The optimizer can take care of this later, but doing it early here is more efficient.
-                emit(InstExt::Basic(BasicInst::LoadImmediate {
-                    dst,
-                    imm: OperationKind::from(kind)
-                        .apply_const(0, i32_to_i64(imm))
-                        .try_into()
-                        .expect("load immediate overflow"),
-                }));
-            } else {
-                emit(InstExt::Basic(BasicInst::AnyAny {
-                    kind,
-                    dst,
-                    src1: src,
-                    src2: (imm as u32).into(),
-                }));
+            match src {
+                RegImm::Imm(0) => {
+                    // The optimizer can take care of this later, but doing it early here is more efficient.
+                    emit(InstExt::Basic(BasicInst::LoadImmediate {
+                        dst,
+                        imm: OperationKind::from(kind)
+                            .apply_const(0, i32_to_i64(imm))
+                            .try_into()
+                            .expect("load immediate overflow"),
+                    }));
+                }
+                RegImm::Reg(src) if imm == 0 && ((!rv64 && kind == AnyAnyKind::Add) || (rv64 && kind == AnyAnyKind::Add64)) => {
+                    emit(InstExt::Basic(BasicInst::MoveReg { dst, src }));
+                }
+                _ => {
+                    emit(InstExt::Basic(BasicInst::AnyAny {
+                        kind,
+                        dst,
+                        src1: src,
+                        src2: (imm as u32).into(),
+                    }));
+                }
             }
 
             Ok(())
@@ -2213,11 +2216,9 @@ fn convert_instruction(
             }));
 
             if let Some(output) = output {
-                emit(InstExt::Basic(BasicInst::AnyAny {
-                    kind: AnyAnyKind::Add,
+                emit(InstExt::Basic(BasicInst::MoveReg {
                     dst: output,
-                    src1: old_value.into(),
-                    src2: RegImm::Imm(0),
+                    src: old_value,
                 }));
             }
 
@@ -3846,7 +3847,7 @@ impl BlockRegs {
         None
     }
 
-    fn simplify_instruction(&self, instruction: BasicInst<AnyTarget>) -> Option<BasicInst<AnyTarget>> {
+    fn simplify_instruction(&self, rv64: bool, instruction: BasicInst<AnyTarget>) -> Option<BasicInst<AnyTarget>> {
         match instruction {
             BasicInst::RegReg { kind, dst, src1, src2 } => {
                 let src1_value = self.get_reg(src1);
@@ -3893,6 +3894,18 @@ impl BlockRegs {
                             src1,
                             src2: RegImm::Imm(value as u32),
                         });
+                    }
+                }
+
+                if (!rv64 && kind == AnyAnyKind::Add) || (rv64 && kind == AnyAnyKind::Add64) {
+                    if src1_value == RegValue::Constant(0) {
+                        if let RegImm::Reg(src) = src2 {
+                            return Some(BasicInst::MoveReg { dst, src });
+                        }
+                    } else if src2_value == RegValue::Constant(0) {
+                        if let RegImm::Reg(src) = src1 {
+                            return Some(BasicInst::MoveReg { dst, src });
+                        }
                     }
                 }
 
@@ -3976,6 +3989,11 @@ impl BlockRegs {
                     return Some(BasicInst::Nop);
                 }
             }
+            BasicInst::MoveReg { dst, src } => {
+                if dst == src {
+                    return Some(BasicInst::Nop);
+                }
+            }
             _ => {}
         }
 
@@ -4022,6 +4040,9 @@ impl BlockRegs {
                 target: AnyTarget::Data(target),
             } => {
                 self.set_reg(dst, RegValue::DataAddress(target));
+            }
+            BasicInst::MoveReg { dst, src } => {
+                self.set_reg(dst, self.get_reg(src));
             }
             BasicInst::AnyAny {
                 kind: AnyAnyKind::Add | AnyAnyKind::Or,
@@ -4190,7 +4211,7 @@ where
             continue;
         }
 
-        while let Some(new_instruction) = regs.simplify_instruction(instruction) {
+        while let Some(new_instruction) = regs.simplify_instruction(elf.is_64(), instruction) {
             if !modified_this_block {
                 references = gather_references(&all_blocks[current.index()]);
                 modified_this_block = true;
@@ -5464,11 +5485,9 @@ fn spill_fake_registers(
                         if src_reg == dst_reg {
                             continue;
                         }
-                        BasicInst::AnyAny {
-                            kind: AnyAnyKind::Add,
+                        BasicInst::MoveReg {
                             dst: dst_reg,
-                            src1: src_reg.into(),
-                            src2: RegImm::Imm(0),
+                            src: src_reg,
                         }
                     }
                     // Won't be emitted according to `regalloc2` docs.
@@ -6437,6 +6456,7 @@ fn emit_code(
                         }
                     }
                 }
+                BasicInst::MoveReg { dst, src } => Instruction::move_reg(conv_reg(dst), conv_reg(src)),
                 BasicInst::AnyAny { kind, dst, src1, src2 } => {
                     use AnyAnyKind as K;
                     use Instruction as I;
@@ -6479,7 +6499,6 @@ fn emit_code(
                         (RegImm::Reg(src1), RegImm::Imm(src2)) => {
                             let src1 = conv_reg(src1);
                             match kind {
-                                K::Add if src2 == 0 => I::move_reg(dst, src1),
                                 K::Add => I::add_imm(dst, src1, src2),
                                 K::Add64 => I::add_64_imm(dst, src1, src2),
                                 K::Sub => I::add_imm(dst, src1, (-(src2 as i32)) as u32),
