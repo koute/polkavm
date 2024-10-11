@@ -11,12 +11,11 @@ use alloc::vec::Vec;
 
 use polkavm_common::abi::MemoryMapBuilder;
 use polkavm_common::program::{asm, DefaultInstructionSet};
-use polkavm_common::program::{BlobLen, Reg::*};
+use polkavm_common::program::{BlobLen, ProgramParts, Reg::*};
 use polkavm_common::utils::align_to_next_page_u32;
 use polkavm_common::writer::ProgramBlobBuilder;
 
 use paste::paste;
-use polkavm_linker::ProgramParts;
 
 fn get_native_page_size() -> usize {
     if_compiler_is_supported! {
