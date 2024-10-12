@@ -44,7 +44,7 @@ blake3 = { version = "1.5.4", default-features = false }
 clap = "4.4.6"
 diff = "0.1.13"
 env_logger = { version = "0.10.0", default-features = false }
-gimli = { version = "0.28.0", default-features = false }
+gimli = { version = "0.31.1", default-features = false }
 hashbrown = { version = "0.14.1", default-features = false }
 iced-x86 = "1.20.0"
 image = { version = "0.24.7", default-features = false }
