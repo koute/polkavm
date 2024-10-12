@@ -3812,14 +3812,6 @@ pub struct ProgramParts {
 }
 
 impl ProgramParts {
-    pub fn blob_length(raw_blob: &[u8]) -> Option<BlobLen> {
-        let end = BLOB_LEN_OFFSET + BLOB_LEN_SIZE;
-        if raw_blob.len() < end {
-            return None;
-        }
-        Some(BlobLen::from_le_bytes(raw_blob[BLOB_LEN_OFFSET..end].try_into().unwrap()))
-    }
-
     pub fn from_bytes(blob: ArcBytes) -> Result<Self, ProgramParseError> {
         if !blob.starts_with(&BLOB_MAGIC) {
             return Err(ProgramParseError(ProgramParseErrorKind::Other(
@@ -3833,9 +3825,6 @@ impl ProgramParts {
         };
 
         let blob_version = reader.read_byte()?;
-
-        reader.read_slice(BLOB_LEN_SIZE)?;
-
         let is_64_bit = if blob_version == BLOB_VERSION_V1_32 {
             false
         } else if blob_version == BLOB_VERSION_V1_64 {
@@ -3845,6 +3834,13 @@ impl ProgramParts {
                 version: blob_version,
             }));
         };
+
+        let blob_len = BlobLen::from_le_bytes(reader.read_slice(BLOB_LEN_SIZE)?.try_into().unwrap());
+        if blob_len != blob.len() as u64 {
+            return Err(ProgramParseError(ProgramParseErrorKind::Other(
+                "blob size doesn't match the blob length metadata",
+            )));
+        }
 
         let mut parts = ProgramParts {
             is_64_bit,
@@ -3917,6 +3913,17 @@ impl ProgramParts {
 }
 
 impl ProgramBlob {
+    /// Parses the blob length information from the given `raw_blob` bytes.
+    ///
+    /// Returns `None` if `raw_blob` doesn't contain enough bytes to read the length.
+    pub fn blob_length(raw_blob: &[u8]) -> Option<BlobLen> {
+        let end = BLOB_LEN_OFFSET + BLOB_LEN_SIZE;
+        if raw_blob.len() < end {
+            return None;
+        }
+        Some(BlobLen::from_le_bytes(raw_blob[BLOB_LEN_OFFSET..end].try_into().unwrap()))
+    }
+
     /// Parses the given bytes into a program blob.
     pub fn parse(bytes: ArcBytes) -> Result<Self, ProgramParseError> {
         let parts = ProgramParts::from_bytes(bytes)?;
