@@ -88,23 +88,20 @@ extern "C" fn refine() -> u32 {
         let n = u32::from_le_bytes(buffer[0..4].try_into().unwrap());
         let fib_n = u32::from_le_bytes(buffer[4..8].try_into().unwrap());
         let fib_n_minus_1 = u32::from_le_bytes(buffer[8..12].try_into().unwrap());
-
+    
         let new_fib_n = fib_n + fib_n_minus_1;
-        let new_buffer: Vec<u8> = [(n + 1).to_le_bytes(), new_fib_n.to_le_bytes(), fib_n.to_le_bytes()]
-            .iter()
-            .flat_map(|array| array.iter())
-            .copied()
-            .collect();
-
-        buffer.copy_from_slice(&new_buffer);
+    
+        buffer[0..4].copy_from_slice(&(n + 1).to_le_bytes());
+        buffer[4..8].copy_from_slice(&new_fib_n.to_le_bytes());
+        buffer[8..12].copy_from_slice(&fib_n.to_le_bytes());
+    
     } else {
-        buffer = [1u8, 0, 0, 0, 1u8, 0, 0, 0, 0, 0, 0, 0];
+        buffer.copy_from_slice(&[1u8, 0u8, 0u8, 0u8, 1u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8]);
     }
 
     unsafe {
         export(buffer.as_mut_ptr(), buffer.len() as u32);
     }
-
     0
 }
 
