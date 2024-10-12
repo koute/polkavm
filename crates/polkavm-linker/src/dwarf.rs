@@ -818,7 +818,7 @@ where
                 }
             }
 
-            if !row.execute(instruction, &mut program) {
+            if !row.execute(instruction, &mut program)? {
                 continue;
             }
 
@@ -2150,7 +2150,7 @@ where
     let mut attributes = &[][..];
     let code = input.read_uleb128()?;
     if code != 0 {
-        let abbrev = unit.abbreviations.get(code).ok_or(gimli::Error::UnknownAbbreviation)?;
+        let abbrev = unit.abbreviations.get(code).ok_or(gimli::Error::UnknownAbbreviation(code))?;
         attributes = abbrev.attributes();
     }
 
