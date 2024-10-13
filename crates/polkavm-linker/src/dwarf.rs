@@ -12,7 +12,7 @@ use std::sync::Arc;
 fn find_unit<R>(
     units: &[Unit<R>],
     target_offset: gimli::DebugInfoOffset<R::Offset>,
-) -> Result<(&Unit<R>, gimli::UnitOffset<R::Offset>), ProgramFromElfError>
+) -> Result<(&Unit<R>, Option<gimli::UnitOffset<R::Offset>>), ProgramFromElfError>
 where
     R: gimli::Reader,
 {
@@ -27,14 +27,15 @@ where
         }
         Err(index) => &units[index - 1],
     };
-    let unit_offset = target_offset.to_unit_offset(&target_unit.raw_unit.header).ok_or_else(|| {
-        ProgramFromElfError::other(format!(
+    if let Some(unit_offset) = target_offset.to_unit_offset(&target_unit.raw_unit.header) {
+        Ok((target_unit, Some(unit_offset)))
+    } else {
+        log::warn!(
             "failed to process DWARF: found a unit for offset={:x} but couldn't compute a relative offset",
             target_offset.0.into_u64()
-        ))
-    })?;
-
-    Ok((target_unit, unit_offset))
+        );
+        Ok((target_unit, None))
+    }
 }
 
 struct AttributeParser<R: gimli::Reader> {
@@ -536,11 +537,14 @@ impl<R: gimli::Reader> AttributeParser<R> {
         };
 
         let (target_unit, target_offset) = find_unit(units, value)?;
-        let mut parser = AttributeParser::new(self.depth + 1, self.is_64bit);
-        parser.recursion_limit = self.recursion_limit - 1;
-        parser.try_match(sections, relocations, dwarf, target_unit, target_offset)?;
-
-        Ok(Some((target_unit, parser)))
+        if let Some(target_offset) = target_offset {
+            let mut parser = AttributeParser::new(self.depth + 1, self.is_64bit);
+            parser.recursion_limit = self.recursion_limit - 1;
+            parser.try_match(sections, relocations, dwarf, target_unit, target_offset)?;
+            Ok(Some((target_unit, parser)))
+        } else {
+            Ok(None)
+        }
     }
 
     fn resolve_while(
