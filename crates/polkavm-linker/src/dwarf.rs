@@ -1709,7 +1709,7 @@ where
                     }
 
                     if let Some(last_source) = previous {
-                        if inline_source.offset_range.start < last_source.offset_range.end {
+                        if inline_source.offset_range.is_overlapping(&last_source.offset_range) {
                             return Err(ProgramFromElfError::other(
                                 "failed to process DWARF: found overlapping inline subroutines in a parent subprogram",
                             ));
@@ -1745,11 +1745,10 @@ where
                     let child = child.clone();
 
                     if let Some(last_source) = previous {
-                        if child.source.offset_range.start < last_source.offset_range.end {
-                            return Err(ProgramFromElfError::other(
-                                "failed to process DWARF: found overlapping inline subroutines in a parent inline subroutine",
-                            ));
+                        if child.source.offset_range.is_overlapping(&last_source.offset_range) {
+                            log::warn!("failed to process DWARF: found overlapping inline subroutines in a parent inline subroutine");
                         }
+                        continue;
                     }
 
                     previous = Some(child.source);
