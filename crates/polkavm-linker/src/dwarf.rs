@@ -573,14 +573,20 @@ fn try_fetch_relocation(
         return Ok(None);
     };
 
-    let RelocationKind::Abs {
-        target,
-        size: RelocationSize::U32,
-    } = relocation
-    else {
-        return Err(ProgramFromElfError::other(format!(
-            "failed to process DWARF: unexpected relocation at {relocation_target}: {relocation:?}"
-        )));
+    let target = match relocation {
+        RelocationKind::Abs {
+            target,
+            size: RelocationSize::U64,
+        } => target,
+        RelocationKind::Abs {
+            target,
+            size: RelocationSize::U32,
+        } => target,
+        _ => {
+            return Err(ProgramFromElfError::other(format!(
+                "failed to process DWARF: unexpected relocation at {relocation_target}: {relocation:?}"
+            )));
+        }
     };
 
     Ok(Some(*target))
@@ -603,6 +609,10 @@ fn try_fetch_size_relocation(
         RelocationKind::Abs {
             target,
             size: RelocationSize::U32,
+        } => Ok(Some((target.section_index, (target.offset..target.offset).into()))),
+        RelocationKind::Abs {
+            target,
+            size: RelocationSize::U64,
         } => Ok(Some((target.section_index, (target.offset..target.offset).into()))),
         _ => Err(ProgramFromElfError::other(format!(
             "failed to process DWARF: unexpected relocation at {relocation_target}: {relocation:?}"
@@ -2218,14 +2228,20 @@ where
                     )));
                 };
 
-                let RelocationKind::Abs {
-                    target,
-                    size: RelocationSize::U32,
-                } = relocation
-                else {
-                    return Err(ProgramFromElfError::other(format!(
-                        "failed to process DWARF: failed to fetch DW_AT_low_pc for a unit: unexpected relocation at {relocation_target}: {relocation:?}"
-                    )));
+                let target = match relocation {
+                    RelocationKind::Abs {
+                        target,
+                        size: RelocationSize::U64,
+                    } => target,
+                    RelocationKind::Abs {
+                        target,
+                        size: RelocationSize::U32,
+                    } => target,
+                    _ => {
+                        return Err(ProgramFromElfError::other(format!(
+                            "failed to process DWARF: failed to fetch DW_AT_low_pc for a unit: unexpected relocation at {relocation_target}: {relocation:?}"
+                        )));
+                    }
                 };
 
                 return Ok(Some(*target));

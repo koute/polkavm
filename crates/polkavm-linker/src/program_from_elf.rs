@@ -581,6 +581,10 @@ enum BasicInst<T> {
         dst: Reg,
         imm: i32,
     },
+    LoadImmediate64 {
+        dst: Reg,
+        imm: i64,
+    },
     MoveReg {
         dst: Reg,
         src: Reg,
@@ -633,6 +637,7 @@ impl<T> BasicInst<T> {
         match *self {
             BasicInst::Nop
             | BasicInst::LoadImmediate { .. }
+            | BasicInst::LoadImmediate64 { .. }
             | BasicInst::LoadAbsolute { .. }
             | BasicInst::LoadAddress { .. }
             | BasicInst::LoadAddressIndirect { .. } => RegMask::empty(),
@@ -653,6 +658,7 @@ impl<T> BasicInst<T> {
             BasicInst::Nop | BasicInst::StoreAbsolute { .. } | BasicInst::StoreIndirect { .. } => RegMask::empty(),
             BasicInst::MoveReg { dst, .. }
             | BasicInst::LoadImmediate { dst, .. }
+            | BasicInst::LoadImmediate64 { dst, .. }
             | BasicInst::LoadAbsolute { dst, .. }
             | BasicInst::LoadAddress { dst, .. }
             | BasicInst::LoadAddressIndirect { dst, .. }
@@ -672,6 +678,7 @@ impl<T> BasicInst<T> {
             BasicInst::Nop
             | BasicInst::MoveReg { .. }
             | BasicInst::LoadImmediate { .. }
+            | BasicInst::LoadImmediate64 { .. }
             | BasicInst::LoadAddress { .. }
             | BasicInst::LoadAddressIndirect { .. }
             | BasicInst::RegReg { .. }
@@ -684,6 +691,10 @@ impl<T> BasicInst<T> {
         // Note: ALWAYS map the inputs first; otherwise `regalloc2` might break!
         match self {
             BasicInst::LoadImmediate { dst, imm } => Some(BasicInst::LoadImmediate {
+                dst: map(dst, OpKind::Write),
+                imm,
+            }),
+            BasicInst::LoadImmediate64 { dst, imm } => Some(BasicInst::LoadImmediate64 {
                 dst: map(dst, OpKind::Write),
                 imm,
             }),
@@ -799,6 +810,7 @@ impl<T> BasicInst<T> {
         Ok(match self {
             BasicInst::MoveReg { dst, src } => BasicInst::MoveReg { dst, src },
             BasicInst::LoadImmediate { dst, imm } => BasicInst::LoadImmediate { dst, imm },
+            BasicInst::LoadImmediate64 { dst, imm } => BasicInst::LoadImmediate64 { dst, imm },
             BasicInst::LoadAbsolute { kind, dst, target } => BasicInst::LoadAbsolute { kind, dst, target },
             BasicInst::StoreAbsolute { kind, src, target } => BasicInst::StoreAbsolute { kind, src, target },
             BasicInst::LoadAddress { dst, target } => BasicInst::LoadAddress { dst, target: map(target)? },
@@ -824,6 +836,7 @@ impl<T> BasicInst<T> {
             BasicInst::Nop
             | BasicInst::MoveReg { .. }
             | BasicInst::LoadImmediate { .. }
+            | BasicInst::LoadImmediate64 { .. }
             | BasicInst::LoadIndirect { .. }
             | BasicInst::StoreIndirect { .. }
             | BasicInst::RegReg { .. }
@@ -3632,8 +3645,28 @@ impl OperationKind {
             Self::SetGreaterOrEqualUnsigned => i64::from((lhs as u64) >= (rhs as u64)),
             Self::SetGreaterOrEqualSigned => i64::from((lhs as i64) >= (rhs as i64)),
 
+            //
+            // 64-bit instructions
+            // TODO: Merge 64-bit and 32-bit flavours of Bitwise and Set instructions.
+            //
             Self::Add64 => lhs.wrapping_add(rhs),
-            _ => todo!("unimplemented 64-bit operation: {self:?}"),
+            Self::Sub64 => lhs.wrapping_sub(rhs),
+            Self::And64 => lhs & rhs,
+            Self::Or64 => lhs | rhs,
+            Self::Xor64 => lhs ^ rhs,
+            Self::SetLessThanUnsigned64 => i64::from((lhs as u64) < (rhs as u64)),
+            Self::SetLessThanSigned64 => i64::from((lhs as i64) < (rhs as i64)),
+            Self::ShiftLogicalLeft64 => (lhs as u64).wrapping_shl(rhs as u32) as i64,
+            Self::ShiftLogicalRight64 => (lhs as u64).wrapping_shr(rhs as u32) as i64,
+            Self::ShiftArithmeticRight64 => (lhs as i64).wrapping_shr(rhs as u32) as i64,
+            Self::Mul64 => lhs.wrapping_mul(rhs),
+            Self::MulUpperSignedSigned64 => mulh64(lhs, rhs),
+            Self::MulUpperSignedUnsigned64 => mulhsu64(lhs, rhs as u64),
+            Self::MulUpperUnsignedUnsigned64 => mulhu64(lhs as u64, rhs as u64) as i64,
+            Self::Div64 => div64(lhs, rhs),
+            Self::DivUnsigned64 => divu64(lhs as u64, rhs as u64) as i64,
+            Self::Rem64 => rem64(lhs, rhs),
+            Self::RemUnsigned64 => remu64(lhs as u64, rhs as u64) as i64,
         }
     }
 
@@ -3723,7 +3756,7 @@ enum RegValue {
 }
 
 impl RegValue {
-    fn to_instruction(self, dst: Reg) -> Option<BasicInst<AnyTarget>> {
+    fn to_instruction(self, dst: Reg, is_rv64: bool) -> Option<BasicInst<AnyTarget>> {
         match self {
             RegValue::CodeAddress(target) => Some(BasicInst::LoadAddress {
                 dst,
@@ -3734,7 +3767,13 @@ impl RegValue {
                 target: AnyTarget::Data(target),
             }),
             RegValue::Constant(imm) => {
-                let imm = i32::try_from(imm).expect("load immediate operand overflow");
+                let Ok(imm) = i32::try_from(imm) else {
+                    if is_rv64 {
+                        return Some(BasicInst::LoadImmediate64 { dst, imm });
+                    } else {
+                        panic!("load operand overflow")
+                    }
+                };
                 Some(BasicInst::LoadImmediate { dst, imm })
             }
             _ => None,
@@ -3743,8 +3782,8 @@ impl RegValue {
 
     fn bits_used(self) -> u64 {
         match self {
-            RegValue::InputReg(..) | RegValue::CodeAddress(..) | RegValue::DataAddress(..) => u64::from(u32::MAX),
-            RegValue::Constant(value) => u64::from(value as u32),
+            RegValue::InputReg(..) | RegValue::CodeAddress(..) | RegValue::DataAddress(..) => u64::MAX,
+            RegValue::Constant(value) => value as u64,
             RegValue::Unknown { bits_used, .. } | RegValue::OutputReg { bits_used, .. } => bits_used,
         }
     }
@@ -3752,22 +3791,25 @@ impl RegValue {
 
 #[derive(Clone, PartialEq, Eq)]
 struct BlockRegs {
+    bitness: Bitness,
     regs: [RegValue; Reg::ALL.len()],
 }
 
 impl BlockRegs {
-    fn new_input(source_block: BlockTarget) -> Self {
+    fn new_input(bitness: Bitness, source_block: BlockTarget) -> Self {
         BlockRegs {
+            bitness,
             regs: Reg::ALL.map(|reg| RegValue::InputReg(reg, source_block)),
         }
     }
 
-    fn new_output(source_block: BlockTarget) -> Self {
+    fn new_output(bitness: Bitness, source_block: BlockTarget) -> Self {
         BlockRegs {
+            bitness,
             regs: Reg::ALL.map(|reg| RegValue::OutputReg {
                 reg,
                 source_block,
-                bits_used: u64::from(u32::MAX),
+                bits_used: bitness.bits_used_mask(),
             }),
         }
     }
@@ -3847,13 +3889,15 @@ impl BlockRegs {
         None
     }
 
-    fn simplify_instruction(&self, rv64: bool, instruction: BasicInst<AnyTarget>) -> Option<BasicInst<AnyTarget>> {
+    fn simplify_instruction(&self, instruction: BasicInst<AnyTarget>) -> Option<BasicInst<AnyTarget>> {
+        let is_rv64 = self.bitness == Bitness::B64;
+
         match instruction {
             BasicInst::RegReg { kind, dst, src1, src2 } => {
                 let src1_value = self.get_reg(src1);
                 let src2_value = self.get_reg(src2);
                 if let Some(value) = OperationKind::from(kind).apply(src1_value, src2_value) {
-                    if let Some(new_instruction) = value.to_instruction(dst) {
+                    if let Some(new_instruction) = value.to_instruction(dst, is_rv64) {
                         if new_instruction != instruction {
                             return Some(new_instruction);
                         }
@@ -3868,7 +3912,7 @@ impl BlockRegs {
                         return Some(BasicInst::Nop);
                     }
 
-                    if let Some(new_instruction) = value.to_instruction(dst) {
+                    if let Some(new_instruction) = value.to_instruction(dst, is_rv64) {
                         if new_instruction != instruction {
                             return Some(new_instruction);
                         }
@@ -3897,7 +3941,7 @@ impl BlockRegs {
                     }
                 }
 
-                if (!rv64 && kind == AnyAnyKind::Add) || (rv64 && kind == AnyAnyKind::Add64) {
+                if (!is_rv64 && kind == AnyAnyKind::Add) || (is_rv64 && kind == AnyAnyKind::Add64) {
                     if src1_value == RegValue::Constant(0) {
                         if let RegImm::Reg(src) = src2 {
                             return Some(BasicInst::MoveReg { dst, src });
@@ -3909,7 +3953,8 @@ impl BlockRegs {
                     }
                 }
 
-                if kind == AnyAnyKind::Add
+                if !is_rv64
+                    && kind == AnyAnyKind::Add
                     && src1_value != RegValue::Constant(0)
                     && src2_value != RegValue::Constant(0)
                     && (src1_value.bits_used() & src2_value.bits_used()) == 0
@@ -4001,7 +4046,8 @@ impl BlockRegs {
     }
 
     fn set_reg_unknown(&mut self, dst: Reg, unknown_counter: &mut u64, bits_used: u64) {
-        if bits_used == 0 {
+        let bits_used_masked = bits_used & self.bitness.bits_used_mask();
+        if bits_used_masked == 0 {
             self.set_reg(dst, RegValue::Constant(0));
             return;
         }
@@ -4010,7 +4056,7 @@ impl BlockRegs {
             dst,
             RegValue::Unknown {
                 unique: *unknown_counter,
-                bits_used,
+                bits_used: bits_used_masked,
             },
         );
         *unknown_counter += 1;
@@ -4020,6 +4066,9 @@ impl BlockRegs {
         match instruction {
             BasicInst::LoadImmediate { dst, imm } => {
                 self.set_reg(dst, RegValue::Constant(i32_to_i64(imm)));
+            }
+            BasicInst::LoadImmediate64 { dst, imm } => {
+                self.set_reg(dst, RegValue::Constant(imm));
             }
             BasicInst::LoadAddress {
                 dst,
@@ -4081,7 +4130,8 @@ impl BlockRegs {
             } => {
                 let src1_value = self.get_reg(src1);
                 let src2_value = self.get_reg(src2);
-                self.set_reg_unknown(dst, unknown_counter, src1_value.bits_used() & src2_value.bits_used());
+                let bits_used = src1_value.bits_used() & src2_value.bits_used();
+                self.set_reg_unknown(dst, unknown_counter, bits_used);
             }
             BasicInst::AnyAny {
                 kind: AnyAnyKind::Or,
@@ -4091,7 +4141,8 @@ impl BlockRegs {
             } => {
                 let src1_value = self.get_reg(src1);
                 let src2_value = self.get_reg(src2);
-                self.set_reg_unknown(dst, unknown_counter, src1_value.bits_used() | src2_value.bits_used());
+                let bits_used = src1_value.bits_used() | src2_value.bits_used();
+                self.set_reg_unknown(dst, unknown_counter, bits_used);
             }
             BasicInst::AnyAny {
                 kind: AnyAnyKind::ShiftLogicalRight,
@@ -4100,7 +4151,8 @@ impl BlockRegs {
                 src2: RegImm::Imm(src2),
             } => {
                 let src1_value = self.get_reg(src1);
-                self.set_reg_unknown(dst, unknown_counter, src1_value.bits_used() >> src2);
+                let bits_used = src1_value.bits_used() >> src2;
+                self.set_reg_unknown(dst, unknown_counter, bits_used);
             }
             BasicInst::AnyAny {
                 kind: AnyAnyKind::ShiftLogicalLeft,
@@ -4109,7 +4161,8 @@ impl BlockRegs {
                 src2: RegImm::Imm(src2),
             } => {
                 let src1_value = self.get_reg(src1);
-                self.set_reg_unknown(dst, unknown_counter, src1_value.bits_used() << src2);
+                let bits_used = src1_value.bits_used() << src2;
+                self.set_reg_unknown(dst, unknown_counter, bits_used);
             }
             BasicInst::AnyAny {
                 kind: AnyAnyKind::SetLessThanSigned | AnyAnyKind::SetLessThanUnsigned,
@@ -4136,7 +4189,7 @@ impl BlockRegs {
             }
             _ => {
                 for dst in instruction.dst_mask(imports) {
-                    self.set_reg_unknown(dst, unknown_counter, u64::from(u32::MAX));
+                    self.set_reg_unknown(dst, unknown_counter, self.bitness.bits_used_mask());
                 }
             }
         }
@@ -4158,6 +4211,8 @@ fn perform_constant_propagation<H>(
 where
     H: object::read::elf::FileHeader<Endian = object::LittleEndian>,
 {
+    let is_rv64 = elf.is_64();
+
     let Some(reachability) = reachability_graph.for_code.get(&current) else {
         return false;
     };
@@ -4211,7 +4266,7 @@ where
             continue;
         }
 
-        while let Some(new_instruction) = regs.simplify_instruction(elf.is_64(), instruction) {
+        while let Some(new_instruction) = regs.simplify_instruction(instruction) {
             if !modified_this_block {
                 references = gather_references(&all_blocks[current.index()]);
                 modified_this_block = true;
@@ -4230,25 +4285,37 @@ where
                         .data()
                         .get(target.offset as usize..target.offset as usize + 8)
                         .map(|xs| u64::from_le_bytes([xs[0], xs[1], xs[2], xs[3], xs[4], xs[5], xs[6], xs[7]]))
-                        .map(|_| todo!("64bit support")),
+                        .map(|xs| xs as i64),
                     LoadKind::U32 => section
                         .data()
                         .get(target.offset as usize..target.offset as usize + 4)
-                        .map(|xs| u32::from_le_bytes([xs[0], xs[1], xs[2], xs[3]]) as i32),
+                        .map(|xs| u32::from_le_bytes([xs[0], xs[1], xs[2], xs[3]]) as i32)
+                        .map(i32_to_i64),
                     LoadKind::I32 => section
                         .data()
                         .get(target.offset as usize..target.offset as usize + 4)
-                        .map(|xs| i32::from_le_bytes([xs[0], xs[1], xs[2], xs[3]])),
+                        .map(|xs| i32::from_le_bytes([xs[0], xs[1], xs[2], xs[3]]))
+                        .map(i32_to_i64),
                     LoadKind::U16 => section
                         .data()
                         .get(target.offset as usize..target.offset as usize + 2)
-                        .map(|xs| u32::from(u16::from_le_bytes([xs[0], xs[1]])) as i32),
+                        .map(|xs| u32::from(u16::from_le_bytes([xs[0], xs[1]])) as i32)
+                        .map(i32_to_i64),
                     LoadKind::I16 => section
                         .data()
                         .get(target.offset as usize..target.offset as usize + 2)
-                        .map(|xs| i32::from(i16::from_le_bytes([xs[0], xs[1]]))),
-                    LoadKind::I8 => section.data().get(target.offset as usize).map(|&x| i32::from(x as i8)),
-                    LoadKind::U8 => section.data().get(target.offset as usize).map(|&x| u32::from(x) as i32),
+                        .map(|xs| i32::from(i16::from_le_bytes([xs[0], xs[1]])))
+                        .map(i32_to_i64),
+                    LoadKind::I8 => section
+                        .data()
+                        .get(target.offset as usize)
+                        .map(|&x| i32::from(x as i8))
+                        .map(i32_to_i64),
+                    LoadKind::U8 => section
+                        .data()
+                        .get(target.offset as usize)
+                        .map(|&x| u32::from(x) as i32)
+                        .map(i32_to_i64),
                 };
 
                 if let Some(imm) = value {
@@ -4258,7 +4325,14 @@ where
                         modified = true;
                     }
 
-                    instruction = BasicInst::LoadImmediate { dst, imm };
+                    if let Ok(imm) = i32::try_from(imm) {
+                        instruction = BasicInst::LoadImmediate { dst, imm };
+                    } else if is_rv64 {
+                        instruction = BasicInst::LoadImmediate64 { dst, imm };
+                    } else {
+                        unreachable!("load immediate overflow in 32-bit");
+                    }
+
                     all_blocks[current.index()].ops[nth_instruction].1 = instruction;
                 }
             }
@@ -4384,6 +4458,8 @@ fn optimize_program<H>(
 ) where
     H: object::read::elf::FileHeader<Endian = object::LittleEndian>,
 {
+    let bitness = if elf.is_64() { Bitness::B64 } else { Bitness::B32 };
+
     let mut optimize_queue = VecSet::new();
     for current in (0..all_blocks.len()).map(BlockTarget::from_raw) {
         if !reachability_graph.is_code_reachable(current) {
@@ -4434,8 +4510,8 @@ fn optimize_program<H>(
     let mut input_regs_for_block = Vec::with_capacity(all_blocks.len());
     let mut output_regs_for_block = Vec::with_capacity(all_blocks.len());
     for current in (0..all_blocks.len()).map(BlockTarget::from_raw) {
-        input_regs_for_block.push(BlockRegs::new_input(current));
-        output_regs_for_block.push(BlockRegs::new_output(current));
+        input_regs_for_block.push(BlockRegs::new_input(bitness, current));
+        output_regs_for_block.push(BlockRegs::new_output(bitness, current));
     }
 
     let mut registers_needed_for_block = Vec::with_capacity(all_blocks.len());
@@ -4795,6 +4871,7 @@ mod test {
                 &used_imports,
                 &jump_target_for_block,
                 true,
+                false,
             )
             .unwrap();
 
@@ -5205,6 +5282,7 @@ fn spill_fake_registers(
     imports: &[Import],
     used_blocks: &[BlockTarget],
     regspill_size: &mut usize,
+    is_rv64: bool,
 ) {
     struct RegAllocBlock<'a> {
         instructions: &'a [Vec<regalloc2::Operand>],
@@ -5453,16 +5531,17 @@ fn spill_fake_registers(
                 // Advance the iterator so that we can use `continue` later.
                 edits.next();
 
+                let reg_size = if is_rv64 { 8 } else { 4 };
                 let src_reg = src.as_reg();
                 let dst_reg = dst.as_reg();
                 let new_instruction = match (dst_reg, src_reg) {
                     (Some(dst_reg), None) => {
                         let dst_reg = Reg::from_usize(dst_reg.hw_enc()).unwrap();
                         let src_slot = src.as_stack().unwrap();
-                        let offset = src_slot.index() * 4;
-                        *regspill_size = core::cmp::max(*regspill_size, offset + 4);
+                        let offset = src_slot.index() * reg_size;
+                        *regspill_size = core::cmp::max(*regspill_size, offset + reg_size);
                         BasicInst::LoadAbsolute {
-                            kind: LoadKind::U32,
+                            kind: if is_rv64 { LoadKind::U64 } else { LoadKind::U32 },
                             dst: dst_reg,
                             target: SectionTarget {
                                 section_index: section_regspill,
@@ -5473,10 +5552,10 @@ fn spill_fake_registers(
                     (None, Some(src_reg)) => {
                         let src_reg = Reg::from_usize(src_reg.hw_enc()).unwrap();
                         let dst_slot = dst.as_stack().unwrap();
-                        let offset = dst_slot.index() * 4;
-                        *regspill_size = core::cmp::max(*regspill_size, offset + 4);
+                        let offset = dst_slot.index() * reg_size;
+                        *regspill_size = core::cmp::max(*regspill_size, offset + reg_size);
                         BasicInst::StoreAbsolute {
-                            kind: StoreKind::U32,
+                            kind: if is_rv64 { StoreKind::U64 } else { StoreKind::U32 },
                             src: src_reg.into(),
                             target: SectionTarget {
                                 section_index: section_regspill,
@@ -6252,6 +6331,7 @@ fn emit_code(
     used_imports: &HashSet<usize>,
     jump_target_for_block: &[Option<JumpTarget>],
     is_optimized: bool,
+    is_rv64: bool,
 ) -> Result<Vec<(SourceStack, Instruction)>, ProgramFromElfError> {
     use polkavm_common::program::Reg as PReg;
     fn conv_reg(reg: Reg) -> polkavm_common::program::RawReg {
@@ -6338,6 +6418,13 @@ fn emit_code(
         for (source, op) in &block.ops {
             let op = match *op {
                 BasicInst::LoadImmediate { dst, imm } => Instruction::load_imm(conv_reg(dst), imm as u32),
+                BasicInst::LoadImmediate64 { dst, imm } => {
+                    if !is_rv64 {
+                        unreachable!("internal error: load_imm64 found when processing 32-bit binary")
+                    }
+                    // todo: change this to load_imm64
+                    Instruction::load_imm(conv_reg(dst), imm as u32)
+                }
                 BasicInst::LoadAbsolute { kind, dst, target } => {
                     codegen! {
                         args = (conv_reg(dst), get_data_address(target)?),
@@ -6760,6 +6847,15 @@ fn emit_code(
 enum Bitness {
     B32,
     B64,
+}
+
+impl Bitness {
+    fn bits_used_mask(self) -> u64 {
+        match self {
+            Bitness::B32 => u64::from(u32::MAX),
+            Bitness::B64 => u64::MAX,
+        }
+    }
 }
 
 impl InstructionSet for Bitness {
@@ -7849,7 +7945,8 @@ fn program_from_elf_internal<H>(config: Config, mut elf: Elf<H>) -> Result<Vec<u
 where
     H: object::read::elf::FileHeader<Endian = object::LittleEndian>,
 {
-    let bitness = if elf.is_64() { Bitness::B64 } else { Bitness::B32 };
+    let is_rv64 = elf.is_64();
+    let bitness = if is_rv64 { Bitness::B64 } else { Bitness::B32 };
 
     if elf.section_by_name(".got").next().is_none() {
         elf.add_empty_data_section(".got");
@@ -8040,6 +8137,7 @@ where
             &imports,
             &used_blocks,
             &mut regspill_size,
+            is_rv64,
         );
         used_blocks = add_missing_fallthrough_blocks(&mut all_blocks, &mut reachability_graph, used_blocks);
         merge_consecutive_fallthrough_blocks(&mut all_blocks, &mut reachability_graph, &mut section_to_block, &mut used_blocks);
@@ -8091,6 +8189,7 @@ where
             &imports,
             &used_blocks,
             &mut regspill_size,
+            is_rv64,
         );
     }
 
@@ -8207,6 +8306,7 @@ where
         &used_imports,
         &jump_target_for_block,
         config.optimize,
+        is_rv64,
     )?;
 
     {
