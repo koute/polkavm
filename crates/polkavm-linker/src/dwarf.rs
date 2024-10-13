@@ -1732,15 +1732,17 @@ where
 
                 let mut previous: Option<Source> = None;
                 for child in &child_inlined {
+                    // Valid child's address range:
+                    assert!(child.source.offset_range.start <= child.source.offset_range.end);
+
+                    // Skip the children out of range:
                     if child.source.offset_range.end <= inlined.source.offset_range.start
                         || child.source.offset_range.start >= inlined.source.offset_range.end
                     {
                         continue;
                     }
 
-                    let mut child = child.clone();
-                    child.source.offset_range.start = core::cmp::max(child.source.offset_range.start, inlined.source.offset_range.start);
-                    child.source.offset_range.end = core::cmp::min(child.source.offset_range.end, inlined.source.offset_range.end);
+                    let child = child.clone();
 
                     if let Some(last_source) = previous {
                         if child.source.offset_range.start < last_source.offset_range.end {
