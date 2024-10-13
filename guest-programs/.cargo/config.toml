@@ -1,9 +1,0 @@
-[build]
-target = "riscv32ema-unknown-none-elf"
-
-[target.riscv32ema-unknown-none-elf]
-rustflags = [
-    "-C", "relocation-model=pie",
-    "-C", "link-arg=--emit-relocs",
-    "-C", "link-arg=--unique",
-]
