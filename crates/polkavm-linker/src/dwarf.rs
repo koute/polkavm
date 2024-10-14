@@ -963,16 +963,16 @@ where
     R: gimli::Reader,
 {
     for child in &mut inlined.inlined {
-        let Some(namespace) = subprogram_offset_to_namespace.get(&inlined.abstract_origin) else {
-            return Err(ProgramFromElfError::other(format!(
+        if let Some(namespace) = subprogram_offset_to_namespace.get(&inlined.abstract_origin) {
+            child.namespace = namespace.clone();
+            finalize_inline_frames::<R>(subprogram_offset_to_namespace, child)?;
+        } else {
+            log::warn!(
                 "failed to process DWARF: inline subroutine '{}' found with no corresponding subprogram (abstract origin = {:?})",
                 inlined.function_name.as_deref().unwrap_or(""),
                 inlined.abstract_origin
-            )));
-        };
-
-        child.namespace = namespace.clone();
-        finalize_inline_frames::<R>(subprogram_offset_to_namespace, child)?;
+            );
+        }
     }
 
     Ok(())
@@ -1107,13 +1107,14 @@ where
         {
             let inline_source = inlined.source;
             for offset in (inline_source.offset_range.start..inline_source.offset_range.end).step_by(2) {
-                let list = output.get_mut(&offset).unwrap();
-                if inlined.call_location.is_some() {
-                    list.push(LocationKindRef::InlineCall(inlined));
-                }
+                if let Some(list) = output.get_mut(&offset) {
+                    if inlined.call_location.is_some() {
+                        list.push(LocationKindRef::InlineCall(inlined));
+                    }
 
-                if inlined.decl_location.is_some() {
-                    list.push(LocationKindRef::InlineDecl(inlined));
+                    if inlined.decl_location.is_some() {
+                        list.push(LocationKindRef::InlineDecl(inlined));
+                    }
                 }
             }
 
@@ -1144,9 +1145,10 @@ where
 
             for subprogram in subprograms {
                 let source = subprogram.sources[0];
-                let section_index = source.section_index;
-                let line_range_map = line_range_map_for_section.get(&section_index).unwrap();
                 log::trace!("  Frame: {}", source);
+
+                let section_index = source.section_index;
+                let line_range_map = line_range_map_for_section.get(&section_index);
 
                 let mut map: LocationsForOffset<R> = BTreeMap::new();
                 for offset in (source.offset_range.start..source.offset_range.end).step_by(2) {
@@ -1160,8 +1162,12 @@ where
                 #[allow(clippy::type_complexity)]
                 let mut last_emitted: Option<(Vec<LocationKindRef<R>>, Arc<[Location]>)> = None;
                 for offset in (source.offset_range.start..source.offset_range.end).step_by(2) {
+                    let Some(line_range_map) = line_range_map else {
+                        continue;
+                    };
                     let mut list = map.remove(&offset).unwrap();
                     let mut fallback = false;
+
                     if let Some(line_entry) = line_range_map.get_value(offset) {
                         let target_position = {
                             // I'm not entirely sure if this is actually necessary; are the line entries always guaranteed
@@ -1487,9 +1493,7 @@ where
                 };
 
                 if decl_location.is_some() && name.is_none() {
-                    return Err(ProgramFromElfError::other(
-                        "failed to process DWARF: subprogram has a decl location but no name",
-                    ));
+                    log::warn!("failed to process DWARF: subprogram has a decl location but no name");
                 }
 
                 let mut subprogram = SubProgram::<R> {
@@ -1587,9 +1591,7 @@ where
                 }
 
                 if decl_path.is_some() && name.is_none() {
-                    return Err(ProgramFromElfError::other(
-                        "failed to process DWARF: subprogram has a decl file but no name",
-                    ));
+                    log::warn!("failed to process DWARF: subprogram has a decl file but no name");
                 }
 
                 if call_column.is_some() && call_line.is_none() {
@@ -1599,15 +1601,11 @@ where
                 }
 
                 if call_line.is_some() && call_path.is_none() {
-                    return Err(ProgramFromElfError::other(
-                        "failed to process DWARF: inline subroutine has a call line but no call file",
-                    ));
+                    log::warn!("failed to process DWARF: inline subroutine has a call line but no call file");
                 }
 
                 if call_path.is_some() && name.is_none() {
-                    return Err(ProgramFromElfError::other(
-                        "failed to process DWARF: inline subroutine has a call file but no name",
-                    ));
+                    log::warn!("failed to process DWARF: inline subroutine has a call file but no name");
                 }
 
                 let call_location = match (call_path, call_line, call_column) {
@@ -1696,27 +1694,23 @@ where
                 for inlined in &child_inlined {
                     let inline_source = inlined.source;
                     if inline_source.section_index != parent_source.section_index {
-                        return Err(ProgramFromElfError::other(
-                            "failed to process DWARF: found inline subroutine with a different target section than its parent subprogram",
-                        ));
+                        log::warn!(
+                            "failed to process DWARF: found inline subroutine with a different target section than its parent subprogram"
+                        );
                     }
 
                     if inline_source.offset_range.start < parent_source.offset_range.start
                         || inline_source.offset_range.end > parent_source.offset_range.end
                     {
-                        return Err(ProgramFromElfError::other(
-                            format!(
+                        log::warn!(
                                 "failed to process DWARF: found inline subroutine which exceedes the bounds of its parent subprogram (parent = {}, inline = {})",
                                 parent_source, inline_source
-                            )
-                        ));
+                        );
                     }
 
                     if let Some(last_source) = previous {
                         if inline_source.offset_range.is_overlapping(&last_source.offset_range) {
-                            return Err(ProgramFromElfError::other(
-                                "failed to process DWARF: found overlapping inline subroutines in a parent subprogram",
-                            ));
+                            log::warn!("failed to process DWARF: found overlapping inline subroutines in a parent subprogram");
                         }
                     }
 
