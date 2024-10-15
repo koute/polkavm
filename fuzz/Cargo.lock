@@ -73,7 +73,7 @@ checksum = "3fdb12b2476b595f9358c5161aa467c2438859caa136dec86c26fdd2efe17b92"
 
 [[package]]
 name = "polkavm"
-version = "0.12.0"
+version = "0.13.0"
 dependencies = [
  "libc",
  "log",
@@ -84,14 +84,14 @@ dependencies = [
 
 [[package]]
 name = "polkavm-assembler"
-version = "0.12.0"
+version = "0.13.0"
 dependencies = [
  "log",
 ]
 
 [[package]]
 name = "polkavm-common"
-version = "0.12.0"
+version = "0.13.0"
 dependencies = [
  "log",
  "polkavm-assembler",
@@ -108,7 +108,7 @@ dependencies = [
 
 [[package]]
 name = "polkavm-linux-raw"
-version = "0.12.0"
+version = "0.13.0"
 
 [[package]]
 name = "proc-macro2"
