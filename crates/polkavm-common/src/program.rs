@@ -2868,6 +2868,12 @@ where
     }
 }
 
+impl<'a, T> From<&'a T> for Reader<'a, T> {
+    fn from(blob: &'a T) -> Self {
+        Self { blob, position: 0 }
+    }
+}
+
 impl<'a, T> Reader<'a, T>
 where
     T: ?Sized + AsRef<[u8]>,
@@ -3829,6 +3835,13 @@ impl ProgramParts {
             }));
         };
 
+        let blob_len = BlobLen::from_le_bytes(reader.read_slice(BLOB_LEN_SIZE)?.try_into().unwrap());
+        if blob_len != blob.len() as u64 {
+            return Err(ProgramParseError(ProgramParseErrorKind::Other(
+                "blob size doesn't match the blob length metadata",
+            )));
+        }
+
         let mut parts = ProgramParts {
             is_64_bit,
             ..ProgramParts::default()
@@ -3900,6 +3913,17 @@ impl ProgramParts {
 }
 
 impl ProgramBlob {
+    /// Parses the blob length information from the given `raw_blob` bytes.
+    ///
+    /// Returns `None` if `raw_blob` doesn't contain enough bytes to read the length.
+    pub fn blob_length(raw_blob: &[u8]) -> Option<BlobLen> {
+        let end = BLOB_LEN_OFFSET + BLOB_LEN_SIZE;
+        if raw_blob.len() < end {
+            return None;
+        }
+        Some(BlobLen::from_le_bytes(raw_blob[BLOB_LEN_OFFSET..end].try_into().unwrap()))
+    }
+
     /// Parses the given bytes into a program blob.
     pub fn parse(bytes: ArcBytes) -> Result<Self, ProgramParseError> {
         let parts = ProgramParts::from_bytes(bytes)?;
@@ -4795,6 +4819,14 @@ proptest::proptest! {
 
 /// The magic bytes with which every program blob must start with.
 pub const BLOB_MAGIC: [u8; 4] = [b'P', b'V', b'M', b'\0'];
+
+/// The blob length is the length of the blob itself encoded as an 64bit LE integer.
+/// By embedding this metadata into the header, program blobs stay opaque,
+/// however this information can still easily be retrieved.
+/// Found at offset 5 after the magic bytes and version number.
+pub type BlobLen = u64;
+pub const BLOB_LEN_SIZE: usize = core::mem::size_of::<BlobLen>();
+pub const BLOB_LEN_OFFSET: usize = BLOB_MAGIC.len() + 1;
 
 pub const SECTION_MEMORY_CONFIG: u8 = 1;
 pub const SECTION_RO_DATA: u8 = 2;
