@@ -22,7 +22,7 @@ members = [
 ]
 
 [workspace.package]
-version = "0.12.0"
+version = "0.13.0"
 authors = ["Jan Bujak <jan@parity.io>", "Parity Technologies <admin@parity.io>"]
 license = "MIT/Apache-2.0"
 edition = "2021"
@@ -30,15 +30,15 @@ rust-version = "1.75.0"
 repository = "https://github.com/koute/polkavm"
 
 [workspace.dependencies]
-polkavm                   = { version = "0.12.0", path = "crates/polkavm" }
-polkavm-assembler         = { version = "0.12.0", path = "crates/polkavm-assembler" }
-polkavm-disassembler      = { version = "0.12.0", path = "crates/polkavm-disassembler" }
-polkavm-common            = { version = "0.12.0", path = "crates/polkavm-common" }
-polkavm-derive            = { version = "0.12.0", path = "crates/polkavm-derive" }
-polkavm-derive-impl       = { version = "0.12.0", path = "crates/polkavm-derive-impl" }
-polkavm-derive-impl-macro = { version = "0.12.0", path = "crates/polkavm-derive-impl-macro" }
-polkavm-linker            = { version = "0.12.0", path = "crates/polkavm-linker" }
-polkavm-linux-raw         = { version = "0.12.0", path = "crates/polkavm-linux-raw" }
+polkavm                   = { version = "0.13.0", path = "crates/polkavm" }
+polkavm-assembler         = { version = "0.13.0", path = "crates/polkavm-assembler" }
+polkavm-disassembler      = { version = "0.13.0", path = "crates/polkavm-disassembler" }
+polkavm-common            = { version = "0.13.0", path = "crates/polkavm-common" }
+polkavm-derive            = { version = "0.13.0", path = "crates/polkavm-derive" }
+polkavm-derive-impl       = { version = "0.13.0", path = "crates/polkavm-derive-impl" }
+polkavm-derive-impl-macro = { version = "0.13.0", path = "crates/polkavm-derive-impl-macro" }
+polkavm-linker            = { version = "0.13.0", path = "crates/polkavm-linker" }
+polkavm-linux-raw         = { version = "0.13.0", path = "crates/polkavm-linux-raw" }
 
 blake3 = { version = "1.5.4", default-features = false }
 clap = "4.4.6"
