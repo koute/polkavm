@@ -2344,8 +2344,8 @@ fn test_basic_debug_info() {
 
 #[test]
 fn blob_len_works() {
-    const DOOM: &[u8] = include_bytes!("../../../guest-programs/output/example-hello-world.polkavm");
-    assert_eq!(Some(DOOM.len() as BlobLen), ProgramBlob::blob_length(DOOM));
+    const EXAMPLE_BLOB: &[u8] = include_bytes!("../../../guest-programs/output/example-hello-world.polkavm");
+    assert_eq!(Some(EXAMPLE_BLOB.len() as BlobLen), ProgramBlob::blob_length(EXAMPLE_BLOB));
 }
 
 #[cfg(not(feature = "std"))]
