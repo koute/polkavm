@@ -7646,7 +7646,7 @@ where
                     }
                     object::elf::R_RISCV_RVC_BRANCH => {
                         let inst_raw = read_u16(section_data, relative_address)?;
-                        let Some(inst) = Inst::decode_compressed(decoder_config, inst_raw.into()) else {
+                        let Some(inst) = Inst::decode(decoder_config, inst_raw.into()) else {
                             return Err(ProgramFromElfError::other(format!(
                                 "R_RISCV_RVC_BRANCH for an unsupported instruction: 0x{inst_raw:04}"
                             )));

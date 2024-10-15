@@ -575,7 +575,7 @@ impl Inst {
         op & 0b00000011 < 0b00000011
     }
 
-    pub fn decode_compressed(config: &DecoderConfig, op: u32) -> Option<Self> {
+    fn decode_compressed(config: &DecoderConfig, op: u32) -> Option<Self> {
         ctx!(config.rv64);
 
         let quadrant = op & 0b11;
@@ -853,8 +853,8 @@ impl Inst {
     pub fn decode(config: &DecoderConfig, op: u32) -> Option<Self> {
         ctx!(config.rv64);
 
-        if let Some(compressed_instruction) = Self::decode_compressed(config, op) {
-            return Some(compressed_instruction);
+        if Inst::is_compressed((op & 0xff) as u8) {
+            return Self::decode_compressed(config, op);
         }
 
         // This is mostly unofficial, but it's a defacto standard used by both LLVM and GCC.
