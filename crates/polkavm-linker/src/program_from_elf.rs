@@ -7955,7 +7955,7 @@ where
         elf.add_empty_data_section(".got");
     }
 
-    let mut decoder_config = DecoderConfig::new();
+    let mut decoder_config = DecoderConfig::new_32bit();
     decoder_config.set_rv64(elf.is_64());
 
     let mut sections_ro_data = Vec::new();
