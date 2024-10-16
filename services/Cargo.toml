@@ -1,0 +1,20 @@
+[profile.release]
+lto = "fat"
+panic = "abort"
+opt-level = 3
+codegen-units = 1
+debug = true
+
+[profile.no-lto]
+inherits = "release"
+lto = false
+
+[workspace]
+resolver = "2"
+members = [
+    "fib",
+    "admin",
+    "staking",
+    "accounts",
+ #   "tokens",
+]

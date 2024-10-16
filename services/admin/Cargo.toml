@@ -1,0 +1,17 @@
+cargo-features = ["edition2024"]
+
+[package]
+name = "admin"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[lib]
+name = "admin"
+path = "src/main.rs"
+crate-type = ["staticlib", "rlib"]
+
+[dependencies]
+polkavm-derive = { path = "../../crates/polkavm-derive" }
+simplealloc = { path = "../../crates/simplealloc" }
+

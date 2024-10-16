@@ -1,0 +1,2 @@
+[toolchain]
+channel = "riscv32em-nightly-2024-01-05-r0-x86_64-unknown-linux-gnu"

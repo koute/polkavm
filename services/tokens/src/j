@@ -1,0 +1,64 @@
+
+#[derive(Debug)]
+pub enum TokenMessage<AccountId: Eq + Hash + Clone + fmt::Debug> {
+    New {
+        name: String,
+        symbol: String,
+        decimals: u8,
+        initial_supply: u128,
+        controlled_access_type: ControlledAccessType,
+        automator: AccountId,
+        client: AccountId,
+        default_admin: AccountId,
+        upgrader: AccountId,
+        signature: Signature,
+    },
+    Mint {
+        token_id: TokenID,
+        to: AccountId,
+        amount: u128,
+        signature: Signature,
+    },
+    Burn {
+        token_id: TokenID,
+        from: AccountId,
+        amount: u128,
+        signature: Signature,
+    },
+    Pause {
+        token_id: TokenID,
+        sender: AccountId,
+        signature: Signature,
+    },
+    Unpause {
+        token_id: TokenID,
+        sender: AccountId,
+        signature: Signature,
+    },
+    Transfer {
+        token_id: TokenID,
+        from: AccountId,
+        to: AccountId,
+        amount: u128,
+        signature: Signature,
+    },
+    Approve {
+        token_id: TokenID,
+        owner: AccountId,
+        spender: AccountId,
+        amount: u128,
+        signature: Signature,
+    },
+    Permit {
+        token_id: TokenID,
+        owner: AccountId,
+        spender: AccountId,
+        value: u128,
+        deadline: u64,
+        v: u8,
+        r: [u8; 32],
+        s: [u8; 32],
+        signature: Signature,
+    },
+}
+
