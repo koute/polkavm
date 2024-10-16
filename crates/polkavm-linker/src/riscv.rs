@@ -42,7 +42,7 @@ pub struct DecoderConfig {
 }
 
 impl DecoderConfig {
-    pub fn new() -> Self {
+    pub fn new_32bit() -> Self {
         DecoderConfig { rv64: false }
     }
 
@@ -1433,7 +1433,7 @@ impl Inst {
 
 #[test]
 fn test_decode_jump_and_link() {
-    let config = DecoderConfig::new();
+    let config = DecoderConfig::new_32bit();
     assert_eq!(
         Inst::decode(&config, 0xd6dff06f).unwrap(),
         Inst::JumpAndLink {
@@ -1445,7 +1445,7 @@ fn test_decode_jump_and_link() {
 
 #[test]
 fn test_decode_branch() {
-    let config = DecoderConfig::new();
+    let config = DecoderConfig::new_32bit();
     assert_eq!(
         Inst::decode(&config, 0x00c5fe63).unwrap(),
         Inst::Branch {
@@ -1469,7 +1469,7 @@ fn test_decode_branch() {
 
 #[test]
 fn test_decode_multiply() {
-    let config = DecoderConfig::new();
+    let config = DecoderConfig::new_32bit();
 
     assert_eq!(
         // 02f333b3                mulhu   t2,t1,a5
@@ -1507,7 +1507,7 @@ fn test_decode_multiply() {
 
 #[test]
 fn test_decode_cmov() {
-    let config = DecoderConfig::new();
+    let config = DecoderConfig::new_32bit();
 
     assert_eq!(
         Inst::decode(&config, 0x42a6158b).unwrap(),
@@ -1522,7 +1522,7 @@ fn test_decode_cmov() {
 
 #[test]
 fn test_decode_srliw() {
-    let mut config = DecoderConfig::new();
+    let mut config = DecoderConfig::new_32bit();
     config.set_rv64(true);
 
     assert_eq!(
@@ -1552,8 +1552,7 @@ fn test_decode_srliw() {
 
 #[test]
 fn test_decode_sraiw() {
-    let mut config = DecoderConfig::new();
-    config.set_rv64(true);
+    let mut config = DecoderConfig::new_64bit();
 
     assert_eq!(
         // sraiw   a0,a1,0xc
@@ -1583,7 +1582,7 @@ fn test_decode_sraiw() {
 #[cfg_attr(debug_assertions, ignore)]
 #[cfg(test)]
 fn test_encode(rv64: bool) {
-    let mut config = DecoderConfig::new();
+    let mut config = DecoderConfig::new_32bit();
     config.set_rv64(rv64);
 
     for op in (0..=0xFFFFFFFF_u32).filter(|op| Inst::decode_compressed(&config, *op).is_none()) {
@@ -1633,7 +1632,7 @@ mod test_decode_compressed {
 
     #[test]
     fn illegal_instruction() {
-        let config = DecoderConfig::new();
+        let config = DecoderConfig::new_32bit();
         let config64 = DecoderConfig::new_64bit();
 
         assert_eq!(Inst::decode_compressed(&config, 1 << 16), Some(Inst::Unimplemented));
@@ -1650,7 +1649,7 @@ mod test_decode_compressed {
     #[test]
     fn c_addi4spn() {
         let op = 0b000_10101010_111_00;
-        let config = DecoderConfig::new();
+        let config = DecoderConfig::new_32bit();
         let config64 = DecoderConfig::new_64bit();
 
         assert_eq!(
@@ -1682,7 +1681,7 @@ mod test_decode_compressed {
     #[test]
     fn c_lw() {
         let op = 0b010_101_010_01_111_00;
-        let config = DecoderConfig::new();
+        let config = DecoderConfig::new_32bit();
         let config64 = DecoderConfig::new_64bit();
 
         assert_eq!(
@@ -1709,7 +1708,7 @@ mod test_decode_compressed {
     #[test]
     fn c_ld() {
         let op = 0b011_110_110_10_101_00;
-        let config = DecoderConfig::new();
+        let config = DecoderConfig::new_32bit();
         let config64 = DecoderConfig::new_64bit();
 
         assert_eq!(
@@ -1728,7 +1727,7 @@ mod test_decode_compressed {
     #[test]
     fn c_sw() {
         let op = 0b110_101_010_01_111_00;
-        let config = DecoderConfig::new();
+        let config = DecoderConfig::new_32bit();
         let config64 = DecoderConfig::new_64bit();
 
         assert_eq!(
@@ -1755,7 +1754,7 @@ mod test_decode_compressed {
     #[test]
     fn c_sd() {
         let op = 0b111_101_010_01_111_00;
-        let config = DecoderConfig::new();
+        let config = DecoderConfig::new_32bit();
         let config64 = DecoderConfig::new_64bit();
 
         assert_eq!(
@@ -1774,7 +1773,7 @@ mod test_decode_compressed {
     #[test]
     fn c_nop() {
         let op = 0b000_0_00000_00000_01;
-        let config = DecoderConfig::new();
+        let config = DecoderConfig::new_32bit();
 
         assert_eq!(
             Inst::decode_compressed(&config, op),
@@ -1790,7 +1789,7 @@ mod test_decode_compressed {
     #[test]
     fn c_addi() {
         let op = 0b000_1_01000_11011_01;
-        let config = DecoderConfig::new();
+        let config = DecoderConfig::new_32bit();
         let config64 = DecoderConfig::new_64bit();
 
         assert_eq!(
@@ -1822,7 +1821,7 @@ mod test_decode_compressed {
     #[test]
     fn c_jal() {
         let op = 0b001_10101010101_01;
-        let config = DecoderConfig::new();
+        let config = DecoderConfig::new_32bit();
 
         assert_eq!(
             Inst::decode_compressed(&config, op),
@@ -1852,7 +1851,7 @@ mod test_decode_compressed {
     #[test]
     fn c_j() {
         let op = 0b101_01010101010_01;
-        let config = DecoderConfig::new();
+        let config = DecoderConfig::new_32bit();
         let config64 = DecoderConfig::new_64bit();
         let insn = Some(Inst::JumpAndLink {
             dst: Reg::Zero,
@@ -1866,7 +1865,7 @@ mod test_decode_compressed {
     #[test]
     fn c_li() {
         let op = 0b010_1_01000_10101_01;
-        let config = DecoderConfig::new();
+        let config = DecoderConfig::new_32bit();
         let config64 = DecoderConfig::new_64bit();
 
         assert_eq!(
@@ -1899,7 +1898,7 @@ mod test_decode_compressed {
     fn c_addi16sp() {
         let op = 0b011_1_00010_01010_01;
         let imm = 0b11111111_11111111_11111110_11000000u32 as i32;
-        let config = DecoderConfig::new();
+        let config = DecoderConfig::new_32bit();
         let config64 = DecoderConfig::new_64bit();
 
         assert_eq!(
@@ -1932,7 +1931,7 @@ mod test_decode_compressed {
     fn c_lui() {
         let op = 0b011_1_01100_10101_01;
         let value = 0b11111111_11111111_01010000_00000000;
-        let config = DecoderConfig::new();
+        let config = DecoderConfig::new_32bit();
         let config64 = DecoderConfig::new_64bit();
 
         assert_eq!(
@@ -1959,7 +1958,7 @@ mod test_decode_compressed {
     #[test]
     fn c_srli() {
         let op = 0b100_0_00_100_10000_01;
-        let config = DecoderConfig::new();
+        let config = DecoderConfig::new_32bit();
         let config64 = DecoderConfig::new_64bit();
 
         assert_eq!(
@@ -2004,7 +2003,7 @@ mod test_decode_compressed {
     #[test]
     fn c_srai() {
         let op = 0b100_0_01_100_10000_01;
-        let config = DecoderConfig::new();
+        let config = DecoderConfig::new_32bit();
         let config64 = DecoderConfig::new_64bit();
 
         assert_eq!(
@@ -2049,7 +2048,7 @@ mod test_decode_compressed {
     #[test]
     fn c_andi() {
         let op = 0b100_1_10_100_10101_01;
-        let config = DecoderConfig::new();
+        let config = DecoderConfig::new_32bit();
         let config64 = DecoderConfig::new_64bit();
 
         assert_eq!(
@@ -2076,7 +2075,7 @@ mod test_decode_compressed {
     #[test]
     fn c_sub() {
         let op = 0b100_0_11_111_00_100_01;
-        let config = DecoderConfig::new();
+        let config = DecoderConfig::new_32bit();
         let config64 = DecoderConfig::new_64bit();
 
         assert_eq!(
@@ -2115,7 +2114,7 @@ mod test_decode_compressed {
     #[test]
     fn c_xor() {
         let op = 0b100_0_11_111_01_100_01;
-        let config = DecoderConfig::new();
+        let config = DecoderConfig::new_32bit();
         let config64 = DecoderConfig::new_64bit();
 
         assert_eq!(
@@ -2142,7 +2141,7 @@ mod test_decode_compressed {
     #[test]
     fn c_or() {
         let op = 0b100_0_11_111_10_100_01;
-        let config = DecoderConfig::new();
+        let config = DecoderConfig::new_32bit();
         let config64 = DecoderConfig::new_64bit();
 
         assert_eq!(
@@ -2169,7 +2168,7 @@ mod test_decode_compressed {
     #[test]
     fn c_and() {
         let op = 0b100_0_11_111_11_100_01;
-        let config = DecoderConfig::new();
+        let config = DecoderConfig::new_32bit();
         let config64 = DecoderConfig::new_64bit();
 
         assert_eq!(
@@ -2196,7 +2195,7 @@ mod test_decode_compressed {
     #[test]
     fn c_beqz() {
         let op = 0b110_101_100_01010_01;
-        let config = DecoderConfig::new();
+        let config = DecoderConfig::new_32bit();
 
         assert_eq!(
             Inst::decode_compressed(&config, op),
@@ -2212,7 +2211,7 @@ mod test_decode_compressed {
     #[test]
     fn c_bnez() {
         let op = 0b111_001_100_10101_01;
-        let config = DecoderConfig::new();
+        let config = DecoderConfig::new_32bit();
 
         assert_eq!(
             Inst::decode_compressed(&config, op),
@@ -2228,7 +2227,7 @@ mod test_decode_compressed {
     #[test]
     fn c_slli() {
         let op = 0b000_0_01100_10101_10;
-        let config = DecoderConfig::new();
+        let config = DecoderConfig::new_32bit();
         let config64 = DecoderConfig::new_64bit();
 
         assert_eq!(
@@ -2290,7 +2289,7 @@ mod test_decode_compressed {
     #[test]
     fn c_lwsp() {
         let op = 0b010_1_01100_01010_10;
-        let config = DecoderConfig::new();
+        let config = DecoderConfig::new_32bit();
 
         assert_eq!(
             Inst::decode_compressed(&config, op),
@@ -2310,7 +2309,7 @@ mod test_decode_compressed {
     #[test]
     fn c_ldsp() {
         let op = 0b011_1_01100_01010_10;
-        let config = DecoderConfig::new();
+        let config = DecoderConfig::new_32bit();
         let config64 = DecoderConfig::new_64bit();
 
         assert_eq!(
@@ -2333,7 +2332,7 @@ mod test_decode_compressed {
     #[test]
     fn c_jr() {
         let op = 0b100_0_01100_00000_10;
-        let config = DecoderConfig::new();
+        let config = DecoderConfig::new_32bit();
 
         assert_eq!(
             Inst::decode_compressed(&config, op),
@@ -2352,7 +2351,7 @@ mod test_decode_compressed {
     #[test]
     fn c_mv() {
         let op = 0b100_0_01100_01101_10;
-        let config = DecoderConfig::new();
+        let config = DecoderConfig::new_32bit();
         let config64 = DecoderConfig::new_64bit();
 
         assert_eq!(
@@ -2384,7 +2383,7 @@ mod test_decode_compressed {
     #[test]
     fn c_ebreak() {
         let op = 0b100_1_00000_00000_10;
-        let config = DecoderConfig::new();
+        let config = DecoderConfig::new_32bit();
         let config64 = DecoderConfig::new_64bit();
 
         // ebreak is not supported
@@ -2395,7 +2394,7 @@ mod test_decode_compressed {
     #[test]
     fn c_jalr() {
         let op = 0b100_1_01100_00000_10;
-        let config = DecoderConfig::new();
+        let config = DecoderConfig::new_32bit();
         let config64 = DecoderConfig::new_64bit();
 
         assert_eq!(
@@ -2420,7 +2419,7 @@ mod test_decode_compressed {
     #[test]
     fn c_add() {
         let op = 0b100_1_01100_01101_10;
-        let config = DecoderConfig::new();
+        let config = DecoderConfig::new_32bit();
         let config64 = DecoderConfig::new_64bit();
 
         assert_eq!(
@@ -2464,7 +2463,7 @@ mod test_decode_compressed {
     #[test]
     fn c_swsp() {
         let op = 0b110_101010_01100_10;
-        let config = DecoderConfig::new();
+        let config = DecoderConfig::new_32bit();
 
         assert_eq!(
             Inst::decode_compressed(&config, op),
@@ -2480,7 +2479,7 @@ mod test_decode_compressed {
     #[test]
     fn c_sdsp() {
         let op = 0b111_101010_01100_10;
-        let config = DecoderConfig::new();
+        let config = DecoderConfig::new_32bit();
         let config64 = DecoderConfig::new_64bit();
 
         assert_eq!(
@@ -2500,7 +2499,7 @@ mod test_decode_compressed {
         #[test]
         fn c_invalid_q0(value in BitSetStrategy::masked(0b000_111_111_11_111_00)) {
             let op = 0b001_000_000_00_000_00 | value;
-            let config = DecoderConfig::new();
+            let config = DecoderConfig::new_32bit();
 
             // C.FLD; C.LQ
             assert_eq!(Inst::decode_compressed(&config, op), None);
@@ -2525,7 +2524,7 @@ mod test_decode_compressed {
         #[test]
         fn c_invalid_q1(value in BitSetStrategy::masked(0b000_0_00_111_00_000_00)) {
             let op = 0b100_1_11_000_00_000_01 | value;
-            let config = DecoderConfig::new();
+            let config = DecoderConfig::new_32bit();
 
             // C.SUBW
             assert_eq!(Inst::decode_compressed(&config, op), None);
@@ -2546,7 +2545,7 @@ mod test_decode_compressed {
         #[test]
         fn c_invalid_q2(value in BitSetStrategy::masked(0b000_1_11111_11111_00)) {
             let op = 0b001_0_00000_00000_10 | value;
-            let config = DecoderConfig::new();
+            let config = DecoderConfig::new_32bit();
 
             // C.FLDSP; C.LQSP
             assert_eq!(Inst::decode_compressed(&config, op), None);
@@ -2563,7 +2562,7 @@ mod test_decode_compressed {
         #[test]
         fn c_reserved(value in BitSetStrategy::masked(0b000_0_00_111_00_111_00)) {
             let op = 0b100_1_11_000_10_000_01 | value;
-            let config = DecoderConfig::new();
+            let config = DecoderConfig::new_32bit();
 
             // reserved
             assert_eq!(Inst::decode_compressed(&config, op), None);
