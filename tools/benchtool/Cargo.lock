@@ -318,9 +318,12 @@ checksum = "37b2a672a2cb129a2e41c10b1224bb368f9f37a2b16b612598138befd7b37eb5"
 
 [[package]]
 name = "cc"
-version = "1.0.97"
+version = "1.1.18"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "099a5357d84c4c61eb35fc8eafa9a79a902c2f76911e5747ced4e032edd8d9b4"
+checksum = "b62ac837cdb5cb22e10a256099b4fc502b1dfe560cb282963a974d7abd80e476"
+dependencies = [
+ "shlex 1.3.0",
+]
 
 [[package]]
 name = "cexpr"
@@ -1664,7 +1667,7 @@ checksum = "b4596b6d070b27117e987119b4dac604f3c58cfb0b191112e24771b2faeac1a6"
 
 [[package]]
 name = "polkavm"
-version = "0.10.0"
+version = "0.13.0"
 dependencies = [
  "libc",
  "log",
@@ -1675,14 +1678,14 @@ dependencies = [
 
 [[package]]
 name = "polkavm-assembler"
-version = "0.10.0"
+version = "0.13.0"
 dependencies = [
  "log",
 ]
 
 [[package]]
 name = "polkavm-common"
-version = "0.10.0"
+version = "0.13.0"
 dependencies = [
  "log",
  "polkavm-assembler",
@@ -1690,7 +1693,7 @@ dependencies = [
 
 [[package]]
 name = "polkavm-linux-raw"
-version = "0.10.0"
+version = "0.13.0"
 
 [[package]]
 name = "postcard"

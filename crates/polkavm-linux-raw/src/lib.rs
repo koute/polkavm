@@ -105,6 +105,7 @@ pub use crate::arch_bindings::{
     __NR_ioctl as SYS_ioctl,
     __NR_kill as SYS_kill,
     __NR_lseek as SYS_lseek,
+    __NR_nanosleep as SYS_nanosleep,
     __NR_madvise as SYS_madvise,
     __NR_memfd_create as SYS_memfd_create,
     __NR_mmap as SYS_mmap,
@@ -516,6 +517,7 @@ pub use crate::arch_bindings::{
     SA_RESTORER,
     SA_SIGINFO,
     SECCOMP_RET_ALLOW,
+    SECCOMP_RET_ERRNO,
     SECCOMP_RET_KILL_THREAD,
     SECCOMP_SET_MODE_FILTER,
     SIG_BLOCK,
@@ -999,6 +1001,8 @@ macro_rules! bpf {
     (@op $labels:expr, $nth_instruction:expr, return $value:expr) => { $crate::sock_filter { code: $crate::BPF_RET | $crate::BPF_K, jt: 0, jf: 0, k: $value } };
     (@op $labels:expr, $nth_instruction:expr, seccomp_allow) => { $crate::bpf!(@op $labels, $nth_instruction, return $crate::SECCOMP_RET_ALLOW) };
     (@op $labels:expr, $nth_instruction:expr, seccomp_kill_thread) => { $crate::bpf!(@op $labels, $nth_instruction, return $crate::SECCOMP_RET_KILL_THREAD) };
+    (@op $labels:expr, $nth_instruction:expr, seccomp_return_error($errno:expr)) => { $crate::bpf!(@op $labels, $nth_instruction, return $crate::SECCOMP_RET_ERRNO | { let errno: u16 = $errno; errno as u32 }) };
+    (@op $labels:expr, $nth_instruction:expr, seccomp_return_eperm) => { $crate::bpf!(@op $labels, $nth_instruction, seccomp_return_error($crate::EPERM as u16)) };
     (@op $labels:expr, $nth_instruction:expr, a = syscall_nr) => { $crate::bpf!(@op $labels, $nth_instruction, a = *abs[0]) };
     (@op $labels:expr, $nth_instruction:expr, a = syscall_arg[$nth_arg:expr]) => { $crate::bpf!(@op $labels, $nth_instruction, a = *abs[16 + $nth_arg * 8]) };
 
@@ -1609,8 +1613,8 @@ pub fn sys_fcntl(fd: FdRef, cmd: u32, arg: u32) -> Result<i32, Error> {
     Ok(result as i32)
 }
 
-pub fn sys_fcntl_dupfd(fd: FdRef, arg: u32) -> Result<Fd, Error> {
-    let fd = sys_fcntl(fd, F_DUPFD, arg)?;
+pub fn sys_fcntl_dupfd(fd: FdRef, min: c_int) -> Result<Fd, Error> {
+    let fd = sys_fcntl(fd, F_DUPFD, min as u32)?;
     Ok(Fd::from_raw_unchecked(fd))
 }
 
@@ -2097,6 +2101,27 @@ pub fn sys_clock_gettime(clock_id: u32) -> Result<Duration, Error> {
 
     let duration = Duration::new(output.tv_sec as u64, output.tv_nsec as u32);
     Ok(duration)
+}
+
+pub fn sys_nanosleep(duration: Duration) -> Result<Option<Duration>, Error> {
+    let duration = timespec {
+        tv_sec: duration.as_secs() as i64,
+        tv_nsec: u64::from(duration.subsec_nanos()) as i64,
+    };
+
+    let mut remaining = timespec { tv_sec: 0, tv_nsec: 0 };
+    let result = unsafe { syscall_readonly!(SYS_nanosleep, core::ptr::addr_of!(duration), core::ptr::addr_of_mut!(remaining)) };
+    let error = Error::from_syscall("nanosleep", result);
+    if let Err(error) = error {
+        if error.errno() == EINTR {
+            let remaining = Duration::new(remaining.tv_sec as u64, remaining.tv_nsec as u32);
+            Ok(Some(remaining))
+        } else {
+            Err(error)
+        }
+    } else {
+        Ok(None)
+    }
 }
 
 pub fn sys_waitid(which: u32, pid: pid_t, info: &mut siginfo_t, options: u32, usage: Option<&mut rusage>) -> Result<(), Error> {

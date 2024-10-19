@@ -1,7 +1,10 @@
 pre: a0 = 0x20FFC
+pre: gas = 10000
 
 %rw_data_size = 4
 
 pub @main:
 pub @expected_exit:
     u32 [a0 + 1] = 0x12345678
+
+post: gas = 9998

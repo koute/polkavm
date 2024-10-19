@@ -158,105 +158,183 @@ impl core::fmt::Display for Reg {
     }
 }
 
-#[allow(clippy::partial_pub_fields)]
-#[doc(hidden)]
-pub struct VisitorHelper<T> {
-    pub visitor: T,
+#[inline(never)]
+#[cold]
+fn find_next_offset_unbounded(bitmask: &[u8], code_len: u32, mut offset: u32) -> u32 {
+    while let Some(&byte) = bitmask.get(offset as usize >> 3) {
+        let shift = offset & 7;
+        let mask = byte >> shift;
+        if mask == 0 {
+            offset += 8 - shift;
+        } else {
+            offset += mask.trailing_zeros();
+            break;
+        }
+    }
+
+    core::cmp::min(code_len, offset)
 }
 
-impl<T> VisitorHelper<T> {
-    #[allow(clippy::type_complexity)]
-    #[inline(never)]
-    #[cold]
-    fn step_slow(
-        &mut self,
-        code: &[u8],
-        bitmask: &[u8],
-        instruction_offset: usize,
-        decode_table: &[fn(state: &mut Self, chunk: u128, instruction_offset: u32, args_length: u32) -> <T as ParsingVisitor>::ReturnTy],
-    ) -> Option<(usize, <T as ParsingVisitor>::ReturnTy)>
-    where
-        T: ParsingVisitor,
-    {
-        let (next_offset, args_length) = parse_bitmask_slow(bitmask, instruction_offset)?;
-        let chunk_length = core::cmp::min(16, args_length + 1);
-        let chunk = code.get(instruction_offset..instruction_offset + chunk_length)?;
-        let opcode = chunk[0];
-
-        let mut t: [u8; 16] = [0; 16];
-        t[..chunk_length].copy_from_slice(chunk);
-        let chunk = u128::from_le_bytes([
-            t[0], t[1], t[2], t[3], t[4], t[5], t[6], t[7], t[8], t[9], t[10], t[11], t[12], t[13], t[14], t[15],
-        ]) >> 8;
-
-        Some((
-            next_offset,
-            decode_table[opcode as usize](self, chunk, instruction_offset as u32, args_length as u32),
-        ))
+#[inline(never)]
+fn visitor_step_slow<T>(
+    state: &mut <T as OpcodeVisitor>::State,
+    code: &[u8],
+    bitmask: &[u8],
+    offset: u32,
+    opcode_visitor: T,
+) -> (u32, <T as OpcodeVisitor>::ReturnTy, bool)
+where
+    T: OpcodeVisitor,
+{
+    if offset as usize >= code.len() {
+        return (offset + 1, visitor_step_invalid_instruction(state, offset, opcode_visitor), true);
     }
 
-    #[allow(clippy::type_complexity)]
-    #[cfg_attr(not(debug_assertions), inline(always))]
-    fn step(
-        &mut self,
-        code: &[u8],
-        bitmask: &[u8],
-        instruction_offset: usize,
-        decode_table: &[fn(state: &mut Self, chunk: u128, instruction_offset: u32, args_length: u32) -> <T as ParsingVisitor>::ReturnTy],
-    ) -> Option<(usize, <T as ParsingVisitor>::ReturnTy)>
-    where
-        T: ParsingVisitor,
-    {
-        if let Some((next_offset, args_length)) = parse_bitmask_fast(bitmask, instruction_offset) {
-            debug_assert!(args_length <= BITMASK_MAX as usize);
-            if let Some(chunk) = code.get(instruction_offset..instruction_offset + 32) {
-                assert!(chunk.len() >= 32);
-                let opcode = chunk[0];
+    debug_assert!(code.len() <= u32::MAX as usize);
+    debug_assert_eq!(bitmask.len(), (code.len() + 7) / 8);
+    debug_assert!(offset as usize <= code.len());
+    debug_assert!(get_bit_for_offset(bitmask, code.len(), offset), "bit at {offset} is zero");
 
-                // NOTE: This should produce the same assembly as the unsafe `read_unaligned`.
-                let chunk = u128::from_le_bytes([
-                    chunk[1], chunk[2], chunk[3], chunk[4], chunk[5], chunk[6], chunk[7], chunk[8], chunk[9], chunk[10], chunk[11],
-                    chunk[12], chunk[13], chunk[14], chunk[15], chunk[16],
-                ]);
+    let (skip, mut is_next_instruction_invalid) = parse_bitmask_slow(bitmask, code.len(), offset);
+    let chunk = &code[offset as usize..core::cmp::min(offset as usize + 17, code.len())];
+    let opcode = chunk[0];
 
-                return Some((
-                    next_offset,
-                    decode_table[opcode as usize](self, chunk, instruction_offset as u32, args_length as u32),
-                ));
-            }
+    if is_next_instruction_invalid && offset as usize + skip as usize + 1 >= code.len() {
+        // This is the last instruction.
+        if !opcode_visitor
+            .instruction_set()
+            .opcode_from_u8(opcode)
+            .unwrap_or(Opcode::trap)
+            .can_fallthrough()
+        {
+            // We can't fallthrough, so there's no need to inject a trap after this instruction.
+            is_next_instruction_invalid = false;
         }
-
-        self.step_slow(code, bitmask, instruction_offset, decode_table)
     }
 
-    #[inline]
-    pub fn new(visitor: T) -> Self {
-        VisitorHelper { visitor }
-    }
+    let mut t: [u8; 16] = [0; 16];
+    t[..chunk.len() - 1].copy_from_slice(&chunk[1..]);
+    let chunk = u128::from_le_bytes([
+        t[0], t[1], t[2], t[3], t[4], t[5], t[6], t[7], t[8], t[9], t[10], t[11], t[12], t[13], t[14], t[15],
+    ]);
 
-    #[allow(clippy::type_complexity)]
-    #[inline]
-    pub fn run(
-        mut self,
-        blob: &ProgramBlob,
-        decode_table: &[fn(&mut Self, chunk: u128, instruction_offset: u32, args_length: u32) -> <T as ParsingVisitor>::ReturnTy; 256],
-    ) -> T
-    where
-        T: ParsingVisitor<ReturnTy = ()>,
-    {
-        let code = blob.code();
-        let bitmask = blob.bitmask();
-        debug_assert_eq!(bitmask[0] & 0b1, 1);
+    debug_assert!(
+        opcode_visitor.instruction_set().opcode_from_u8(opcode).is_some()
+            || !is_jump_target_valid(opcode_visitor.instruction_set(), code, bitmask, offset + skip + 1)
+    );
 
-        let mut offset = 0;
-        loop {
-            let Some((next_offset, ())) = self.step(code, bitmask, offset, decode_table) else {
-                break;
-            };
+    (
+        offset + skip + 1,
+        opcode_visitor.dispatch(state, usize::from(opcode), chunk, offset, skip),
+        is_next_instruction_invalid,
+    )
+}
+
+#[cfg_attr(not(debug_assertions), inline(always))]
+fn visitor_step_fast<T>(
+    state: &mut <T as OpcodeVisitor>::State,
+    code: &[u8],
+    bitmask: &[u8],
+    offset: u32,
+    opcode_visitor: T,
+) -> (u32, <T as OpcodeVisitor>::ReturnTy, bool)
+where
+    T: OpcodeVisitor,
+{
+    debug_assert!(code.len() <= u32::MAX as usize);
+    debug_assert_eq!(bitmask.len(), (code.len() + 7) / 8);
+    debug_assert!(offset as usize <= code.len());
+    debug_assert!(get_bit_for_offset(bitmask, code.len(), offset), "bit at {offset} is zero");
+
+    debug_assert!(offset as usize + 32 <= code.len());
+
+    let Some(chunk) = code.get(offset as usize..offset as usize + 32) else {
+        unreachable!()
+    };
+    let Some(skip) = parse_bitmask_fast(bitmask, offset) else {
+        unreachable!()
+    };
+    let opcode = usize::from(chunk[0]);
+
+    // NOTE: This should produce the same assembly as the unsafe `read_unaligned`.
+    let chunk = u128::from_le_bytes([
+        chunk[1], chunk[2], chunk[3], chunk[4], chunk[5], chunk[6], chunk[7], chunk[8], chunk[9], chunk[10], chunk[11], chunk[12],
+        chunk[13], chunk[14], chunk[15], chunk[16],
+    ]);
+
+    debug_assert!(skip <= BITMASK_MAX);
+    debug_assert!(
+        opcode_visitor.instruction_set().opcode_from_u8(opcode as u8).is_some()
+            || !is_jump_target_valid(opcode_visitor.instruction_set(), code, bitmask, offset + skip + 1)
+    );
+    let result = opcode_visitor.dispatch(state, opcode, chunk, offset, skip);
+
+    let next_offset = offset + skip + 1;
+    let is_next_instruction_invalid = skip == 24 && !get_bit_for_offset(bitmask, code.len(), next_offset);
+    (next_offset, result, is_next_instruction_invalid)
+}
+
+#[cfg_attr(not(debug_assertions), inline(always))]
+#[cold]
+fn visitor_step_invalid_instruction<T>(state: &mut <T as OpcodeVisitor>::State, offset: u32, opcode_visitor: T) -> T::ReturnTy
+where
+    T: OpcodeVisitor,
+{
+    opcode_visitor.dispatch(state, INVALID_INSTRUCTION_INDEX as usize, 0, offset, 0)
+}
+
+#[cfg_attr(not(debug_assertions), inline(always))]
+fn visitor_step_runner<T, const FAST_PATH: bool>(
+    state: &mut <T as OpcodeVisitor>::State,
+    code: &[u8],
+    bitmask: &[u8],
+    mut offset: u32,
+    opcode_visitor: T,
+) -> u32
+where
+    T: OpcodeVisitor<ReturnTy = ()>,
+{
+    let (next_offset, (), is_next_instruction_invalid) = if FAST_PATH {
+        visitor_step_fast(state, code, bitmask, offset, opcode_visitor)
+    } else {
+        visitor_step_slow(state, code, bitmask, offset, opcode_visitor)
+    };
+
+    offset = next_offset;
+    if is_next_instruction_invalid {
+        visitor_step_invalid_instruction(state, offset, opcode_visitor);
+        if (offset as usize) < code.len() {
+            let next_offset = find_next_offset_unbounded(bitmask, code.len() as u32, offset);
+            debug_assert!(next_offset > offset);
             offset = next_offset;
         }
+    }
 
-        self.visitor
+    offset
+}
+
+// Having this be never inlined makes it easier to analyze the resulting assembly/machine code,
+// and it also seems to make the code mariginally faster for some reason.
+#[inline(never)]
+fn visitor_run<T>(state: &mut <T as OpcodeVisitor>::State, blob: &ProgramBlob, opcode_visitor: T)
+where
+    T: OpcodeVisitor<ReturnTy = ()>,
+{
+    let code = blob.code();
+    let bitmask = blob.bitmask();
+
+    let mut offset = 0;
+    if !get_bit_for_offset(bitmask, code.len(), 0) {
+        visitor_step_invalid_instruction(state, 0, opcode_visitor);
+        offset = find_next_offset_unbounded(bitmask, code.len() as u32, 0);
+    }
+
+    while offset as usize + 32 <= code.len() {
+        offset = visitor_step_runner::<T, true>(state, code, bitmask, offset, opcode_visitor);
+    }
+
+    while (offset as usize) < code.len() {
+        offset = visitor_step_runner::<T, false>(state, code, bitmask, offset, opcode_visitor);
     }
 }
 
@@ -644,20 +722,51 @@ mod kani {
     }
 }
 
+/// The lowest level visitor; dispatches directly on opcode numbers.
+pub trait OpcodeVisitor: Copy {
+    type State;
+    type ReturnTy;
+    type InstructionSet: InstructionSet;
+
+    fn instruction_set(self) -> Self::InstructionSet;
+    fn dispatch(self, state: &mut Self::State, opcode: usize, chunk: u128, offset: u32, skip: u32) -> Self::ReturnTy;
+}
+
 macro_rules! define_opcodes {
-    (@impl_shared $($name:ident = $value:expr,)+) => {
-        #[allow(non_camel_case_types)]
-        #[derive(Copy, Clone, PartialEq, Eq, Debug, Hash)]
-        #[repr(u8)]
-        pub enum Opcode {
-            $(
-                $name = $value,
-            )+
+    (@impl_instruction_set $instruction_set:ident [$($instruction_set_tag:tt),+] $([$($tag:tt),+] $name:ident = $value:expr,)+) => {
+        impl $instruction_set {
+            #[doc(hidden)]
+            pub const IS_INSTRUCTION_VALID_CONST: [bool; 256] = {
+                let mut is_valid = [false; 256];
+                let b = [$($instruction_set_tag),+];
+                $(
+                    is_valid[$value] = {
+                        let a = [$($tag),+];
+                        let mut found = false;
+                        let mut i = 0;
+                        'outer: while i < a.len() {
+                            let mut j = 0;
+                            while j < b.len() {
+                                if a[i] == b[j] {
+                                    found = true;
+                                    break 'outer;
+                                }
+                                j += 1;
+                            }
+                            i += 1;
+                        }
+                        found
+                    };
+                )+
+                is_valid
+            };
         }
 
-        impl Opcode {
+        impl InstructionSet for $instruction_set {
             #[cfg_attr(feature = "alloc", inline)]
-            pub fn from_u8(byte: u8) -> Option<Opcode> {
+            fn opcode_from_u8(self, byte: u8) -> Option<Opcode> {
+                static IS_INSTRUCTION_VALID: [bool; 256] = $instruction_set::IS_INSTRUCTION_VALID_CONST;
+
                 if !IS_INSTRUCTION_VALID[byte as usize] {
                     return None;
                 }
@@ -669,51 +778,65 @@ macro_rules! define_opcodes {
                 }
             }
         }
+    };
 
-        #[test]
-        fn test_opcode_from_u8() {
-            fn from_u8_naive(byte: u8) -> Option<Opcode> {
+    (@impl_shared $([$($tag:tt),+] $name:ident = $value:expr,)+) => {
+        #[allow(non_camel_case_types)]
+        #[derive(Copy, Clone, PartialEq, Eq, Debug, Hash)]
+        #[repr(u8)]
+        pub enum Opcode {
+            $(
+                $name = $value,
+            )+
+        }
+
+        impl Opcode {
+            pub fn from_u8_any(byte: u8) -> Option<Opcode> {
                 match byte {
                     $($value => Some(Opcode::$name),)+
                     _ => None
                 }
             }
-
-            for byte in 0..=255 {
-                assert_eq!(from_u8_naive(byte), Opcode::from_u8(byte));
-            }
         }
 
-        const IS_INSTRUCTION_VALID_CONST: [bool; 256] = {
-            let mut is_valid = [false; 256];
-            $(
-                is_valid[$value] = true;
-            )+
-            is_valid
-        };
+        define_opcodes!(@impl_instruction_set ISA32_V1         [I_32, I_SBRK]  $([$($tag),+] $name = $value,)+);
+        define_opcodes!(@impl_instruction_set ISA32_V1_NoSbrk  [I_32]          $([$($tag),+] $name = $value,)+);
+        define_opcodes!(@impl_instruction_set ISA64_V1         [I_64, I_SBRK]  $([$($tag),+] $name = $value,)+);
 
-        #[cfg(feature = "alloc")]
-        static IS_INSTRUCTION_VALID: [bool; 256] = IS_INSTRUCTION_VALID_CONST;
+        #[test]
+        fn test_opcode_from_u8() {
+            for byte in 0..=255 {
+                if let Some(opcode) = Opcode::from_u8_any(byte) {
+                    assert_eq!(ISA32_V1.opcode_from_u8(byte).unwrap_or(opcode), opcode);
+                    assert_eq!(ISA32_V1_NoSbrk.opcode_from_u8(byte).unwrap_or(opcode), opcode);
+                    assert_eq!(ISA64_V1.opcode_from_u8(byte).unwrap_or(opcode), opcode);
+                } else {
+                    assert_eq!(ISA32_V1.opcode_from_u8(byte), None);
+                    assert_eq!(ISA32_V1_NoSbrk.opcode_from_u8(byte), None);
+                    assert_eq!(ISA64_V1.opcode_from_u8(byte), None);
+                }
+            }
 
-        #[cfg(not(feature = "alloc"))]
-        use IS_INSTRUCTION_VALID_CONST as IS_INSTRUCTION_VALID;
+            assert!(ISA32_V1.opcode_from_u8(Opcode::sbrk as u8).is_some());
+            assert!(ISA32_V1_NoSbrk.opcode_from_u8(Opcode::sbrk as u8).is_none());
+        }
     };
 
     (
         $d:tt
 
-        [$($name_argless:ident = $value_argless:expr,)+]
-        [$($name_reg_imm:ident = $value_reg_imm:expr,)+]
-        [$($name_reg_imm_offset:ident = $value_reg_imm_offset:expr,)+]
-        [$($name_reg_imm_imm:ident = $value_reg_imm_imm:expr,)+]
-        [$($name_reg_reg_imm:ident = $value_reg_reg_imm:expr,)+]
-        [$($name_reg_reg_offset:ident = $value_reg_reg_offset:expr,)+]
-        [$($name_reg_reg_reg:ident = $value_reg_reg_reg:expr,)+]
-        [$($name_offset:ident = $value_offset:expr,)+]
-        [$($name_imm:ident = $value_imm:expr,)+]
-        [$($name_imm_imm:ident = $value_imm_imm:expr,)+]
-        [$($name_reg_reg:ident = $value_reg_reg:expr,)+]
-        [$($name_reg_reg_imm_imm:ident = $value_reg_reg_imm_imm:expr,)+]
+        [$([$($tag_argless:tt),+] $name_argless:ident = $value_argless:expr,)+]
+        [$([$($tag_reg_imm:tt),+] $name_reg_imm:ident = $value_reg_imm:expr,)+]
+        [$([$($tag_reg_imm_offset:tt),+] $name_reg_imm_offset:ident = $value_reg_imm_offset:expr,)+]
+        [$([$($tag_reg_imm_imm:tt),+] $name_reg_imm_imm:ident = $value_reg_imm_imm:expr,)+]
+        [$([$($tag_reg_reg_imm:tt),+] $name_reg_reg_imm:ident = $value_reg_reg_imm:expr,)+]
+        [$([$($tag_reg_reg_offset:tt),+] $name_reg_reg_offset:ident = $value_reg_reg_offset:expr,)+]
+        [$([$($tag_reg_reg_reg:tt),+] $name_reg_reg_reg:ident = $value_reg_reg_reg:expr,)+]
+        [$([$($tag_offset:tt),+] $name_offset:ident = $value_offset:expr,)+]
+        [$([$($tag_imm:tt),+] $name_imm:ident = $value_imm:expr,)+]
+        [$([$($tag_imm_imm:tt),+] $name_imm_imm:ident = $value_imm_imm:expr,)+]
+        [$([$($tag_reg_reg:tt),+] $name_reg_reg:ident = $value_reg_reg:expr,)+]
+        [$([$($tag_reg_reg_imm_imm:tt),+] $name_reg_reg_imm_imm:ident = $value_reg_reg_imm_imm:expr,)+]
     ) => {
         pub trait ParsingVisitor {
             type ReturnTy;
@@ -731,11 +854,7 @@ macro_rules! define_opcodes {
             $(fn $name_reg_reg(&mut self, offset: u32, args_length: u32, reg1: RawReg, reg2: RawReg) -> Self::ReturnTy;)+
             $(fn $name_reg_reg_imm_imm(&mut self, offset: u32, args_length: u32, reg1: RawReg, reg2: RawReg, imm1: u32, imm2: u32) -> Self::ReturnTy;)+
 
-            #[inline(never)]
-            #[cold]
-            fn invalid(&mut self, offset: u32, args_length: u32) -> Self::ReturnTy {
-                self.trap(offset, args_length)
-            }
+            fn invalid(&mut self, offset: u32, args_length: u32) -> Self::ReturnTy;
         }
 
         pub trait InstructionVisitor {
@@ -754,11 +873,7 @@ macro_rules! define_opcodes {
             $(fn $name_reg_reg(&mut self, reg1: RawReg, reg2: RawReg) -> Self::ReturnTy;)+
             $(fn $name_reg_reg_imm_imm(&mut self, reg1: RawReg, reg2: RawReg, imm1: u32, imm2: u32) -> Self::ReturnTy;)+
 
-            #[inline(never)]
-            #[cold]
-            fn invalid(&mut self) -> Self::ReturnTy {
-                self.trap()
-            }
+            fn invalid(&mut self) -> Self::ReturnTy;
         }
 
         #[derive(Copy, Clone, PartialEq, Eq, Debug)]
@@ -777,7 +892,7 @@ macro_rules! define_opcodes {
             $($name_imm_imm(u32, u32) = $value_imm_imm,)+
             $($name_reg_reg(RawReg, RawReg) = $value_reg_reg,)+
             $($name_reg_reg_imm_imm(RawReg, RawReg, u32, u32) = $value_reg_reg_imm_imm,)+
-            invalid = 88,
+            invalid = INVALID_INSTRUCTION_INDEX as u32,
         }
 
         impl Instruction {
@@ -918,389 +1033,337 @@ macro_rules! define_opcodes {
         }
 
         #[macro_export]
-        macro_rules! prepare_visitor {
-            (@define_table $table_name:ident, $visitor_ty:ident<$d($visitor_ty_params:tt),*>) => {
+        macro_rules! build_static_dispatch_table {
+            ($table_name:ident, $instruction_set:tt, $visitor_ty:ident<$d($visitor_ty_params:tt),*>) => {{
                 use $crate::program::{
-                    ParsingVisitor,
-                    VisitorHelper,
+                    ParsingVisitor
                 };
 
                 type ReturnTy<$d($visitor_ty_params),*> = <$visitor_ty<$d($visitor_ty_params),*> as ParsingVisitor>::ReturnTy;
-                type VisitFn<$d($visitor_ty_params),*> = fn(state: &mut VisitorHelper<$visitor_ty<$d($visitor_ty_params),*>>, chunk: u128, instruction_offset: u32, args_length: u32) -> ReturnTy<$d($visitor_ty_params),*>;
+                type VisitFn<$d($visitor_ty_params),*> = fn(state: &mut $visitor_ty<$d($visitor_ty_params),*>, chunk: u128, instruction_offset: u32, args_length: u32);
 
-                #[allow(unsafe_code)]
-                static $table_name: [VisitFn; 256] = {
-                    let mut table = [invalid_instruction as VisitFn; 256];
+                #[derive(Copy, Clone)]
+                struct DispatchTable<'a>(&'a [VisitFn<'a>; 257]);
+
+                impl<'a> $crate::program::OpcodeVisitor for DispatchTable<'a> {
+                    type State = $visitor_ty<'a>;
+                    type ReturnTy = ();
+                    type InstructionSet = $instruction_set;
+
+                    #[inline]
+                    fn instruction_set(self) -> Self::InstructionSet {
+                        $instruction_set
+                    }
+
+                    #[inline]
+                    fn dispatch(self, state: &mut $visitor_ty<'a>, opcode: usize, chunk: u128, offset: u32, skip: u32) {
+                        self.0[opcode](state, chunk, offset, skip)
+                    }
+                }
+
+                static $table_name: [VisitFn; 257] = {
+                    let mut table = [invalid_instruction as VisitFn; 257];
+
                     $({
                         // Putting all of the handlers in a single link section can make a big difference
                         // when it comes to performance, even up to 10% in some cases. This will force the
                         // compiler and the linker to put all of this code near each other, minimizing
                         // instruction cache misses.
                         #[cfg_attr(target_os = "linux", link_section = concat!(".text.", stringify!($table_name)))]
-                        fn $name_argless<$d($visitor_ty_params),*>(state: &mut VisitorHelper<$visitor_ty<$d($visitor_ty_params),*>>, _chunk: u128, instruction_offset: u32, args_length: u32) -> ReturnTy<$d($visitor_ty_params),*>{
-                            state.visitor.$name_argless(instruction_offset, args_length)
+                        fn $name_argless<$d($visitor_ty_params),*>(state: &mut $visitor_ty<$d($visitor_ty_params),*>, _chunk: u128, instruction_offset: u32, skip: u32) -> ReturnTy<$d($visitor_ty_params),*>{
+                            state.$name_argless(instruction_offset, skip)
                         }
 
-                        table[$value_argless] = $name_argless;
+                        if $instruction_set::IS_INSTRUCTION_VALID_CONST[$value_argless] {
+                            table[$value_argless] = $name_argless;
+                        }
                     })*
 
                     $({
                         #[cfg_attr(target_os = "linux", link_section = concat!(".text.", stringify!($table_name)))]
-                        fn $name_reg_imm<$d($visitor_ty_params),*>(state: &mut VisitorHelper<$visitor_ty<$d($visitor_ty_params),*>>, chunk: u128, instruction_offset: u32, args_length: u32) -> ReturnTy<$d($visitor_ty_params),*>{
-                            let (reg, imm) = $crate::program::read_args_reg_imm(chunk, args_length);
-                            state.visitor.$name_reg_imm(instruction_offset, args_length, reg, imm)
+                        fn $name_reg_imm<$d($visitor_ty_params),*>(state: &mut $visitor_ty<$d($visitor_ty_params),*>, chunk: u128, instruction_offset: u32, skip: u32) -> ReturnTy<$d($visitor_ty_params),*>{
+                            let (reg, imm) = $crate::program::read_args_reg_imm(chunk, skip);
+                            state.$name_reg_imm(instruction_offset, skip, reg, imm)
                         }
 
-                        table[$value_reg_imm] = $name_reg_imm;
+                        if $instruction_set::IS_INSTRUCTION_VALID_CONST[$value_reg_imm] {
+                            table[$value_reg_imm] = $name_reg_imm;
+                        }
                     })*
 
                     $({
                         #[cfg_attr(target_os = "linux", link_section = concat!(".text.", stringify!($table_name)))]
-                        fn $name_reg_imm_offset<$d($visitor_ty_params),*>(state: &mut VisitorHelper<$visitor_ty<$d($visitor_ty_params),*>>, chunk: u128, instruction_offset: u32, args_length: u32) -> ReturnTy<$d($visitor_ty_params),*>{
-                            let (reg, imm1, imm2) = $crate::program::read_args_reg_imm_offset(chunk, instruction_offset, args_length);
-                            state.visitor.$name_reg_imm_offset(instruction_offset, args_length, reg, imm1, imm2)
+                        fn $name_reg_imm_offset<$d($visitor_ty_params),*>(state: &mut $visitor_ty<$d($visitor_ty_params),*>, chunk: u128, instruction_offset: u32, skip: u32) -> ReturnTy<$d($visitor_ty_params),*>{
+                            let (reg, imm1, imm2) = $crate::program::read_args_reg_imm_offset(chunk, instruction_offset, skip);
+                            state.$name_reg_imm_offset(instruction_offset, skip, reg, imm1, imm2)
                         }
 
-                        table[$value_reg_imm_offset] = $name_reg_imm_offset;
+                        if $instruction_set::IS_INSTRUCTION_VALID_CONST[$value_reg_imm_offset] {
+                            table[$value_reg_imm_offset] = $name_reg_imm_offset;
+                        }
                     })*
 
                     $({
                         #[cfg_attr(target_os = "linux", link_section = concat!(".text.", stringify!($table_name)))]
-                        fn $name_reg_imm_imm<$d($visitor_ty_params),*>(state: &mut VisitorHelper<$visitor_ty<$d($visitor_ty_params),*>>, chunk: u128, instruction_offset: u32, args_length: u32) -> ReturnTy<$d($visitor_ty_params),*>{
-                            let (reg, imm1, imm2) = $crate::program::read_args_reg_imm2(chunk, args_length);
-                            state.visitor.$name_reg_imm_imm(instruction_offset, args_length, reg, imm1, imm2)
+                        fn $name_reg_imm_imm<$d($visitor_ty_params),*>(state: &mut $visitor_ty<$d($visitor_ty_params),*>, chunk: u128, instruction_offset: u32, skip: u32) -> ReturnTy<$d($visitor_ty_params),*>{
+                            let (reg, imm1, imm2) = $crate::program::read_args_reg_imm2(chunk, skip);
+                            state.$name_reg_imm_imm(instruction_offset, skip, reg, imm1, imm2)
                         }
 
-                        table[$value_reg_imm_imm] = $name_reg_imm_imm;
+                        if $instruction_set::IS_INSTRUCTION_VALID_CONST[$value_reg_imm_imm] {
+                            table[$value_reg_imm_imm] = $name_reg_imm_imm;
+                        }
                     })*
 
                     $({
                         #[cfg_attr(target_os = "linux", link_section = concat!(".text.", stringify!($table_name)))]
-                        fn $name_reg_reg_imm<$d($visitor_ty_params),*>(state: &mut VisitorHelper<$visitor_ty<$d($visitor_ty_params),*>>, chunk: u128, instruction_offset: u32, args_length: u32) -> ReturnTy<$d($visitor_ty_params),*>{
-                            let (reg1, reg2, imm) = $crate::program::read_args_regs2_imm(chunk, args_length);
-                            state.visitor.$name_reg_reg_imm(instruction_offset, args_length, reg1, reg2, imm)
+                        fn $name_reg_reg_imm<$d($visitor_ty_params),*>(state: &mut $visitor_ty<$d($visitor_ty_params),*>, chunk: u128, instruction_offset: u32, skip: u32) -> ReturnTy<$d($visitor_ty_params),*>{
+                            let (reg1, reg2, imm) = $crate::program::read_args_regs2_imm(chunk, skip);
+                            state.$name_reg_reg_imm(instruction_offset, skip, reg1, reg2, imm)
                         }
 
-                        table[$value_reg_reg_imm] = $name_reg_reg_imm;
+                        if $instruction_set::IS_INSTRUCTION_VALID_CONST[$value_reg_reg_imm] {
+                            table[$value_reg_reg_imm] = $name_reg_reg_imm;
+                        }
                     })*
 
                     $({
                         #[cfg_attr(target_os = "linux", link_section = concat!(".text.", stringify!($table_name)))]
-                        fn $name_reg_reg_offset<$d($visitor_ty_params),*>(state: &mut VisitorHelper<$visitor_ty<$d($visitor_ty_params),*>>, chunk: u128, instruction_offset: u32, args_length: u32) -> ReturnTy<$d($visitor_ty_params),*>{
-                            let (reg1, reg2, imm) = $crate::program::read_args_regs2_offset(chunk, instruction_offset, args_length);
-                            state.visitor.$name_reg_reg_offset(instruction_offset, args_length, reg1, reg2, imm)
+                        fn $name_reg_reg_offset<$d($visitor_ty_params),*>(state: &mut $visitor_ty<$d($visitor_ty_params),*>, chunk: u128, instruction_offset: u32, skip: u32) -> ReturnTy<$d($visitor_ty_params),*>{
+                            let (reg1, reg2, imm) = $crate::program::read_args_regs2_offset(chunk, instruction_offset, skip);
+                            state.$name_reg_reg_offset(instruction_offset, skip, reg1, reg2, imm)
                         }
 
-                        table[$value_reg_reg_offset] = $name_reg_reg_offset;
+                        if $instruction_set::IS_INSTRUCTION_VALID_CONST[$value_reg_reg_offset] {
+                            table[$value_reg_reg_offset] = $name_reg_reg_offset;
+                        }
                     })*
 
                     $({
                         #[cfg_attr(target_os = "linux", link_section = concat!(".text.", stringify!($table_name)))]
-                        fn $name_reg_reg_reg<$d($visitor_ty_params),*>(state: &mut VisitorHelper<$visitor_ty<$d($visitor_ty_params),*>>, chunk: u128, instruction_offset: u32, args_length: u32) -> ReturnTy<$d($visitor_ty_params),*>{
+                        fn $name_reg_reg_reg<$d($visitor_ty_params),*>(state: &mut $visitor_ty<$d($visitor_ty_params),*>, chunk: u128, instruction_offset: u32, skip: u32) -> ReturnTy<$d($visitor_ty_params),*>{
                             let (reg1, reg2, reg3) = $crate::program::read_args_regs3(chunk);
-                            state.visitor.$name_reg_reg_reg(instruction_offset, args_length, reg1, reg2, reg3)
+                            state.$name_reg_reg_reg(instruction_offset, skip, reg1, reg2, reg3)
                         }
 
-                        table[$value_reg_reg_reg] = $name_reg_reg_reg;
+                        if $instruction_set::IS_INSTRUCTION_VALID_CONST[$value_reg_reg_reg] {
+                            table[$value_reg_reg_reg] = $name_reg_reg_reg;
+                        }
                     })*
 
                     $({
                         #[cfg_attr(target_os = "linux", link_section = concat!(".text.", stringify!($table_name)))]
-                        fn $name_offset<$d($visitor_ty_params),*>(state: &mut VisitorHelper<$visitor_ty<$d($visitor_ty_params),*>>, chunk: u128, instruction_offset: u32, args_length: u32) -> ReturnTy<$d($visitor_ty_params),*>{
-                            let imm = $crate::program::read_args_offset(chunk, instruction_offset, args_length);
-                            state.visitor.$name_offset(instruction_offset, args_length, imm)
+                        fn $name_offset<$d($visitor_ty_params),*>(state: &mut $visitor_ty<$d($visitor_ty_params),*>, chunk: u128, instruction_offset: u32, skip: u32) -> ReturnTy<$d($visitor_ty_params),*>{
+                            let imm = $crate::program::read_args_offset(chunk, instruction_offset, skip);
+                            state.$name_offset(instruction_offset, skip, imm)
                         }
 
-                        table[$value_offset] = $name_offset;
+                        if $instruction_set::IS_INSTRUCTION_VALID_CONST[$value_offset] {
+                            table[$value_offset] = $name_offset;
+                        }
                     })*
 
                     $({
                         #[cfg_attr(target_os = "linux", link_section = concat!(".text.", stringify!($table_name)))]
-                        fn $name_imm<$d($visitor_ty_params),*>(state: &mut VisitorHelper<$visitor_ty<$d($visitor_ty_params),*>>, chunk: u128, instruction_offset: u32, args_length: u32) -> ReturnTy<$d($visitor_ty_params),*>{
-                            let imm = $crate::program::read_args_imm(chunk, args_length);
-                            state.visitor.$name_imm(instruction_offset, args_length, imm)
+                        fn $name_imm<$d($visitor_ty_params),*>(state: &mut $visitor_ty<$d($visitor_ty_params),*>, chunk: u128, instruction_offset: u32, skip: u32) -> ReturnTy<$d($visitor_ty_params),*>{
+                            let imm = $crate::program::read_args_imm(chunk, skip);
+                            state.$name_imm(instruction_offset, skip, imm)
                         }
 
-                        table[$value_imm] = $name_imm;
+                        if $instruction_set::IS_INSTRUCTION_VALID_CONST[$value_imm] {
+                            table[$value_imm] = $name_imm;
+                        }
                     })*
 
                     $({
                         #[cfg_attr(target_os = "linux", link_section = concat!(".text.", stringify!($table_name)))]
-                        fn $name_imm_imm<$d($visitor_ty_params),*>(state: &mut VisitorHelper<$visitor_ty<$d($visitor_ty_params),*>>, chunk: u128, instruction_offset: u32, args_length: u32) -> ReturnTy<$d($visitor_ty_params),*>{
-                            let (imm1, imm2) = $crate::program::read_args_imm2(chunk, args_length);
-                            state.visitor.$name_imm_imm(instruction_offset, args_length, imm1, imm2)
+                        fn $name_imm_imm<$d($visitor_ty_params),*>(state: &mut $visitor_ty<$d($visitor_ty_params),*>, chunk: u128, instruction_offset: u32, skip: u32) -> ReturnTy<$d($visitor_ty_params),*>{
+                            let (imm1, imm2) = $crate::program::read_args_imm2(chunk, skip);
+                            state.$name_imm_imm(instruction_offset, skip, imm1, imm2)
                         }
 
-                        table[$value_imm_imm] = $name_imm_imm;
+                        if $instruction_set::IS_INSTRUCTION_VALID_CONST[$value_imm_imm] {
+                            table[$value_imm_imm] = $name_imm_imm;
+                        }
                     })*
 
                     $({
                         #[cfg_attr(target_os = "linux", link_section = concat!(".text.", stringify!($table_name)))]
-                        fn $name_reg_reg<$d($visitor_ty_params),*>(state: &mut VisitorHelper<$visitor_ty<$d($visitor_ty_params),*>>, chunk: u128, instruction_offset: u32, args_length: u32) -> ReturnTy<$d($visitor_ty_params),*>{
+                        fn $name_reg_reg<$d($visitor_ty_params),*>(state: &mut $visitor_ty<$d($visitor_ty_params),*>, chunk: u128, instruction_offset: u32, skip: u32) -> ReturnTy<$d($visitor_ty_params),*>{
                             let (reg1, reg2) = $crate::program::read_args_regs2(chunk);
-                            state.visitor.$name_reg_reg(instruction_offset, args_length, reg1, reg2)
+                            state.$name_reg_reg(instruction_offset, skip, reg1, reg2)
                         }
 
-                        table[$value_reg_reg] = $name_reg_reg;
+                        if $instruction_set::IS_INSTRUCTION_VALID_CONST[$value_reg_reg] {
+                            table[$value_reg_reg] = $name_reg_reg;
+                        }
                     })*
 
                     $({
                         #[cfg_attr(target_os = "linux", link_section = concat!(".text.", stringify!($table_name)))]
-                        fn $name_reg_reg_imm_imm<$d($visitor_ty_params),*>(state: &mut VisitorHelper<$visitor_ty<$d($visitor_ty_params),*>>, chunk: u128, instruction_offset: u32, args_length: u32) -> ReturnTy<$d($visitor_ty_params),*>{
-                            let (reg1, reg2, imm1, imm2) = $crate::program::read_args_regs2_imm2(chunk, args_length);
-                            state.visitor.$name_reg_reg_imm_imm(instruction_offset, args_length, reg1, reg2, imm1, imm2)
+                        fn $name_reg_reg_imm_imm<$d($visitor_ty_params),*>(state: &mut $visitor_ty<$d($visitor_ty_params),*>, chunk: u128, instruction_offset: u32, skip: u32) -> ReturnTy<$d($visitor_ty_params),*>{
+                            let (reg1, reg2, imm1, imm2) = $crate::program::read_args_regs2_imm2(chunk, skip);
+                            state.$name_reg_reg_imm_imm(instruction_offset, skip, reg1, reg2, imm1, imm2)
                         }
 
-                        table[$value_reg_reg_imm_imm] = $name_reg_reg_imm_imm;
+                        if $instruction_set::IS_INSTRUCTION_VALID_CONST[$value_reg_reg_imm_imm] {
+                            table[$value_reg_reg_imm_imm] = $name_reg_reg_imm_imm;
+                        }
                     })*
 
                     #[cfg_attr(target_os = "linux", link_section = concat!(".text.", stringify!($table_name)))]
                     #[cold]
-                    fn invalid_instruction<$d($visitor_ty_params),*>(state: &mut VisitorHelper<$visitor_ty<$d($visitor_ty_params),*>>, _chunk: u128, instruction_offset: u32, args_length: u32) -> ReturnTy<$d($visitor_ty_params),*>{
-                        state.visitor.invalid(instruction_offset, args_length)
+                    fn invalid_instruction<$d($visitor_ty_params),*>(state: &mut $visitor_ty<$d($visitor_ty_params),*>, _chunk: u128, instruction_offset: u32, skip: u32) -> ReturnTy<$d($visitor_ty_params),*>{
+                        state.invalid(instruction_offset, skip)
                     }
 
                     table
                 };
-            };
-
-            ($table_name:ident, $visitor_ty:ident<$d($visitor_ty_params:tt),*>) => {{
-                $crate::program::prepare_visitor!(@define_table $table_name, $visitor_ty<$d($visitor_ty_params),*>);
 
                 #[inline]
-                fn run<$d($visitor_ty_params),*>(
-                    blob: &ProgramBlob,
-                    visitor: $visitor_ty<$d($visitor_ty_params),*>,
-                )
-                    -> $visitor_ty<$d($visitor_ty_params),*>
-                {
-                    let decode_table: &'static [VisitFn; 256] = &$table_name;
-
-                    #[allow(unsafe_code)]
-                    // SAFETY: Here we transmute the lifetimes which were unnecessarily extended to be 'static due to the table here being a `static`.
-                    let decode_table: &[VisitFn; 256] = unsafe { core::mem::transmute(decode_table) };
-
-                    VisitorHelper::new(visitor).run(blob, decode_table)
+                #[allow(unsafe_code)]
+                // SAFETY: Here we transmute the lifetimes which were unnecessarily extended to be 'static due to the table here being a `static`.
+                fn transmute_lifetime<'a>(table: DispatchTable<'static>) -> DispatchTable<'a> {
+                    unsafe { core::mem::transmute(&$table_name) }
                 }
 
-                run
+                transmute_lifetime(DispatchTable(&$table_name))
             }};
         }
 
-        pub use prepare_visitor;
+        pub use build_static_dispatch_table;
 
-        impl<'a> ParsingVisitor for ToEnumVisitor<'a> {
+        #[derive(Copy, Clone)]
+        struct EnumVisitor<I> {
+            instruction_set: I
+        }
+
+        impl<'a, I> OpcodeVisitor for EnumVisitor<I> where I: InstructionSet {
+            type State = ();
             type ReturnTy = Instruction;
+            type InstructionSet = I;
 
-            $(fn $name_argless(&mut self, _offset: u32, args_length: u32) -> Self::ReturnTy {
-                self.args_length = args_length;
-                Instruction::$name_argless
-            })+
-            $(fn $name_reg_imm(&mut self, _offset: u32, args_length: u32, reg: RawReg, imm: u32) -> Self::ReturnTy {
-                self.args_length = args_length;
-                Instruction::$name_reg_imm(reg, imm)
-            })+
-            $(fn $name_reg_imm_offset(&mut self, _offset: u32, args_length: u32, reg: RawReg, imm1: u32, imm2: u32) -> Self::ReturnTy {
-                self.args_length = args_length;
-                Instruction::$name_reg_imm_offset(reg, imm1, imm2)
-            })+
-            $(fn $name_reg_imm_imm(&mut self, _offset: u32, args_length: u32, reg: RawReg, imm1: u32, imm2: u32) -> Self::ReturnTy {
-                self.args_length = args_length;
-                Instruction::$name_reg_imm_imm(reg, imm1, imm2)
-            })+
-            $(fn $name_reg_reg_imm(&mut self, _offset: u32, args_length: u32, reg1: RawReg, reg2: RawReg, imm: u32) -> Self::ReturnTy {
-                self.args_length = args_length;
-                Instruction::$name_reg_reg_imm(reg1, reg2, imm)
-            })+
-            $(fn $name_reg_reg_offset(&mut self, _offset: u32, args_length: u32, reg1: RawReg, reg2: RawReg, imm: u32) -> Self::ReturnTy {
-                self.args_length = args_length;
-                Instruction::$name_reg_reg_offset(reg1, reg2, imm)
-            })+
-            $(fn $name_reg_reg_reg(&mut self, _offset: u32, args_length: u32, reg1: RawReg, reg2: RawReg, reg3: RawReg) -> Self::ReturnTy {
-                self.args_length = args_length;
-                Instruction::$name_reg_reg_reg(reg1, reg2, reg3)
-            })+
-            $(fn $name_offset(&mut self, _offset: u32, args_length: u32, imm: u32) -> Self::ReturnTy {
-                self.args_length = args_length;
-                Instruction::$name_offset(imm)
-            })+
-            $(fn $name_imm(&mut self, _offset: u32, args_length: u32, imm: u32) -> Self::ReturnTy {
-                self.args_length = args_length;
-                Instruction::$name_imm(imm)
-            })+
-            $(fn $name_imm_imm(&mut self, _offset: u32, args_length: u32, imm1: u32, imm2: u32) -> Self::ReturnTy {
-                self.args_length = args_length;
-                Instruction::$name_imm_imm(imm1, imm2)
-            })+
-            $(fn $name_reg_reg(&mut self, _offset: u32, args_length: u32, reg1: RawReg, reg2: RawReg) -> Self::ReturnTy {
-                self.args_length = args_length;
-                Instruction::$name_reg_reg(reg1, reg2)
-            })+
-            $(fn $name_reg_reg_imm_imm(&mut self, _offset: u32, args_length: u32, reg1: RawReg, reg2: RawReg, imm1: u32, imm2: u32) -> Self::ReturnTy {
-                self.args_length = args_length;
-                Instruction::$name_reg_reg_imm_imm(reg1, reg2, imm1, imm2)
-            })+
+            fn instruction_set(self) -> Self::InstructionSet {
+                self.instruction_set
+            }
+
+            fn dispatch(self, _state: &mut (), opcode: usize, chunk: u128, offset: u32, skip: u32) -> Instruction {
+                if self.instruction_set().opcode_from_u8(opcode as u8).is_none() {
+                    return Instruction::invalid
+                }
+
+                match opcode {
+                    $(
+                        $value_argless => Instruction::$name_argless,
+                    )+
+                    $(
+                        $value_reg_imm => {
+                            let (reg, imm) = $crate::program::read_args_reg_imm(chunk, skip);
+                            Instruction::$name_reg_imm(reg, imm)
+                        },
+                    )+
+                    $(
+                        $value_reg_imm_offset => {
+                            let (reg, imm1, imm2) = $crate::program::read_args_reg_imm_offset(chunk, offset, skip);
+                            Instruction::$name_reg_imm_offset(reg, imm1, imm2)
+                        },
+                    )+
+                    $(
+                        $value_reg_imm_imm => {
+                            let (reg, imm1, imm2) = $crate::program::read_args_reg_imm2(chunk, skip);
+                            Instruction::$name_reg_imm_imm(reg, imm1, imm2)
+                        },
+                    )+
+                    $(
+                        $value_reg_reg_imm => {
+                            let (reg1, reg2, imm) = $crate::program::read_args_regs2_imm(chunk, skip);
+                            Instruction::$name_reg_reg_imm(reg1, reg2, imm)
+                        }
+                    )+
+                    $(
+                        $value_reg_reg_offset => {
+                            let (reg1, reg2, imm) = $crate::program::read_args_regs2_offset(chunk, offset, skip);
+                            Instruction::$name_reg_reg_offset(reg1, reg2, imm)
+                        }
+                    )+
+                    $(
+                        $value_reg_reg_reg => {
+                            let (reg1, reg2, reg3) = $crate::program::read_args_regs3(chunk);
+                            Instruction::$name_reg_reg_reg(reg1, reg2, reg3)
+                        }
+                    )+
+                    $(
+                        $value_offset => {
+                            let imm = $crate::program::read_args_offset(chunk, offset, skip);
+                            Instruction::$name_offset(imm)
+                        }
+                    )+
+                    $(
+                        $value_imm => {
+                            let imm = $crate::program::read_args_imm(chunk, skip);
+                            Instruction::$name_imm(imm)
+                        }
+                    )+
+                    $(
+                        $value_imm_imm => {
+                            let (imm1, imm2) = $crate::program::read_args_imm2(chunk, skip);
+                            Instruction::$name_imm_imm(imm1, imm2)
+                        }
+                    )+
+                    $(
+                        $value_reg_reg => {
+                            let (reg1, reg2) = $crate::program::read_args_regs2(chunk);
+                            Instruction::$name_reg_reg(reg1, reg2)
+                        }
+                    )+
+                    $(
+                        $value_reg_reg_imm_imm => {
+                            let (reg1, reg2, imm1, imm2) = $crate::program::read_args_regs2_imm2(chunk, skip);
+                            Instruction::$name_reg_reg_imm_imm(reg1, reg2, imm1, imm2)
+                        }
+                    )+
+                    _ => Instruction::invalid,
+                }
+            }
         }
 
         define_opcodes!(
             @impl_shared
-            $($name_argless = $value_argless,)+
-            $($name_reg_imm = $value_reg_imm,)+
-            $($name_reg_imm_offset = $value_reg_imm_offset,)+
-            $($name_reg_imm_imm = $value_reg_imm_imm,)+
-            $($name_reg_reg_imm = $value_reg_reg_imm,)+
-            $($name_reg_reg_offset = $value_reg_reg_offset,)+
-            $($name_reg_reg_reg = $value_reg_reg_reg,)+
-            $($name_offset = $value_offset,)+
-            $($name_imm = $value_imm,)+
-            $($name_imm_imm = $value_imm_imm,)+
-            $($name_reg_reg = $value_reg_reg,)+
-            $($name_reg_reg_imm_imm = $value_reg_reg_imm_imm,)+
+            $([$($tag_argless),+] $name_argless = $value_argless,)+
+            $([$($tag_reg_imm),+] $name_reg_imm = $value_reg_imm,)+
+            $([$($tag_reg_imm_offset),+] $name_reg_imm_offset = $value_reg_imm_offset,)+
+            $([$($tag_reg_imm_imm),+] $name_reg_imm_imm = $value_reg_imm_imm,)+
+            $([$($tag_reg_reg_imm),+] $name_reg_reg_imm = $value_reg_reg_imm,)+
+            $([$($tag_reg_reg_offset),+] $name_reg_reg_offset = $value_reg_reg_offset,)+
+            $([$($tag_reg_reg_reg),+] $name_reg_reg_reg = $value_reg_reg_reg,)+
+            $([$($tag_offset),+] $name_offset = $value_offset,)+
+            $([$($tag_imm),+] $name_imm = $value_imm,)+
+            $([$($tag_imm_imm),+] $name_imm_imm = $value_imm_imm,)+
+            $([$($tag_reg_reg),+] $name_reg_reg = $value_reg_reg,)+
+            $([$($tag_reg_reg_imm_imm),+] $name_reg_reg_imm_imm = $value_reg_reg_imm_imm,)+
         );
     }
 }
 
-struct ToEnumVisitor<'a> {
-    args_length: u32,
-    phantom: core::marker::PhantomData<&'a ()>,
-}
-
 #[inline]
-fn parse_instruction(code: &[u8], bitmask: &[u8], offset: &mut usize) -> Option<ParsedInstruction> {
-    prepare_visitor!(@define_table TO_ENUM_VISITOR, ToEnumVisitor<'a>);
-
-    let decode_table: &[VisitFn; 256] = &TO_ENUM_VISITOR;
-
-    #[allow(unsafe_code)]
-    // SAFETY: Here we transmute the lifetimes which were unnecessarily extended to be 'static due to the table here being a `static`.
-    let decode_table: &[VisitFn; 256] = unsafe { core::mem::transmute(decode_table) };
-
-    let mut helper = VisitorHelper::new(ToEnumVisitor {
-        args_length: 0,
-        phantom: core::marker::PhantomData,
-    });
-
-    let origin = *offset;
-    let (next_offset, instruction) = helper.step(code, bitmask, origin, decode_table)?;
-    *offset = next_offset;
-
-    let length = helper.visitor.args_length + 1;
-    Some(ParsedInstruction {
-        kind: instruction,
-        offset: ProgramCounter(origin as u32),
-        length,
-    })
+fn parse_instruction<I>(instruction_set: I, code: &[u8], bitmask: &[u8], offset: u32) -> (u32, Instruction, bool)
+where
+    I: InstructionSet,
+{
+    let visitor = EnumVisitor { instruction_set };
+    if offset as usize + 32 <= code.len() {
+        visitor_step_fast(&mut (), code, bitmask, offset, visitor)
+    } else {
+        visitor_step_slow(&mut (), code, bitmask, offset, visitor)
+    }
 }
 
-#[test]
-#[ignore]
-fn test_parse_instruction() {
-    // Instruction with no arguments.
-    assert_eq!(
-        parse_instruction(&[Opcode::fallthrough as u8], &[0b11111111], &mut 0),
-        Some(ParsedInstruction {
-            kind: Instruction::fallthrough,
-            offset: ProgramCounter(0),
-            length: 1
-        })
-    );
+const INVALID_INSTRUCTION_INDEX: u32 = 256;
 
-    // Instruction with no arguments, overparametrized.
-    assert_eq!(
-        parse_instruction(&[Opcode::fallthrough as u8, 0xff], &[0b00000101], &mut 0),
-        Some(ParsedInstruction {
-            kind: Instruction::fallthrough,
-            offset: ProgramCounter(0),
-            length: 2
-        })
-    );
-
-    // Instruction with no arguments, overparametrized, truncated code.
-    assert_eq!(parse_instruction(&[Opcode::fallthrough as u8], &[0b00000101], &mut 0), None);
-
-    // Instruction with no arguments, overparametrized until end of code.
-    assert_eq!(
-        parse_instruction(
-            &[Opcode::fallthrough as u8, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff],
-            &[0b00000001],
-            &mut 0
-        ),
-        Some(ParsedInstruction {
-            kind: Instruction::fallthrough,
-            offset: ProgramCounter(0),
-            length: 8
-        })
-    );
-
-    // Instruction with one immediate argument.
-    assert_eq!(
-        parse_instruction(&[Opcode::ecalli as u8], &[0b00000011], &mut 0),
-        Some(ParsedInstruction {
-            kind: Instruction::ecalli(0),
-            offset: ProgramCounter(0),
-            length: 1
-        })
-    );
-
-    assert_eq!(
-        parse_instruction(&[Opcode::ecalli as u8, 0xff, 0xff, 0xff, 0xff], &[0b00100001], &mut 0),
-        Some(ParsedInstruction {
-            kind: Instruction::ecalli(0x80000000),
-            offset: ProgramCounter(0),
-            length: 5
-        })
-    );
-
-    // Instruction with one immediate argument, overparametrized.
-    assert_eq!(
-        parse_instruction(&[Opcode::ecalli as u8, 0xff, 0xff, 0xff, 0xff, 0x66], &[0b01000001], &mut 0),
-        Some(ParsedInstruction {
-            kind: Instruction::ecalli(0x80000000),
-            offset: ProgramCounter(0),
-            length: 6
-        })
-    );
-
-    // Instruction with two registers and one immediate argument.
-    assert_eq!(
-        parse_instruction(&[Opcode::add_imm as u8, 0x00, 0xff, 0xff, 0xff, 0xff], &[0b01000001], &mut 0),
-        Some(ParsedInstruction {
-            kind: Instruction::add_imm(Reg::RA.into(), Reg::RA.into(), 0x80000000),
-            offset: ProgramCounter(0),
-            length: 6
-        })
-    );
-
-    // Instruction with two registers and one immediate argument, overparametrized.
-    assert_eq!(
-        parse_instruction(&[Opcode::add_imm as u8, 0x00, 0xff, 0xff, 0xff, 0xff, 0x66], &[0b10000001], &mut 0),
-        Some(ParsedInstruction {
-            kind: Instruction::add_imm(Reg::RA.into(), Reg::RA.into(), 0x80000000),
-            offset: ProgramCounter(0),
-            length: 7
-        })
-    );
-
-    extern crate alloc;
-    use alloc::vec;
-    use alloc::vec::Vec;
-
-    let length = 512;
-    let mut bitmask = vec![0; length / 8];
-    bitmask[0] = 0b00000001;
-    let mut code = Vec::new();
-    code.resize(length, 0xff);
-    code[0] = Opcode::add_imm as u8;
-    code[1] = 0x00;
-    assert_eq!(
-        parse_instruction(&code, &bitmask, &mut 0),
-        Some(ParsedInstruction {
-            kind: Instruction::add_imm(Reg::RA.into(), Reg::RA.into(), 0x80000000),
-            offset: ProgramCounter(0),
-            length: 25
-        })
-    );
-}
+// Constants so that `define_opcodes` works. The exact values don't matter.
+const I_32: usize = 0;
+const I_64: usize = 1;
+const I_SBRK: usize = 2;
 
 // NOTE: The opcodes here are assigned roughly in the order of how common a given instruction is,
 // except the `trap` which is deliberately hardcoded as zero.
@@ -1309,144 +1372,194 @@ define_opcodes! {
 
     // Instructions with args: none
     [
-        trap                                     = 0,
-        fallthrough                              = 17,
+        [I_64, I_32] trap                                     = 0,
+        [I_64, I_32] fallthrough                              = 17,
     ]
 
     // Instructions with args: reg, imm
     [
-        jump_indirect                            = 19,
-        load_imm                                 = 4,
-        load_u8                                  = 60,
-        load_i8                                  = 74,
-        load_u16                                 = 76,
-        load_i16                                 = 66,
-        load_u32                                 = 10,
-        store_u8                                 = 71,
-        store_u16                                = 69,
-        store_u32                                = 22,
+        [I_64, I_32] jump_indirect                            = 19,
+        [I_64, I_32] load_imm                                 = 4,
+        [I_64, I_32] load_u8                                  = 60,
+        [I_64, I_32] load_i8                                  = 74,
+        [I_64, I_32] load_u16                                 = 76,
+        [I_64, I_32] load_i16                                 = 66,
+        [I_64, I_32] load_u32                                 = 10,
+        [I_64]       load_i32                                 = 102,
+        [I_64]       load_u64                                 = 95,
+        [I_64, I_32] store_u8                                 = 71,
+        [I_64, I_32] store_u16                                = 69,
+        [I_64, I_32] store_u32                                = 22,
+        [I_64]       store_u64                                = 96,
     ]
 
     // Instructions with args: reg, imm, offset
     [
-        load_imm_and_jump                        = 6,
-        branch_eq_imm                            = 7,
-        branch_not_eq_imm                        = 15,
-        branch_less_unsigned_imm                 = 44,
-        branch_less_signed_imm                   = 32,
-        branch_greater_or_equal_unsigned_imm     = 52,
-        branch_greater_or_equal_signed_imm       = 45,
-        branch_less_or_equal_signed_imm          = 46,
-        branch_less_or_equal_unsigned_imm        = 59,
-        branch_greater_signed_imm                = 53,
-        branch_greater_unsigned_imm              = 50,
+        [I_64, I_32] load_imm_and_jump                        = 6,
+        [I_64, I_32] branch_eq_imm                            = 7,
+        [I_64, I_32] branch_not_eq_imm                        = 15,
+        [I_64, I_32] branch_less_unsigned_imm                 = 44,
+        [I_64, I_32] branch_less_signed_imm                   = 32,
+        [I_64, I_32] branch_greater_or_equal_unsigned_imm     = 52,
+        [I_64, I_32] branch_greater_or_equal_signed_imm       = 45,
+        [I_64, I_32] branch_less_or_equal_signed_imm          = 46,
+        [I_64, I_32] branch_less_or_equal_unsigned_imm        = 59,
+        [I_64, I_32] branch_greater_signed_imm                = 53,
+        [I_64, I_32] branch_greater_unsigned_imm              = 50,
     ]
 
     // Instructions with args: reg, imm, imm
     [
-        store_imm_indirect_u8                    = 26,
-        store_imm_indirect_u16                   = 54,
-        store_imm_indirect_u32                   = 13,
+        [I_64, I_32] store_imm_indirect_u8                    = 26,
+        [I_64, I_32] store_imm_indirect_u16                   = 54,
+        [I_64, I_32] store_imm_indirect_u32                   = 13,
+        [I_64]       store_imm_indirect_u64                   = 93,
     ]
 
     // Instructions with args: reg, reg, imm
     [
-        store_indirect_u8                        = 16,
-        store_indirect_u16                       = 29,
-        store_indirect_u32                       = 3,
-        load_indirect_u8                         = 11,
-        load_indirect_i8                         = 21,
-        load_indirect_u16                        = 37,
-        load_indirect_i16                        = 33,
-        load_indirect_u32                        = 1,
-        add_imm                                  = 2,
-        and_imm                                  = 18,
-        xor_imm                                  = 31,
-        or_imm                                   = 49,
-        mul_imm                                  = 35,
-        mul_upper_signed_signed_imm              = 65,
-        mul_upper_unsigned_unsigned_imm          = 63,
-        set_less_than_unsigned_imm               = 27,
-        set_less_than_signed_imm                 = 56,
-        shift_logical_left_imm                   = 9,
-        shift_logical_right_imm                  = 14,
-        shift_arithmetic_right_imm               = 25,
-        negate_and_add_imm                       = 40,
-        set_greater_than_unsigned_imm            = 39,
-        set_greater_than_signed_imm              = 61,
-        shift_logical_right_imm_alt              = 72,
-        shift_arithmetic_right_imm_alt           = 80,
-        shift_logical_left_imm_alt               = 75,
+        [I_64, I_32] store_indirect_u8                        = 16,
+        [I_64, I_32] store_indirect_u16                       = 29,
+        [I_64, I_32] store_indirect_u32                       = 3,
+        [I_64]       store_indirect_u64                       = 90,
+        [I_64, I_32] load_indirect_u8                         = 11,
+        [I_64, I_32] load_indirect_i8                         = 21,
+        [I_64, I_32] load_indirect_u16                        = 37,
+        [I_64, I_32] load_indirect_i16                        = 33,
+        [I_64]       load_indirect_i32                        = 99,
+        [I_64, I_32] load_indirect_u32                        = 1,
+        [I_64]       load_indirect_u64                        = 91,
+        [I_64, I_32] add_imm                                  = 2,
+        [I_64]       add_64_imm                               = 104,
+        [I_64, I_32] and_imm                                  = 18,
+        [I_64]       and_64_imm                               = 118,
+        [I_64, I_32] xor_imm                                  = 31,
+        [I_64]       xor_64_imm                               = 119,
+        [I_64, I_32] or_imm                                   = 49,
+        [I_64]       or_64_imm                                = 120,
+        [I_64, I_32] mul_imm                                  = 35,
+        [I_64]       mul_64_imm                               = 121,
+        [I_64, I_32] mul_upper_signed_signed_imm              = 65,
+        [I_64]       mul_upper_signed_signed_imm_64           = 131,
+        [I_64, I_32] mul_upper_unsigned_unsigned_imm          = 63,
+        [I_64]       mul_upper_unsigned_unsigned_imm_64       = 132,
+        [I_64, I_32] set_less_than_unsigned_imm               = 27,
+        [I_64]       set_less_than_unsigned_64_imm            = 125,
+        [I_64, I_32] set_less_than_signed_imm                 = 56,
+        [I_64]       set_less_than_signed_64_imm              = 126,
+        [I_64, I_32] shift_logical_left_imm                   = 9,
+        [I_64]       shift_logical_left_64_imm                = 105,
+        [I_64, I_32] shift_logical_right_imm                  = 14,
+        [I_64]       shift_logical_right_64_imm               = 106,
+        [I_64, I_32] shift_arithmetic_right_imm               = 25,
+        [I_64]       shift_arithmetic_right_64_imm            = 107,
+        [I_64, I_32] negate_and_add_imm                       = 40,
+        [I_64, I_32] set_greater_than_unsigned_imm            = 39,
+        [I_64]       set_greater_than_unsigned_64_imm         = 129,
+        [I_64, I_32] set_greater_than_signed_imm              = 61,
+        [I_64]       set_greater_than_signed_64_imm           = 130,
+        [I_64, I_32] shift_logical_right_imm_alt              = 72,
+        [I_64]       shift_logical_right_64_imm_alt           = 103,
+        [I_64, I_32] shift_arithmetic_right_imm_alt           = 80,
+        [I_64]       shift_arithmetic_right_64_imm_alt        = 111,
+        [I_64, I_32] shift_logical_left_imm_alt               = 75,
+        [I_64]       shift_logical_left_64_imm_alt            = 110,
 
-        cmov_if_zero_imm                         = 85,
-        cmov_if_not_zero_imm                     = 86,
+        [I_64, I_32] cmov_if_zero_imm                         = 85,
+        [I_64, I_32] cmov_if_not_zero_imm                     = 86,
     ]
 
     // Instructions with args: reg, reg, offset
     [
-        branch_eq                                = 24,
-        branch_not_eq                            = 30,
-        branch_less_unsigned                     = 47,
-        branch_less_signed                       = 48,
-        branch_greater_or_equal_unsigned         = 41,
-        branch_greater_or_equal_signed           = 43,
+        [I_64, I_32] branch_eq                                = 24,
+        [I_64, I_32] branch_not_eq                            = 30,
+        [I_64, I_32] branch_less_unsigned                     = 47,
+        [I_64, I_32] branch_less_signed                       = 48,
+        [I_64, I_32] branch_greater_or_equal_unsigned         = 41,
+        [I_64, I_32] branch_greater_or_equal_signed           = 43,
     ]
 
     // Instructions with args: reg, reg, reg
     [
-        add                                      = 8,
-        sub                                      = 20,
-        and                                      = 23,
-        xor                                      = 28,
-        or                                       = 12,
-        mul                                      = 34,
-        mul_upper_signed_signed                  = 67,
-        mul_upper_unsigned_unsigned              = 57,
-        mul_upper_signed_unsigned                = 81,
-        set_less_than_unsigned                   = 36,
-        set_less_than_signed                     = 58,
-        shift_logical_left                       = 55,
-        shift_logical_right                      = 51,
-        shift_arithmetic_right                   = 77,
-        div_unsigned                             = 68,
-        div_signed                               = 64,
-        rem_unsigned                             = 73,
-        rem_signed                               = 70,
+        [I_64, I_32] add                                      = 8,
+        [I_64]       add_64                                   = 101,
+        [I_64, I_32] sub                                      = 20,
+        [I_64]       sub_64                                   = 112,
+        [I_64, I_32] and                                      = 23,
+        [I_64]       and_64                                   = 124,
+        [I_64, I_32] xor                                      = 28,
+        [I_64]       xor_64                                   = 122,
+        [I_64, I_32] or                                       = 12,
+        [I_64]       or_64                                    = 123,
+        [I_64, I_32] mul                                      = 34,
+        [I_64]       mul_64                                   = 113,
+        [I_64, I_32] mul_upper_signed_signed                  = 67,
+        [I_64]       mul_upper_signed_signed_64               = 133,
+        [I_64, I_32] mul_upper_unsigned_unsigned              = 57,
+        [I_64]       mul_upper_unsigned_unsigned_64           = 134,
+        [I_64, I_32] mul_upper_signed_unsigned                = 81,
+        [I_64]       mul_upper_signed_unsigned_64             = 135,
+        [I_64, I_32] set_less_than_unsigned                   = 36,
+        [I_64]       set_less_than_unsigned_64                = 127,
+        [I_64, I_32] set_less_than_signed                     = 58,
+        [I_64]       set_less_than_signed_64                  = 128,
+        [I_64, I_32] shift_logical_left                       = 55,
+        [I_64]       shift_logical_left_64                    = 100,
+        [I_64, I_32] shift_logical_right                      = 51,
+        [I_64]       shift_logical_right_64                   = 108,
+        [I_64, I_32] shift_arithmetic_right                   = 77,
+        [I_64]       shift_arithmetic_right_64                = 109,
+        [I_64, I_32] div_unsigned                             = 68,
+        [I_64]       div_unsigned_64                          = 114,
+        [I_64, I_32] div_signed                               = 64,
+        [I_64]       div_signed_64                            = 115,
+        [I_64, I_32] rem_unsigned                             = 73,
+        [I_64]       rem_unsigned_64                          = 116,
+        [I_64, I_32] rem_signed                               = 70,
+        [I_64]       rem_signed_64                            = 117,
 
-        cmov_if_zero                             = 83,
-        cmov_if_not_zero                         = 84,
+        [I_64, I_32] cmov_if_zero                             = 83,
+        [I_64, I_32] cmov_if_not_zero                         = 84,
     ]
 
     // Instructions with args: offset
     [
-        jump                                     = 5,
+        [I_64, I_32] jump                                     = 5,
     ]
 
     // Instructions with args: imm
     [
-        ecalli                                   = 78,
+        [I_64, I_32] ecalli                                   = 78,
     ]
 
     // Instructions with args: imm, imm
     [
-        store_imm_u8                             = 62,
-        store_imm_u16                            = 79,
-        store_imm_u32                            = 38,
+        [I_64, I_32] store_imm_u8                             = 62,
+        [I_64, I_32] store_imm_u16                            = 79,
+        [I_64, I_32] store_imm_u32                            = 38,
+        [I_64]       store_imm_u64                            = 98,
     ]
 
     // Instructions with args: reg, reg
     [
-        move_reg                                 = 82,
-        sbrk                                     = 87,
+        [I_64, I_32] move_reg                                 = 82,
+        [I_SBRK]     sbrk                                     = 87,
     ]
 
     // Instructions with args: reg, reg, imm, imm
     [
-        load_imm_and_jump_indirect               = 42,
+        [I_64, I_32] load_imm_and_jump_indirect               = 42,
     ]
 }
 
 impl Opcode {
+    pub fn can_fallthrough(self) -> bool {
+        !matches!(
+            self,
+            Self::trap | Self::jump | Self::jump_indirect | Self::load_imm_and_jump | Self::load_imm_and_jump_indirect
+        )
+    }
+
     pub fn starts_new_basic_block(self) -> bool {
         matches!(
             self,
@@ -1486,13 +1599,13 @@ impl core::fmt::Display for Instruction {
 }
 
 impl Instruction {
-    pub fn display(self, format: &'_ InstructionFormat) -> impl core::fmt::Display + '_ {
-        struct Inner<'a> {
+    pub fn display<'a>(self, format: &'a InstructionFormat<'a>) -> impl core::fmt::Display + 'a {
+        struct Inner<'a, 'b> {
             instruction: Instruction,
-            format: &'a InstructionFormat,
+            format: &'a InstructionFormat<'b>,
         }
 
-        impl<'a> core::fmt::Display for Inner<'a> {
+        impl<'a, 'b> core::fmt::Display for Inner<'a, 'b> {
             fn fmt(&self, fmt: &mut core::fmt::Formatter) -> core::fmt::Result {
                 self.instruction.visit(&mut InstructionFormatter { format: self.format, fmt })
             }
@@ -1599,17 +1712,18 @@ pub const MAX_INSTRUCTION_LENGTH: usize = 2 + MAX_VARINT_LENGTH * 2;
 
 #[derive(Default)]
 #[non_exhaustive]
-pub struct InstructionFormat {
+pub struct InstructionFormat<'a> {
     pub prefer_non_abi_reg_names: bool,
     pub prefer_unaliased: bool,
+    pub jump_target_formatter: Option<&'a dyn Fn(u32, &mut core::fmt::Formatter) -> core::fmt::Result>,
 }
 
-struct InstructionFormatter<'a, 'b> {
-    format: &'a InstructionFormat,
+struct InstructionFormatter<'a, 'b, 'c> {
+    format: &'a InstructionFormat<'c>,
     fmt: &'a mut core::fmt::Formatter<'b>,
 }
 
-impl<'a, 'b> InstructionFormatter<'a, 'b> {
+impl<'a, 'b, 'c> InstructionFormatter<'a, 'b, 'c> {
     fn format_reg(&self, reg: RawReg) -> &'static str {
         if self.format.prefer_non_abi_reg_names {
             reg.get().name_non_abi()
@@ -1617,15 +1731,30 @@ impl<'a, 'b> InstructionFormatter<'a, 'b> {
             reg.get().name()
         }
     }
+
+    fn format_jump(&self, imm: u32) -> impl core::fmt::Display + 'a {
+        struct Formatter<'a>(Option<&'a dyn Fn(u32, &mut core::fmt::Formatter) -> core::fmt::Result>, u32);
+        impl<'a> core::fmt::Display for Formatter<'a> {
+            fn fmt(&self, fmt: &mut core::fmt::Formatter) -> core::fmt::Result {
+                if let Some(f) = self.0 {
+                    f(self.1, fmt)
+                } else {
+                    write!(fmt, "{}", self.1)
+                }
+            }
+        }
+
+        Formatter(self.format.jump_target_formatter, imm)
+    }
 }
 
-impl<'a, 'b> core::fmt::Write for InstructionFormatter<'a, 'b> {
+impl<'a, 'b, 'c> core::fmt::Write for InstructionFormatter<'a, 'b, 'c> {
     fn write_str(&mut self, s: &str) -> Result<(), core::fmt::Error> {
         self.fmt.write_str(s)
     }
 }
 
-impl<'a, 'b> InstructionVisitor for InstructionFormatter<'a, 'b> {
+impl<'a, 'b, 'c> InstructionVisitor for InstructionFormatter<'a, 'b, 'c> {
     type ReturnTy = core::fmt::Result;
 
     fn trap(&mut self) -> Self::ReturnTy {
@@ -1658,6 +1787,41 @@ impl<'a, 'b> InstructionVisitor for InstructionFormatter<'a, 'b> {
         let s1 = self.format_reg(s1);
         let s2 = self.format_reg(s2);
         write!(self, "{d} = {s1} <s {s2}")
+    }
+
+    fn set_less_than_unsigned_64(&mut self, d: RawReg, s1: RawReg, s2: RawReg) -> Self::ReturnTy {
+        let d = self.format_reg(d);
+        let s1 = self.format_reg(s1);
+        let s2 = self.format_reg(s2);
+        write!(self, "{d} = {s1} <u64 {s2}")
+    }
+
+    fn set_less_than_signed_64(&mut self, d: RawReg, s1: RawReg, s2: RawReg) -> Self::ReturnTy {
+        let d = self.format_reg(d);
+        let s1 = self.format_reg(s1);
+        let s2 = self.format_reg(s2);
+        write!(self, "{d} = {s1} <s64 {s2}")
+    }
+
+    fn shift_logical_right_64(&mut self, d: RawReg, s1: RawReg, s2: RawReg) -> Self::ReturnTy {
+        let d = self.format_reg(d);
+        let s1 = self.format_reg(s1);
+        let s2 = self.format_reg(s2);
+        write!(self, "{d} = {s1} >>64 {s2}")
+    }
+
+    fn shift_arithmetic_right_64(&mut self, d: RawReg, s1: RawReg, s2: RawReg) -> Self::ReturnTy {
+        let d = self.format_reg(d);
+        let s1 = self.format_reg(s1);
+        let s2 = self.format_reg(s2);
+        write!(self, "{d} = {s1} >>a64 {s2}")
+    }
+
+    fn shift_logical_left_64(&mut self, d: RawReg, s1: RawReg, s2: RawReg) -> Self::ReturnTy {
+        let d = self.format_reg(d);
+        let s1 = self.format_reg(s1);
+        let s2 = self.format_reg(s2);
+        write!(self, "{d} = {s1} <<64 {s2}")
     }
 
     fn shift_logical_right(&mut self, d: RawReg, s1: RawReg, s2: RawReg) -> Self::ReturnTy {
@@ -1702,11 +1866,39 @@ impl<'a, 'b> InstructionVisitor for InstructionFormatter<'a, 'b> {
         write!(self, "{d} = {s1} | {s2}")
     }
 
+    fn xor_64(&mut self, d: RawReg, s1: RawReg, s2: RawReg) -> Self::ReturnTy {
+        let d = self.format_reg(d);
+        let s1 = self.format_reg(s1);
+        let s2 = self.format_reg(s2);
+        write!(self, "i64 {d} = {s1} ^ {s2}")
+    }
+
+    fn and_64(&mut self, d: RawReg, s1: RawReg, s2: RawReg) -> Self::ReturnTy {
+        let d = self.format_reg(d);
+        let s1 = self.format_reg(s1);
+        let s2 = self.format_reg(s2);
+        write!(self, "i64 {d} = {s1} & {s2}")
+    }
+
+    fn or_64(&mut self, d: RawReg, s1: RawReg, s2: RawReg) -> Self::ReturnTy {
+        let d = self.format_reg(d);
+        let s1 = self.format_reg(s1);
+        let s2 = self.format_reg(s2);
+        write!(self, "i64 {d} = {s1} | {s2}")
+    }
+
     fn add(&mut self, d: RawReg, s1: RawReg, s2: RawReg) -> Self::ReturnTy {
         let d = self.format_reg(d);
         let s1 = self.format_reg(s1);
         let s2 = self.format_reg(s2);
         write!(self, "{d} = {s1} + {s2}")
+    }
+
+    fn add_64(&mut self, d: RawReg, s1: RawReg, s2: RawReg) -> Self::ReturnTy {
+        let d = self.format_reg(d);
+        let s1 = self.format_reg(s1);
+        let s2 = self.format_reg(s2);
+        write!(self, "i64 {d} = {s1} + {s2}")
     }
 
     fn sub(&mut self, d: RawReg, s1: RawReg, s2: RawReg) -> Self::ReturnTy {
@@ -1716,6 +1908,13 @@ impl<'a, 'b> InstructionVisitor for InstructionFormatter<'a, 'b> {
         write!(self, "{d} = {s1} - {s2}")
     }
 
+    fn sub_64(&mut self, d: RawReg, s1: RawReg, s2: RawReg) -> Self::ReturnTy {
+        let d = self.format_reg(d);
+        let s1 = self.format_reg(s1);
+        let s2 = self.format_reg(s2);
+        write!(self, "i64 {d} = i64 {s1} - i64 {s2}")
+    }
+
     fn mul(&mut self, d: RawReg, s1: RawReg, s2: RawReg) -> Self::ReturnTy {
         let d = self.format_reg(d);
         let s1 = self.format_reg(s1);
@@ -1723,10 +1922,23 @@ impl<'a, 'b> InstructionVisitor for InstructionFormatter<'a, 'b> {
         write!(self, "{d} = {s1} * {s2}")
     }
 
+    fn mul_64(&mut self, d: RawReg, s1: RawReg, s2: RawReg) -> Self::ReturnTy {
+        let d = self.format_reg(d);
+        let s1 = self.format_reg(s1);
+        let s2 = self.format_reg(s2);
+        write!(self, "i64 {d} = i64 {s1} * i64 {s2}")
+    }
+
     fn mul_imm(&mut self, d: RawReg, s1: RawReg, s2: u32) -> Self::ReturnTy {
         let d = self.format_reg(d);
         let s1 = self.format_reg(s1);
         write!(self, "{d} = {s1} * {s2}")
+    }
+
+    fn mul_64_imm(&mut self, d: RawReg, s1: RawReg, s2: u32) -> Self::ReturnTy {
+        let d = self.format_reg(d);
+        let s1 = self.format_reg(s1);
+        write!(self, "i64 {d} = {s1} * {s2}")
     }
 
     fn mul_upper_signed_signed(&mut self, d: RawReg, s1: RawReg, s2: RawReg) -> Self::ReturnTy {
@@ -1736,10 +1948,23 @@ impl<'a, 'b> InstructionVisitor for InstructionFormatter<'a, 'b> {
         write!(self, "{d} = ({s1} as i64 * {s2} as i64) >> 32")
     }
 
+    fn mul_upper_signed_signed_64(&mut self, d: RawReg, s1: RawReg, s2: RawReg) -> Self::ReturnTy {
+        let d = self.format_reg(d);
+        let s1 = self.format_reg(s1);
+        let s2 = self.format_reg(s2);
+        write!(self, "{d} = ({s1} as i128 * {s2} as i128) >> 64")
+    }
+
     fn mul_upper_signed_signed_imm(&mut self, d: RawReg, s1: RawReg, s2: u32) -> Self::ReturnTy {
         let d = self.format_reg(d);
         let s1 = self.format_reg(s1);
         write!(self, "{d} = ({s1} as i64 * {s2} as i64) >> 32", s2 = s2 as i32)
+    }
+
+    fn mul_upper_signed_signed_imm_64(&mut self, d: RawReg, s1: RawReg, s2: u32) -> Self::ReturnTy {
+        let d = self.format_reg(d);
+        let s1 = self.format_reg(s1);
+        write!(self, "{d} = ({s1} as i128 * {s2} as i128) >> 64", s2 = i64::from(s2))
     }
 
     fn mul_upper_unsigned_unsigned(&mut self, d: RawReg, s1: RawReg, s2: RawReg) -> Self::ReturnTy {
@@ -1749,10 +1974,23 @@ impl<'a, 'b> InstructionVisitor for InstructionFormatter<'a, 'b> {
         write!(self, "{d} = ({s1} as u64 * {s2} as u64) >> 32")
     }
 
+    fn mul_upper_unsigned_unsigned_64(&mut self, d: RawReg, s1: RawReg, s2: RawReg) -> Self::ReturnTy {
+        let d = self.format_reg(d);
+        let s1 = self.format_reg(s1);
+        let s2 = self.format_reg(s2);
+        write!(self, "{d} = ({s1} as u128 * {s2} as u128) >> 64")
+    }
+
     fn mul_upper_unsigned_unsigned_imm(&mut self, d: RawReg, s1: RawReg, s2: u32) -> Self::ReturnTy {
         let d = self.format_reg(d);
         let s1 = self.format_reg(s1);
         write!(self, "{d} = ({s1} as u64 * {s2} as u64) >> 32")
+    }
+
+    fn mul_upper_unsigned_unsigned_imm_64(&mut self, d: RawReg, s1: RawReg, s2: u32) -> Self::ReturnTy {
+        let d = self.format_reg(d);
+        let s1 = self.format_reg(s1);
+        write!(self, "{d} = ({s1} as u128 * {s2} as u128) >> 64")
     }
 
     fn mul_upper_signed_unsigned(&mut self, d: RawReg, s1: RawReg, s2: RawReg) -> Self::ReturnTy {
@@ -1760,6 +1998,13 @@ impl<'a, 'b> InstructionVisitor for InstructionFormatter<'a, 'b> {
         let s1 = self.format_reg(s1);
         let s2 = self.format_reg(s2);
         write!(self, "{d} = ({s1} as i64 * {s2} as u64) >> 32")
+    }
+
+    fn mul_upper_signed_unsigned_64(&mut self, d: RawReg, s1: RawReg, s2: RawReg) -> Self::ReturnTy {
+        let d = self.format_reg(d);
+        let s1 = self.format_reg(s1);
+        let s2 = self.format_reg(s2);
+        write!(self, "{d} = ({s1} as i128 * {s2} as u128) >> 64")
     }
 
     fn div_unsigned(&mut self, d: RawReg, s1: RawReg, s2: RawReg) -> Self::ReturnTy {
@@ -1790,13 +2035,53 @@ impl<'a, 'b> InstructionVisitor for InstructionFormatter<'a, 'b> {
         write!(self, "{d} = {s1} %s {s2}")
     }
 
+    fn div_unsigned_64(&mut self, d: RawReg, s1: RawReg, s2: RawReg) -> Self::ReturnTy {
+        let d = self.format_reg(d);
+        let s1 = self.format_reg(s1);
+        let s2 = self.format_reg(s2);
+        write!(self, "i64 {d} = i64 {s1} /u i64 {s2}")
+    }
+
+    fn div_signed_64(&mut self, d: RawReg, s1: RawReg, s2: RawReg) -> Self::ReturnTy {
+        let d = self.format_reg(d);
+        let s1 = self.format_reg(s1);
+        let s2 = self.format_reg(s2);
+        write!(self, "i32 {d} = i64 {s1} /s i64 {s2}")
+    }
+
+    fn rem_unsigned_64(&mut self, d: RawReg, s1: RawReg, s2: RawReg) -> Self::ReturnTy {
+        let d = self.format_reg(d);
+        let s1 = self.format_reg(s1);
+        let s2 = self.format_reg(s2);
+        write!(self, "i64 {d} = i64 {s1} %u i64 {s2}")
+    }
+
+    fn rem_signed_64(&mut self, d: RawReg, s1: RawReg, s2: RawReg) -> Self::ReturnTy {
+        let d = self.format_reg(d);
+        let s1 = self.format_reg(s1);
+        let s2 = self.format_reg(s2);
+        write!(self, "i64 {d} = i64 {s1} %s i64 {s2}")
+    }
+
     fn set_less_than_unsigned_imm(&mut self, d: RawReg, s1: RawReg, s2: u32) -> Self::ReturnTy {
         let d = self.format_reg(d);
         let s1 = self.format_reg(s1);
         write!(self, "{d} = {s1} <u 0x{s2:x}")
     }
 
+    fn set_less_than_unsigned_64_imm(&mut self, d: RawReg, s1: RawReg, s2: u32) -> Self::ReturnTy {
+        let d = self.format_reg(d);
+        let s1 = self.format_reg(s1);
+        write!(self, "i64 {d} = {s1} <u 0x{s2:x}")
+    }
+
     fn set_greater_than_unsigned_imm(&mut self, d: RawReg, s1: RawReg, s2: u32) -> Self::ReturnTy {
+        let d = self.format_reg(d);
+        let s1 = self.format_reg(s1);
+        write!(self, "{d} = {s1} >u 0x{s2:x}")
+    }
+
+    fn set_greater_than_unsigned_64_imm(&mut self, d: RawReg, s1: RawReg, s2: u32) -> Self::ReturnTy {
         let d = self.format_reg(d);
         let s1 = self.format_reg(s1);
         write!(self, "{d} = {s1} >u 0x{s2:x}")
@@ -1808,7 +2093,19 @@ impl<'a, 'b> InstructionVisitor for InstructionFormatter<'a, 'b> {
         write!(self, "{d} = {s1} <s {s2}", s2 = s2 as i32)
     }
 
+    fn set_less_than_signed_64_imm(&mut self, d: RawReg, s1: RawReg, s2: u32) -> Self::ReturnTy {
+        let d = self.format_reg(d);
+        let s1 = self.format_reg(s1);
+        write!(self, "i64 {d} = {s1} <s {s2}", s2 = s2 as i32)
+    }
+
     fn set_greater_than_signed_imm(&mut self, d: RawReg, s1: RawReg, s2: u32) -> Self::ReturnTy {
+        let d = self.format_reg(d);
+        let s1 = self.format_reg(s1);
+        write!(self, "{d} = {s1} >s {s2}", s2 = s2 as i32)
+    }
+
+    fn set_greater_than_signed_64_imm(&mut self, d: RawReg, s1: RawReg, s2: u32) -> Self::ReturnTy {
         let d = self.format_reg(d);
         let s1 = self.format_reg(s1);
         write!(self, "{d} = {s1} >s {s2}", s2 = s2 as i32)
@@ -1832,6 +2129,24 @@ impl<'a, 'b> InstructionVisitor for InstructionFormatter<'a, 'b> {
         write!(self, "{d} = {s1} >>a {s2}")
     }
 
+    fn shift_logical_right_64_imm(&mut self, d: RawReg, s1: RawReg, s2: u32) -> Self::ReturnTy {
+        let d = self.format_reg(d);
+        let s1 = self.format_reg(s1);
+        write!(self, "{d} = {s1} >>64 {s2}")
+    }
+
+    fn shift_logical_right_64_imm_alt(&mut self, d: RawReg, s2: RawReg, s1: u32) -> Self::ReturnTy {
+        let d = self.format_reg(d);
+        let s2 = self.format_reg(s2);
+        write!(self, "{d} = {s1} >>64 {s2}")
+    }
+
+    fn shift_arithmetic_right_64_imm(&mut self, d: RawReg, s1: RawReg, s2: u32) -> Self::ReturnTy {
+        let d = self.format_reg(d);
+        let s1 = self.format_reg(s1);
+        write!(self, "{d} = {s1} >>a64 {s2}")
+    }
+
     fn shift_arithmetic_right_imm_alt(&mut self, d: RawReg, s2: RawReg, s1: u32) -> Self::ReturnTy {
         let d = self.format_reg(d);
         let s2 = self.format_reg(s2);
@@ -1850,6 +2165,24 @@ impl<'a, 'b> InstructionVisitor for InstructionFormatter<'a, 'b> {
         write!(self, "{d} = {s1} << {s2}")
     }
 
+    fn shift_arithmetic_right_64_imm_alt(&mut self, d: RawReg, s2: RawReg, s1: u32) -> Self::ReturnTy {
+        let d = self.format_reg(d);
+        let s2 = self.format_reg(s2);
+        write!(self, "{d} = {s1} >>a64 {s2}")
+    }
+
+    fn shift_logical_left_64_imm(&mut self, d: RawReg, s1: RawReg, s2: u32) -> Self::ReturnTy {
+        let d = self.format_reg(d);
+        let s1 = self.format_reg(s1);
+        write!(self, "{d} = {s1} <<64 {s2}")
+    }
+
+    fn shift_logical_left_64_imm_alt(&mut self, d: RawReg, s2: RawReg, s1: u32) -> Self::ReturnTy {
+        let d = self.format_reg(d);
+        let s2 = self.format_reg(s2);
+        write!(self, "{d} = {s1} <<64 {s2}")
+    }
+
     fn or_imm(&mut self, d: RawReg, s1: RawReg, s2: u32) -> Self::ReturnTy {
         let d = self.format_reg(d);
         let s1 = self.format_reg(s1);
@@ -1866,6 +2199,24 @@ impl<'a, 'b> InstructionVisitor for InstructionFormatter<'a, 'b> {
         let d = self.format_reg(d);
         let s1 = self.format_reg(s1);
         write!(self, "{d} = {s1} ^ 0x{s2:x}")
+    }
+
+    fn or_64_imm(&mut self, d: RawReg, s1: RawReg, s2: u32) -> Self::ReturnTy {
+        let d = self.format_reg(d);
+        let s1 = self.format_reg(s1);
+        write!(self, "i64 {d} = {s1} | 0x{s2:x}")
+    }
+
+    fn and_64_imm(&mut self, d: RawReg, s1: RawReg, s2: u32) -> Self::ReturnTy {
+        let d = self.format_reg(d);
+        let s1 = self.format_reg(s1);
+        write!(self, "i64 {d} = {s1} & 0x{s2:x}")
+    }
+
+    fn xor_64_imm(&mut self, d: RawReg, s1: RawReg, s2: u32) -> Self::ReturnTy {
+        let d = self.format_reg(d);
+        let s1 = self.format_reg(s1);
+        write!(self, "i64 {d} = {s1} ^ 0x{s2:x}")
     }
 
     fn load_imm(&mut self, d: RawReg, a: u32) -> Self::ReturnTy {
@@ -1905,6 +2256,16 @@ impl<'a, 'b> InstructionVisitor for InstructionFormatter<'a, 'b> {
         write!(self, "{d} = {s} if {c} != 0")
     }
 
+    fn add_64_imm(&mut self, d: RawReg, s1: RawReg, s2: u32) -> Self::ReturnTy {
+        let d = self.format_reg(d);
+        let s1 = self.format_reg(s1);
+        if !self.format.prefer_unaliased && (s2 as i32) < 0 && (s2 as i32) > -4096 {
+            write!(self, "i64 {d} = i64 {s1} - i64 {s2}", s2 = -(s2 as i32))
+        } else {
+            write!(self, "i64 {d} = i64 {s1} + 0x{s2:x}")
+        }
+    }
+
     fn add_imm(&mut self, d: RawReg, s1: RawReg, s2: u32) -> Self::ReturnTy {
         let d = self.format_reg(d);
         let s1 = self.format_reg(s1);
@@ -1940,6 +2301,11 @@ impl<'a, 'b> InstructionVisitor for InstructionFormatter<'a, 'b> {
         write!(self, "u32 [{base} + {offset}] = {value}")
     }
 
+    fn store_imm_indirect_u64(&mut self, base: RawReg, offset: u32, value: u32) -> Self::ReturnTy {
+        let base = self.format_reg(base);
+        write!(self, "u64 [{base} + {offset}] = {value}")
+    }
+
     fn store_indirect_u8(&mut self, src: RawReg, base: RawReg, offset: u32) -> Self::ReturnTy {
         let base = self.format_reg(base);
         if self.format.prefer_unaliased || offset != 0 {
@@ -1969,6 +2335,16 @@ impl<'a, 'b> InstructionVisitor for InstructionFormatter<'a, 'b> {
         }
     }
 
+    fn store_indirect_u64(&mut self, src: RawReg, base: RawReg, offset: u32) -> Self::ReturnTy {
+        let src = self.format_reg(src);
+        let base = self.format_reg(base);
+        if self.format.prefer_unaliased || offset != 0 {
+            write!(self, "u64 [{base} + {offset}] = {src}")
+        } else {
+            write!(self, "u64 [{base}] = {src}")
+        }
+    }
+
     fn store_imm_u8(&mut self, offset: u32, value: u32) -> Self::ReturnTy {
         write!(self, "u8 [0x{offset:x}] = {value}")
     }
@@ -1979,6 +2355,10 @@ impl<'a, 'b> InstructionVisitor for InstructionFormatter<'a, 'b> {
 
     fn store_imm_u32(&mut self, offset: u32, value: u32) -> Self::ReturnTy {
         write!(self, "u32 [0x{offset:x}] = {value}")
+    }
+
+    fn store_imm_u64(&mut self, offset: u32, value: u32) -> Self::ReturnTy {
+        write!(self, "u64 [0x{offset:x}] = {value}")
     }
 
     fn store_u8(&mut self, src: RawReg, offset: u32) -> Self::ReturnTy {
@@ -1994,6 +2374,11 @@ impl<'a, 'b> InstructionVisitor for InstructionFormatter<'a, 'b> {
     fn store_u32(&mut self, src: RawReg, offset: u32) -> Self::ReturnTy {
         let src = self.format_reg(src);
         write!(self, "u32 [0x{offset:x}] = {src}")
+    }
+
+    fn store_u64(&mut self, src: RawReg, offset: u32) -> Self::ReturnTy {
+        let src = self.format_reg(src);
+        write!(self, "u64 [0x{offset:x}] = {src}")
     }
 
     fn load_indirect_u8(&mut self, dst: RawReg, base: RawReg, offset: u32) -> Self::ReturnTy {
@@ -2046,6 +2431,26 @@ impl<'a, 'b> InstructionVisitor for InstructionFormatter<'a, 'b> {
         }
     }
 
+    fn load_indirect_i32(&mut self, dst: RawReg, base: RawReg, offset: u32) -> Self::ReturnTy {
+        let dst = self.format_reg(dst);
+        let base = self.format_reg(base);
+        if self.format.prefer_unaliased || offset != 0 {
+            write!(self, "{} = i32 [{} + {}]", dst, base, offset)
+        } else {
+            write!(self, "{} = i32 [{}]", dst, base)
+        }
+    }
+
+    fn load_indirect_u64(&mut self, dst: RawReg, base: RawReg, offset: u32) -> Self::ReturnTy {
+        let dst = self.format_reg(dst);
+        let base = self.format_reg(base);
+        if self.format.prefer_unaliased || offset != 0 {
+            write!(self, "{} = u64 [{} + {}]", dst, base, offset)
+        } else {
+            write!(self, "{} = u64 [{}]", dst, base)
+        }
+    }
+
     fn load_u8(&mut self, dst: RawReg, offset: u32) -> Self::ReturnTy {
         let dst = self.format_reg(dst);
         write!(self, "{} = u8 [0x{:x}]", dst, offset)
@@ -2066,103 +2471,131 @@ impl<'a, 'b> InstructionVisitor for InstructionFormatter<'a, 'b> {
         write!(self, "{} = i16 [0x{:x}]", dst, offset)
     }
 
+    fn load_i32(&mut self, dst: RawReg, offset: u32) -> Self::ReturnTy {
+        let dst = self.format_reg(dst);
+        write!(self, "{} = i32 [0x{:x}]", dst, offset)
+    }
+
     fn load_u32(&mut self, dst: RawReg, offset: u32) -> Self::ReturnTy {
         let dst = self.format_reg(dst);
         write!(self, "{} = u32 [0x{:x}]", dst, offset)
     }
 
+    fn load_u64(&mut self, dst: RawReg, offset: u32) -> Self::ReturnTy {
+        let dst = self.format_reg(dst);
+        write!(self, "{} = u64 [0x{:x}]", dst, offset)
+    }
+
     fn branch_less_unsigned(&mut self, s1: RawReg, s2: RawReg, imm: u32) -> Self::ReturnTy {
         let s1 = self.format_reg(s1);
         let s2 = self.format_reg(s2);
+        let imm = self.format_jump(imm);
         write!(self, "jump {} if {} <u {}", imm, s1, s2)
     }
 
     fn branch_less_signed(&mut self, s1: RawReg, s2: RawReg, imm: u32) -> Self::ReturnTy {
         let s1 = self.format_reg(s1);
         let s2 = self.format_reg(s2);
+        let imm = self.format_jump(imm);
         write!(self, "jump {} if {} <s {}", imm, s1, s2)
     }
 
     fn branch_less_unsigned_imm(&mut self, s1: RawReg, s2: u32, imm: u32) -> Self::ReturnTy {
         let s1 = self.format_reg(s1);
+        let imm = self.format_jump(imm);
         write!(self, "jump {} if {} <u {}", imm, s1, s2)
     }
 
     fn branch_less_signed_imm(&mut self, s1: RawReg, s2: u32, imm: u32) -> Self::ReturnTy {
         let s1 = self.format_reg(s1);
+        let imm = self.format_jump(imm);
         write!(self, "jump {} if {} <s {}", imm, s1, s2)
     }
 
     fn branch_greater_or_equal_unsigned(&mut self, s1: RawReg, s2: RawReg, imm: u32) -> Self::ReturnTy {
         let s1 = self.format_reg(s1);
         let s2 = self.format_reg(s2);
+        let imm = self.format_jump(imm);
         write!(self, "jump {} if {} >=u {}", imm, s1, s2)
     }
 
     fn branch_greater_or_equal_signed(&mut self, s1: RawReg, s2: RawReg, imm: u32) -> Self::ReturnTy {
         let s1 = self.format_reg(s1);
         let s2 = self.format_reg(s2);
+        let imm = self.format_jump(imm);
         write!(self, "jump {} if {} >=s {}", imm, s1, s2)
     }
 
     fn branch_greater_or_equal_unsigned_imm(&mut self, s1: RawReg, s2: u32, imm: u32) -> Self::ReturnTy {
         let s1 = self.format_reg(s1);
+        let imm = self.format_jump(imm);
         write!(self, "jump {} if {} >=u {}", imm, s1, s2)
     }
 
     fn branch_greater_or_equal_signed_imm(&mut self, s1: RawReg, s2: u32, imm: u32) -> Self::ReturnTy {
         let s1 = self.format_reg(s1);
+        let imm = self.format_jump(imm);
         write!(self, "jump {} if {} >=s {}", imm, s1, s2)
     }
 
     fn branch_eq(&mut self, s1: RawReg, s2: RawReg, imm: u32) -> Self::ReturnTy {
         let s1 = self.format_reg(s1);
         let s2 = self.format_reg(s2);
+        let imm = self.format_jump(imm);
         write!(self, "jump {} if {} == {}", imm, s1, s2)
     }
 
     fn branch_not_eq(&mut self, s1: RawReg, s2: RawReg, imm: u32) -> Self::ReturnTy {
         let s1 = self.format_reg(s1);
         let s2 = self.format_reg(s2);
+        let imm = self.format_jump(imm);
         write!(self, "jump {} if {} != {}", imm, s1, s2)
     }
 
     fn branch_eq_imm(&mut self, s1: RawReg, s2: u32, imm: u32) -> Self::ReturnTy {
         let s1 = self.format_reg(s1);
+        let imm = self.format_jump(imm);
         write!(self, "jump {} if {} == {}", imm, s1, s2)
     }
 
     fn branch_not_eq_imm(&mut self, s1: RawReg, s2: u32, imm: u32) -> Self::ReturnTy {
         let s1 = self.format_reg(s1);
+        let imm = self.format_jump(imm);
         write!(self, "jump {} if {} != {}", imm, s1, s2)
     }
 
     fn branch_less_or_equal_unsigned_imm(&mut self, s1: RawReg, s2: u32, imm: u32) -> Self::ReturnTy {
         let s1 = self.format_reg(s1);
+        let imm = self.format_jump(imm);
         write!(self, "jump {} if {} <=u {}", imm, s1, s2)
     }
 
     fn branch_less_or_equal_signed_imm(&mut self, s1: RawReg, s2: u32, imm: u32) -> Self::ReturnTy {
         let s1 = self.format_reg(s1);
+        let imm = self.format_jump(imm);
         write!(self, "jump {} if {} <=s {}", imm, s1, s2)
     }
 
     fn branch_greater_unsigned_imm(&mut self, s1: RawReg, s2: u32, imm: u32) -> Self::ReturnTy {
         let s1 = self.format_reg(s1);
+        let imm = self.format_jump(imm);
         write!(self, "jump {} if {} >u {}", imm, s1, s2)
     }
 
     fn branch_greater_signed_imm(&mut self, s1: RawReg, s2: u32, imm: u32) -> Self::ReturnTy {
         let s1 = self.format_reg(s1);
+        let imm = self.format_jump(imm);
         write!(self, "jump {} if {} >s {}", imm, s1, s2)
     }
 
     fn jump(&mut self, target: u32) -> Self::ReturnTy {
+        let target = self.format_jump(target);
         write!(self, "jump {}", target)
     }
 
     fn load_imm_and_jump(&mut self, ra: RawReg, value: u32, target: u32) -> Self::ReturnTy {
         let ra = self.format_reg(ra);
+        let target = self.format_jump(target);
         write!(self, "{ra} = {value}, jump {target}")
     }
 
@@ -2391,6 +2824,11 @@ where
 /// A partially deserialized PolkaVM program.
 #[derive(Clone, Default)]
 pub struct ProgramBlob {
+    #[cfg(feature = "unique-id")]
+    unique_id: u64,
+
+    is_64_bit: bool,
+
     ro_data_size: u32,
     rw_data_size: u32,
     stack_size: u32,
@@ -2427,6 +2865,12 @@ where
             blob: self.blob,
             position: self.position,
         }
+    }
+}
+
+impl<'a, T> From<&'a T> for Reader<'a, T> {
+    fn from(blob: &'a T) -> Self {
+        Self { blob, position: 0 }
     }
 }
 
@@ -2666,106 +3110,331 @@ impl<'a> Iterator for JumpTableIter<'a> {
     }
 }
 
-const BITMASK_MAX: u32 = 24;
+pub const BITMASK_MAX: u32 = 24;
 
-#[cfg_attr(not(debug_assertions), inline(always))]
-fn parse_bitmask_slow(bitmask: &[u8], mut offset: usize) -> Option<(usize, usize)> {
-    if bitmask.is_empty() {
+pub fn get_bit_for_offset(bitmask: &[u8], code_len: usize, offset: u32) -> bool {
+    let Some(byte) = bitmask.get(offset as usize >> 3) else {
+        return false;
+    };
+
+    if offset as usize > code_len {
+        return false;
+    }
+
+    let shift = offset & 7;
+    ((byte >> shift) & 1) == 1
+}
+
+fn get_previous_instruction_skip(bitmask: &[u8], offset: u32) -> Option<u32> {
+    let shift = offset & 7;
+    let mut mask = u32::from(bitmask[offset as usize >> 3]) << 24;
+    if offset >= 8 {
+        mask |= u32::from(bitmask[(offset as usize >> 3) - 1]) << 16;
+    }
+    if offset >= 16 {
+        mask |= u32::from(bitmask[(offset as usize >> 3) - 2]) << 8;
+    }
+    if offset >= 24 {
+        mask |= u32::from(bitmask[(offset as usize >> 3) - 3]);
+    }
+
+    mask <<= 8 - shift;
+    mask >>= 1;
+    let skip = mask.leading_zeros() - 1;
+    if skip > BITMASK_MAX {
+        None
+    } else {
+        Some(skip)
+    }
+}
+
+#[test]
+fn test_get_previous_instruction_skip() {
+    assert_eq!(get_previous_instruction_skip(&[0b00000001], 0), None);
+    assert_eq!(get_previous_instruction_skip(&[0b00000011], 0), None);
+    assert_eq!(get_previous_instruction_skip(&[0b00000010], 1), None);
+    assert_eq!(get_previous_instruction_skip(&[0b00000011], 1), Some(0));
+    assert_eq!(get_previous_instruction_skip(&[0b00000001], 1), Some(0));
+    assert_eq!(get_previous_instruction_skip(&[0b00000001, 0b00000001], 8), Some(7));
+    assert_eq!(get_previous_instruction_skip(&[0b00000001, 0b00000000], 8), Some(7));
+}
+
+pub trait InstructionSet: Copy {
+    fn opcode_from_u8(self, byte: u8) -> Option<Opcode>;
+}
+
+#[allow(non_camel_case_types)]
+#[derive(Copy, Clone, Debug, Default)]
+pub struct ISA32_V1;
+
+#[allow(non_camel_case_types)]
+#[derive(Copy, Clone, Debug, Default)]
+pub struct ISA32_V1_NoSbrk;
+
+#[allow(non_camel_case_types)]
+#[derive(Copy, Clone, Debug, Default)]
+pub struct ISA64_V1;
+
+pub type DefaultInstructionSet = ISA32_V1;
+
+/// Returns whether a jump to a given `offset` is allowed.
+#[inline]
+pub fn is_jump_target_valid<I>(instruction_set: I, code: &[u8], bitmask: &[u8], offset: u32) -> bool
+where
+    I: InstructionSet,
+{
+    if !get_bit_for_offset(bitmask, code.len(), offset) {
+        // We can't jump if there's no instruction here.
+        return false;
+    }
+
+    if offset == 0 {
+        // This is the very first instruction, so we can always jump here.
+        return true;
+    }
+
+    let Some(skip) = get_previous_instruction_skip(bitmask, offset) else {
+        // We can't jump if there's no previous instruction in range.
+        return false;
+    };
+
+    let Some(opcode) = instruction_set.opcode_from_u8(code[offset as usize - skip as usize - 1]) else {
+        // We can't jump after an invalid instruction.
+        return false;
+    };
+
+    if !opcode.starts_new_basic_block() {
+        // We can't jump after this instruction.
+        return false;
+    }
+
+    true
+}
+
+#[inline]
+pub fn find_start_of_basic_block<I>(instruction_set: I, code: &[u8], bitmask: &[u8], mut offset: u32) -> Option<u32>
+where
+    I: InstructionSet,
+{
+    if !get_bit_for_offset(bitmask, code.len(), offset) {
+        // We can't jump if there's no instruction here.
         return None;
     }
 
-    offset += 1;
-    let mut args_length = 0;
-    while let Some(&byte) = bitmask.get(offset >> 3) {
-        let shift = offset & 7;
-        let mask = byte >> shift;
-        let length = if mask == 0 {
-            8 - shift
-        } else {
-            let length = mask.trailing_zeros() as usize;
-            if length == 0 {
-                break;
-            }
-            length
-        };
-
-        let new_args_length = args_length + length;
-        if new_args_length >= BITMASK_MAX as usize {
-            offset += BITMASK_MAX as usize - args_length;
-            args_length = BITMASK_MAX as usize;
-            break;
-        }
-
-        args_length = new_args_length;
-        offset += length;
+    if offset == 0 {
+        // This is the very first instruction, so we can always jump here.
+        return Some(0);
     }
 
-    Some((offset, args_length))
+    loop {
+        // We can't jump if there's no previous instruction in range.
+        let skip = get_previous_instruction_skip(bitmask, offset)?;
+        let previous_offset = offset - skip - 1;
+        let opcode = instruction_set
+            .opcode_from_u8(code[previous_offset as usize])
+            .unwrap_or(Opcode::trap);
+        if opcode.starts_new_basic_block() {
+            // We can jump after this instruction.
+            return Some(offset);
+        }
+
+        offset = previous_offset;
+        if offset == 0 {
+            return Some(0);
+        }
+    }
+}
+
+#[test]
+fn test_is_jump_target_valid() {
+    fn assert_get_previous_instruction_skip_matches_instruction_parser(code: &[u8], bitmask: &[u8]) {
+        for instruction in Instructions::new(DefaultInstructionSet::default(), code, bitmask, 0, false) {
+            match instruction.kind {
+                Instruction::trap => {
+                    let skip = get_previous_instruction_skip(bitmask, instruction.offset.0);
+                    if let Some(skip) = skip {
+                        let previous_offset = instruction.offset.0 - skip - 1;
+                        assert_eq!(
+                            Instructions::new(DefaultInstructionSet::default(), code, bitmask, previous_offset, true)
+                                .next()
+                                .unwrap(),
+                            ParsedInstruction {
+                                kind: Instruction::trap,
+                                offset: ProgramCounter(previous_offset),
+                                next_offset: instruction.offset,
+                            }
+                        );
+                    } else {
+                        for skip in 0..=24 {
+                            let Some(previous_offset) = instruction.offset.0.checked_sub(skip + 1) else {
+                                continue;
+                            };
+                            assert_eq!(
+                                Instructions::new(DefaultInstructionSet::default(), code, bitmask, previous_offset, true)
+                                    .next()
+                                    .unwrap()
+                                    .kind,
+                                Instruction::invalid,
+                            );
+                        }
+                    }
+                }
+                Instruction::invalid => {}
+                _ => unreachable!(),
+            }
+        }
+    }
+
+    macro_rules! gen {
+        ($code_length:expr, $bits:expr) => {{
+            let mut bitmask = [0; ($code_length + 7) / 8];
+            for bit in $bits {
+                let bit: usize = bit;
+                assert!(bit < $code_length);
+                bitmask[bit / 8] |= (1 << (bit % 8));
+            }
+
+            let code = [Opcode::trap as u8; $code_length];
+            assert_get_previous_instruction_skip_matches_instruction_parser(&code, &bitmask);
+            (code, bitmask)
+        }};
+    }
+
+    // Make sure the helper macro works correctly.
+    assert_eq!(gen!(1, [0]).1, [0b00000001]);
+    assert_eq!(gen!(2, [1]).1, [0b00000010]);
+    assert_eq!(gen!(8, [7]).1, [0b10000000]);
+    assert_eq!(gen!(9, [8]).1, [0b00000000, 0b00000001]);
+    assert_eq!(gen!(10, [9]).1, [0b00000000, 0b00000010]);
+    assert_eq!(gen!(10, [2, 9]).1, [0b00000100, 0b00000010]);
+
+    macro_rules! assert_valid {
+        ($code_length:expr, $bits:expr, $offset:expr) => {{
+            let (code, bitmask) = gen!($code_length, $bits);
+            assert!(is_jump_target_valid(DefaultInstructionSet::default(), &code, &bitmask, $offset));
+        }};
+    }
+
+    macro_rules! assert_invalid {
+        ($code_length:expr, $bits:expr, $offset:expr) => {{
+            let (code, bitmask) = gen!($code_length, $bits);
+            assert!(!is_jump_target_valid(DefaultInstructionSet::default(), &code, &bitmask, $offset));
+        }};
+    }
+
+    assert_valid!(1, [0], 0);
+    assert_invalid!(1, [], 0);
+    assert_valid!(2, [0, 1], 1);
+    assert_invalid!(2, [1], 1);
+    assert_valid!(8, [0, 7], 7);
+    assert_valid!(9, [0, 8], 8);
+    assert_valid!(25, [0, 24], 24);
+    assert_valid!(26, [0, 25], 25);
+    assert_invalid!(27, [0, 26], 26);
+
+    assert!(is_jump_target_valid(
+        DefaultInstructionSet::default(),
+        &[Opcode::load_imm as u8],
+        &[0b00000001],
+        0
+    ));
+
+    assert!(!is_jump_target_valid(
+        DefaultInstructionSet::default(),
+        &[Opcode::load_imm as u8, Opcode::load_imm as u8],
+        &[0b00000011],
+        1
+    ));
+
+    assert!(is_jump_target_valid(
+        DefaultInstructionSet::default(),
+        &[Opcode::trap as u8, Opcode::load_imm as u8],
+        &[0b00000011],
+        1
+    ));
 }
 
 #[cfg_attr(not(debug_assertions), inline(always))]
-pub(crate) fn parse_bitmask_fast(bitmask: &[u8], mut offset: usize) -> Option<(usize, usize)> {
+fn parse_bitmask_slow(bitmask: &[u8], code_length: usize, offset: u32) -> (u32, bool) {
+    let mut offset = offset as usize + 1;
+    let mut is_next_instruction_invalid = true;
+    let origin = offset;
+    while let Some(&byte) = bitmask.get(offset >> 3) {
+        let shift = offset & 7;
+        let mask = byte >> shift;
+        if mask == 0 {
+            offset += 8 - shift;
+            if (offset - origin) < BITMASK_MAX as usize {
+                continue;
+            }
+        } else {
+            offset += mask.trailing_zeros() as usize;
+            is_next_instruction_invalid = offset >= code_length || (offset - origin) > BITMASK_MAX as usize;
+        }
+        break;
+    }
+
+    use core::cmp::min;
+    let offset = min(offset, code_length);
+    let skip = min((offset - origin) as u32, BITMASK_MAX);
+    (skip, is_next_instruction_invalid)
+}
+
+#[cfg_attr(not(debug_assertions), inline(always))]
+pub(crate) fn parse_bitmask_fast(bitmask: &[u8], mut offset: u32) -> Option<u32> {
+    debug_assert!(offset < u32::MAX);
+    debug_assert!(get_bit_for_offset(bitmask, offset as usize + 1, offset));
     offset += 1;
 
-    let bitmask = bitmask.get(offset >> 3..(offset >> 3) + 4)?;
+    let bitmask = bitmask.get(offset as usize >> 3..(offset as usize >> 3) + 4)?;
     let shift = offset & 7;
     let mask: u32 = (u32::from_le_bytes([bitmask[0], bitmask[1], bitmask[2], bitmask[3]]) >> shift) | (1 << BITMASK_MAX);
-    let args_length = mask.trailing_zeros() as usize;
-    debug_assert!(args_length <= BITMASK_MAX as usize);
-    offset += args_length;
-
-    Some((offset, args_length))
+    Some(mask.trailing_zeros())
 }
 
 #[test]
 fn test_parse_bitmask() {
     #[track_caller]
-    fn parse_both(bitmask: &[u8], offset: usize) -> Option<(usize, usize)> {
-        let result_fast = parse_bitmask_fast(bitmask, offset);
-        let result_slow = parse_bitmask_slow(bitmask, offset);
+    fn parse_both(bitmask: &[u8], offset: u32) -> u32 {
+        let result_fast = parse_bitmask_fast(bitmask, offset).unwrap();
+        let result_slow = parse_bitmask_slow(bitmask, bitmask.len() * 8, offset).0;
         assert_eq!(result_fast, result_slow);
 
         result_fast
     }
 
-    assert_eq!(parse_both(&[0b00000011, 0, 0, 0], 0), Some((1, 0)));
-    assert_eq!(parse_both(&[0b00000101, 0, 0, 0], 0), Some((2, 1)));
-    assert_eq!(parse_both(&[0b10000001, 0, 0, 0], 0), Some((7, 6)));
-    assert_eq!(parse_both(&[0b00000001, 1, 0, 0], 0), Some((8, 7)));
-    assert_eq!(parse_both(&[0b00000001, 1 << 7, 0, 0], 0), Some((15, 14)));
-    assert_eq!(parse_both(&[0b00000001, 0, 1, 0], 0), Some((16, 15)));
-    assert_eq!(parse_both(&[0b00000001, 0, 1 << 7, 0], 0), Some((23, 22)));
-    assert_eq!(parse_both(&[0b00000001, 0, 0, 1], 0), Some((24, 23)));
+    assert_eq!(parse_both(&[0b00000011, 0, 0, 0], 0), 0);
+    assert_eq!(parse_both(&[0b00000101, 0, 0, 0], 0), 1);
+    assert_eq!(parse_both(&[0b10000001, 0, 0, 0], 0), 6);
+    assert_eq!(parse_both(&[0b00000001, 1, 0, 0], 0), 7);
+    assert_eq!(parse_both(&[0b00000001, 1 << 7, 0, 0], 0), 14);
+    assert_eq!(parse_both(&[0b00000001, 0, 1, 0], 0), 15);
+    assert_eq!(parse_both(&[0b00000001, 0, 1 << 7, 0], 0), 22);
+    assert_eq!(parse_both(&[0b00000001, 0, 0, 1], 0), 23);
 
-    assert_eq!(parse_both(&[0b11000000, 0, 0, 0, 0], 6), Some((7, 0)));
-    assert_eq!(parse_both(&[0b01000000, 1, 0, 0, 0], 6), Some((8, 1)));
+    assert_eq!(parse_both(&[0b11000000, 0, 0, 0, 0], 6), 0);
+    assert_eq!(parse_both(&[0b01000000, 1, 0, 0, 0], 6), 1);
 
-    assert_eq!(parse_both(&[0b10000000, 1, 0, 0, 0], 7), Some((8, 0)));
-    assert_eq!(parse_both(&[0b10000000, 1 << 1, 0, 0, 0], 7), Some((9, 1)));
-
-    assert_eq!(parse_both(&[0, 0, 0, 0, 0b00000001], 0), Some((25, 24)));
-    assert_eq!(parse_both(&[0, 0, 0, 0, 0b00000001], 6), Some((31, 24)));
-    assert_eq!(parse_both(&[0, 0, 0, 0, 0b00000001], 7), Some((32, 24)));
+    assert_eq!(parse_both(&[0b10000000, 1, 0, 0, 0], 7), 0);
+    assert_eq!(parse_both(&[0b10000000, 1 << 1, 0, 0, 0], 7), 1);
 }
 
 #[derive(Clone)]
-pub struct Instructions<'a> {
+pub struct Instructions<'a, I> {
     code: &'a [u8],
     bitmask: &'a [u8],
-    offset: usize,
+    offset: u32,
+    invalid_offset: Option<u32>,
+    is_bounded: bool,
+    is_done: bool,
+    instruction_set: I,
 }
 
 #[derive(Copy, Clone, PartialEq, Eq, Debug)]
 pub struct ParsedInstruction {
     pub kind: Instruction,
     pub offset: ProgramCounter,
-    pub length: u32,
-}
-
-impl ParsedInstruction {
-    pub fn next_offset(&self) -> ProgramCounter {
-        ProgramCounter(self.offset.0 + self.length)
-    }
+    pub next_offset: ProgramCounter,
 }
 
 impl core::ops::Deref for ParsedInstruction {
@@ -2783,19 +3452,55 @@ impl core::fmt::Display for ParsedInstruction {
     }
 }
 
-impl<'a> Instructions<'a> {
+impl<'a, I> Instructions<'a, I>
+where
+    I: InstructionSet,
+{
     #[inline]
-    pub fn new(code: &'a [u8], bitmask: &'a [u8], offset: u32) -> Self {
+    pub fn new_bounded(instruction_set: I, code: &'a [u8], bitmask: &'a [u8], offset: u32) -> Self {
+        Self::new(instruction_set, code, bitmask, offset, true)
+    }
+
+    #[inline]
+    pub fn new_unbounded(instruction_set: I, code: &'a [u8], bitmask: &'a [u8], offset: u32) -> Self {
+        Self::new(instruction_set, code, bitmask, offset, false)
+    }
+
+    #[inline]
+    fn new(instruction_set: I, code: &'a [u8], bitmask: &'a [u8], offset: u32, is_bounded: bool) -> Self {
+        assert!(code.len() <= u32::MAX as usize);
+        assert_eq!(bitmask.len(), (code.len() + 7) / 8);
+
+        let is_valid = get_bit_for_offset(bitmask, code.len(), offset);
+        let mut is_done = false;
+        let (offset, invalid_offset) = if is_valid {
+            (offset, None)
+        } else if is_bounded {
+            is_done = true;
+            (core::cmp::min(offset + 1, code.len() as u32), Some(offset))
+        } else {
+            let next_offset = find_next_offset_unbounded(bitmask, code.len() as u32, offset);
+            debug_assert!(
+                next_offset as usize == code.len() || get_bit_for_offset(bitmask, code.len(), next_offset),
+                "bit at {offset} is zero"
+            );
+            (next_offset, Some(offset))
+        };
+
         Self {
             code,
             bitmask,
-            offset: offset as usize,
+            offset,
+            invalid_offset,
+            is_bounded,
+            is_done,
+            instruction_set,
         }
     }
 
     #[inline]
     pub fn offset(&self) -> u32 {
-        self.offset as u32
+        self.invalid_offset.unwrap_or(self.offset)
     }
 
     #[inline]
@@ -2808,43 +3513,288 @@ impl<'a> Instructions<'a> {
     }
 }
 
-impl<'a> Iterator for Instructions<'a> {
+impl<'a, I> Iterator for Instructions<'a, I>
+where
+    I: InstructionSet,
+{
     type Item = ParsedInstruction;
+
     #[inline(always)]
     fn next(&mut self) -> Option<Self::Item> {
-        parse_instruction(self.code, self.bitmask, &mut self.offset)
-    }
+        if let Some(offset) = self.invalid_offset.take() {
+            return Some(ParsedInstruction {
+                kind: Instruction::invalid,
+                offset: ProgramCounter(offset),
+                next_offset: ProgramCounter(self.offset),
+            });
+        }
 
-    fn size_hint(&self) -> (usize, Option<usize>) {
-        (0, Some(self.code.len() - core::cmp::min(self.offset, self.code.len())))
-    }
-}
-
-impl<'a> DoubleEndedIterator for Instructions<'a> {
-    #[inline(always)]
-    fn next_back(&mut self) -> Option<Self::Item> {
-        if self.offset == 0 {
+        if self.is_done || self.offset as usize >= self.code.len() {
             return None;
         }
 
-        self.offset -= 1;
-        loop {
-            let offset = self.offset;
-            if (self.bitmask[self.offset >> 3] >> (offset & 7)) & 1 == 1 {
-                return parse_instruction(self.code, self.bitmask, &mut self.offset);
+        let offset = self.offset;
+        debug_assert!(get_bit_for_offset(self.bitmask, self.code.len(), offset), "bit at {offset} is zero");
+
+        let (next_offset, instruction, is_next_instruction_invalid) =
+            parse_instruction(self.instruction_set, self.code, self.bitmask, self.offset);
+        debug_assert!(next_offset > self.offset);
+
+        if !is_next_instruction_invalid {
+            self.offset = next_offset;
+            debug_assert!(
+                self.offset as usize == self.code.len() || get_bit_for_offset(self.bitmask, self.code.len(), self.offset),
+                "bit at {} is zero",
+                self.offset
+            );
+        } else {
+            if next_offset as usize == self.code.len() {
+                self.offset = self.code.len() as u32 + 1;
+            } else if self.is_bounded {
+                self.is_done = true;
+                if instruction.opcode().can_fallthrough() {
+                    self.offset = self.code.len() as u32;
+                } else {
+                    self.offset = next_offset;
+                }
+            } else {
+                self.offset = find_next_offset_unbounded(self.bitmask, self.code.len() as u32, next_offset);
+                debug_assert!(
+                    self.offset as usize == self.code.len() || get_bit_for_offset(self.bitmask, self.code.len(), self.offset),
+                    "bit at {} is zero",
+                    self.offset
+                );
             }
 
-            self.offset -= 1;
-            if self.offset == 0 {
-                return None;
+            if instruction.opcode().can_fallthrough() {
+                self.invalid_offset = Some(next_offset);
             }
         }
+
+        Some(ParsedInstruction {
+            kind: instruction,
+            offset: ProgramCounter(offset),
+            next_offset: ProgramCounter(next_offset),
+        })
     }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        (0, Some(self.code.len() - core::cmp::min(self.offset() as usize, self.code.len())))
+    }
+}
+
+#[test]
+fn test_instructions_iterator_with_implicit_trap() {
+    for is_bounded in [false, true] {
+        let mut i = Instructions::new(
+            DefaultInstructionSet::default(),
+            &[Opcode::fallthrough as u8],
+            &[0b00000001],
+            0,
+            is_bounded,
+        );
+        assert_eq!(
+            i.next(),
+            Some(ParsedInstruction {
+                kind: Instruction::fallthrough,
+                offset: ProgramCounter(0),
+                next_offset: ProgramCounter(1),
+            })
+        );
+
+        assert_eq!(
+            i.next(),
+            Some(ParsedInstruction {
+                kind: Instruction::invalid,
+                offset: ProgramCounter(1),
+                next_offset: ProgramCounter(2),
+            })
+        );
+
+        assert_eq!(i.next(), None);
+    }
+}
+
+#[test]
+fn test_instructions_iterator_without_implicit_trap() {
+    for is_bounded in [false, true] {
+        let mut i = Instructions::new(
+            DefaultInstructionSet::default(),
+            &[Opcode::trap as u8],
+            &[0b00000001],
+            0,
+            is_bounded,
+        );
+        assert_eq!(
+            i.next(),
+            Some(ParsedInstruction {
+                kind: Instruction::trap,
+                offset: ProgramCounter(0),
+                next_offset: ProgramCounter(1),
+            })
+        );
+
+        assert_eq!(i.next(), None);
+    }
+}
+
+#[test]
+fn test_instructions_iterator_very_long_bitmask_bounded() {
+    let mut code = [0_u8; 64];
+    code[0] = Opcode::fallthrough as u8;
+    let mut bitmask = [0_u8; 8];
+    bitmask[0] = 0b00000001;
+    bitmask[7] = 0b10000000;
+
+    let mut i = Instructions::new(DefaultInstructionSet::default(), &code, &bitmask, 0, true);
+    assert_eq!(
+        i.next(),
+        Some(ParsedInstruction {
+            kind: Instruction::fallthrough,
+            offset: ProgramCounter(0),
+            next_offset: ProgramCounter(25),
+        })
+    );
+
+    assert_eq!(
+        i.next(),
+        Some(ParsedInstruction {
+            kind: Instruction::invalid,
+            offset: ProgramCounter(25),
+            next_offset: ProgramCounter(64),
+        })
+    );
+
+    assert_eq!(i.next(), None);
+}
+
+#[test]
+fn test_instructions_iterator_very_long_bitmask_unbounded() {
+    let mut code = [0_u8; 64];
+    code[0] = Opcode::fallthrough as u8;
+    let mut bitmask = [0_u8; 8];
+    bitmask[0] = 0b00000001;
+    bitmask[7] = 0b10000000;
+
+    let mut i = Instructions::new(DefaultInstructionSet::default(), &code, &bitmask, 0, false);
+    assert_eq!(
+        i.next(),
+        Some(ParsedInstruction {
+            kind: Instruction::fallthrough,
+            offset: ProgramCounter(0),
+            next_offset: ProgramCounter(25),
+        })
+    );
+
+    assert_eq!(
+        i.next(),
+        Some(ParsedInstruction {
+            kind: Instruction::invalid,
+            offset: ProgramCounter(25),
+            next_offset: ProgramCounter(63),
+        })
+    );
+
+    assert_eq!(
+        i.next(),
+        Some(ParsedInstruction {
+            kind: Instruction::trap,
+            offset: ProgramCounter(63),
+            next_offset: ProgramCounter(64),
+        })
+    );
+
+    assert_eq!(i.next(), None);
+}
+
+#[test]
+fn test_instructions_iterator_start_at_invalid_offset_bounded() {
+    let mut i = Instructions::new(DefaultInstructionSet::default(), &[Opcode::trap as u8; 8], &[0b10000001], 1, true);
+    assert_eq!(
+        i.next(),
+        Some(ParsedInstruction {
+            kind: Instruction::invalid,
+            offset: ProgramCounter(1),
+            // Since a bounded iterator doesn't scan forward it just assumes the next offset.
+            next_offset: ProgramCounter(2),
+        })
+    );
+
+    assert_eq!(i.next(), None);
+}
+
+#[test]
+fn test_instructions_iterator_start_at_invalid_offset_unbounded() {
+    let mut i = Instructions::new(DefaultInstructionSet::default(), &[Opcode::trap as u8; 8], &[0b10000001], 1, false);
+    assert_eq!(
+        i.next(),
+        Some(ParsedInstruction {
+            kind: Instruction::invalid,
+            offset: ProgramCounter(1),
+            next_offset: ProgramCounter(7),
+        })
+    );
+
+    assert_eq!(
+        i.next(),
+        Some(ParsedInstruction {
+            kind: Instruction::trap,
+            offset: ProgramCounter(7),
+            next_offset: ProgramCounter(8),
+        })
+    );
+
+    assert_eq!(i.next(), None);
+}
+
+#[test]
+fn test_instructions_iterator_does_not_emit_unnecessary_invalid_instructions_if_bounded_and_ends_with_a_trap() {
+    let code = [Opcode::trap as u8; 32];
+    let bitmask = [0b00000001, 0b00000000, 0b00000000, 0b00000100];
+    let mut i = Instructions::new(DefaultInstructionSet::default(), &code, &bitmask, 0, true);
+    assert_eq!(i.offset(), 0);
+    assert_eq!(
+        i.next(),
+        Some(ParsedInstruction {
+            kind: Instruction::trap,
+            offset: ProgramCounter(0),
+            next_offset: ProgramCounter(25)
+        })
+    );
+    assert_eq!(i.offset(), 25);
+    assert_eq!(i.next(), None);
+}
+
+#[test]
+fn test_instructions_iterator_does_not_emit_unnecessary_invalid_instructions_if_unbounded_and_ends_with_a_trap() {
+    let code = [Opcode::trap as u8; 32];
+    let bitmask = [0b00000001, 0b00000000, 0b00000000, 0b00000100];
+    let mut i = Instructions::new(DefaultInstructionSet::default(), &code, &bitmask, 0, false);
+    assert_eq!(i.offset(), 0);
+    assert_eq!(
+        i.next(),
+        Some(ParsedInstruction {
+            kind: Instruction::trap,
+            offset: ProgramCounter(0),
+            next_offset: ProgramCounter(25)
+        })
+    );
+    assert_eq!(i.offset(), 26);
+    assert_eq!(
+        i.next(),
+        Some(ParsedInstruction {
+            kind: Instruction::trap,
+            offset: ProgramCounter(26),
+            next_offset: ProgramCounter(32)
+        })
+    );
+    assert_eq!(i.next(), None);
 }
 
 #[derive(Clone, Default)]
 #[non_exhaustive]
 pub struct ProgramParts {
+    pub is_64_bit: bool,
     pub ro_data_size: u32,
     pub rw_data_size: u32,
     pub stack_size: u32,
@@ -2875,13 +3825,27 @@ impl ProgramParts {
         };
 
         let blob_version = reader.read_byte()?;
-        if blob_version != BLOB_VERSION_V1 {
+        let is_64_bit = if blob_version == BLOB_VERSION_V1_32 {
+            false
+        } else if blob_version == BLOB_VERSION_V1_64 {
+            true
+        } else {
             return Err(ProgramParseError(ProgramParseErrorKind::UnsupportedVersion {
                 version: blob_version,
             }));
+        };
+
+        let blob_len = BlobLen::from_le_bytes(reader.read_slice(BLOB_LEN_SIZE)?.try_into().unwrap());
+        if blob_len != blob.len() as u64 {
+            return Err(ProgramParseError(ProgramParseErrorKind::Other(
+                "blob size doesn't match the blob length metadata",
+            )));
         }
 
-        let mut parts = ProgramParts::default();
+        let mut parts = ProgramParts {
+            is_64_bit,
+            ..ProgramParts::default()
+        };
 
         let mut section = reader.read_byte()?;
         if section == SECTION_MEMORY_CONFIG {
@@ -2949,6 +3913,17 @@ impl ProgramParts {
 }
 
 impl ProgramBlob {
+    /// Parses the blob length information from the given `raw_blob` bytes.
+    ///
+    /// Returns `None` if `raw_blob` doesn't contain enough bytes to read the length.
+    pub fn blob_length(raw_blob: &[u8]) -> Option<BlobLen> {
+        let end = BLOB_LEN_OFFSET + BLOB_LEN_SIZE;
+        if raw_blob.len() < end {
+            return None;
+        }
+        Some(BlobLen::from_le_bytes(raw_blob[BLOB_LEN_OFFSET..end].try_into().unwrap()))
+    }
+
     /// Parses the given bytes into a program blob.
     pub fn parse(bytes: ArcBytes) -> Result<Self, ProgramParseError> {
         let parts = ProgramParts::from_bytes(bytes)?;
@@ -2958,6 +3933,11 @@ impl ProgramBlob {
     /// Creates a program blob from parts.
     pub fn from_parts(parts: ProgramParts) -> Result<Self, ProgramParseError> {
         let mut blob = ProgramBlob {
+            #[cfg(feature = "unique-id")]
+            unique_id: 0,
+
+            is_64_bit: parts.is_64_bit,
+
             ro_data_size: parts.ro_data_size,
             rw_data_size: parts.rw_data_size,
             stack_size: parts.stack_size,
@@ -3029,18 +4009,113 @@ impl ProgramBlob {
             blob.bitmask = reader.read_slice_as_bytes(bitmask_length)?;
 
             let mut expected_bitmask_length = blob.code.len() / 8;
-            if blob.code.len() % 8 != 0 {
-                expected_bitmask_length += 1;
-            }
+            let is_bitmask_padded = blob.code.len() % 8 != 0;
+            expected_bitmask_length += usize::from(is_bitmask_padded);
 
             if blob.bitmask.len() != expected_bitmask_length {
                 return Err(ProgramParseError(ProgramParseErrorKind::Other(
                     "the bitmask length doesn't match the code length",
                 )));
             }
+
+            if is_bitmask_padded {
+                let last_byte = *blob.bitmask.last().unwrap();
+                let padding_bits = blob.bitmask.len() * 8 - blob.code.len();
+                let padding_mask = ((0b10000000_u8 as i8) >> (padding_bits - 1)) as u8;
+                if last_byte & padding_mask != 0 {
+                    return Err(ProgramParseError(ProgramParseErrorKind::Other(
+                        "the bitmask is padded with non-zero bits",
+                    )));
+                }
+            }
+        }
+
+        #[cfg(feature = "unique-id")]
+        {
+            static ID_COUNTER: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+            blob.unique_id = ID_COUNTER.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
         }
 
         Ok(blob)
+    }
+
+    #[cfg(feature = "unique-id")]
+    /// Returns an unique ID of the program blob.
+    ///
+    /// This is an automatically incremented counter every time a `ProgramBlob` is created.
+    pub fn unique_id(&self) -> u64 {
+        self.unique_id
+    }
+
+    /// Returns whether the blob contains a 64-bit program.
+    pub fn is_64_bit(&self) -> bool {
+        self.is_64_bit
+    }
+
+    /// Calculates an unique hash of the program blob.
+    pub fn unique_hash(&self, include_debug: bool) -> crate::hasher::Hash {
+        let ProgramBlob {
+            #[cfg(feature = "unique-id")]
+                unique_id: _,
+            is_64_bit,
+            ro_data_size,
+            rw_data_size,
+            stack_size,
+            ro_data,
+            rw_data,
+            code,
+            jump_table,
+            jump_table_entry_size,
+            bitmask,
+            import_offsets,
+            import_symbols,
+            exports,
+            debug_strings,
+            debug_line_program_ranges,
+            debug_line_programs,
+        } = self;
+
+        let mut hasher = crate::hasher::Hasher::new();
+
+        hasher.update_u32_array([
+            1_u32, // VERSION
+            u32::from(*is_64_bit),
+            *ro_data_size,
+            *rw_data_size,
+            *stack_size,
+            ro_data.len() as u32,
+            rw_data.len() as u32,
+            code.len() as u32,
+            jump_table.len() as u32,
+            u32::from(*jump_table_entry_size),
+            bitmask.len() as u32,
+            import_offsets.len() as u32,
+            import_symbols.len() as u32,
+            exports.len() as u32,
+        ]);
+
+        hasher.update(ro_data);
+        hasher.update(rw_data);
+        hasher.update(code);
+        hasher.update(jump_table);
+        hasher.update(bitmask);
+        hasher.update(import_offsets);
+        hasher.update(import_symbols);
+        hasher.update(exports);
+
+        if include_debug {
+            hasher.update_u32_array([
+                debug_strings.len() as u32,
+                debug_line_program_ranges.len() as u32,
+                debug_line_programs.len() as u32,
+            ]);
+
+            hasher.update(debug_strings);
+            hasher.update(debug_line_program_ranges);
+            hasher.update(debug_line_programs);
+        }
+
+        hasher.finalize()
     }
 
     /// Returns the contents of the read-only data section.
@@ -3079,6 +4154,12 @@ impl ProgramBlob {
     /// Returns the program code in its raw form.
     pub fn code(&self) -> &[u8] {
         &self.code
+    }
+
+    #[cfg(feature = "export-internals-for-testing")]
+    #[doc(hidden)]
+    pub fn set_code(&mut self, code: ArcBytes) {
+        self.code = code;
     }
 
     /// Returns the code bitmask in its raw form.
@@ -3146,28 +4227,43 @@ impl ProgramBlob {
         }
     }
 
-    #[inline]
-    pub fn instructions(&self) -> Instructions {
-        Instructions {
-            code: self.code(),
-            bitmask: self.bitmask(),
-            offset: 0,
-        }
+    /// Visits every instrution in the program.
+    #[cfg_attr(not(debug_assertions), inline(always))]
+    pub fn visit<T>(&self, dispatch_table: T, visitor: &mut T::State)
+    where
+        T: OpcodeVisitor<ReturnTy = ()>,
+    {
+        visitor_run(visitor, self, dispatch_table);
     }
 
+    /// Returns an iterator over all of the instructions in the program.
+    ///
+    /// WARNING: this is unbounded and has O(n) complexity; just creating this iterator can iterate over the whole program, even if `next` is never called!
     #[inline]
-    pub fn instructions_at(&self, offset: ProgramCounter) -> Option<Instructions> {
-        let offset = offset.0;
-        let bitmask = self.bitmask();
-        if (bitmask.get(offset as usize >> 3)? >> (offset as usize & 7)) & 1 == 0 {
-            None
-        } else {
-            Some(Instructions {
-                code: self.code(),
-                bitmask,
-                offset: offset as usize,
-            })
-        }
+    pub fn instructions<I>(&self, instruction_set: I) -> Instructions<I>
+    where
+        I: InstructionSet,
+    {
+        Instructions::new_unbounded(instruction_set, self.code(), self.bitmask(), 0)
+    }
+
+    /// Returns an interator over instructions starting at a given offset.
+    ///
+    /// This iterator is bounded and has O(1) complexity.
+    #[inline]
+    pub fn instructions_bounded_at<I>(&self, instruction_set: I, offset: ProgramCounter) -> Instructions<I>
+    where
+        I: InstructionSet,
+    {
+        Instructions::new_bounded(instruction_set, self.code(), self.bitmask(), offset.0)
+    }
+
+    /// Returns whether the given program counter is a valid target for a jump.
+    pub fn is_jump_target_valid<I>(&self, instruction_set: I, target: ProgramCounter) -> bool
+    where
+        I: InstructionSet,
+    {
+        is_jump_target_valid(instruction_set, self.code(), self.bitmask(), target.0)
     }
 
     /// Returns a jump table.
@@ -3724,6 +4820,14 @@ proptest::proptest! {
 /// The magic bytes with which every program blob must start with.
 pub const BLOB_MAGIC: [u8; 4] = [b'P', b'V', b'M', b'\0'];
 
+/// The blob length is the length of the blob itself encoded as an 64bit LE integer.
+/// By embedding this metadata into the header, program blobs stay opaque,
+/// however this information can still easily be retrieved.
+/// Found at offset 5 after the magic bytes and version number.
+pub type BlobLen = u64;
+pub const BLOB_LEN_SIZE: usize = core::mem::size_of::<BlobLen>();
+pub const BLOB_LEN_OFFSET: usize = BLOB_MAGIC.len() + 1;
+
 pub const SECTION_MEMORY_CONFIG: u8 = 1;
 pub const SECTION_RO_DATA: u8 = 2;
 pub const SECTION_RW_DATA: u8 = 3;
@@ -3735,7 +4839,8 @@ pub const SECTION_OPT_DEBUG_LINE_PROGRAMS: u8 = 129;
 pub const SECTION_OPT_DEBUG_LINE_PROGRAM_RANGES: u8 = 130;
 pub const SECTION_END_OF_FILE: u8 = 0;
 
-pub const BLOB_VERSION_V1: u8 = 1;
+pub const BLOB_VERSION_V1_64: u8 = 0;
+pub const BLOB_VERSION_V1_32: u8 = 1;
 
 pub const VERSION_DEBUG_LINE_PROGRAM_V1: u8 = 1;
 

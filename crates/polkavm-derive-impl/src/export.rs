@@ -208,6 +208,17 @@ pub fn polkavm_export(attributes: ExportBlockAttributes, input: syn::ItemFn) -> 
                     metadata = sym METADATA,
                     function = sym trampoline,
                 );
+
+                #[cfg(target_arch = "riscv64")]
+                ::core::arch::global_asm!(
+                    ".pushsection .polkavm_exports,\"R\",@note\n",
+                    ".byte 1\n", // Version.
+                    ".8byte {metadata}",
+                    ".8byte {function}",
+                    ".popsection\n",
+                    metadata = sym METADATA,
+                    function = sym trampoline,
+                );
             }
 
             #(#body)*

@@ -1,8 +1,13 @@
+pre: gas = 10000
+
 pub @main:
     a0 = @target
     a0 = a0 + 1
-pub @expected_exit:
     jump [a0]
     trap
 @target:
     a1 = 0xdeadbeef
+
+post: a1 = 0
+post: gas = 9997
+post: pc = @main[2]

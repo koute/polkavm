@@ -1,3 +1,5 @@
+pre: gas = 10000
+
 pub @main:
     a0 = -10
     a1 = 10
@@ -5,3 +7,6 @@ pub @main:
     trap
 @target:
     a0 = 0xdeadbeef
+
+post: a0 = 0xdeadbeef
+post: gas = 9995

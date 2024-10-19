@@ -3,7 +3,7 @@
 #![allow(clippy::exit)]
 
 use clap::Parser;
-use polkavm_common::program::{Opcode, ProgramBlob};
+use polkavm_common::program::{Opcode, ProgramBlob, ISA32_V1, ISA64_V1};
 use polkavm_disassembler::DisassemblyFormat;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -19,6 +19,10 @@ enum Args {
 
         #[clap(short = 's', long)]
         strip: bool,
+
+        /// Will disable optimizations.
+        #[clap(long)]
+        disable_optimizations: bool,
 
         /// Will only run if the output file doesn't exist, or the input is newer.
         #[clap(long)]
@@ -79,8 +83,9 @@ fn main() {
             output,
             input,
             strip,
+            disable_optimizations,
             run_only_if_newer,
-        } => main_link(input, output, strip, run_only_if_newer),
+        } => main_link(input, output, strip, disable_optimizations, run_only_if_newer),
         Args::Disassemble {
             output,
             format,
@@ -98,7 +103,7 @@ fn main() {
     }
 }
 
-fn main_link(input: PathBuf, output: PathBuf, strip: bool, run_only_if_newer: bool) -> Result<(), String> {
+fn main_link(input: PathBuf, output: PathBuf, strip: bool, disable_optimizations: bool, run_only_if_newer: bool) -> Result<(), String> {
     if run_only_if_newer {
         if let Ok(output_mtime) = std::fs::metadata(&output).and_then(|m| m.modified()) {
             if let Ok(input_mtime) = std::fs::metadata(&input).and_then(|m| m.modified()) {
@@ -111,6 +116,7 @@ fn main_link(input: PathBuf, output: PathBuf, strip: bool, run_only_if_newer: bo
 
     let mut config = polkavm_linker::Config::default();
     config.set_strip(strip);
+    config.set_optimize(!disable_optimizations);
 
     let data = match std::fs::read(&input) {
         Ok(data) => data,
@@ -154,14 +160,19 @@ fn load_blob(input: &Path) -> Result<ProgramBlob, String> {
 fn main_stats(inputs: Vec<PathBuf>) -> Result<(), String> {
     let mut map = HashMap::new();
     for opcode in 0..=255 {
-        if let Some(opcode) = Opcode::from_u8(opcode) {
+        if let Some(opcode) = Opcode::from_u8_any(opcode) {
             map.insert(opcode, 0);
         }
     }
 
     for input in inputs {
         let blob = load_blob(&input)?;
-        for instruction in blob.instructions() {
+        let instructions: Vec<_> = if blob.is_64_bit() {
+            blob.instructions(ISA64_V1).collect()
+        } else {
+            blob.instructions(ISA32_V1).collect()
+        };
+        for instruction in instructions {
             *map.get_mut(&instruction.opcode()).unwrap() += 1;
         }
     }

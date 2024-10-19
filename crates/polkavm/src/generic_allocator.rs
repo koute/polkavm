@@ -1,41 +1,100 @@
 use core::mem::replace;
 
-// This is based on: https://github.com/sebbbi/OffsetAllocator/blob/main/offsetAllocator.cpp
-#[doc(hidden)]
-#[inline]
-pub const fn to_bin_index<const MANTISSA_BITS: u32, const ROUND_UP: bool>(size: u32) -> u32 {
-    if size == 0 {
-        return 0;
-    }
+#[rustfmt::skip] // Screws up the formatting otherwise.
+macro_rules! define_for_size {
+    ($d:tt $Size:ty) => {
+        // This is based on: https://github.com/sebbbi/OffsetAllocator/blob/main/offsetAllocator.cpp
+        #[doc(hidden)]
+        #[inline]
+        pub const fn to_bin_index<const MANTISSA_BITS: u32, const ROUND_UP: bool>(size: $Size) -> u32 {
+            if size == 0 {
+                return 0;
+            }
 
-    let mantissa_value = 1 << MANTISSA_BITS;
-    let mantissa_mask = mantissa_value - 1;
+            let mantissa_value = 1 << MANTISSA_BITS;
+            if size < mantissa_value {
+                // The first 2^MANTISSA_BITS buckets contain only a single element.
+                return (size - 1) as u32;
+            }
 
-    let exponent;
-    let mut mantissa;
-    if size < mantissa_value {
-        exponent = 0;
-        mantissa = size;
-    } else {
-        let mantissa_start_bit: u32 = (31 - size.leading_zeros()) - MANTISSA_BITS;
+            let mantissa_start_bit: u32 = (core::mem::size_of::<$Size>() as u32 * 8 - 1 - size.leading_zeros()) - MANTISSA_BITS;
+            let exponent = mantissa_start_bit + 1;
+            let mut mantissa = (size >> mantissa_start_bit) & (mantissa_value - 1);
 
-        exponent = mantissa_start_bit + 1;
-        mantissa = (size >> mantissa_start_bit) & mantissa_mask;
+            if ROUND_UP {
+                let low_bits_mask: $Size = (1 << mantissa_start_bit) - 1;
+                if (size & low_bits_mask) != 0 {
+                    mantissa += 1;
+                }
+            }
 
-        if ROUND_UP {
-            let low_bits_mask: u32 = (1 << mantissa_start_bit) - 1;
-            if (size & low_bits_mask) != 0 {
-                mantissa += 1;
+            let out = exponent << MANTISSA_BITS;
+            let mantissa = mantissa as u32;
+            if ROUND_UP {
+                out + mantissa - 1
+            } else {
+                (out | mantissa) - 1
             }
         }
-    }
 
-    let out = exponent << MANTISSA_BITS;
-    if ROUND_UP {
-        out + mantissa - 1
-    } else {
-        (out | mantissa) - 1
-    }
+        #[doc(hidden)]
+        pub const fn calculate_optimal_bin_config<PrimaryMask, SecondaryMask>(
+            max_allocation_size: $Size,
+            mut requested_max_bins: u32,
+        ) -> super::AllocatorBinConfig {
+            let true_max_bins = (core::mem::size_of::<PrimaryMask>() * 8 * ::core::mem::size_of::<SecondaryMask>() * 8) as u32;
+            if true_max_bins < requested_max_bins {
+                requested_max_bins = true_max_bins
+            }
+
+            macro_rules! try_all {
+                ($d($mantissa_bits:expr),+) => {
+                    $d(
+                        let highest_bin_index = to_bin_index::<$mantissa_bits, true>(max_allocation_size);
+                        if highest_bin_index < requested_max_bins {
+                            return super::AllocatorBinConfig {
+                                mantissa_bits: $mantissa_bits,
+                                bin_count: highest_bin_index + 1
+                            };
+                        }
+                    )+
+                }
+            }
+
+            try_all! {
+                8, 7, 6, 5, 4, 3, 2, 1
+            }
+
+            panic!("failed to calculate optimal configuration for the allocator");
+        }
+    };
+}
+
+#[cfg(kani)]
+#[kani::proof]
+fn proof_to_bin_index_rounded_up_is_never_less_than_rounded_down() {
+    let size: u64 = kani::any();
+    let bin_rounded_down = self::u64::to_bin_index::<8, false>(size);
+    let bin_rounded_up = self::u64::to_bin_index::<8, true>(size);
+    assert!(bin_rounded_down <= bin_rounded_up);
+}
+
+#[cfg(kani)]
+#[kani::proof]
+fn proof_bin_indexes_never_decrease_with_increasing_size() {
+    let size: u64 = kani::any_where(|&size| size < u64::MAX);
+    let current_bin = self::u64::to_bin_index::<8, false>(size);
+    let next_bin = self::u64::to_bin_index::<8, false>(size + 1);
+    assert!(next_bin >= current_bin);
+}
+
+#[cfg(kani)]
+#[kani::proof]
+fn proof_bitness_of_the_size_does_not_matter_when_calculating_the_bin_index() {
+    let size: u32 = kani::any();
+    let bin32 = self::u32::to_bin_index::<8, false>(size);
+    let bin64 = self::u64::to_bin_index::<8, false>(u64::from(size));
+    assert!(bin32 == bin64);
 }
 
 // Printing out the bucket ranges:
@@ -58,9 +117,9 @@ pub const fn to_bin_index<const MANTISSA_BITS: u32, const ROUND_UP: bool>(size: 
 
 #[test]
 fn test_to_bin_index() {
-    assert_eq!(to_bin_index::<3, true>(0), 0);
-    assert_eq!(to_bin_index::<3, true>(1), 0);
-    assert_eq!(to_bin_index::<3, true>(2), 1);
+    assert_eq!(self::u32::to_bin_index::<3, true>(0), 0);
+    assert_eq!(self::u32::to_bin_index::<3, true>(1), 0);
+    assert_eq!(self::u32::to_bin_index::<3, true>(2), 1);
 }
 
 #[doc(hidden)]
@@ -70,41 +129,10 @@ pub struct AllocatorBinConfig {
     pub bin_count: u32,
 }
 
-#[doc(hidden)]
-pub const fn calculate_optimal_bin_config<PrimaryMask, SecondaryMask>(
-    max_allocation_size: u32,
-    mut requested_max_bins: u32,
-) -> AllocatorBinConfig {
-    let true_max_bins = (core::mem::size_of::<PrimaryMask>() * 8 * ::core::mem::size_of::<SecondaryMask>() * 8) as u32;
-    if true_max_bins < requested_max_bins {
-        requested_max_bins = true_max_bins
-    }
-
-    macro_rules! try_all {
-        ($($mantissa_bits:expr),+) => {
-            $(
-                let highest_bin_index = to_bin_index::<$mantissa_bits, true>(max_allocation_size);
-                if highest_bin_index < requested_max_bins {
-                    return AllocatorBinConfig {
-                        mantissa_bits: $mantissa_bits,
-                        bin_count: highest_bin_index + 1
-                    };
-                }
-            )+
-        }
-    }
-
-    try_all! {
-        8, 7, 6, 5, 4, 3, 2, 1
-    }
-
-    panic!("failed to calculate optimal configuration for the allocator");
-}
-
 #[test]
 fn test_calculate_optimal_bin_config() {
     assert_eq!(
-        calculate_optimal_bin_config::<u64, u64>((i32::MAX as u32) / 4096, u32::MAX),
+        self::u32::calculate_optimal_bin_config::<u64, u64>((i32::MAX as u32) / 4096, u32::MAX),
         AllocatorBinConfig {
             mantissa_bits: 8,
             bin_count: 3072
@@ -112,7 +140,7 @@ fn test_calculate_optimal_bin_config() {
     );
 
     assert_eq!(
-        calculate_optimal_bin_config::<u64, u64>((i32::MAX as u32) / 4096, 3072),
+        self::u32::calculate_optimal_bin_config::<u64, u64>((i32::MAX as u32) / 4096, 3072),
         AllocatorBinConfig {
             mantissa_bits: 8,
             bin_count: 3072
@@ -120,7 +148,7 @@ fn test_calculate_optimal_bin_config() {
     );
 
     assert_eq!(
-        calculate_optimal_bin_config::<u64, u64>((i32::MAX as u32) / 4096, 3071),
+        self::u32::calculate_optimal_bin_config::<u64, u64>((i32::MAX as u32) / 4096, 3071),
         AllocatorBinConfig {
             mantissa_bits: 7,
             bin_count: 1664
@@ -139,7 +167,7 @@ impl<const LENGTH: usize> EmptyInit for [u32; LENGTH] {
     }
 }
 
-trait BitIndexT: Copy {
+trait BitIndexT: Copy + core::fmt::Debug {
     fn index(&self) -> usize;
 }
 
@@ -153,8 +181,8 @@ trait BitMaskT: Default {
 
 impl<Primary, Secondary> BitIndexT for crate::bit_mask::BitIndex<Primary, Secondary>
 where
-    Primary: Copy,
-    Secondary: Copy,
+    Primary: Copy + core::fmt::Debug,
+    Secondary: Copy + core::fmt::Debug,
 {
     #[inline]
     fn index(&self) -> usize {
@@ -190,9 +218,35 @@ where
     }
 }
 
+pub trait SizeT:
+    Copy
+    + From<u32>
+    + Ord
+    + core::ops::Add<Output = Self>
+    + core::ops::AddAssign
+    + core::ops::Sub<Output = Self>
+    + core::fmt::LowerHex
+    + core::fmt::Debug
+    + core::hash::Hash
+{
+    #[doc(hidden)]
+    const ZERO: Self;
+}
+
+impl SizeT for u32 {
+    const ZERO: Self = 0;
+}
+
+impl SizeT for u64 {
+    const ZERO: Self = 0;
+}
+
 pub trait AllocatorConfig {
     #[doc(hidden)]
-    const MAX_ALLOCATION_SIZE: u32;
+    type Size: SizeT;
+
+    #[doc(hidden)]
+    const MAX_ALLOCATION_SIZE: Self::Size;
 
     #[doc(hidden)]
     #[allow(private_bounds)]
@@ -203,7 +257,16 @@ pub trait AllocatorConfig {
     type BinArray: core::ops::Index<usize, Output = u32> + core::ops::IndexMut<usize> + EmptyInit;
 
     #[doc(hidden)]
-    fn to_bin_index<const ROUND_UP: bool>(size: u32) -> u32;
+    fn to_bin_index<const ROUND_UP: bool>(size: Self::Size) -> u32;
+}
+
+pub mod u32 {
+    define_for_size!($ u32);
+}
+
+#[cfg(any(kani, test, feature = "export-internals-for-testing"))]
+pub mod u64 {
+    define_for_size!($ u64);
 }
 
 // TODO: Remove this once this is fixed: https://github.com/rust-lang/rust/issues/60551
@@ -212,24 +275,28 @@ pub trait AllocatorConfig {
 macro_rules! _allocator_config {
     (
         impl AllocatorConfig for $type:ty {
-            const MAX_ALLOCATION_SIZE: u32 = $max_allocation_size:expr;
+            const MAX_ALLOCATION_SIZE: $Size:ident = $max_allocation_size:expr;
             const MAX_BINS: u32 = $max_bins:expr;
         }
     ) => {
         impl $crate::generic_allocator::AllocatorConfig for $type {
-            const MAX_ALLOCATION_SIZE: u32 = $max_allocation_size;
+            type Size = $Size;
+            const MAX_ALLOCATION_SIZE: $Size = $max_allocation_size;
             type BitMask = $crate::bit_mask::bitmask_type!(
                 usize,
                 usize,
-                $crate::generic_allocator::calculate_optimal_bin_config::<usize, usize>($max_allocation_size, $max_bins).bin_count as usize
+                $crate::generic_allocator::$Size::calculate_optimal_bin_config::<usize, usize>($max_allocation_size, $max_bins).bin_count
+                    as usize
             );
-            type BinArray = [u32; $crate::generic_allocator::calculate_optimal_bin_config::<usize, usize>($max_allocation_size, $max_bins)
-                .bin_count as usize];
+            type BinArray =
+                [u32; $crate::generic_allocator::$Size::calculate_optimal_bin_config::<usize, usize>($max_allocation_size, $max_bins)
+                    .bin_count as usize];
 
-            fn to_bin_index<const ROUND_UP: bool>(size: u32) -> u32 {
+            fn to_bin_index<const ROUND_UP: bool>(size: $Size) -> u32 {
                 const MANTISSA_BITS: u32 =
-                    $crate::generic_allocator::calculate_optimal_bin_config::<usize, usize>($max_allocation_size, $max_bins).mantissa_bits;
-                $crate::generic_allocator::to_bin_index::<MANTISSA_BITS, ROUND_UP>(size)
+                    $crate::generic_allocator::$Size::calculate_optimal_bin_config::<usize, usize>($max_allocation_size, $max_bins)
+                        .mantissa_bits;
+                $crate::generic_allocator::$Size::to_bin_index::<MANTISSA_BITS, ROUND_UP>(size)
             }
         }
     };
@@ -240,47 +307,50 @@ pub use _allocator_config as allocator_config;
 const EMPTY: u32 = u32::MAX;
 
 #[derive(Clone, Debug)]
-struct Node {
+struct Node<Size> {
     next_by_address: u32,
     prev_by_address: u32,
     next_in_bin: u32,
     prev_in_bin: u32,
-    offset: u32,
-    size: u32,
+    offset: Size,
+    size: Size,
     is_allocated: bool,
 }
 
 #[derive(Debug)]
 pub struct GenericAllocator<C: AllocatorConfig> {
-    nodes: Vec<Node>,
+    nodes: Vec<Node<C::Size>>,
     unused_node_slots: Vec<u32>,
     bins_with_free_space: C::BitMask,
     first_unallocated_for_bin: C::BinArray,
 }
 
-#[derive(Copy, Clone)]
-pub struct GenericAllocation {
+#[derive(Copy, Clone, Debug)]
+pub struct GenericAllocation<Size> {
     node: u32,
-    offset: u32,
-    size: u32,
+    offset: Size,
+    size: Size,
 }
 
-impl GenericAllocation {
-    pub const EMPTY: GenericAllocation = GenericAllocation {
+impl<Size> GenericAllocation<Size>
+where
+    Size: SizeT,
+{
+    pub const EMPTY: GenericAllocation<Size> = GenericAllocation {
         node: EMPTY,
-        offset: 0,
-        size: 0,
+        offset: Size::ZERO,
+        size: Size::ZERO,
     };
 
     pub fn is_empty(&self) -> bool {
         self.node == EMPTY
     }
 
-    pub fn offset(&self) -> u32 {
+    pub fn offset(&self) -> Size {
         self.offset
     }
 
-    pub fn size(&self) -> u32 {
+    pub fn size(&self) -> Size {
         self.size
     }
 }
@@ -289,7 +359,7 @@ impl<C> GenericAllocator<C>
 where
     C: AllocatorConfig,
 {
-    pub fn new(total_space: u32) -> Self {
+    pub fn new(total_space: C::Size) -> Self {
         let mut mutable = GenericAllocator {
             bins_with_free_space: C::BitMask::default(),
             first_unallocated_for_bin: C::BinArray::empty_init(),
@@ -297,21 +367,25 @@ where
             unused_node_slots: Vec::new(),
         };
 
-        mutable.insert_free_node(0, total_space);
+        mutable.insert_free_node(C::Size::from(0), total_space);
         mutable
     }
 
-    fn size_to_bin_round_down(size: u32) -> <C::BitMask as BitMaskT>::Index {
+    fn size_to_bin_round_down(size: C::Size) -> <C::BitMask as BitMaskT>::Index {
         let size = core::cmp::min(size, C::MAX_ALLOCATION_SIZE);
         C::BitMask::index(C::to_bin_index::<false>(size))
     }
 
-    fn size_to_bin_round_up(size: u32) -> <C::BitMask as BitMaskT>::Index {
+    fn size_to_bin_round_up(size: C::Size) -> <C::BitMask as BitMaskT>::Index {
         let size = core::cmp::min(size, C::MAX_ALLOCATION_SIZE);
         C::BitMask::index(C::to_bin_index::<true>(size))
     }
 
-    fn insert_free_node(&mut self, offset: u32, size: u32) -> u32 {
+    fn insert_free_node(&mut self, offset: C::Size, size: C::Size) -> Option<u32> {
+        if size == C::Size::from(0) {
+            return None;
+        }
+
         // Get the bin index; round down to make sure the node's size is at least as big as what the bin expects.
         let bin = Self::size_to_bin_round_down(size);
 
@@ -342,7 +416,7 @@ where
         }
 
         self.first_unallocated_for_bin[bin.index()] = new_node;
-        new_node
+        Some(new_node)
     }
 
     fn remove_node(&mut self, node: u32) {
@@ -378,31 +452,45 @@ where
         }
     }
 
-    pub fn alloc(&mut self, size: u32) -> Option<GenericAllocation> {
-        if size == 0 {
+    pub fn alloc(&mut self, size: C::Size) -> Option<GenericAllocation<C::Size>> {
+        if size == C::Size::from(0) {
             return Some(GenericAllocation::EMPTY);
+        }
+
+        if size > C::MAX_ALLOCATION_SIZE {
+            return None;
         }
 
         // Calculate the minimum bin to fit this allocation; round up in case the size doesn't match the bin size exactly.
         let min_bin = Self::size_to_bin_round_up(size);
 
         // Find a bin with enough free space and allocate a node there.
-        let bin = self.bins_with_free_space.find_first(min_bin)?;
-        let node = self.first_unallocated_for_bin[bin.index()];
-        let original_size = replace(&mut self.nodes[node as usize].size, size);
+        let (bin, node) = if let Some(bin) = self.bins_with_free_space.find_first(min_bin) {
+            (bin, self.first_unallocated_for_bin[bin.index()])
+        } else {
+            // No such bin exists; let's try rounding down and see if maybe we can find an oversized region in the previous bin.
+            let bin = self.bins_with_free_space.find_first(Self::size_to_bin_round_down(size))?;
+            let node = self.first_unallocated_for_bin[bin.index()];
 
+            if self.nodes[node as usize].size < size {
+                return None;
+            }
+
+            (bin, node)
+        };
+
+        let original_size = replace(&mut self.nodes[node as usize].size, size);
+        debug_assert!(original_size >= size);
         debug_assert!(!self.nodes[node as usize].is_allocated);
         self.nodes[node as usize].is_allocated = true;
 
         // Remove the node from the bin's free node list.
         self.remove_first_free_node(node, bin);
 
+        // If we haven't allocated all of the free space then add what's remaining back for later use.
         let offset = self.nodes[node as usize].offset;
         let remaining_free_pages = original_size - size;
-        if remaining_free_pages > 0 {
-            // We haven't allocated all of the free space; add what's remaining back for later use.
-            let new_free_node = self.insert_free_node(offset + size, remaining_free_pages);
-
+        if let Some(new_free_node) = self.insert_free_node(offset + size, remaining_free_pages) {
             // Link the nodes together so that we can later merge them.
             let next_by_address = replace(&mut self.nodes[node as usize].next_by_address, new_free_node);
             if let Some(next) = self.nodes.get_mut(next_by_address as usize) {
@@ -417,7 +505,7 @@ where
         Some(GenericAllocation { node, offset, size })
     }
 
-    pub fn free(&mut self, alloc: GenericAllocation) {
+    pub fn free(&mut self, alloc: GenericAllocation<C::Size>) {
         if alloc.is_empty() {
             return;
         }
@@ -437,7 +525,7 @@ where
 
                 self.remove_node(prev_by_address);
 
-                assert_eq!(self.nodes[prev_by_address as usize].next_by_address, node);
+                debug_assert_eq!(self.nodes[prev_by_address as usize].next_by_address, node);
                 self.nodes[node as usize].prev_by_address = self.nodes[prev_by_address as usize].prev_by_address;
             }
         }
@@ -450,7 +538,7 @@ where
 
                 self.remove_node(next_by_address);
 
-                assert_eq!(self.nodes[next_by_address as usize].prev_by_address, node);
+                debug_assert_eq!(self.nodes[next_by_address as usize].prev_by_address, node);
                 self.nodes[node as usize].next_by_address = self.nodes[next_by_address as usize].next_by_address;
             }
         }
@@ -460,14 +548,119 @@ where
         self.unused_node_slots.push(node);
 
         let new_node = self.insert_free_node(offset, size);
-        if next_by_address != EMPTY {
-            self.nodes[new_node as usize].next_by_address = next_by_address;
-            self.nodes[next_by_address as usize].prev_by_address = new_node;
+        debug_assert!(new_node.is_some());
+        if let Some(new_node) = new_node {
+            if next_by_address != EMPTY {
+                self.nodes[new_node as usize].next_by_address = next_by_address;
+                self.nodes[next_by_address as usize].prev_by_address = new_node;
+            }
+
+            if prev_by_address != EMPTY {
+                self.nodes[new_node as usize].prev_by_address = prev_by_address;
+                self.nodes[prev_by_address as usize].next_by_address = new_node;
+            }
+        }
+    }
+}
+
+#[cfg(any(test, feature = "export-internals-for-testing"))]
+pub mod tests {
+    use super::{GenericAllocation, GenericAllocator};
+    use std::collections::HashMap;
+
+    pub struct TestAllocator<C>
+    where
+        C: super::AllocatorConfig,
+    {
+        allocator: GenericAllocator<C>,
+        allocations: HashMap<C::Size, GenericAllocation<C::Size>>,
+    }
+
+    impl<C> TestAllocator<C>
+    where
+        C: super::AllocatorConfig,
+    {
+        pub fn new(size: C::Size) -> Self {
+            Self {
+                allocator: GenericAllocator::<C>::new(size),
+                allocations: HashMap::new(),
+            }
         }
 
-        if prev_by_address != EMPTY {
-            self.nodes[new_node as usize].prev_by_address = prev_by_address;
-            self.nodes[prev_by_address as usize].next_by_address = new_node;
+        pub fn alloc(&mut self, size: C::Size) -> Option<C::Size> {
+            let allocation = self.allocator.alloc(size)?;
+            if size == C::Size::from(0) {
+                assert_eq!(allocation.offset(), C::Size::from(0));
+                return Some(allocation.offset());
+            }
+
+            let pointer = allocation.offset();
+            for (&old_pointer, old_allocation) in &self.allocations {
+                let is_overlapping = (pointer >= old_pointer && pointer < (old_pointer + old_allocation.size()))
+                    || (pointer + allocation.size() > old_pointer && pointer + allocation.size() <= (old_pointer + old_allocation.size()));
+
+                assert!(
+                    !is_overlapping,
+                    "overlapping allocation: original = 0x{:08x}-0x{:08x}, new = 0x{:08x}-0x{:08x}",
+                    old_pointer,
+                    old_pointer + old_allocation.size(),
+                    pointer,
+                    pointer + allocation.size(),
+                );
+            }
+
+            let offset = allocation.offset();
+            assert!(self.allocations.insert(allocation.offset(), allocation).is_none());
+            Some(offset)
         }
+
+        pub fn free(&mut self, pointer: C::Size) -> bool {
+            if let Some(allocation) = self.allocations.remove(&pointer) {
+                self.allocator.free(allocation);
+                true
+            } else {
+                false
+            }
+        }
+    }
+
+    #[cfg(test)]
+    struct TestConfig64;
+
+    #[cfg(test)]
+    crate::generic_allocator::allocator_config! {
+        impl AllocatorConfig for TestConfig64 {
+            const MAX_ALLOCATION_SIZE: u64 = 6000000;
+            const MAX_BINS: u32 = 4096;
+        }
+    }
+
+    #[test]
+    fn test_allocations_over_the_max_size_fail() {
+        let mut allocator = TestAllocator::<TestConfig64>::new(6000000);
+        let a0 = allocator.alloc(6000000).unwrap();
+        assert_eq!(allocator.alloc(6000000), None);
+        assert!(allocator.free(a0));
+        let a0 = allocator.alloc(6000000).unwrap();
+        assert!(allocator.free(a0));
+        assert_eq!(allocator.alloc(6000001), None);
+        assert_eq!(allocator.alloc(u64::MAX), None);
+    }
+
+    #[test]
+    fn test_zero_max_size_allocator_only_gives_out_zero_sized_allocations() {
+        let mut allocator = TestAllocator::<TestConfig64>::new(0);
+        assert!(allocator.alloc(1).is_none());
+        assert!(allocator.alloc(0).is_some());
+    }
+
+    #[test]
+    fn test_allocator_after_using_up_all_free_space() {
+        let mut allocator = TestAllocator::<TestConfig64>::new(3);
+        assert!(allocator.alloc(1).is_some());
+        assert!(allocator.alloc(1).is_some());
+        assert!(allocator.alloc(1).is_some());
+        assert!(allocator.alloc(1).is_none());
+        assert!(allocator.alloc(0).is_some());
     }
 }

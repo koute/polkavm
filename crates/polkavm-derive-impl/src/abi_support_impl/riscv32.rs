@@ -1,3 +1,4 @@
+#[cfg(target_pointer_width = "32")]
 impl IntoHost for u32 {
     type Regs = (u32,);
     type Destructor = ();
@@ -8,6 +9,7 @@ impl IntoHost for u32 {
     }
 }
 
+#[cfg(target_pointer_width = "32")]
 impl IntoHost for i32 {
     type Regs = (u32,);
     type Destructor = ();
@@ -40,6 +42,7 @@ impl IntoHost for isize {
     }
 }
 
+#[cfg(target_pointer_width = "32")]
 impl IntoHost for u64 {
     type Regs = (u32, u32);
     type Destructor = ();
@@ -50,6 +53,7 @@ impl IntoHost for u64 {
     }
 }
 
+#[cfg(target_pointer_width = "32")]
 impl IntoHost for i64 {
     type Regs = (u32, u32);
     type Destructor = ();
@@ -60,6 +64,7 @@ impl IntoHost for i64 {
     }
 }
 
+#[cfg(target_pointer_width = "32")]
 impl FromHost for u32 {
     type Regs = (u32,);
 
@@ -69,6 +74,7 @@ impl FromHost for u32 {
     }
 }
 
+#[cfg(target_pointer_width = "32")]
 impl FromHost for i32 {
     type Regs = <u32 as FromHost>::Regs;
 
@@ -98,6 +104,7 @@ impl FromHost for isize {
     }
 }
 
+#[cfg(target_pointer_width = "32")]
 impl FromHost for u64 {
     type Regs = (u32, u32);
 
@@ -107,6 +114,7 @@ impl FromHost for u64 {
     }
 }
 
+#[cfg(target_pointer_width = "32")]
 impl FromHost for i64 {
     type Regs = <u64 as FromHost>::Regs;
 
@@ -116,6 +124,7 @@ impl FromHost for i64 {
     }
 }
 
+#[cfg(target_pointer_width = "32")]
 impl<T> IntoHost for *const T {
     type Regs = (u32,);
     type Destructor = ();
@@ -126,6 +135,7 @@ impl<T> IntoHost for *const T {
     }
 }
 
+#[cfg(target_pointer_width = "32")]
 impl<T> IntoHost for *mut T {
     type Regs = (u32,);
     type Destructor = ();

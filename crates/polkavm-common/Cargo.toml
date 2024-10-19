@@ -11,13 +11,17 @@ description = "The common crate for PolkaVM"
 [dependencies]
 log = { workspace = true, optional = true }
 polkavm-assembler = { workspace = true, optional = true }
+blake3 = { workspace = true, optional = true }
 
 [features]
 default = []
 alloc = []
-std = ["alloc"]
+std = ["alloc", "blake3/std"]
 logging = ["dep:log"]
 regmap = ["dep:polkavm-assembler"]
+blake3 = ["dep:blake3"]
+unique-id = []
+export-internals-for-testing = []
 
 [dev-dependencies]
 proptest = { workspace = true }

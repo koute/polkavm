@@ -36,3 +36,8 @@ pub mod zygote;
 
 #[cfg(feature = "regmap")]
 pub mod regmap;
+
+pub mod hasher;
+
+#[cfg(not(feature = "blake3"))]
+mod blake3;

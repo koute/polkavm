@@ -1,3 +1,5 @@
+#![allow(unsafe_code)]
+
 use core::mem::MaybeUninit;
 use core::ops::{Deref, Range};
 
@@ -6,30 +8,85 @@ use alloc::{borrow::Cow, sync::Arc, vec::Vec};
 
 use crate::program::Reg;
 
-#[derive(Clone, Debug, Default)]
-pub struct ArcBytes {
-    #[cfg(feature = "alloc")]
-    data: Option<Arc<[u8]>>,
-    #[cfg(not(feature = "alloc"))]
-    data: &'static [u8],
-    range: Range<usize>,
+#[cfg(feature = "alloc")]
+#[derive(Clone)]
+enum LifetimeObject {
+    None,
+    Arc {
+        _obj: Arc<[u8]>,
+    },
+    #[allow(dyn_drop)]
+    Other {
+        _obj: Arc<dyn Drop>,
+    },
 }
 
+#[derive(Clone)]
+pub struct ArcBytes {
+    pointer: core::ptr::NonNull<u8>,
+    length: usize,
+
+    #[cfg(feature = "alloc")]
+    lifetime: LifetimeObject,
+}
+
+impl core::fmt::Debug for ArcBytes {
+    fn fmt(&self, fmt: &mut core::fmt::Formatter) -> core::fmt::Result {
+        fmt.debug_struct("ArcBytes").field("data", &self.deref()).finish()
+    }
+}
+
+impl Default for ArcBytes {
+    fn default() -> Self {
+        ArcBytes::empty()
+    }
+}
+
+// SAFETY: It's always safe to send `ArcBytes` to another thread due to atomic refcounting.
+unsafe impl Send for ArcBytes {}
+
+// SAFETY: It's always safe to access `ArcBytes` from multiple threads due to atomic refcounting.
+unsafe impl Sync for ArcBytes {}
+
 impl ArcBytes {
+    pub const fn empty() -> Self {
+        ArcBytes {
+            pointer: core::ptr::NonNull::dangling(),
+            length: 0,
+
+            #[cfg(feature = "alloc")]
+            lifetime: LifetimeObject::None,
+        }
+    }
+
+    pub const fn from_static(bytes: &'static [u8]) -> Self {
+        ArcBytes {
+            // SAFETY: `bytes` is always a valid slice, so its pointer is also always non-null and valid.
+            pointer: unsafe { core::ptr::NonNull::new_unchecked(bytes.as_ptr().cast_mut()) },
+            length: bytes.len(),
+
+            #[cfg(feature = "alloc")]
+            lifetime: LifetimeObject::None,
+        }
+    }
+
     pub(crate) fn subslice(&self, subrange: Range<usize>) -> Self {
         if subrange.start == subrange.end {
-            return Default::default();
+            return Self::empty();
         }
 
-        let start = self.range.start + subrange.start;
-        let end = self.range.start + subrange.end;
-        assert!(start <= self.range.end);
-        assert!(end <= self.range.end);
+        assert!(subrange.end >= subrange.start);
+        let length = subrange.end - subrange.start;
+        assert!(length <= self.length);
 
         ArcBytes {
-            #[allow(noop_method_call)]
-            data: self.data.clone(),
-            range: start..end,
+            // TODO: Use `NonNull::add` once we migrate to Rust 1.80+.
+            // SAFETY: We've checked that the new subslice is valid with `assert`s.
+            pointer: unsafe { core::ptr::NonNull::new_unchecked(self.pointer.as_ptr().add(subrange.start)) },
+            length,
+
+            #[cfg(feature = "alloc")]
+            lifetime: self.lifetime.clone(),
         }
     }
 }
@@ -42,23 +99,12 @@ impl PartialEq for ArcBytes {
     }
 }
 
-#[cfg(feature = "alloc")]
 impl Deref for ArcBytes {
     type Target = [u8];
 
     fn deref(&self) -> &Self::Target {
-        const EMPTY: &[u8] = &[];
-        let slice = self.data.as_ref().map_or(EMPTY, |slice| &slice[..]);
-        &slice[self.range.clone()]
-    }
-}
-
-#[cfg(not(feature = "alloc"))]
-impl Deref for ArcBytes {
-    type Target = [u8];
-
-    fn deref(&self) -> &Self::Target {
-        &self.data[self.range.clone()]
+        // SAFETY: `pointer` is always non-null and `length` is always valid.
+        unsafe { core::slice::from_raw_parts(self.pointer.as_ptr(), self.length) }
     }
 }
 
@@ -71,20 +117,15 @@ impl AsRef<[u8]> for ArcBytes {
 #[cfg(feature = "alloc")]
 impl<'a> From<&'a [u8]> for ArcBytes {
     fn from(data: &'a [u8]) -> Self {
-        ArcBytes {
-            data: Some(data.into()),
-            range: 0..data.len(),
-        }
+        let data: Arc<[u8]> = data.into();
+        Self::from(data)
     }
 }
 
 #[cfg(not(feature = "alloc"))]
 impl<'a> From<&'static [u8]> for ArcBytes {
     fn from(data: &'static [u8]) -> Self {
-        ArcBytes {
-            data,
-            range: 0..data.len(),
-        }
+        ArcBytes::from_static(data)
     }
 }
 
@@ -92,8 +133,9 @@ impl<'a> From<&'static [u8]> for ArcBytes {
 impl From<Vec<u8>> for ArcBytes {
     fn from(data: Vec<u8>) -> Self {
         ArcBytes {
-            range: 0..data.len(),
-            data: Some(data.into()),
+            pointer: core::ptr::NonNull::new(data.as_ptr().cast_mut()).unwrap(),
+            length: data.len(),
+            lifetime: LifetimeObject::Other { _obj: Arc::new(data) },
         }
     }
 }
@@ -102,8 +144,9 @@ impl From<Vec<u8>> for ArcBytes {
 impl From<Arc<[u8]>> for ArcBytes {
     fn from(data: Arc<[u8]>) -> Self {
         ArcBytes {
-            range: 0..data.len(),
-            data: Some(data),
+            pointer: core::ptr::NonNull::new(data.deref().as_ptr().cast_mut()).unwrap(),
+            length: data.len(),
+            lifetime: LifetimeObject::Arc { _obj: data },
         }
     }
 }
@@ -252,4 +295,31 @@ pub fn parse_reg(text: &str) -> Option<Reg> {
     }
 
     None
+}
+
+#[test]
+fn test_arc_bytes() {
+    assert_eq!(&*ArcBytes::empty(), b"");
+    assert_eq!(ArcBytes::empty().as_ptr(), ArcBytes::empty().as_ptr());
+
+    #[cfg(feature = "alloc")]
+    #[allow(clippy::redundant_clone)]
+    {
+        let ab = ArcBytes::from(alloc::vec![1, 2, 3, 4]);
+        assert_eq!(ab.as_ptr(), ab.as_ptr());
+        assert_eq!(ab.clone().as_ptr(), ab.as_ptr());
+        assert_eq!(&*ab, &[1, 2, 3, 4]);
+        assert_eq!(&*ab.subslice(0..4), &[1, 2, 3, 4]);
+        assert_eq!(&*ab.subslice(0..3), &[1, 2, 3]);
+        assert_eq!(&*ab.subslice(1..4), &[2, 3, 4]);
+
+        let mut arc = Arc::<[u8]>::from(alloc::vec![1, 2, 3, 4]);
+        assert!(Arc::get_mut(&mut arc).is_some());
+        let ab2 = ArcBytes::from(Arc::clone(&arc));
+        assert!(Arc::get_mut(&mut arc).is_none());
+        assert_eq!(ab2.as_ptr(), ab2.as_ptr());
+        assert_eq!(ab2.clone().as_ptr(), ab2.as_ptr());
+        core::mem::drop(ab2);
+        assert!(Arc::get_mut(&mut arc).is_some());
+    }
 }

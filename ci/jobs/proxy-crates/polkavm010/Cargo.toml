@@ -1,0 +1,10 @@
+[package]
+name = "polkavm"
+version = "0.10.0"
+edition = "2021"
+
+[dependencies]
+polkavm = { path = "../../../../crates/polkavm" }
+
+[features]
+std = ["polkavm/std"]

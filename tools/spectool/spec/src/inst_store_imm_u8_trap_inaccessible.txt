@@ -1,5 +1,9 @@
+pre: gas = 10000
+
 %rw_data_size = 0
 
 pub @main:
 pub @expected_exit:
     u8 [0x20000] = 0x12
+
+post: gas = 9998

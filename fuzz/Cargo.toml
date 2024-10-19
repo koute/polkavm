@@ -1,0 +1,37 @@
+[package]
+name = "polkavm-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+arbitrary = { version = "1", features = ["derive"] }
+libfuzzer-sys = "0.4"
+
+[dependencies.polkavm]
+path = "../crates/polkavm"
+features = ["export-internals-for-testing"]
+
+[[bin]]
+name = "fuzz_shm_allocator"
+path = "fuzz_targets/fuzz_shm_allocator.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "fuzz_generic_allocator"
+path = "fuzz_targets/fuzz_generic_allocator.rs"
+test = false
+doc = false
+bench = false
+
+[workspace]
+resolver = "2"
+members = ["."]
+
+[workspace.lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(kani)', 'cfg(polkavm_dev_debug_zygote)'] }

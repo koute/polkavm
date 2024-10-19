@@ -11,7 +11,7 @@ env:
 
 jobs:
   build-and-test-linux:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-22.04
     steps:
     - uses: actions/checkout@v4
     - name: Enable unprivileged userfaultfd
@@ -46,17 +46,17 @@ jobs:
       shell: bash
       run: ./ci/jobs/build-and-test.sh
   kani:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-22.04
     steps:
     - uses: actions/checkout@v4
     - name: Install kani
-      run: cargo install --locked kani-verifier
+      run: cargo install --locked --version 0.55.0 kani-verifier
     - name: Setup kani
       run: cargo kani setup
     - name: Run kani
       run: ./ci/jobs/kani.sh
   clippy:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-22.04
     steps:
     - uses: actions/checkout@v4
     - name: Install clippy (base toolchain)
@@ -66,7 +66,7 @@ jobs:
     - name: Run clippy
       run: ./ci/jobs/clippy.sh
   rustfmt:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-22.04
     steps:
     - uses: actions/checkout@v4
     - name: Install rustfmt (base toolchain)
@@ -75,3 +75,23 @@ jobs:
       run: cd crates/polkavm-zygote && rustup component add rustfmt
     - name: Run rustfmt
       run: ./ci/jobs/rustfmt.sh
+  pallet-revive-tests:
+    runs-on: ubuntu-22.04
+    steps:
+    - uses: actions/checkout@v4
+    - name: Enable unprivileged userfaultfd
+      run: echo "1" | sudo tee /proc/sys/vm/unprivileged_userfaultfd
+    - name: Install LLD
+      run: sudo apt-get install -y lld
+    - name: Install target -- riscv32em-unknown-none-elf
+      run: ./ci/jobs/detect-or-install-riscv-toolchain.sh
+    - name: Build and test
+      run: ./ci/jobs/build-and-test-pallet-revive.sh
+  fuzz:
+    runs-on: ubuntu-22.04
+    steps:
+    - uses: actions/checkout@v4
+    - name: Install cargo fuzz
+      run: cargo install cargo-fuzz
+    - name: Fuzz
+      run: ./ci/jobs/fuzz.sh

@@ -4,12 +4,13 @@
 
 use core::ptr::addr_of_mut;
 use core::sync::atomic::Ordering;
-use core::sync::atomic::{AtomicBool, AtomicI32, AtomicU64, AtomicUsize};
+use core::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize};
 
 #[rustfmt::skip]
 use polkavm_common::{
     utils::align_to_next_page_usize,
     zygote::{
+        self,
         AddressTableRaw, ExtTableRaw, VmCtx as VmCtxInner,
         VmMap, VmFd, JmpBuf,
         VM_ADDR_JUMP_TABLE_RETURN_TO_HOST,
@@ -127,13 +128,13 @@ impl DisplayLite for Hex<u64> {
 
 macro_rules! trace {
     ($arg:expr) => {{
-        let fd = linux_raw::FdRef::from_raw_unchecked(linux_raw::STDERR_FILENO);
+        let fd = linux_raw::FdRef::from_raw_unchecked(zygote::FD_LOGGER_STDERR);
         let _ = linux_raw::sys_write(fd, $arg.as_bytes());
         let _ = linux_raw::sys_write(fd, b"\n");
     }};
 
     ($($arg:expr),+) => {{
-        let fd = linux_raw::FdRef::from_raw_unchecked(linux_raw::STDERR_FILENO);
+        let fd = linux_raw::FdRef::from_raw_unchecked(zygote::FD_LOGGER_STDERR);
         $(
             DisplayLite::fmt_lite(&$arg, |s| {
                 let _ = linux_raw::sys_write(fd, s.as_bytes());
@@ -220,7 +221,7 @@ fn graceful_abort() -> ! {
 
 #[cold]
 fn abort_with_message(error: &str) -> ! {
-    let fd = linux_raw::FdRef::from_raw_unchecked(linux_raw::STDERR_FILENO);
+    let fd = linux_raw::FdRef::from_raw_unchecked(zygote::FD_LOGGER_STDERR);
     let _ = linux_raw::sys_write(fd, b"fatal error: ");
     let _ = linux_raw::sys_write(fd, error.as_bytes());
     let _ = linux_raw::sys_write(fd, b"\n");
@@ -234,10 +235,11 @@ fn abort_with_message(error: &str) -> ! {
 
 #[cold]
 fn abort_with_error(error: &str, err_obj: linux_raw::Error) -> ! {
-    let fd = linux_raw::FdRef::from_raw_unchecked(linux_raw::STDERR_FILENO);
+    let fd = linux_raw::FdRef::from_raw_unchecked(zygote::FD_LOGGER_STDERR);
     let _ = linux_raw::sys_write(fd, b"fatal error: ");
     let _ = linux_raw::sys_write(fd, error.as_bytes());
     let _ = linux_raw::sys_write(fd, b": ");
+
     reset_message();
     append_to_message(error.as_bytes());
     append_to_message(b": ");
@@ -251,25 +253,20 @@ fn abort_with_error(error: &str, err_obj: linux_raw::Error) -> ! {
     graceful_abort();
 }
 
-const HOST_SOCKET_FILENO: linux_raw::c_int = linux_raw::STDIN_FILENO;
-
 unsafe extern "C" fn entry_point(stack: *mut usize) -> ! {
     trace!("initializing...");
     initialize(stack);
     main_loop();
 }
 
-static SHM_FD: AtomicI32 = AtomicI32::new(-1);
-static MEMORY_FD: AtomicI32 = AtomicI32::new(-1);
-
 #[inline]
 fn shm_fd() -> linux_raw::FdRef<'static> {
-    linux_raw::FdRef::from_raw_unchecked(SHM_FD.load(Ordering::Relaxed))
+    linux_raw::FdRef::from_raw_unchecked(zygote::FD_SHM)
 }
 
 #[inline]
 fn memory_fd() -> linux_raw::FdRef<'static> {
-    linux_raw::FdRef::from_raw_unchecked(MEMORY_FD.load(Ordering::Relaxed))
+    linux_raw::FdRef::from_raw_unchecked(zygote::FD_MEM)
 }
 
 static IN_SIGNAL_HANDLER: AtomicBool = AtomicBool::new(false);
@@ -447,9 +444,7 @@ unsafe fn initialize(mut stack: *mut usize) {
         }
     };
 
-    let socket = linux_raw::Fd::from_raw_unchecked(HOST_SOCKET_FILENO);
-    let vmctx_memfd = linux_raw::recvfd(socket.borrow()).unwrap_or_else(|error| abort_with_error("failed to read vmctx fd", error));
-
+    let vmctx_memfd = linux_raw::Fd::from_raw_unchecked(zygote::FD_VMCTX);
     linux_raw::sys_mmap(
         &VMCTX as *const VmCtx as *mut core::ffi::c_void,
         page_size,
@@ -460,11 +455,8 @@ unsafe fn initialize(mut stack: *mut usize) {
     )
     .unwrap_or_else(|error| abort_with_error("failed to mmap vmctx", error));
 
-    vmctx_memfd
-        .close()
-        .unwrap_or_else(|error| abort_with_error("failed to close vmctx memfd", error));
-
-    let lifetime_pipe = linux_raw::recvfd(socket.borrow()).unwrap_or_else(|error| abort_with_error("failed to read lifetime pipe", error));
+    let socket = linux_raw::Fd::from_raw_unchecked(zygote::FD_SOCKET);
+    let lifetime_pipe = linux_raw::Fd::from_raw_unchecked(zygote::FD_LIFETIME_PIPE);
 
     // Make sure we're killed when the parent process exits.
     let pid = linux_raw::sys_getpid().unwrap_or_else(|error| abort_with_error("failed to get process PID", error)) as u32;
@@ -480,22 +472,16 @@ unsafe fn initialize(mut stack: *mut usize) {
 
     lifetime_pipe.leak();
 
-    // Read the shared memory FD.
-    let shm_fd = linux_raw::recvfd(socket.borrow()).unwrap_or_else(|error| abort_with_error("failed to read SHM fd", error));
-
     // Map the shared memory.
     linux_raw::sys_mmap(
         VM_ADDR_SHARED_MEMORY as *mut core::ffi::c_void,
         VM_SHARED_MEMORY_SIZE as usize,
         linux_raw::PROT_READ,
         linux_raw::MAP_FIXED | linux_raw::MAP_SHARED,
-        Some(shm_fd.borrow()),
+        Some(shm_fd()),
         0,
     )
     .unwrap_or_else(|error| abort_with_error("failed to mmap shared memory", error));
-
-    // Stash the shared memory FD.
-    SHM_FD.store(shm_fd.leak(), Ordering::Relaxed);
 
     // Wait for the host to fill out vmctx.
     VMCTX.futex.store(VMCTX_FUTEX_IDLE, Ordering::Release);
@@ -538,13 +524,14 @@ unsafe fn initialize(mut stack: *mut usize) {
     .unwrap_or_else(|error| abort_with_error("failed to make sure the jump table address space is unmapped", error));
 
     if VMCTX.init.uffd_available.load(Ordering::Relaxed) {
-        let memory_fd = linux_raw::recvfd(socket.borrow()).unwrap_or_else(|error| abort_with_error("failed to read memory fd", error));
-
-        MEMORY_FD.store(memory_fd.leak(), Ordering::Relaxed);
-
         // Set up and send the userfaultfd to the host.
         let userfaultfd = linux_raw::sys_userfaultfd(linux_raw::O_CLOEXEC)
             .unwrap_or_else(|error| abort_with_error("failed to create an userfaultfd", error));
+
+        if userfaultfd.raw() <= zygote::LAST_USED_FD {
+            // We expect all of the FDs less or equal to `LAST_USED_FD` to be allocated.
+            abort_with_message("internal error: userfaultfd is using too low file descriptor")
+        }
 
         linux_raw::sendfd(socket.borrow(), userfaultfd.borrow())
             .unwrap_or_else(|error| abort_with_error("failed to send the userfaultfd to the host", error));
@@ -553,11 +540,6 @@ unsafe fn initialize(mut stack: *mut usize) {
             .close()
             .unwrap_or_else(|error| abort_with_error("failed to close the userfaultfd", error));
     }
-
-    // Close the socket; we don't need it anymore.
-    socket
-        .close()
-        .unwrap_or_else(|error| abort_with_error("failed to close the socket", error));
 
     // Set up our signal handler.
     let minsigstksz = align_to_next_page_usize(page_size, minsigstksz).unwrap_or_else(|| abort_with_message("overflow"));
@@ -629,6 +611,29 @@ unsafe fn initialize(mut stack: *mut usize) {
             .unwrap_or_else(|error| abort_with_error("failed to set the %gs register", error));
     }
 
+    // Close all of the FDs we don't need anymore.
+    vmctx_memfd
+        .close()
+        .unwrap_or_else(|error| abort_with_error("failed to close vmctx memfd", error));
+
+    socket
+        .close()
+        .unwrap_or_else(|error| abort_with_error("failed to close the socket", error));
+
+    linux_raw::Fd::from_raw_unchecked(zygote::FD_DUMMY_STDIN)
+        .close()
+        .unwrap_or_else(|error| abort_with_error("failed to close dummy stdin", error));
+
+    if !VMCTX.init.logging_enabled.load(Ordering::Relaxed) {
+        linux_raw::Fd::from_raw_unchecked(zygote::FD_LOGGER_STDOUT)
+            .close()
+            .unwrap_or_else(|error| abort_with_error("failed to close stdout logger", error));
+
+        linux_raw::Fd::from_raw_unchecked(zygote::FD_LOGGER_STDERR)
+            .close()
+            .unwrap_or_else(|error| abort_with_error("failed to close stdin logger", error));
+    }
+
     if !VMCTX.init.sandbox_disabled.load(Ordering::Relaxed) {
         linux_raw::sys_setrlimit(linux_raw::RLIMIT_NOFILE, &linux_raw::rlimit { rlim_cur: 0, rlim_max: 0 })
             .unwrap_or_else(|error| abort_with_error("failed to set RLIMIT_NOFILE", error));
@@ -677,11 +682,11 @@ unsafe fn initialize(mut stack: *mut usize) {
             (if a == linux_raw::SYS_rt_sigreturn => jump @1),
             (if a == linux_raw::SYS_sched_yield => jump @1),
             (if a == linux_raw::SYS_exit => jump @1),
-            (seccomp_kill_thread),
+            (seccomp_return_eperm),
 
             // SYS_write
             ([3]: a = syscall_arg[0]),
-            (if a != linux_raw::STDERR_FILENO => jump @0),
+            (if a != zygote::FD_LOGGER_STDERR => jump @0),
             (seccomp_allow),
 
             // SYS_madvise
@@ -700,7 +705,7 @@ unsafe fn initialize(mut stack: *mut usize) {
             (if a != linux_raw::PROT_EXEC => jump @0),
             (seccomp_allow),
 
-            ([0]: seccomp_kill_thread),
+            ([0]: seccomp_return_eperm),
             ([1]: seccomp_allow),
         };
 

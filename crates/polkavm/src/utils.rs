@@ -29,11 +29,17 @@ pub struct GuestInit<'a> {
     pub ro_data_size: u32,
     pub rw_data_size: u32,
     pub stack_size: u32,
+    pub aux_data_size: u32,
 }
 
 impl<'a> GuestInit<'a> {
     pub fn memory_map(&self) -> Result<polkavm_common::abi::MemoryMap, &'static str> {
-        polkavm_common::abi::MemoryMap::new(self.page_size, self.ro_data_size, self.rw_data_size, self.stack_size)
+        polkavm_common::abi::MemoryMapBuilder::new(self.page_size)
+            .ro_data_size(self.ro_data_size)
+            .rw_data_size(self.rw_data_size)
+            .stack_size(self.stack_size)
+            .aux_data_size(self.aux_data_size)
+            .build()
     }
 }
 

@@ -1,13 +1,13 @@
-use alloc::borrow::Cow;
 use alloc::boxed::Box;
 use alloc::format;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 
-use polkavm_common::abi::MemoryMap;
-use polkavm_common::abi::{VM_ADDR_RETURN_TO_HOST, VM_ADDR_USER_STACK_HIGH};
-use polkavm_common::program::{FrameKind, Imports, Reg};
-use polkavm_common::program::{Instructions, JumpTable, ProgramBlob};
+use polkavm_common::abi::{MemoryMap, MemoryMapBuilder, VM_ADDR_RETURN_TO_HOST};
+use polkavm_common::program::{
+    build_static_dispatch_table, FrameKind, ISA32_V1_NoSbrk, Imports, InstructionSet, Instructions, JumpTable, Opcode, ProgramBlob, Reg,
+    ISA32_V1, ISA64_V1,
+};
 use polkavm_common::utils::{ArcBytes, AsUninitSliceMut};
 
 use crate::config::{BackendKind, Config, GasMeteringKind, ModuleConfig, SandboxKind};
@@ -15,6 +15,9 @@ use crate::error::{bail, bail_static, Error};
 use crate::interpreter::{InterpretedInstance, InterpretedModule};
 use crate::utils::{GuestInit, InterruptKind};
 use crate::{Gas, ProgramCounter};
+
+#[cfg(feature = "module-cache")]
+use crate::module_cache::{ModuleCache, ModuleKey};
 
 if_compiler_is_supported! {
     {
@@ -26,15 +29,18 @@ if_compiler_is_supported! {
         #[cfg(feature = "generic-sandbox")]
         use crate::sandbox::generic::Sandbox as SandboxGeneric;
 
-        #[derive(Default)]
         pub(crate) struct EngineState {
             pub(crate) sandbox_global: Option<crate::sandbox::GlobalStateKind>,
             pub(crate) sandbox_cache: Option<crate::sandbox::WorkerCacheKind>,
             compiler_cache: CompilerCache,
+            #[cfg(feature = "module-cache")]
+            module_cache: ModuleCache,
         }
     } else {
-        #[derive(Default)]
-        pub(crate) struct EngineState {}
+        pub(crate) struct EngineState {
+            #[cfg(feature = "module-cache")]
+            module_cache: ModuleCache,
+        }
     }
 }
 
@@ -58,6 +64,26 @@ impl<T> IntoResult<T> for T {
 }
 
 pub type RegValue = u32;
+
+#[derive(Copy, Clone)]
+pub struct RuntimeInstructionSet {
+    allow_sbrk: bool,
+    is_64_bit: bool,
+}
+
+impl InstructionSet for RuntimeInstructionSet {
+    fn opcode_from_u8(self, byte: u8) -> Option<Opcode> {
+        if !self.is_64_bit {
+            if self.allow_sbrk {
+                ISA32_V1.opcode_from_u8(byte)
+            } else {
+                ISA32_V1_NoSbrk.opcode_from_u8(byte)
+            }
+        } else {
+            ISA64_V1.opcode_from_u8(byte)
+        }
+    }
+}
 
 pub struct Engine {
     selected_backend: BackendKind,
@@ -95,6 +121,17 @@ impl Engine {
         let selected_backend = config.backend.unwrap_or(default_backend);
         log::debug!("Selected backend: '{selected_backend}'");
 
+        #[cfg(feature = "module-cache")]
+        let module_cache = {
+            log::debug!("Enabling module cache... (LRU cache size = {})", config.lru_cache_size);
+            ModuleCache::new(config.cache_enabled, config.lru_cache_size)
+        };
+
+        #[cfg(not(feature = "module-cache"))]
+        if config.cache_enabled {
+            log::warn!("`cache_enabled` is true, but we were not compiled with the `module-cache` feature; caching will be disabled!");
+        }
+
         let (selected_sandbox, state) = if_compiler_is_supported! {
             {
                 if selected_backend == BackendKind::Compiler {
@@ -124,25 +161,30 @@ impl Engine {
                     let state = Arc::new(EngineState {
                         sandbox_global: Some(sandbox_global),
                         sandbox_cache: Some(sandbox_cache),
-                        compiler_cache: Default::default()
+                        compiler_cache: Default::default(),
+
+                        #[cfg(feature = "module-cache")]
+                        module_cache,
                     });
 
                     (Some(selected_sandbox), state)
                 } else {
-                    Default::default()
+                    (None, Arc::new(EngineState {
+                        sandbox_global: None,
+                        sandbox_cache: None,
+                        compiler_cache: Default::default(),
+
+                        #[cfg(feature = "module-cache")]
+                        module_cache
+                    }))
                 }
             } else {
-                Default::default()
+                (None, Arc::new(EngineState {
+                    #[cfg(feature = "module-cache")]
+                    module_cache
+                }))
             }
         };
-
-        if (crosscheck || selected_backend == BackendKind::Interpreter) && config.allow_dynamic_paging() {
-            bail!("dynamic paging is currently not supported by the interpreter");
-        }
-
-        if config.allow_dynamic_paging() && !config.allow_experimental {
-            bail!("cannot enable dynamic paging: this is not production ready nor even finished; you can enable `set_allow_experimental`/`POLKAVM_ALLOW_EXPERIMENTAL` to be able to use it anyway");
-        }
 
         Ok(Engine {
             selected_backend,
@@ -152,6 +194,11 @@ impl Engine {
             state,
             allow_dynamic_paging: config.allow_dynamic_paging(),
         })
+    }
+
+    /// Returns the backend used by the engine.
+    pub fn backend(&self) -> BackendKind {
+        self.selected_backend
     }
 }
 
@@ -177,7 +224,7 @@ impl CompiledModuleKind {
     }
 }
 
-struct ModulePrivate {
+pub(crate) struct ModulePrivate {
     engine_state: Option<Arc<EngineState>>,
     crosscheck: bool,
 
@@ -191,67 +238,105 @@ struct ModulePrivate {
     dynamic_paging: bool,
     page_size_mask: u32,
     page_shift: u32,
+    instruction_set: RuntimeInstructionSet,
+    #[cfg(feature = "module-cache")]
+    pub(crate) module_key: Option<ModuleKey>,
 }
 
 /// A compiled PolkaVM program module.
 #[derive(Clone)]
-pub struct Module(Arc<ModulePrivate>);
+pub struct Module(pub(crate) Option<Arc<ModulePrivate>>);
+
+impl Drop for Module {
+    fn drop(&mut self) {
+        #[cfg(feature = "module-cache")]
+        if let Some(state) = self.0.take() {
+            if let Some(ref engine_state) = state.engine_state {
+                let engine_state = Arc::clone(engine_state);
+                engine_state.module_cache.on_drop(state);
+            }
+        }
+    }
+}
 
 impl Module {
+    fn state(&self) -> &ModulePrivate {
+        if let Some(ref private) = self.0 {
+            private
+        } else {
+            // SAFETY: self.0 is only ever `None` in the destructor.
+            unsafe { core::hint::unreachable_unchecked() }
+        }
+    }
+
     pub(crate) fn is_strict(&self) -> bool {
-        self.0.is_strict
+        self.state().is_strict
     }
 
     pub(crate) fn is_step_tracing(&self) -> bool {
-        self.0.step_tracing
+        self.state().step_tracing
     }
 
     pub(crate) fn is_dynamic_paging(&self) -> bool {
-        self.0.dynamic_paging
+        self.state().dynamic_paging
     }
 
     pub(crate) fn compiled_module(&self) -> &CompiledModuleKind {
-        &self.0.compiled_module
+        &self.state().compiled_module
     }
 
     pub(crate) fn interpreted_module(&self) -> Option<&InterpretedModule> {
-        self.0.interpreted_module.as_ref()
+        self.state().interpreted_module.as_ref()
     }
 
     pub(crate) fn blob(&self) -> &ProgramBlob {
-        &self.0.blob
+        &self.state().blob
     }
 
     pub(crate) fn code_len(&self) -> u32 {
-        self.0.blob.code().len() as u32
+        self.state().blob.code().len() as u32
     }
 
-    pub(crate) fn instructions_at(&self, offset: ProgramCounter) -> Option<Instructions> {
-        self.0.blob.instructions_at(offset)
+    pub(crate) fn instructions_bounded_at(&self, offset: ProgramCounter) -> Instructions<RuntimeInstructionSet> {
+        self.state().blob.instructions_bounded_at(self.state().instruction_set, offset)
+    }
+
+    pub(crate) fn is_jump_target_valid(&self, offset: ProgramCounter) -> bool {
+        self.state().blob.is_jump_target_valid(self.state().instruction_set, offset)
+    }
+
+    pub(crate) fn find_start_of_basic_block(&self, offset: ProgramCounter) -> Option<ProgramCounter> {
+        polkavm_common::program::find_start_of_basic_block(
+            self.state().instruction_set,
+            self.state().blob.code(),
+            self.state().blob.bitmask(),
+            offset.0,
+        )
+        .map(ProgramCounter)
     }
 
     pub(crate) fn jump_table(&self) -> JumpTable {
-        self.0.blob.jump_table()
+        self.state().blob.jump_table()
     }
 
     pub fn get_debug_string(&self, offset: u32) -> Result<&str, polkavm_common::program::ProgramParseError> {
-        self.0.blob.get_debug_string(offset)
+        self.state().blob.get_debug_string(offset)
     }
 
     pub(crate) fn gas_metering(&self) -> Option<GasMeteringKind> {
-        self.0.gas_metering
+        self.state().gas_metering
     }
 
     pub(crate) fn is_multiple_of_page_size(&self, value: u32) -> bool {
-        (value & self.0.page_size_mask) == 0
+        (value & self.state().page_size_mask) == 0
     }
 
     pub(crate) fn round_to_page_size_down(&self, value: u32) -> u32 {
-        value & !self.0.page_size_mask
+        value & !self.state().page_size_mask
     }
 
     pub(crate) fn address_to_page(&self, address: u32) -> u32 {
-        address >> self.0.page_shift
+        address >> self.state().page_shift
     }
 
     /// Creates a new module by deserializing the program from the given `bytes`.
@@ -272,8 +357,22 @@ impl Module {
             bail!("dynamic paging was not enabled; use `Config::set_allow_dynamic_paging` to enable it");
         }
 
+        #[cfg(feature = "module-cache")]
+        let module_key = {
+            let (module_key, module) = engine.state.module_cache.get(config, &blob);
+            if let Some(module) = module {
+                return Ok(module);
+            }
+            module_key
+        };
+
         // Do an early check for memory config validity.
-        MemoryMap::new(config.page_size, blob.ro_data_size(), blob.rw_data_size(), blob.stack_size()).map_err(Error::from_static_str)?;
+        MemoryMapBuilder::new(config.page_size)
+            .ro_data_size(blob.ro_data_size())
+            .rw_data_size(blob.rw_data_size())
+            .stack_size(blob.stack_size())
+            .build()
+            .map_err(Error::from_static_str)?;
 
         if config.is_strict || cfg!(debug_assertions) {
             log::trace!("Checking imports...");
@@ -328,15 +427,22 @@ impl Module {
             ro_data_size: blob.ro_data_size(),
             rw_data_size: blob.rw_data_size(),
             stack_size: blob.stack_size(),
+            aux_data_size: config.aux_data_size(),
+        };
+
+        let instruction_set = RuntimeInstructionSet {
+            allow_sbrk: config.allow_sbrk,
+            is_64_bit: blob.is_64_bit(),
         };
 
         #[allow(unused_macros)]
         macro_rules! compile_module {
             ($sandbox_kind:ident, $visitor_name:ident, $module_kind:ident) => {{
                 type VisitorTy<'a> = crate::compiler::CompilerVisitor<'a, $sandbox_kind>;
-                let (visitor, aux) = crate::compiler::CompilerVisitor::<$sandbox_kind>::new(
+                let (mut visitor, aux) = crate::compiler::CompilerVisitor::<$sandbox_kind>::new(
                     &engine.state.compiler_cache,
                     config,
+                    instruction_set,
                     blob.jump_table(),
                     blob.code(),
                     blob.bitmask(),
@@ -346,8 +452,18 @@ impl Module {
                     init,
                 )?;
 
-                let run = polkavm_common::program::prepare_visitor!($visitor_name, VisitorTy<'a>);
-                let visitor = run(&blob, visitor);
+                if config.allow_sbrk {
+                    blob.visit(
+                        build_static_dispatch_table!($visitor_name, ISA32_V1, VisitorTy<'a>),
+                        &mut visitor,
+                    );
+                } else {
+                    blob.visit(
+                        build_static_dispatch_table!($visitor_name, ISA32_V1_NoSbrk, VisitorTy<'a>),
+                        &mut visitor,
+                    );
+                }
+
                 let global = $sandbox_kind::downcast_global_state(engine.state.sandbox_global.as_ref().unwrap());
                 let module = visitor.finish_compilation(global, &engine.state.compiler_cache, aux)?;
                 Some(CompiledModuleKind::$module_kind(module))
@@ -435,11 +551,18 @@ impl Module {
             blob.stack_size(),
             memory_map.stack_range().len(),
         );
+        log::debug!(
+            "  Memory map:     Aux: 0x{:08x}..0x{:08x} ({}/{} bytes requested)",
+            memory_map.aux_data_range().start,
+            memory_map.aux_data_range().end,
+            config.aux_data_size(),
+            memory_map.aux_data_range().len(),
+        );
 
         let page_shift = memory_map.page_size().ilog2();
         let page_size_mask = (1 << page_shift) - 1;
 
-        Ok(Module(Arc::new(ModulePrivate {
+        let module = Arc::new(ModulePrivate {
             engine_state: Some(Arc::clone(&engine.state)),
 
             blob,
@@ -450,18 +573,42 @@ impl Module {
             is_strict: config.is_strict,
             step_tracing: config.step_tracing,
             dynamic_paging: config.dynamic_paging,
+            instruction_set,
             crosscheck: engine.crosscheck,
             page_size_mask,
             page_shift,
-        })))
+
+            #[cfg(feature = "module-cache")]
+            module_key,
+        });
+
+        #[cfg(feature = "module-cache")]
+        if let Some(module_key) = module_key {
+            return Ok(engine.state.module_cache.insert(module_key, module));
+        }
+
+        Ok(Module(Some(module)))
+    }
+
+    /// Fetches a cached module for the given `blob`.
+    #[cfg_attr(not(feature = "module-cache"), allow(unused_variables))]
+    pub fn from_cache(engine: &Engine, config: &ModuleConfig, blob: &ProgramBlob) -> Option<Self> {
+        #[cfg(feature = "module-cache")]
+        {
+            let (_, module) = engine.state.module_cache.get(config, blob);
+            module
+        }
+
+        #[cfg(not(feature = "module-cache"))]
+        None
     }
 
     /// Instantiates a new module.
     pub fn instantiate(&self) -> Result<RawInstance, Error> {
-        let compiled_module = &self.0.compiled_module;
+        let compiled_module = &self.state().compiled_module;
         let backend = if_compiler_is_supported! {
             {{
-                let Some(engine_state) = self.0.engine_state.as_ref() else {
+                let Some(engine_state) = self.state().engine_state.as_ref() else {
                     return Err(Error::from_static_str("failed to instantiate module: empty module"));
                 };
 
@@ -490,7 +637,7 @@ impl Module {
             None => InstanceBackend::Interpreted(InterpretedInstance::new_from_module(self.clone(), false)),
         };
 
-        let crosscheck_instance = if self.0.crosscheck && !matches!(backend, InstanceBackend::Interpreted(..)) {
+        let crosscheck_instance = if self.state().crosscheck && !matches!(backend, InstanceBackend::Interpreted(..)) {
             Some(Box::new(InterpretedInstance::new_from_module(self.clone(), true)))
         } else {
             None
@@ -505,7 +652,7 @@ impl Module {
 
     /// The program's memory map.
     pub fn memory_map(&self) -> &MemoryMap {
-        &self.0.memory_map
+        &self.state().memory_map
     }
 
     /// The default stack pointer for the module.
@@ -515,12 +662,12 @@ impl Module {
 
     /// Returns the module's exports.
     pub fn exports(&self) -> impl Iterator<Item = crate::program::ProgramExport<&[u8]>> + Clone {
-        self.0.blob.exports()
+        self.state().blob.exports()
     }
 
     /// Returns the module's imports.
     pub fn imports(&self) -> Imports {
-        self.0.blob.imports()
+        self.state().blob.imports()
     }
 
     /// The raw machine code of the compiled module.
@@ -530,7 +677,7 @@ impl Module {
     pub fn machine_code(&self) -> Option<&[u8]> {
         if_compiler_is_supported! {
             {
-                match self.0.compiled_module {
+                match self.state().compiled_module {
                     #[cfg(target_os = "linux")]
                     CompiledModuleKind::Linux(ref module) => Some(module.machine_code()),
                     #[cfg(feature = "generic-sandbox")]
@@ -550,7 +697,7 @@ impl Module {
     pub fn machine_code_origin(&self) -> Option<u64> {
         if_compiler_is_supported! {
             {
-                match self.0.compiled_module {
+                match self.state().compiled_module {
                     #[cfg(target_os = "linux")]
                     CompiledModuleKind::Linux(..) => Some(polkavm_common::zygote::VM_ADDR_NATIVE_CODE),
                     #[cfg(feature = "generic-sandbox")]
@@ -579,7 +726,7 @@ impl Module {
     pub fn program_counter_to_machine_code_offset(&self) -> Option<&[(ProgramCounter, u32)]> {
         if_compiler_is_supported! {
             {
-                match self.0.compiled_module {
+                match self.state().compiled_module {
                     #[cfg(target_os = "linux")]
                     CompiledModuleKind::Linux(ref module) => Some(module.program_counter_to_machine_code_offset()),
                     #[cfg(feature = "generic-sandbox")]
@@ -597,14 +744,18 @@ impl Module {
     /// Will return `None` if the given `code_offset` is invalid.
     /// Mostly only useful for debugging.
     pub fn calculate_gas_cost_for(&self, code_offset: ProgramCounter) -> Option<Gas> {
-        let instructions = self.instructions_at(code_offset)?;
-        Some(i64::from(crate::gas::calculate_for_block(instructions).0))
+        if !self.is_jump_target_valid(code_offset) {
+            return None;
+        }
+
+        let gas = crate::gas::calculate_for_block(self.instructions_bounded_at(code_offset));
+        Some(i64::from(gas.0))
     }
 
     pub(crate) fn debug_print_location(&self, log_level: log::Level, pc: ProgramCounter) {
         log::log!(log_level, "  At #{pc}:");
 
-        let Ok(Some(mut line_program)) = self.0.blob.get_debug_line_program_at(pc) else {
+        let Ok(Some(mut line_program)) = self.state().blob.get_debug_line_program_at(pc) else {
             log::log!(log_level, "    (no location available)");
             return;
         };
@@ -652,12 +803,11 @@ if_compiler_is_supported! {
     }
 }
 
+/// The host failed to access the guest's memory.
 #[derive(Debug)]
-#[non_exhaustive]
-pub struct MemoryAccessError {
-    pub address: u32,
-    pub length: u64,
-    pub error: Cow<'static, str>,
+pub enum MemoryAccessError {
+    OutOfRangeAccess { address: u32, length: u64 },
+    Error(Error),
 }
 
 #[cfg(feature = "std")]
@@ -665,14 +815,20 @@ impl std::error::Error for MemoryAccessError {}
 
 impl core::fmt::Display for MemoryAccessError {
     fn fmt(&self, fmt: &mut core::fmt::Formatter) -> core::fmt::Result {
-        write!(
-            fmt,
-            "out of range memory access in 0x{:x}-0x{:x} ({} bytes): {}",
-            self.address,
-            u64::from(self.address) + self.length,
-            self.length,
-            self.error
-        )
+        match self {
+            MemoryAccessError::OutOfRangeAccess { address, length } => {
+                write!(
+                    fmt,
+                    "out of range memory access in 0x{:x}-0x{:x} ({} bytes)",
+                    address,
+                    u64::from(*address) + length,
+                    length
+                )
+            }
+            MemoryAccessError::Error(error) => {
+                write!(fmt, "memory access failed: {error}")
+            }
+        }
     }
 }
 
@@ -779,7 +935,7 @@ impl RawInstance {
                 assert_eq!(self.program_counter(), crosscheck_program_counter);
                 assert_eq!(self.next_program_counter(), crosscheck_next_program_counter);
 
-                if is_step && !self.module().0.step_tracing {
+                if is_step && !self.module().state().step_tracing {
                     continue;
                 }
             }
@@ -867,23 +1023,52 @@ impl RawInstance {
     where
         B: ?Sized + AsUninitSliceMut,
     {
+        let slice = buffer.as_uninit_slice_mut();
+        if slice.is_empty() {
+            // SAFETY: The slice is empty so it's always safe to assume it's initialized.
+            unsafe {
+                return Ok(polkavm_common::utils::slice_assume_init_mut(slice));
+            }
+        }
+
         if address < 0x10000 {
-            return Err(MemoryAccessError {
+            return Err(MemoryAccessError::OutOfRangeAccess {
                 address,
-                length: buffer.as_uninit_slice_mut().len() as u64,
-                error: "out of range read (accessing addresses lower than 0x10000 is forbidden)".into(),
+                length: slice.len() as u64,
             });
         }
 
-        if u64::from(address) + buffer.as_uninit_slice_mut().len() as u64 > 0x100000000 {
-            return Err(MemoryAccessError {
+        if u64::from(address) + slice.len() as u64 > 0x100000000 {
+            return Err(MemoryAccessError::OutOfRangeAccess {
                 address,
-                length: buffer.as_uninit_slice_mut().len() as u64,
-                error: "out of range read".into(),
+                length: slice.len() as u64,
             });
         }
 
-        access_backend!(self.backend, |backend| backend.read_memory_into(address, buffer))
+        let length = slice.len();
+        let result = access_backend!(self.backend, |backend| backend.read_memory_into(address, slice));
+        if let Some(ref crosscheck) = self.crosscheck_instance {
+            let mut expected_data: Vec<core::mem::MaybeUninit<u8>> = alloc::vec![core::mem::MaybeUninit::new(0xfa); length];
+            let expected_result = crosscheck.read_memory_into(address, &mut expected_data);
+            let expected_success = expected_result.is_ok();
+            let success = result.is_ok();
+            let results_match = match (&result, &expected_result) {
+                (Ok(result), Ok(expected_result)) => result == expected_result,
+                (Err(_), Err(_)) => true,
+                _ => false,
+            };
+            if !results_match {
+                let address_end = u64::from(address) + length as u64;
+                if cfg!(debug_assertions) {
+                    if let (Ok(result), Ok(expected_result)) = (result, expected_result) {
+                        log::trace!("read_memory result (interpreter): {expected_result:?}");
+                        log::trace!("read_memory result (backend):     {result:?}");
+                    }
+                }
+                panic!("read_memory: crosscheck mismatch, range = 0x{address:x}..0x{address_end:x}, interpreter = {expected_success}, backend = {success}");
+            }
+        }
+        result
     }
 
     /// Writes into the VM's memory.
@@ -891,19 +1076,21 @@ impl RawInstance {
     /// When dynamic paging is enabled calling this can be used to resolve a segfault. It can also
     /// be used to preemptively initialize pages for which no segfault is currently triggered.
     pub fn write_memory(&mut self, address: u32, data: &[u8]) -> Result<(), MemoryAccessError> {
+        if data.is_empty() {
+            return Ok(());
+        }
+
         if address < 0x10000 {
-            return Err(MemoryAccessError {
+            return Err(MemoryAccessError::OutOfRangeAccess {
                 address,
                 length: data.len() as u64,
-                error: "out of range write (accessing addresses lower than 0x10000 is forbidden)".into(),
             });
         }
 
         if u64::from(address) + data.len() as u64 > 0x100000000 {
-            return Err(MemoryAccessError {
+            return Err(MemoryAccessError::OutOfRangeAccess {
                 address,
                 length: data.len() as u64,
-                error: "out of range write".into(),
             });
         }
 
@@ -960,31 +1147,64 @@ impl RawInstance {
         self.write_memory(address, &value.to_le_bytes())
     }
 
+    /// A convenience function to read an `u16` from the VM's memory.
+    ///
+    /// This is equivalent to calling [`RawInstance::read_memory_into`].
+    pub fn read_u16(&self, address: u32) -> Result<u16, MemoryAccessError> {
+        let mut buffer = [0; 2];
+        self.read_memory_into(address, &mut buffer)?;
+
+        Ok(u16::from_le_bytes(buffer))
+    }
+
+    /// A convenience function to write an `u16` into the VM's memory.
+    ///
+    /// This is equivalent to calling [`RawInstance::write_memory`].
+    pub fn write_u16(&mut self, address: u32, value: u16) -> Result<(), MemoryAccessError> {
+        self.write_memory(address, &value.to_le_bytes())
+    }
+
+    /// A convenience function to read an `u8` from the VM's memory.
+    ///
+    /// This is equivalent to calling [`RawInstance::read_memory_into`].
+    pub fn read_u8(&self, address: u32) -> Result<u8, MemoryAccessError> {
+        let mut buffer = [0; 1];
+        self.read_memory_into(address, &mut buffer)?;
+
+        Ok(buffer[0])
+    }
+
+    /// A convenience function to write an `u8` into the VM's memory.
+    ///
+    /// This is equivalent to calling [`RawInstance::write_memory`].
+    pub fn write_u8(&mut self, address: u32, value: u8) -> Result<(), MemoryAccessError> {
+        self.write_memory(address, &[value])
+    }
+
     /// Fills the given memory region with zeros.
     ///
     /// `address` must be greater or equal to 0x10000 and `address + length` cannot be greater than 0x100000000.
+    /// If `length` is zero then this call has no effect and will always succeed.
     ///
     /// When dynamic paging is enabled calling this can be used to resolve a segfault. It can also
     /// be used to preemptively initialize pages for which no segfault is currently triggered.
     pub fn zero_memory(&mut self, address: u32, length: u32) -> Result<(), MemoryAccessError> {
+        if length == 0 {
+            return Ok(());
+        }
+
         if address < 0x10000 {
-            return Err(MemoryAccessError {
+            return Err(MemoryAccessError::OutOfRangeAccess {
                 address,
                 length: u64::from(length),
-                error: "out of range write (accessing addresses lower than 0x10000 is forbidden)".into(),
             });
         }
 
         if u64::from(address) + u64::from(length) > 0x100000000 {
-            return Err(MemoryAccessError {
+            return Err(MemoryAccessError::OutOfRangeAccess {
                 address,
                 length: u64::from(length),
-                error: "out of range write (address overflow)".into(),
             });
-        }
-
-        if length == 0 {
-            return Ok(());
         }
 
         let result = access_backend!(self.backend, |mut backend| backend.zero_memory(address, length));
@@ -1004,7 +1224,12 @@ impl RawInstance {
     /// Frees the given page(s).
     ///
     /// `address` must be a multiple of the page size. The value of `length` will be rounded up to the nearest multiple of the page size.
+    /// If `length` is zero then this call has no effect and will always succeed.
     pub fn free_pages(&mut self, address: u32, length: u32) -> Result<(), Error> {
+        if length == 0 {
+            return Ok(());
+        }
+
         if !self.module.is_multiple_of_page_size(address) {
             return Err("address not a multiple of page size".into());
         }
@@ -1042,15 +1267,16 @@ impl RawInstance {
     ///
     /// This function will:
     ///   1) clear all registers to zero,
-    ///   2) initialize `RA` and `SP` to `0xffff0000`,
-    ///   3) set the program counter.
+    ///   2) initialize `RA` to `0xffff0000`,
+    ///   3) initialize `SP` to its default value,
+    ///   4) set the program counter.
     ///
     /// Will panic if `args` has more than 9 elements.
     pub fn prepare_call_untyped(&mut self, pc: ProgramCounter, args: &[RegValue]) {
         assert!(args.len() <= Reg::ARG_REGS.len(), "too many arguments");
 
         self.clear_regs();
-        self.set_reg(Reg::SP, VM_ADDR_USER_STACK_HIGH);
+        self.set_reg(Reg::SP, self.module.default_sp());
         self.set_reg(Reg::RA, VM_ADDR_RETURN_TO_HOST);
         self.set_next_program_counter(pc);
 

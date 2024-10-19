@@ -7,7 +7,11 @@
 
 #define POLKAVM_REGS_FOR_TY_void 0
 #define POLKAVM_REGS_FOR_TY_i32 1
-#define POLKAVM_REGS_FOR_TY_i64 2
+#ifdef _LP64
+    #define POLKAVM_REGS_FOR_TY_i64 1
+#else
+    #define POLKAVM_REGS_FOR_TY_i64 2
+#endif
 
 #define POLKAVM_REGS_FOR_TY_int8_t    POLKAVM_REGS_FOR_TY_i32
 #define POLKAVM_REGS_FOR_TY_uint8_t   POLKAVM_REGS_FOR_TY_i32
@@ -105,6 +109,26 @@ struct PolkaVM_Metadata {
     unsigned char output_regs;
 } __attribute__ ((packed));
 
+#ifdef _LP64
+    #define POLKAVM_EXPORT_DEF()  \
+        ".quad %[metadata]\n" \
+        ".quad %[function]\n"
+#else
+    #define POLKAVM_EXPORT_DEF()  \
+        ".word %[metadata]\n" \
+        ".word %[function]\n"
+#endif
+
+#ifdef _LP64
+    #define POLKAVM_IMPORT_DEF()  \
+        ".quad 0x0000000b\n" \
+        ".quad %[metadata]\n"
+#else
+    #define POLKAVM_IMPORT_DEF()  \
+        ".word 0x0000000b\n" \
+        ".word %[metadata]\n"
+#endif
+
 #define POLKAVM_EXPORT(arg_return_ty, fn_name, ...) \
 static struct PolkaVM_Metadata POLKAVM_JOIN(fn_name, __EXPORT_METADATA) __attribute__ ((section(".polkavm_metadata"))) = { \
     1, 0, sizeof(#fn_name) - 1, #fn_name, POLKAVM_COUNT_REGS(__VA_ARGS__), POLKAVM_COUNT_REGS(arg_return_ty) \
@@ -113,8 +137,7 @@ static void __attribute__ ((naked, used)) POLKAVM_UNIQUE(polkavm_export_dummy)()
     __asm__( \
         ".pushsection .polkavm_exports,\"R\",@note\n" \
         ".byte 1\n" \
-        ".word %[metadata]\n" \
-        ".word %[function]\n" \
+        POLKAVM_EXPORT_DEF() \
         ".popsection\n" \
         : \
         : \
@@ -130,8 +153,7 @@ static struct PolkaVM_Metadata POLKAVM_JOIN(fn_name, __IMPORT_METADATA) __attrib
 }; \
 static arg_return_ty __attribute__ ((naked)) fn_name(POLKAVM_IMPORT_ARGS_IMPL(__VA_ARGS__)) { \
     __asm__( \
-        ".word 0x0000000b\n" \
-        ".word %[metadata]\n" \
+        POLKAVM_IMPORT_DEF() \
         "ret\n" \
         : \
         : \

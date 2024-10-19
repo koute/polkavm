@@ -20,6 +20,11 @@ impl<'a> Reader<'a> {
         Ok(u32::from_le_bytes([v[0], v[1], v[2], v[3]]))
     }
 
+    pub fn read_u64(&mut self) -> Result<u64, &'static str> {
+        let v = self.read(8)?;
+        Ok(u64::from_le_bytes([v[0], v[1], v[2], v[3], v[4], v[5], v[6], v[7]]))
+    }
+
     pub fn offset(&self) -> usize {
         self.bytes_consumed
     }

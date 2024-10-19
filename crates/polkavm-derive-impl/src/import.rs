@@ -334,6 +334,27 @@ pub fn polkavm_import(attributes: ImportBlockAttributes, input: syn::ItemForeign
                             }
                         }
 
+                        #[cfg(target_arch = "riscv64")]
+                        impl #abi_path::private::ImportSymbol for Sym {
+                            extern fn trampoline(a0: u64, a1: u64, a2: u64, a3: u64, a4: u64, a5: u64) {
+                                unsafe {
+                                    core::arch::asm!(
+                                        ".insn r 0xb, 0, 0, zero, zero, zero\n",
+                                        ".8byte {metadata}\n",
+                                        "ret\n",
+                                        in("a0") a0,
+                                        in("a1") a1,
+                                        in("a2") a2,
+                                        in("a3") a3,
+                                        in("a4") a4,
+                                        in("a5") a5,
+                                        options(noreturn),
+                                        metadata = sym METADATA,
+                                    );
+                                }
+                            }
+                        }
+
                         let result = #abi_path::private::CallImport::call_import::<Sym>(regs);
                         let result = #abi_path::private::IntoTuple::into_tuple(result.0, result.1);
                         #abi_path::FromHost::from_host(result)
