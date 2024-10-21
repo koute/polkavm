@@ -1,5 +1,7 @@
 #![allow(clippy::undocumented_unsafe_blocks)]
 
+use polkavm_common::cast::cast;
+
 use crate::mutex::Mutex;
 use crate::sandbox::get_native_page_size;
 use alloc::sync::Arc;
@@ -66,7 +68,7 @@ impl ShmAllocation {
     }
 
     pub fn offset(&self) -> usize {
-        (self.allocation.offset() << self.allocator.0.page_shift) as usize
+        cast(self.allocation.offset() << self.allocator.0.page_shift).to_usize()
     }
 
     pub fn as_ptr(&self) -> *const u8 {
@@ -76,7 +78,7 @@ impl ShmAllocation {
                 .mmap
                 .as_ptr()
                 .cast::<u8>()
-                .add((self.allocation.offset() << self.allocator.0.page_shift) as usize)
+                .add(cast(self.allocation.offset() << self.allocator.0.page_shift).to_usize())
         }
     }
 
@@ -87,12 +89,12 @@ impl ShmAllocation {
                 .mmap
                 .as_mut_ptr()
                 .cast::<u8>()
-                .add((self.allocation.offset() << self.allocator.0.page_shift) as usize)
+                .add(cast(self.allocation.offset() << self.allocator.0.page_shift).to_usize())
         }
     }
 
     pub fn len(&self) -> usize {
-        (self.allocation.size() << self.allocator.0.page_shift) as usize
+        cast(self.allocation.size() << self.allocator.0.page_shift).to_usize()
     }
 
     #[allow(dead_code)]
@@ -124,7 +126,7 @@ impl ShmAllocator {
         let mmap = unsafe {
             linux_raw::Mmap::map(
                 core::ptr::null_mut(),
-                u32::MAX as usize,
+                cast(u32::MAX).to_usize(),
                 linux_raw::PROT_READ | linux_raw::PROT_WRITE,
                 linux_raw::MAP_SHARED,
                 Some(fd.borrow()),

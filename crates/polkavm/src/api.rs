@@ -4,6 +4,7 @@ use alloc::sync::Arc;
 use alloc::vec::Vec;
 
 use polkavm_common::abi::{MemoryMap, MemoryMapBuilder, VM_ADDR_RETURN_TO_HOST};
+use polkavm_common::cast::cast;
 use polkavm_common::program::{
     build_static_dispatch_table, FrameKind, ISA32_V1_NoSbrk, Imports, InstructionSet, Instructions, JumpTable, Opcode, ProgramBlob, Reg,
     ISA32_V1, ISA64_V1,
@@ -294,7 +295,7 @@ impl Module {
     }
 
     pub(crate) fn code_len(&self) -> u32 {
-        self.state().blob.code().len() as u32
+        cast(self.state().blob.code().len()).assert_always_fits_in_u32()
     }
 
     pub(crate) fn instructions_bounded_at(&self, offset: ProgramCounter) -> Instructions<RuntimeInstructionSet> {
@@ -389,7 +390,7 @@ impl Module {
 
             log::trace!("Checking jump table...");
             for (nth_entry, code_offset) in blob.jump_table().iter().enumerate() {
-                if code_offset.0 as usize >= blob.code().len() {
+                if cast(code_offset.0).to_usize() >= blob.code().len() {
                     log::trace!(
                         "  Invalid jump table entry #{nth_entry}: {code_offset} (should be less than {})",
                         blob.code().len()
@@ -406,7 +407,7 @@ impl Module {
             let mut exports = Vec::with_capacity(1);
             for export in blob.exports() {
                 log::trace!("  Export at {}: {}", export.program_counter(), export.symbol());
-                if config.is_strict && export.program_counter().0 as usize >= blob.code().len() {
+                if config.is_strict && cast(export.program_counter().0).to_usize() >= blob.code().len() {
                     bail!(
                         "out of range export found; export {} points to code offset {}, while the code blob is only {} bytes",
                         export.symbol(),
@@ -448,7 +449,7 @@ impl Module {
                     blob.bitmask(),
                     &exports,
                     config.step_tracing || engine.crosscheck,
-                    blob.code().len() as u32,
+                    cast(blob.code().len()).assert_always_fits_in_u32(),
                     init,
                 )?;
 
@@ -534,7 +535,7 @@ impl Module {
             memory_map.ro_data_range().end,
             blob.ro_data().len(),
             memory_map.ro_data_range().len(),
-            memory_map.ro_data_range().start as usize + blob.ro_data().len(),
+            cast(memory_map.ro_data_range().start).to_usize() + blob.ro_data().len(),
         );
         log::debug!(
             "  Memory map: RW data: 0x{:08x}..0x{:08x} ({}/{} bytes, non-zero until 0x{:08x})",
@@ -542,7 +543,7 @@ impl Module {
             memory_map.rw_data_range().end,
             blob.rw_data().len(),
             memory_map.rw_data_range().len(),
-            memory_map.rw_data_range().start as usize + blob.rw_data().len(),
+            cast(memory_map.rw_data_range().start).to_usize() + blob.rw_data().len(),
         );
         log::debug!(
             "  Memory map:   Stack: 0x{:08x}..0x{:08x} ({}/{} bytes)",
@@ -1034,14 +1035,14 @@ impl RawInstance {
         if address < 0x10000 {
             return Err(MemoryAccessError::OutOfRangeAccess {
                 address,
-                length: slice.len() as u64,
+                length: cast(slice.len()).to_u64(),
             });
         }
 
-        if u64::from(address) + slice.len() as u64 > 0x100000000 {
+        if u64::from(address) + cast(slice.len()).to_u64() > 0x100000000 {
             return Err(MemoryAccessError::OutOfRangeAccess {
                 address,
-                length: slice.len() as u64,
+                length: cast(slice.len()).to_u64(),
             });
         }
 
@@ -1058,7 +1059,7 @@ impl RawInstance {
                 _ => false,
             };
             if !results_match {
-                let address_end = u64::from(address) + length as u64;
+                let address_end = u64::from(address) + cast(length).to_u64();
                 if cfg!(debug_assertions) {
                     if let (Ok(result), Ok(expected_result)) = (result, expected_result) {
                         log::trace!("read_memory result (interpreter): {expected_result:?}");
@@ -1083,14 +1084,14 @@ impl RawInstance {
         if address < 0x10000 {
             return Err(MemoryAccessError::OutOfRangeAccess {
                 address,
-                length: data.len() as u64,
+                length: cast(data.len()).to_u64(),
             });
         }
 
-        if u64::from(address) + data.len() as u64 > 0x100000000 {
+        if u64::from(address) + cast(data.len()).to_u64() > 0x100000000 {
             return Err(MemoryAccessError::OutOfRangeAccess {
                 address,
-                length: data.len() as u64,
+                length: cast(data.len()).to_u64(),
             });
         }
 
@@ -1100,7 +1101,7 @@ impl RawInstance {
             let expected_success = expected_result.is_ok();
             let success = result.is_ok();
             if success != expected_success {
-                let address_end = u64::from(address) + data.len() as u64;
+                let address_end = u64::from(address) + cast(data.len()).to_u64();
                 panic!("write_memory: crosscheck mismatch, range = 0x{address:x}..0x{address_end:x}, interpreter = {expected_success}, backend = {success}");
             }
         }
@@ -1111,7 +1112,7 @@ impl RawInstance {
     /// Reads the VM's memory.
     pub fn read_memory(&self, address: u32, length: u32) -> Result<Vec<u8>, MemoryAccessError> {
         let mut buffer = Vec::new();
-        buffer.reserve_exact(length as usize);
+        buffer.reserve_exact(cast(length).to_usize());
 
         let pointer = buffer.as_ptr();
         let slice = self.read_memory_into(address, buffer.spare_capacity_mut())?;
@@ -1119,12 +1120,12 @@ impl RawInstance {
         // Since `read_memory_into_slice` returns a `&mut [u8]` we can be sure it initialized the buffer
         // we've passed to it, as long as it's actually the same buffer we gave it.
         assert_eq!(slice.as_ptr(), pointer);
-        assert_eq!(slice.len(), length as usize);
+        assert_eq!(slice.len(), cast(length).to_usize());
 
         #[allow(unsafe_code)]
         // SAFETY: `read_memory_into_slice` initialized this buffer, and we've verified this with `assert`s.
         unsafe {
-            buffer.set_len(length as usize);
+            buffer.set_len(cast(length).to_usize());
         }
 
         Ok(buffer)
