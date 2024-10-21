@@ -3178,7 +3178,7 @@ fn perform_inlining(
                 }
             }
         }
-        ControlInst::Call { .. } | ControlInst::CallIndirect { .. } => unreachable!(),
+        ControlInst::Call { .. } => unreachable!(),
         _ => {}
     }
 
@@ -3371,8 +3371,8 @@ fn perform_dead_code_elimination(
             target_true, target_false, ..
         } => registers_needed_for_block[target_true.index()] | registers_needed_for_block[target_false.index()],
         // ...otherwise assume it'll need all of them.
-        ControlInst::Call { .. } | ControlInst::CallIndirect { .. } => unreachable!(),
-        ControlInst::JumpIndirect { .. } => RegMask::all(),
+        ControlInst::Call { .. } => unreachable!(),
+        ControlInst::CallIndirect { .. } | ControlInst::JumpIndirect { .. } => RegMask::all(),
     };
 
     let mut modified = false;
@@ -4362,6 +4362,32 @@ where
         modified = true;
     }
 
+    if let ControlInst::CallIndirect {
+        ra,
+        base,
+        offset: 0,
+        target_return,
+    } = all_blocks[current.index()].next.instruction
+    {
+        if let RegValue::CodeAddress(target) = regs.get_reg(base) {
+            if !modified_this_block {
+                references = gather_references(&all_blocks[current.index()]);
+                modified_this_block = true;
+                modified = true;
+            }
+
+            all_blocks[current.index()].ops.push((
+                all_blocks[current.index()].next.source.clone(),
+                BasicInst::LoadAddress {
+                    dst: ra,
+                    target: AnyTarget::Code(target_return),
+                },
+            ));
+
+            all_blocks[current.index()].next.instruction = ControlInst::Jump { target };
+        }
+    }
+
     while let Some(new_instruction) = regs.simplify_control_instruction(all_blocks[current.index()].next.instruction) {
         log::trace!(
             "Simplifying end of {current:?}: {:?} -> {:?}",
@@ -4397,7 +4423,7 @@ where
                     add_to_optimize_queue(all_blocks, reachability_graph, optimize_queue, target_true);
                     add_to_optimize_queue(all_blocks, reachability_graph, optimize_queue, target_false);
                 }
-                ControlInst::Call { .. } | ControlInst::CallIndirect { .. } => unreachable!(),
+                ControlInst::Call { .. } => unreachable!(),
                 _ => {}
             }
         }
@@ -4435,7 +4461,7 @@ fn perform_load_address_and_jump_fusion(all_blocks: &mut [BasicBlock<AnyTarget, 
                 target_return,
                 ra: dst,
             },
-            ControlInst::JumpIndirect { base, offset } => ControlInst::CallIndirect {
+            ControlInst::JumpIndirect { base, offset } if dst != base => ControlInst::CallIndirect {
                 base,
                 offset,
                 target_return,
@@ -4489,7 +4515,7 @@ fn optimize_program<H>(
                 target_return,
                 base,
                 offset,
-            } => {
+            } if ra != base => {
                 block.ops.push((
                     block.next.source.clone(),
                     BasicInst::LoadAddress {
