@@ -6767,6 +6767,12 @@ fn emit_code(
                 ));
             }
             ControlInst::JumpIndirect { base, offset } => {
+                if offset != 0 {
+                    return Err(ProgramFromElfError::other(
+                        "found an indirect jump with a non-zero offset - this would most likely result in a broken program; aborting",
+                    ));
+                }
+
                 code.push((block.next.source.clone(), Instruction::jump_indirect(conv_reg(base), offset as u32)));
             }
             ControlInst::CallIndirect {
@@ -6775,6 +6781,12 @@ fn emit_code(
                 offset,
                 target_return,
             } => {
+                if offset != 0 {
+                    return Err(ProgramFromElfError::other(
+                        "found an indirect call with a non-zero offset - this would most likely result in a broken program; aborting",
+                    ));
+                }
+
                 assert!(can_fallthrough_to_next_block.contains(block_target));
 
                 let target_return = get_jump_target(target_return)?
