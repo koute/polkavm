@@ -1552,7 +1552,7 @@ fn test_decode_srliw() {
 
 #[test]
 fn test_decode_sraiw() {
-    let mut config = DecoderConfig::new_64bit();
+    let config = DecoderConfig::new_64bit();
 
     assert_eq!(
         // sraiw   a0,a1,0xc
