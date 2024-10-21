@@ -3996,6 +3996,9 @@ impl BlockRegs {
                     });
                 }
             }
+            BasicInst::LoadAddressIndirect { dst, target } => {
+                return Some(BasicInst::LoadAddress { dst, target });
+            }
             BasicInst::StoreIndirect { kind, src, base, offset } => {
                 if let RegValue::DataAddress(base) = self.get_reg(base) {
                     return Some(BasicInst::StoreAbsolute {
