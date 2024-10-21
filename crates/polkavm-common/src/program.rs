@@ -77,6 +77,16 @@ pub enum Reg {
 
 impl Reg {
     #[inline]
+    pub const fn to_usize(self) -> usize {
+        self as usize
+    }
+
+    #[inline]
+    pub const fn to_u32(self) -> u32 {
+        self as u32
+    }
+
+    #[inline]
     pub const fn raw(self) -> RawReg {
         RawReg(self as u32)
     }

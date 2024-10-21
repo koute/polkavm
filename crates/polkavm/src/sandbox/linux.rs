@@ -4,6 +4,7 @@
 extern crate polkavm_linux_raw as linux_raw;
 
 use polkavm_common::{
+    cast::cast,
     program::Reg,
     utils::{align_to_next_page_usize, slice_assume_init_mut},
     zygote::{
@@ -1909,7 +1910,7 @@ impl super::Sandbox for Sandbox {
         log::trace!(
             "Reading memory: 0x{:x}-0x{:x} ({} bytes)",
             address,
-            address as usize + slice.len(),
+            cast(address).to_usize() + slice.len(),
             slice.len()
         );
 

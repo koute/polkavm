@@ -1,5 +1,7 @@
 #![allow(clippy::same_name_method)]
 
+use polkavm_common::cast::cast;
+
 pub trait RawMask:
     Copy
     + core::ops::BitOrAssign<Self>
@@ -73,7 +75,7 @@ impl<Primary, Secondary> Eq for BitIndex<Primary, Secondary> {}
 impl<Primary, Secondary> BitIndex<Primary, Secondary> {
     #[inline]
     pub fn index(&self) -> usize {
-        self.index as usize
+        cast(self.index).to_usize()
     }
 }
 
@@ -209,15 +211,15 @@ where
     /// Sets the bit at `index`.
     #[inline]
     pub fn set(&mut self, index: BitIndex<Primary, Secondary>) {
-        self.secondary_masks[index.primary as usize] |= Secondary::ONE << index.secondary;
+        self.secondary_masks[cast(index.primary).to_usize()] |= Secondary::ONE << index.secondary;
         self.primary_mask |= Primary::ONE << index.primary;
     }
 
     /// Clears the bit at `index`.
     #[inline]
     pub fn unset(&mut self, index: BitIndex<Primary, Secondary>) {
-        self.secondary_masks[index.primary as usize] &= !(Secondary::ONE << index.secondary);
-        if self.secondary_masks[index.primary as usize] == Secondary::ZERO {
+        self.secondary_masks[cast(index.primary).to_usize()] &= !(Secondary::ONE << index.secondary);
+        if self.secondary_masks[cast(index.primary).to_usize()] == Secondary::ZERO {
             self.primary_mask &= !(Primary::ONE << index.primary);
         }
     }
@@ -229,7 +231,7 @@ where
         let mut secondary = u32::MAX;
 
         if (self.primary_mask & (Primary::ONE << primary)) != Primary::ZERO {
-            secondary = self.secondary_masks[primary as usize].lowest_set_bit_after(min_index.secondary);
+            secondary = self.secondary_masks[cast(primary).to_usize()].lowest_set_bit_after(min_index.secondary);
         }
 
         if secondary == u32::MAX {
@@ -238,7 +240,7 @@ where
                 return None;
             }
 
-            secondary = self.secondary_masks[primary as usize].trailing_zeros();
+            secondary = self.secondary_masks[cast(primary).to_usize()].trailing_zeros();
         }
 
         Some(BitIndex {

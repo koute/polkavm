@@ -1,5 +1,6 @@
 #![allow(unknown_lints)] // Because of `non_local_definitions` on older rustc versions.
 #![allow(non_local_definitions)]
+#![deny(clippy::as_conversions)]
 use crate::api::{MemoryAccessError, Module, RegValue};
 use crate::error::Error;
 use crate::gas::GasVisitor;
@@ -12,11 +13,12 @@ use alloc::vec::Vec;
 use core::mem::MaybeUninit;
 use core::num::NonZeroU32;
 use polkavm_common::abi::VM_ADDR_RETURN_TO_HOST;
+use polkavm_common::cast::cast;
 use polkavm_common::operation::*;
 use polkavm_common::program::{asm, InstructionVisitor, RawReg, Reg};
 use polkavm_common::utils::{align_to_next_page_usize, byte_slice_init, slice_assume_init_mut};
 
-type Target = usize;
+type Target = u32;
 
 #[derive(Copy, Clone)]
 pub enum RegImm {
@@ -66,7 +68,7 @@ impl InterpretedModule {
     pub fn new(init: GuestInit) -> Result<Self, Error> {
         let memory_map = init.memory_map().map_err(Error::from_static_str)?;
         let mut ro_data: Vec<_> = init.ro_data.into();
-        ro_data.resize(memory_map.ro_data_size() as usize, 0);
+        ro_data.resize(cast(memory_map.ro_data_size()).to_usize(), 0);
 
         Ok(InterpretedModule {
             ro_data,
@@ -117,11 +119,11 @@ impl BasicMemory {
 
         if let Some(interpreted_module) = module.interpreted_module().as_ref() {
             self.rw_data.extend_from_slice(&interpreted_module.rw_data);
-            self.rw_data.resize(module.memory_map().rw_data_size() as usize, 0);
-            self.stack.resize(module.memory_map().stack_size() as usize, 0);
+            self.rw_data.resize(cast(module.memory_map().rw_data_size()).to_usize(), 0);
+            self.stack.resize(cast(module.memory_map().stack_size()).to_usize(), 0);
 
             // TODO: Do this lazily?
-            self.aux.resize(module.memory_map().aux_data_size() as usize, 0);
+            self.aux.resize(cast(module.memory_map().aux_data_size()).to_usize(), 0);
         }
     }
 
@@ -142,7 +144,7 @@ impl BasicMemory {
         };
 
         let offset = address - start;
-        memory_slice.get(offset as usize..offset as usize + length as usize)
+        memory_slice.get(cast(offset).to_usize()..cast(offset).to_usize() + cast(length).to_usize())
     }
 
     #[inline]
@@ -159,8 +161,8 @@ impl BasicMemory {
         };
 
         self.is_memory_dirty = true;
-        let offset = (address - start) as usize;
-        memory_slice.get_mut(offset..offset + length as usize)
+        let offset = cast(address - start).to_usize();
+        memory_slice.get_mut(offset..offset + cast(length).to_usize())
     }
 
     fn sbrk(&mut self, module: &Module, size: u32) -> Option<u32> {
@@ -186,9 +188,9 @@ impl BasicMemory {
 
         self.heap_size = new_heap_size;
         let heap_top = memory_map.heap_base() + new_heap_size;
-        if heap_top as usize > memory_map.rw_data_address() as usize + self.rw_data.len() {
-            let new_size = align_to_next_page_usize(memory_map.page_size() as usize, heap_top as usize).unwrap()
-                - memory_map.rw_data_address() as usize;
+        if cast(heap_top).to_usize() > cast(memory_map.rw_data_address()).to_usize() + self.rw_data.len() {
+            let new_size = align_to_next_page_usize(cast(memory_map.page_size()).to_usize(), cast(heap_top).to_usize()).unwrap()
+                - cast(memory_map.rw_data_address()).to_usize();
             log::trace!("sbrk: growing memory: {} -> {}", self.rw_data.len(), new_size);
             self.rw_data.resize(new_size, 0);
         }
@@ -199,8 +201,8 @@ impl BasicMemory {
 
 fn empty_page(page_size: u32) -> Box<[u8]> {
     let mut page = Vec::new();
-    page.reserve_exact(page_size as usize);
-    page.resize(page_size as usize, 0);
+    page.reserve_exact(cast(page_size).to_usize());
+    page.resize(cast(page_size).to_usize(), 0);
     page.into()
 }
 
@@ -218,9 +220,16 @@ impl DynamicMemory {
     }
 }
 
+#[allow(clippy::as_conversions)]
+macro_rules! cast_handler {
+    ($e:expr) => {
+        $e as Handler
+    };
+}
+
 macro_rules! emit {
     ($self:ident, $handler_name:ident($($args:tt)*)) => {
-        $self.compiled_handlers.push(raw_handlers::$handler_name::<DEBUG> as Handler);
+        $self.compiled_handlers.push(cast_handler!(raw_handlers::$handler_name::<DEBUG>));
         $self.compiled_args.push(Args::$handler_name($($args)*));
     };
 }
@@ -252,28 +261,33 @@ fn each_page_impl(
     length: u32,
     mut callback: impl FnMut(u32, usize, usize, usize),
 ) {
-    let page_size = page_size as usize;
-    let mut page_address_lo = page_address_lo as usize;
-    let page_address_hi = page_address_hi as usize;
-    let length = length as usize;
+    let page_size = cast(page_size).to_usize();
+    let length = cast(length).to_usize();
 
-    let initial_page_offset = address as usize - page_address_lo;
+    let initial_page_offset = cast(address).to_usize() - cast(page_address_lo).to_usize();
     let initial_chunk_length = core::cmp::min(length, page_size - initial_page_offset);
-    callback(page_address_lo as u32, initial_page_offset, 0, initial_chunk_length);
+    callback(page_address_lo, initial_page_offset, 0, initial_chunk_length);
 
     if page_address_lo == page_address_hi {
         return;
     }
 
-    page_address_lo += page_size;
+    let mut page_address_lo = cast(page_address_lo).to_u64();
+    let page_address_hi = cast(page_address_hi).to_u64();
+    page_address_lo += cast(page_size).to_u64();
     let mut buffer_offset = initial_chunk_length;
     while page_address_lo < page_address_hi {
-        callback(page_address_lo as u32, 0, buffer_offset, page_size);
+        callback(cast(page_address_lo).assert_always_fits_in_u32(), 0, buffer_offset, page_size);
         buffer_offset += page_size;
-        page_address_lo += page_size;
+        page_address_lo += cast(page_size).to_u64();
     }
 
-    callback(page_address_lo as u32, 0, buffer_offset, length - buffer_offset)
+    callback(
+        cast(page_address_lo).assert_always_fits_in_u32(),
+        0,
+        buffer_offset,
+        length - buffer_offset,
+    )
 }
 
 #[test]
@@ -323,6 +337,17 @@ fn test_each_page() {
         (4096,    0,    96, 4096),
         (8192,    0,  4192,  808),
     ]);
+
+    #[rustfmt::skip]
+    assert_eq!(run(0xffffffff - 4095, 4096), alloc::vec![
+        (0xfffff000, 0, 0, 4096)
+    ]);
+
+    #[rustfmt::skip]
+    assert_eq!(run(0xffffffff - 4096, 4095), alloc::vec![
+        (0xffffe000, 4095, 0, 1),
+        (0xfffff000, 0, 1, 4094)
+    ]);
 }
 
 pub(crate) struct InterpretedInstance {
@@ -339,7 +364,7 @@ pub(crate) struct InterpretedInstance {
     compiled_offset_for_block: FlatMap<NonZeroU32>,
     compiled_handlers: Vec<Handler>,
     compiled_args: Vec<Args>,
-    compiled_offset: usize,
+    compiled_offset: u32,
     interrupt: InterruptKind,
     step_tracing: bool,
 }
@@ -371,11 +396,11 @@ impl InterpretedInstance {
     }
 
     pub fn reg(&self, reg: Reg) -> RegValue {
-        self.regs[reg as usize]
+        self.regs[reg.to_usize()]
     }
 
     pub fn set_reg(&mut self, reg: Reg, value: u32) {
-        self.regs[reg as usize] = value;
+        self.regs[reg.to_usize()] = value;
     }
 
     pub fn gas(&self) -> Gas {
@@ -415,10 +440,13 @@ impl InterpretedInstance {
         buffer: &'slice mut [MaybeUninit<u8>],
     ) -> Result<&'slice mut [u8], MemoryAccessError> {
         if !self.module.is_dynamic_paging() {
-            let Some(slice) = self.basic_memory.get_memory_slice(&self.module, address, buffer.len() as u32) else {
+            let Some(slice) = self
+                .basic_memory
+                .get_memory_slice(&self.module, address, cast(buffer.len()).assert_always_fits_in_u32())
+            else {
                 return Err(MemoryAccessError::OutOfRangeAccess {
                     address,
-                    length: buffer.len() as u64,
+                    length: cast(buffer.len()).to_u64(),
                 });
             };
 
@@ -427,10 +455,10 @@ impl InterpretedInstance {
             each_page(
                 &self.module,
                 address,
-                buffer.len() as u32,
+                cast(buffer.len()).assert_always_fits_in_u32(),
                 |page_address, page_offset, buffer_offset, length| {
                     assert!(buffer_offset + length <= buffer.len());
-                    assert!(page_offset + length <= self.module.memory_map().page_size() as usize);
+                    assert!(page_offset + length <= cast(self.module.memory_map().page_size()).to_usize());
                     let page = self.dynamic_memory.pages.get(&page_address);
 
                     // SAFETY: Buffers are non-overlapping and the ranges are in-bounds.
@@ -453,13 +481,13 @@ impl InterpretedInstance {
 
     pub fn write_memory(&mut self, address: u32, data: &[u8]) -> Result<(), MemoryAccessError> {
         if !self.module.is_dynamic_paging() {
-            let Some(slice) = self
-                .basic_memory
-                .get_memory_slice_mut::<true>(&self.module, address, data.len() as u32)
+            let Some(slice) =
+                self.basic_memory
+                    .get_memory_slice_mut::<true>(&self.module, address, cast(data.len()).assert_always_fits_in_u32())
             else {
                 return Err(MemoryAccessError::OutOfRangeAccess {
                     address,
-                    length: data.len() as u64,
+                    length: cast(data.len()).to_u64(),
                 });
             };
 
@@ -470,7 +498,7 @@ impl InterpretedInstance {
             each_page(
                 &self.module,
                 address,
-                data.len() as u32,
+                cast(data.len()).assert_always_fits_in_u32(),
                 move |page_address, page_offset, buffer_offset, length| {
                     let page = dynamic_memory.pages.entry(page_address).or_insert_with(|| empty_page(page_size));
                     page[page_offset..page_offset + length].copy_from_slice(&data[buffer_offset..buffer_offset + length]);
@@ -587,7 +615,7 @@ impl InterpretedInstance {
                 self.cycle_counter += 1;
             }
 
-            let handler = self.compiled_handlers[offset];
+            let handler = self.compiled_handlers[cast(offset).to_usize()];
             let mut visitor = Visitor { inner: self };
             if let Some(next_offset) = handler(&mut visitor) {
                 offset = next_offset;
@@ -622,7 +650,7 @@ impl InterpretedInstance {
 
     #[inline(always)]
     fn pack_target(index: usize, is_jump_target_valid: bool) -> NonZeroU32 {
-        let mut index = index as u32;
+        let mut index = cast(index).assert_always_fits_in_u32();
         if is_jump_target_valid {
             index |= 1 << 31;
         }
@@ -632,7 +660,7 @@ impl InterpretedInstance {
 
     #[inline(always)]
     fn unpack_target(value: NonZeroU32) -> (bool, Target) {
-        ((value.get() >> 31) == 1, ((value.get() << 1) >> 1) as usize)
+        ((value.get() >> 31) == 1, (value.get() << 1) >> 1)
     }
 
     /// Resolve a jump from *within* the program.
@@ -706,7 +734,10 @@ impl InterpretedInstance {
             return None;
         }
 
-        let origin = self.compiled_handlers.len();
+        let Ok(origin) = u32::try_from(self.compiled_handlers.len()) else {
+            panic!("internal compiled program counter overflow: the program is too big!");
+        };
+
         if DEBUG {
             log::debug!("Compiling block:");
         }
@@ -769,7 +800,7 @@ impl InterpretedInstance {
             self.compiled_args[index] = Args::charge_gas(program_counter, gas_cost);
         }
 
-        if self.compiled_handlers.len() == origin {
+        if self.compiled_handlers.len() == cast(origin).to_usize() {
             return None;
         }
 
@@ -800,7 +831,7 @@ impl<'a> Visitor<'a> {
     #[inline(always)]
     fn get(&self, regimm: impl IntoRegImm) -> u32 {
         match regimm.into() {
-            RegImm::Reg(reg) => self.inner.regs[reg as usize],
+            RegImm::Reg(reg) => self.inner.regs[reg.to_usize()],
             RegImm::Imm(value) => value,
         }
     }
@@ -816,7 +847,7 @@ impl<'a> Visitor<'a> {
             log::trace!("  {dst} = 0x{value:x}");
         }
 
-        self.inner.regs[dst as usize] = value;
+        self.inner.regs[dst.to_usize()] = value;
     }
 
     #[inline(always)]
@@ -873,8 +904,8 @@ impl<'a> Visitor<'a> {
         debug_assert_eq!(IS_DYNAMIC, self.inner.module.is_dynamic_paging());
         assert!(core::mem::size_of::<T>() >= 1);
 
-        let address = base.map_or(0, |base| self.inner.regs[base as usize]).wrapping_add(offset);
-        let length = core::mem::size_of::<T>() as u32;
+        let address = base.map_or(0, |base| self.inner.regs[base.to_usize()]).wrapping_add(offset);
+        let length = cast(core::mem::size_of::<T>()).assert_always_fits_in_u32();
         let value = if !IS_DYNAMIC {
             let Some(slice) = self.inner.basic_memory.get_memory_slice(&self.inner.module, address, length) else {
                 if DEBUG {
@@ -897,7 +928,7 @@ impl<'a> Visitor<'a> {
             let page_address_hi = self.inner.module.round_to_page_size_down(address_end - 1);
             if page_address_lo == page_address_hi {
                 if let Some(page) = self.inner.dynamic_memory.pages.get_mut(&page_address_lo) {
-                    let offset = address as usize - page_address_lo as usize;
+                    let offset = cast(address).to_usize() - cast(page_address_lo).to_usize();
                     T::from_slice(&page[offset..offset + core::mem::size_of::<T>()])
                 } else {
                     return self.segfault_impl(program_counter, page_address_lo);
@@ -909,8 +940,8 @@ impl<'a> Visitor<'a> {
 
                 match (lo, hi) {
                     (Some((_, lo)), Some((_, hi))) => {
-                        let page_size = self.inner.module.memory_map().page_size() as usize;
-                        let lo_len = page_address_hi as usize - address as usize;
+                        let page_size = cast(self.inner.module.memory_map().page_size()).to_usize();
+                        let lo_len = cast(page_address_hi).to_usize() - cast(address).to_usize();
                         let hi_len = core::mem::size_of::<T>() - lo_len;
                         let mut buffer = [0; 4];
                         buffer[..lo_len].copy_from_slice(&lo[page_size - lo_len..]);
@@ -951,10 +982,10 @@ impl<'a> Visitor<'a> {
         debug_assert_eq!(IS_DYNAMIC, self.inner.module.is_dynamic_paging());
         assert!(core::mem::size_of::<T>() >= 1);
 
-        let address = base.map_or(0, |base| self.inner.regs[base as usize]).wrapping_add(offset);
+        let address = base.map_or(0, |base| self.inner.regs[base.to_usize()]).wrapping_add(offset);
         let value = match src.into() {
             RegImm::Reg(src) => {
-                let value = self.inner.regs[src as usize];
+                let value = self.inner.regs[src.to_usize()];
                 if DEBUG {
                     log::trace!("  {kind} [0x{address:x}] = {src} = 0x{value:x}", kind = core::any::type_name::<T>());
                 }
@@ -970,7 +1001,7 @@ impl<'a> Visitor<'a> {
             }
         };
 
-        let length = core::mem::size_of::<T>() as u32;
+        let length = cast(core::mem::size_of::<T>()).assert_always_fits_in_u32();
         let value = T::into_bytes(value);
 
         if !IS_DYNAMIC {
@@ -998,7 +1029,7 @@ impl<'a> Visitor<'a> {
             let page_address_hi = self.inner.module.round_to_page_size_down(address_end - 1);
             if page_address_lo == page_address_hi {
                 if let Some(page) = self.inner.dynamic_memory.pages.get_mut(&page_address_lo) {
-                    let offset = address as usize - page_address_lo as usize;
+                    let offset = cast(address).to_usize() - cast(page_address_lo).to_usize();
                     let value = value.as_ref();
                     page[offset..offset + value.len()].copy_from_slice(value);
                 } else {
@@ -1012,8 +1043,8 @@ impl<'a> Visitor<'a> {
                 match (lo, hi) {
                     (Some((_, lo)), Some((_, hi))) => {
                         let value = value.as_ref();
-                        let page_size = self.inner.module.memory_map().page_size() as usize;
-                        let lo_len = page_address_hi as usize - address as usize;
+                        let page_size = cast(self.inner.module.memory_map().page_size()).to_usize();
+                        let lo_len = cast(page_address_hi).to_usize() - cast(address).to_usize();
                         let hi_len = value.len() - lo_len;
                         lo[page_size - lo_len..].copy_from_slice(&value[..lo_len]);
                         hi[..hi_len].copy_from_slice(&value[lo_len..]);
@@ -1084,7 +1115,9 @@ impl LoadTy for u8 {
 
 impl LoadTy for i8 {
     fn from_slice(xs: &[u8]) -> u32 {
-        i32::from(xs[0] as i8) as u32
+        let value = cast(xs[0]).to_signed();
+        let value = cast(value).to_i32_sign_extend();
+        cast(value).to_unsigned()
     }
 }
 
@@ -1096,7 +1129,9 @@ impl LoadTy for u16 {
 
 impl LoadTy for i16 {
     fn from_slice(xs: &[u8]) -> u32 {
-        i32::from(i16::from_le_bytes([xs[0], xs[1]])) as u32
+        let value = i16::from_le_bytes([xs[0], xs[1]]);
+        let value = cast(value).to_i32_sign_extend();
+        cast(value).to_unsigned()
     }
 }
 
@@ -1116,7 +1151,7 @@ impl StoreTy for u8 {
 
     #[inline(always)]
     fn into_bytes(value: u32) -> Self::Array {
-        (value as u8).to_le_bytes()
+        cast(value).truncate_to_u8().to_le_bytes()
     }
 }
 
@@ -1125,7 +1160,7 @@ impl StoreTy for u16 {
 
     #[inline(always)]
     fn into_bytes(value: u32) -> Self::Array {
-        (value as u16).to_le_bytes()
+        cast(value).truncate_to_u16().to_le_bytes()
     }
 }
 
@@ -1170,7 +1205,7 @@ macro_rules! define_interpreter {
             }
         }
 
-        let args = $self.inner.compiled_args[$self.inner.compiled_offset];
+        let args = $self.inner.compiled_args[cast($self.inner.compiled_offset).to_usize()];
         let $a0 = args.a0;
         $body
     }};
@@ -1185,7 +1220,7 @@ macro_rules! define_interpreter {
             }
         }
 
-        let args = $self.inner.compiled_args[$self.inner.compiled_offset];
+        let args = $self.inner.compiled_args[cast($self.inner.compiled_offset).to_usize()];
         let $a0 = ProgramCounter(args.a0);
         $body
     }};
@@ -1201,7 +1236,7 @@ macro_rules! define_interpreter {
             }
         }
 
-        let args = $self.inner.compiled_args[$self.inner.compiled_offset];
+        let args = $self.inner.compiled_args[cast($self.inner.compiled_offset).to_usize()];
         let $a0 = ProgramCounter(args.a0);
         let $a1 = args.a1;
         $body
@@ -1218,7 +1253,7 @@ macro_rules! define_interpreter {
             }
         }
 
-        let args = $self.inner.compiled_args[$self.inner.compiled_offset];
+        let args = $self.inner.compiled_args[cast($self.inner.compiled_offset).to_usize()];
         let $a0 = ProgramCounter(args.a0);
         let $a1 = ProgramCounter(args.a1);
 
@@ -1237,7 +1272,7 @@ macro_rules! define_interpreter {
             }
         }
 
-        let args = $self.inner.compiled_args[$self.inner.compiled_offset];
+        let args = $self.inner.compiled_args[cast($self.inner.compiled_offset).to_usize()];
         let $a0 = ProgramCounter(args.a0);
         let $a1 = args.a1;
         let $a2 = args.a2;
@@ -1249,14 +1284,14 @@ macro_rules! define_interpreter {
             pub fn $handler_name(a0: ProgramCounter, a1: impl Into<Reg>, a2: u32) -> Args {
                 Args {
                     a0: a0.0,
-                    a1: a1.into() as u32,
+                    a1: a1.into().to_u32(),
                     a2,
                     ..Args::default()
                 }
             }
         }
 
-        let args = $self.inner.compiled_args[$self.inner.compiled_offset];
+        let args = $self.inner.compiled_args[cast($self.inner.compiled_offset).to_usize()];
         let $a0 = ProgramCounter(args.a0);
         let $a1 = transmute_reg(args.a1);
         let $a2 = args.a2;
@@ -1269,7 +1304,7 @@ macro_rules! define_interpreter {
             pub fn $handler_name(a0: ProgramCounter, a1: impl Into<Reg>, a2: u32, a3: u32) -> Args {
                 Args {
                     a0: a0.0,
-                    a1: a1.into() as u32,
+                    a1: a1.into().to_u32(),
                     a2,
                     a3,
                     ..Args::default()
@@ -1277,7 +1312,7 @@ macro_rules! define_interpreter {
             }
         }
 
-        let args = $self.inner.compiled_args[$self.inner.compiled_offset];
+        let args = $self.inner.compiled_args[cast($self.inner.compiled_offset).to_usize()];
         let $a0 = ProgramCounter(args.a0);
         let $a1 = transmute_reg(args.a1);
         let $a2 = args.a2;
@@ -1291,15 +1326,15 @@ macro_rules! define_interpreter {
             pub fn $handler_name(a0: ProgramCounter, a1: impl Into<Reg>, a2: impl Into<Reg>, a3: u32) -> Args {
                 Args {
                     a0: a0.0,
-                    a1: a1.into() as u32,
-                    a2: a2.into() as u32,
+                    a1: a1.into().to_u32(),
+                    a2: a2.into().to_u32(),
                     a3,
                     ..Args::default()
                 }
             }
         }
 
-        let args = $self.inner.compiled_args[$self.inner.compiled_offset];
+        let args = $self.inner.compiled_args[cast($self.inner.compiled_offset).to_usize()];
         let $a0 = ProgramCounter(args.a0);
         let $a1 = transmute_reg(args.a1);
         let $a2 = transmute_reg(args.a2);
@@ -1313,7 +1348,7 @@ macro_rules! define_interpreter {
             pub fn $handler_name(a0: ProgramCounter, a1: impl Into<Reg>, a2: impl Into<Reg>, a3: u32, a4: u32) -> Args {
                 Args {
                     a0: a0.0,
-                    a1: a1.into() as u32 | ((a2.into() as u32) << 4),
+                    a1: a1.into().to_u32() | ((a2.into().to_u32()) << 4),
                     a2: a3,
                     a3: a4,
                     ..Args::default()
@@ -1321,7 +1356,7 @@ macro_rules! define_interpreter {
             }
         }
 
-        let args = $self.inner.compiled_args[$self.inner.compiled_offset];
+        let args = $self.inner.compiled_args[cast($self.inner.compiled_offset).to_usize()];
         let $a0 = ProgramCounter(args.a0);
         let $a1 = transmute_reg(args.a1 & 0b1111);
         let $a2 = transmute_reg(args.a1 >> 4);
@@ -1334,14 +1369,14 @@ macro_rules! define_interpreter {
         impl Args {
             pub fn $handler_name(a0: impl Into<Reg>, a1: impl Into<Reg>) -> Args {
                 Args {
-                    a0: a0.into() as u32,
-                    a1: a1.into() as u32,
+                    a0: a0.into().to_u32(),
+                    a1: a1.into().to_u32(),
                     ..Args::default()
                 }
             }
         }
 
-        let args = $self.inner.compiled_args[$self.inner.compiled_offset];
+        let args = $self.inner.compiled_args[cast($self.inner.compiled_offset).to_usize()];
         let $a0 = transmute_reg(args.a0);
         let $a1 = transmute_reg(args.a1);
         $body
@@ -1351,15 +1386,15 @@ macro_rules! define_interpreter {
         impl Args {
             pub fn $handler_name(a0: impl Into<Reg>, a1: impl Into<Reg>, a2: impl Into<Reg>) -> Args {
                 Args {
-                    a0: a0.into() as u32,
-                    a1: a1.into() as u32,
-                    a2: a2.into() as u32,
+                    a0: a0.into().to_u32(),
+                    a1: a1.into().to_u32(),
+                    a2: a2.into().to_u32(),
                     ..Args::default()
                 }
             }
         }
 
-        let args = $self.inner.compiled_args[$self.inner.compiled_offset];
+        let args = $self.inner.compiled_args[cast($self.inner.compiled_offset).to_usize()];
         let $a0 = transmute_reg(args.a0);
         let $a1 = transmute_reg(args.a1);
         let $a2 = transmute_reg(args.a2);
@@ -1370,15 +1405,15 @@ macro_rules! define_interpreter {
         impl Args {
             pub fn $handler_name(a0: impl Into<Reg>, a1: impl Into<Reg>, a2: u32) -> Args {
                 Args {
-                    a0: a0.into() as u32,
-                    a1: a1.into() as u32,
+                    a0: a0.into().to_u32(),
+                    a1: a1.into().to_u32(),
                     a2,
                     ..Args::default()
                 }
             }
         }
 
-        let args = $self.inner.compiled_args[$self.inner.compiled_offset];
+        let args = $self.inner.compiled_args[cast($self.inner.compiled_offset).to_usize()];
         let $a0 = transmute_reg(args.a0);
         let $a1 = transmute_reg(args.a1);
         let $a2 = args.a2;
@@ -1389,14 +1424,14 @@ macro_rules! define_interpreter {
         impl Args {
             pub fn $handler_name(a0: impl Into<Reg>, a1: u32) -> Args {
                 Args {
-                    a0: a0.into() as u32,
+                    a0: a0.into().to_u32(),
                     a1,
                     ..Args::default()
                 }
             }
         }
 
-        let args = $self.inner.compiled_args[$self.inner.compiled_offset];
+        let args = $self.inner.compiled_args[cast($self.inner.compiled_offset).to_usize()];
         let $a0 = transmute_reg(args.a0);
         let $a1 = args.a1;
         $body
@@ -1406,7 +1441,7 @@ macro_rules! define_interpreter {
         impl Args {
             pub fn $handler_name(a0: impl Into<Reg>, a1: u32, a2: u32) -> Args {
                 Args {
-                    a0: a0.into() as u32,
+                    a0: a0.into().to_u32(),
                     a1,
                     a2,
                     ..Args::default()
@@ -1414,7 +1449,7 @@ macro_rules! define_interpreter {
             }
         }
 
-        let args = $self.inner.compiled_args[$self.inner.compiled_offset];
+        let args = $self.inner.compiled_args[cast($self.inner.compiled_offset).to_usize()];
         let $a0 = transmute_reg(args.a0);
         let $a1 = args.a1;
         let $a2 = args.a2;
@@ -1425,14 +1460,14 @@ macro_rules! define_interpreter {
         impl Args {
             pub fn $handler_name(a0: Target) -> Args {
                 Args {
-                    a0: a0 as u32,
+                    a0,
                     ..Args::default()
                 }
             }
         }
 
-        let args = $self.inner.compiled_args[$self.inner.compiled_offset];
-        let $a0 = args.a0 as Target;
+        let args = $self.inner.compiled_args[cast($self.inner.compiled_offset).to_usize()];
+        let $a0 = args.a0;
         $body
     }};
 
@@ -1440,18 +1475,18 @@ macro_rules! define_interpreter {
         impl Args {
             pub fn $handler_name(a0: impl Into<Reg>, a1: impl Into<Reg>, a2: Target) -> Args {
                 Args {
-                    a0: a0.into() as u32,
-                    a1: a1.into() as u32,
-                    a2: a2 as u32,
+                    a0: a0.into().to_u32(),
+                    a1: a1.into().to_u32(),
+                    a2,
                     ..Args::default()
                 }
             }
         }
 
-        let args = $self.inner.compiled_args[$self.inner.compiled_offset];
+        let args = $self.inner.compiled_args[cast($self.inner.compiled_offset).to_usize()];
         let $a0 = transmute_reg(args.a0);
         let $a1 = transmute_reg(args.a1);
-        let $a2 = args.a2 as Target;
+        let $a2 = args.a2;
         $body
     }};
 
@@ -1460,20 +1495,20 @@ macro_rules! define_interpreter {
             #[allow(clippy::needless_update)]
             pub fn $handler_name(a0: impl Into<Reg>, a1: impl Into<Reg>, a2: Target, a3: Target) -> Args {
                 Args {
-                    a0: a0.into() as u32,
-                    a1: a1.into() as u32,
-                    a2: a2 as u32,
-                    a3: a3 as u32,
+                    a0: a0.into().to_u32(),
+                    a1: a1.into().to_u32(),
+                    a2,
+                    a3,
                     ..Args::default()
                 }
             }
         }
 
-        let args = $self.inner.compiled_args[$self.inner.compiled_offset];
+        let args = $self.inner.compiled_args[cast($self.inner.compiled_offset).to_usize()];
         let $a0 = transmute_reg(args.a0);
         let $a1 = transmute_reg(args.a1);
-        let $a2 = args.a2 as Target;
-        let $a3 = args.a3 as Target;
+        let $a2 = args.a2;
+        let $a3 = args.a3;
         $body
     }};
 
@@ -1482,20 +1517,20 @@ macro_rules! define_interpreter {
             #[allow(clippy::needless_update)]
             pub fn $handler_name(a0: impl Into<Reg>, a1: u32, a2: Target, a3: Target) -> Args {
                 Args {
-                    a0: a0.into() as u32,
+                    a0: a0.into().to_u32(),
                     a1,
-                    a2: a2 as u32,
-                    a3: a3 as u32,
+                    a2,
+                    a3,
                     ..Args::default()
                 }
             }
         }
 
-        let args = $self.inner.compiled_args[$self.inner.compiled_offset];
+        let args = $self.inner.compiled_args[cast($self.inner.compiled_offset).to_usize()];
         let $a0 = transmute_reg(args.a0);
         let $a1 = args.a1;
-        let $a2 = args.a2 as Target;
-        let $a3 = args.a3 as Target;
+        let $a2 = args.a2;
+        let $a3 = args.a3;
         $body
     }};
 
@@ -1503,15 +1538,15 @@ macro_rules! define_interpreter {
         impl Args {
             pub fn $handler_name(a0: impl Into<Reg>, a1: impl Into<Reg>, a2: ProgramCounter) -> Args {
                 Args {
-                    a0: a0.into() as u32,
-                    a1: a1.into() as u32,
+                    a0: a0.into().to_u32(),
+                    a1: a1.into().to_u32(),
                     a2: a2.0,
                     ..Args::default()
                 }
             }
         }
 
-        let args = $self.inner.compiled_args[$self.inner.compiled_offset];
+        let args = $self.inner.compiled_args[cast($self.inner.compiled_offset).to_usize()];
         let $a0 = transmute_reg(args.a0);
         let $a1 = transmute_reg(args.a1);
         let $a2 = ProgramCounter(args.a2);
@@ -1523,8 +1558,8 @@ macro_rules! define_interpreter {
             #[allow(clippy::needless_update)]
             pub fn $handler_name(a0: impl Into<Reg>, a1: impl Into<Reg>, a2: ProgramCounter, a3: ProgramCounter) -> Args {
                 Args {
-                    a0: a0.into() as u32,
-                    a1: a1.into() as u32,
+                    a0: a0.into().to_u32(),
+                    a1: a1.into().to_u32(),
                     a2: a2.0,
                     a3: a3.0,
                     ..Args::default()
@@ -1532,7 +1567,7 @@ macro_rules! define_interpreter {
             }
         }
 
-        let args = $self.inner.compiled_args[$self.inner.compiled_offset];
+        let args = $self.inner.compiled_args[cast($self.inner.compiled_offset).to_usize()];
         let $a0 = transmute_reg(args.a0);
         let $a1 = transmute_reg(args.a1);
         let $a2 = ProgramCounter(args.a2);
@@ -1545,7 +1580,7 @@ macro_rules! define_interpreter {
             #[allow(clippy::needless_update)]
             pub fn $handler_name(a0: impl Into<Reg>, a1: u32, a2: ProgramCounter, a3: ProgramCounter) -> Args {
                 Args {
-                    a0: a0.into() as u32,
+                    a0: a0.into().to_u32(),
                     a1,
                     a2: a2.0,
                     a3: a3.0,
@@ -1554,7 +1589,7 @@ macro_rules! define_interpreter {
             }
         }
 
-        let args = $self.inner.compiled_args[$self.inner.compiled_offset];
+        let args = $self.inner.compiled_args[cast($self.inner.compiled_offset).to_usize()];
         let $a0 = transmute_reg(args.a0);
         let $a1 = args.a1;
         let $a2 = ProgramCounter(args.a2);
@@ -1629,8 +1664,8 @@ macro_rules! handle_unresolved_branch {
         let target_false = $visitor.inner.resolve_jump::<DEBUG>($tf).unwrap_or(TARGET_OUT_OF_RANGE);
         if let Some(target_true) = $visitor.inner.resolve_jump::<DEBUG>($tt) {
             let offset = $visitor.inner.compiled_offset;
-            $visitor.inner.compiled_handlers[offset] = raw_handlers::$name::<DEBUG> as Handler;
-            $visitor.inner.compiled_args[offset] = Args::$name($s1, $s2, target_true, target_false);
+            $visitor.inner.compiled_handlers[cast(offset).to_usize()] = cast_handler!(raw_handlers::$name::<DEBUG>);
+            $visitor.inner.compiled_args[cast(offset).to_usize()] = Args::$name($s1, $s2, target_true, target_false);
             Some(offset)
         } else {
             todo!()
@@ -1754,7 +1789,7 @@ define_interpreter! {
             log::trace!("[{}]: {}", visitor.inner.compiled_offset, asm::set_less_than_signed(d, s1, s2));
         }
 
-        visitor.set3::<DEBUG>(d, s1, s2, |s1, s2| u32::from((s1 as i32) < (s2 as i32)))
+        visitor.set3::<DEBUG>(d, s1, s2, |s1, s2| u32::from(cast(s1).to_signed() < cast(s2).to_signed()))
     }
 
     fn shift_logical_right<const DEBUG: bool>(visitor: &mut Visitor, d: Reg, s1: Reg, s2: Reg) -> Option<Target> {
@@ -1770,7 +1805,7 @@ define_interpreter! {
             log::trace!("[{}]: {}", visitor.inner.compiled_offset, asm::shift_arithmetic_right(d, s1, s2));
         }
 
-        visitor.set3::<DEBUG>(d, s1, s2, |s1, s2| ((s1 as i32).wrapping_shr(s2)) as u32)
+        visitor.set3::<DEBUG>(d, s1, s2, |s1, s2| cast(cast(s1).to_signed().wrapping_shr(s2)).to_unsigned())
     }
 
     fn shift_logical_left<const DEBUG: bool>(visitor: &mut Visitor, d: Reg, s1: Reg, s2: Reg) -> Option<Target> {
@@ -1850,7 +1885,7 @@ define_interpreter! {
             log::trace!("[{}]: {}", visitor.inner.compiled_offset, asm::mul_upper_signed_signed(d, s1, s2));
         }
 
-        visitor.set3::<DEBUG>(d, s1, s2, |s1, s2| mulh(s1 as i32, s2 as i32) as u32)
+        visitor.set3::<DEBUG>(d, s1, s2, |s1, s2| cast(mulh(cast(s1).to_signed(), cast(s2).to_signed())).to_unsigned())
     }
 
     fn mul_upper_signed_signed_imm<const DEBUG: bool>(visitor: &mut Visitor, d: Reg, s1: Reg, s2: u32) -> Option<Target> {
@@ -1859,7 +1894,7 @@ define_interpreter! {
         }
 
 
-        visitor.set3::<DEBUG>(d, s1, s2, |s1, s2| mulh(s1 as i32, s2 as i32) as u32)
+        visitor.set3::<DEBUG>(d, s1, s2, |s1, s2| cast(mulh(cast(s1).to_signed(), cast(s2).to_signed())).to_unsigned())
     }
 
     fn mul_upper_unsigned_unsigned<const DEBUG: bool>(visitor: &mut Visitor, d: Reg, s1: Reg, s2: Reg) -> Option<Target> {
@@ -1886,7 +1921,7 @@ define_interpreter! {
         }
 
 
-        visitor.set3::<DEBUG>(d, s1, s2, |s1, s2| mulhsu(s1 as i32, s2) as u32)
+        visitor.set3::<DEBUG>(d, s1, s2, |s1, s2| cast(mulhsu(cast(s1).to_signed(), s2)).to_unsigned())
     }
 
     fn div_unsigned<const DEBUG: bool>(visitor: &mut Visitor, d: Reg, s1: Reg, s2: Reg) -> Option<Target> {
@@ -1903,7 +1938,7 @@ define_interpreter! {
             log::trace!("[{}]: {}", visitor.inner.compiled_offset, asm::div_signed(d, s1, s2));
         }
 
-        visitor.set3::<DEBUG>(d, s1, s2, |s1, s2| div(s1 as i32, s2 as i32) as u32)
+        visitor.set3::<DEBUG>(d, s1, s2, |s1, s2| cast(div(cast(s1).to_signed(), cast(s2).to_signed())).to_unsigned())
     }
 
     fn rem_unsigned<const DEBUG: bool>(visitor: &mut Visitor, d: Reg, s1: Reg, s2: Reg) -> Option<Target> {
@@ -1919,7 +1954,7 @@ define_interpreter! {
             log::trace!("[{}]: {}", visitor.inner.compiled_offset, asm::rem_signed(d, s1, s2));
         }
 
-        visitor.set3::<DEBUG>(d, s1, s2, |s1, s2| rem(s1 as i32, s2 as i32) as u32)
+        visitor.set3::<DEBUG>(d, s1, s2, |s1, s2| cast(rem(cast(s1).to_signed(), cast(s2).to_signed())).to_unsigned())
     }
 
     fn set_less_than_unsigned_imm<const DEBUG: bool>(visitor: &mut Visitor, d: Reg, s1: Reg, s2: u32) -> Option<Target> {
@@ -1943,7 +1978,7 @@ define_interpreter! {
             log::trace!("[{}]: {}", visitor.inner.compiled_offset, asm::set_less_than_signed_imm(d, s1, s2));
         }
 
-        visitor.set3::<DEBUG>(d, s1, s2, |s1, s2| u32::from((s1 as i32) < (s2 as i32)))
+        visitor.set3::<DEBUG>(d, s1, s2, |s1, s2| u32::from(cast(s1).to_signed() < cast(s2).to_signed()))
     }
 
     fn set_greater_than_signed_imm<const DEBUG: bool>(visitor: &mut Visitor, d: Reg, s1: Reg, s2: u32) -> Option<Target> {
@@ -1951,7 +1986,7 @@ define_interpreter! {
             log::trace!("[{}]: {}", visitor.inner.compiled_offset, asm::set_greater_than_signed_imm(d, s1, s2));
         }
 
-        visitor.set3::<DEBUG>(d, s1, s2, |s1, s2| u32::from((s1 as i32) > (s2 as i32)))
+        visitor.set3::<DEBUG>(d, s1, s2, |s1, s2| u32::from(cast(s1).to_signed() > cast(s2).to_signed()))
     }
 
     fn shift_logical_right_imm<const DEBUG: bool>(visitor: &mut Visitor, d: Reg, s1: Reg, s2: u32) -> Option<Target> {
@@ -1975,7 +2010,7 @@ define_interpreter! {
             log::trace!("[{}]: {}", visitor.inner.compiled_offset, asm::shift_arithmetic_right_imm(d, s1, s2));
         }
 
-        visitor.set3::<DEBUG>(d, s1, s2, |s1, s2| ((s1 as i32) >> s2) as u32)
+        visitor.set3::<DEBUG>(d, s1, s2, |s1, s2| cast(cast(s1).to_signed() >> s2).to_unsigned())
     }
 
     fn shift_arithmetic_right_imm_alt<const DEBUG: bool>(visitor: &mut Visitor, d: Reg, s2: Reg, s1: u32) -> Option<Target> {
@@ -1983,7 +2018,7 @@ define_interpreter! {
             log::trace!("[{}]: {}", visitor.inner.compiled_offset, asm::shift_arithmetic_right_imm_alt(d, s2, s1));
         }
 
-        visitor.set3::<DEBUG>(d, s1, s2, |s1, s2| ((s1 as i32) >> s2) as u32)
+        visitor.set3::<DEBUG>(d, s1, s2, |s1, s2| cast(cast(s1).to_signed() >> s2).to_unsigned())
     }
 
     fn shift_logical_left_imm<const DEBUG: bool>(visitor: &mut Visitor, d: Reg, s1: Reg, s2: u32) -> Option<Target> {
@@ -2476,7 +2511,7 @@ define_interpreter! {
             log::trace!("[{}]: jump ~{tt} if {s1} <s {s2}", visitor.inner.compiled_offset);
         }
 
-        visitor.branch::<DEBUG>(s1, s2, tt, tf, |s1, s2| (s1 as i32) < (s2 as i32))
+        visitor.branch::<DEBUG>(s1, s2, tt, tf, |s1, s2| cast(s1).to_signed() < cast(s2).to_signed())
     }
 
     fn branch_less_signed_imm<const DEBUG: bool>(visitor: &mut Visitor, s1: Reg, s2: u32, tt: Target, tf: Target) -> Option<Target> {
@@ -2484,7 +2519,7 @@ define_interpreter! {
             log::trace!("[{}]: jump ~{tt} if {s1} <s {s2}", visitor.inner.compiled_offset);
         }
 
-        visitor.branch::<DEBUG>(s1, s2, tt, tf, |s1, s2| (s1 as i32) < (s2 as i32))
+        visitor.branch::<DEBUG>(s1, s2, tt, tf, |s1, s2| cast(s1).to_signed() < cast(s2).to_signed())
     }
 
     fn branch_eq<const DEBUG: bool>(visitor: &mut Visitor, s1: Reg, s2: Reg, tt: Target, tf: Target) -> Option<Target> {
@@ -2540,7 +2575,7 @@ define_interpreter! {
             log::trace!("[{}]: jump ~{tt} if {s1} >=s {s2}", visitor.inner.compiled_offset);
         }
 
-        visitor.branch::<DEBUG>(s1, s2, tt, tf, |s1, s2| (s1 as i32) >= (s2 as i32))
+        visitor.branch::<DEBUG>(s1, s2, tt, tf, |s1, s2| cast(s1).to_signed() >= cast(s2).to_signed())
     }
 
     fn branch_greater_or_equal_signed_imm<const DEBUG: bool>(visitor: &mut Visitor, s1: Reg, s2: u32, tt: Target, tf: Target) -> Option<Target> {
@@ -2548,7 +2583,7 @@ define_interpreter! {
             log::trace!("[{}]: jump ~{tt} if {s1} >=s {s2}", visitor.inner.compiled_offset);
         }
 
-        visitor.branch::<DEBUG>(s1, s2, tt, tf, |s1, s2| (s1 as i32) >= (s2 as i32))
+        visitor.branch::<DEBUG>(s1, s2, tt, tf, |s1, s2| cast(s1).to_signed() >= cast(s2).to_signed())
     }
 
     fn branch_less_or_equal_unsigned_imm<const DEBUG: bool>(visitor: &mut Visitor, s1: Reg, s2: u32, tt: Target, tf: Target) -> Option<Target> {
@@ -2564,7 +2599,7 @@ define_interpreter! {
             log::trace!("[{}]: jump ~{tt} if {s1} <=s {s2}", visitor.inner.compiled_offset);
         }
 
-        visitor.branch::<DEBUG>(s1, s2, tt, tf, |s1, s2| (s1 as i32) <= (s2 as i32))
+        visitor.branch::<DEBUG>(s1, s2, tt, tf, |s1, s2| cast(s1).to_signed() <= cast(s2).to_signed())
     }
 
     fn branch_greater_unsigned_imm<const DEBUG: bool>(visitor: &mut Visitor, s1: Reg, s2: u32, tt: Target, tf: Target) -> Option<Target> {
@@ -2580,7 +2615,7 @@ define_interpreter! {
             log::trace!("[{}]: jump ~{tt} if {s1} >s {s2}", visitor.inner.compiled_offset);
         }
 
-        visitor.branch::<DEBUG>(s1, s2, tt, tf, |s1, s2| (s1 as i32) > (s2 as i32))
+        visitor.branch::<DEBUG>(s1, s2, tt, tf, |s1, s2| cast(s1).to_signed() > cast(s2).to_signed())
     }
 
     fn jump<const DEBUG: bool>(visitor: &mut Visitor, target: Target) -> Option<Target> {
@@ -2685,14 +2720,14 @@ define_interpreter! {
                 if DEBUG {
                     log::trace!("  -> resolved to fallthrough");
                 }
-                visitor.inner.compiled_handlers[offset] = raw_handlers::fallthrough::<DEBUG> as Handler;
-                visitor.inner.compiled_args[offset] = Args::fallthrough();
+                visitor.inner.compiled_handlers[cast(offset).to_usize()] = cast_handler!(raw_handlers::fallthrough::<DEBUG>);
+                visitor.inner.compiled_args[cast(offset).to_usize()] = Args::fallthrough();
             } else {
                 if DEBUG {
                     log::trace!("  -> resolved to jump");
                 }
-                visitor.inner.compiled_handlers[offset] = raw_handlers::jump::<DEBUG> as Handler;
-                visitor.inner.compiled_args[offset] = Args::jump(target);
+                visitor.inner.compiled_handlers[cast(offset).to_usize()] = cast_handler!(raw_handlers::jump::<DEBUG>);
+                visitor.inner.compiled_args[cast(offset).to_usize()] = Args::jump(target);
             }
 
             Some(target)
@@ -2715,20 +2750,20 @@ define_interpreter! {
                 if DEBUG {
                     log::trace!("  -> resolved to fallthrough");
                 }
-                visitor.inner.compiled_handlers[offset] = raw_handlers::fallthrough::<DEBUG> as Handler;
-                visitor.inner.compiled_args[offset] = Args::fallthrough();
+                visitor.inner.compiled_handlers[cast(offset).to_usize()] = cast_handler!(raw_handlers::fallthrough::<DEBUG>);
+                visitor.inner.compiled_args[cast(offset).to_usize()] = Args::fallthrough();
             } else {
                 if DEBUG {
                     log::trace!("  -> resolved to jump");
                 }
-                visitor.inner.compiled_handlers[offset] = raw_handlers::jump::<DEBUG> as Handler;
-                visitor.inner.compiled_args[offset] = Args::jump(target);
+                visitor.inner.compiled_handlers[cast(offset).to_usize()] = cast_handler!(raw_handlers::jump::<DEBUG>);
+                visitor.inner.compiled_args[cast(offset).to_usize()] = Args::jump(target);
             }
 
             Some(target)
         } else {
-            visitor.inner.compiled_handlers[offset] = raw_handlers::jump::<DEBUG> as Handler;
-            visitor.inner.compiled_args[offset] = Args::jump(TARGET_OUT_OF_RANGE);
+            visitor.inner.compiled_handlers[cast(offset).to_usize()] = cast_handler!(raw_handlers::jump::<DEBUG>);
+            visitor.inner.compiled_args[cast(offset).to_usize()] = Args::jump(TARGET_OUT_OF_RANGE);
             Some(TARGET_OUT_OF_RANGE)
         }
     }

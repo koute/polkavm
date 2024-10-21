@@ -41,3 +41,5 @@ pub mod hasher;
 
 #[cfg(not(feature = "blake3"))]
 mod blake3;
+
+pub mod cast;
