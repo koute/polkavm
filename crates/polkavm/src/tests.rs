@@ -2454,6 +2454,50 @@ fn module_cache(mut config: Config) {
     assert!(Module::from_cache(&engine_with_lru_cache, &Default::default(), &blob).is_some());
 }
 
+fn run_riscv_test(engine_config: Config, elf: &[u8], testnum_reg: Reg, optimize: bool) {
+    let _ = env_logger::try_init();
+    let mut linker_config = polkavm_linker::Config::default();
+    linker_config.set_optimize(optimize);
+    linker_config.set_strip(true);
+    let raw_blob = polkavm_linker::program_from_elf(linker_config, elf).unwrap();
+
+    let _ = env_logger::try_init();
+    let engine = Engine::new(&engine_config).unwrap();
+    let blob = ProgramBlob::parse(raw_blob.into()).unwrap();
+    let mut module_config = ModuleConfig::new();
+    module_config.set_gas_metering(Some(GasMeteringKind::Sync));
+    let module = Module::from_blob(&engine, &module_config, blob).unwrap();
+    let mut instance = module.instantiate().unwrap();
+
+    let entry_point = module.exports().find(|export| export == "main").unwrap().program_counter();
+
+    // Set some gas to prevent infinite loops.
+    instance.set_gas(10000);
+    instance.set_reg(Reg::RA, crate::RETURN_TO_HOST);
+    instance.set_next_program_counter(entry_point);
+    let result = instance.run().unwrap();
+    if !matches!(result, InterruptKind::Finished) {
+        panic!("test {} failed: unexpecte result: {result:?}", instance.reg(testnum_reg));
+    }
+}
+
+macro_rules! riscv_test {
+    ($test_name:ident, $elf_path:expr, $testnum_reg:ident, $is_optimized:expr) => {
+        fn $test_name(engine_config: Config) {
+            run_riscv_test(
+                engine_config,
+                &include_bytes!($elf_path)[..],
+                Reg::$testnum_reg,
+                $is_optimized,
+            );
+        }
+
+        run_tests! { $test_name }
+    };
+}
+
+include!("tests_riscv.rs");
+
 run_tests! {
     basic_test
     fallback_hostcall_handler_works
