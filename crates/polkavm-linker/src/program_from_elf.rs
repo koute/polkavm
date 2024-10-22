@@ -3745,8 +3745,22 @@ impl OperationKind {
             (O::And,                      C(0), _) => C(0),
             // x * 0 = 0
             (O::Mul,                      _, C(0)) => C(0),
+            (O::Mul64,                    _, C(0)) => C(0),
+            (O::MulUpperSignedSigned,     _, C(0)) => C(0),
+            (O::MulUpperSignedSigned64,   _, C(0)) => C(0),
+            (O::MulUpperSignedUnsigned,   _, C(0)) => C(0),
+            (O::MulUpperSignedUnsigned64, _, C(0)) => C(0),
+            (O::MulUpperUnsignedUnsigned, _, C(0)) => C(0),
+            (O::MulUpperUnsignedUnsigned64, _, C(0)) => C(0),
             // 0 * x = 0
             (O::Mul,                      C(0), _) => C(0),
+            (O::Mul64,                    C(0), _) => C(0),
+            (O::MulUpperSignedSigned,     C(0), _) => C(0),
+            (O::MulUpperSignedSigned64,   C(0), _) => C(0),
+            (O::MulUpperSignedUnsigned,   C(0), _) => C(0),
+            (O::MulUpperSignedUnsigned64, C(0), _) => C(0),
+            (O::MulUpperUnsignedUnsigned, C(0), _) => C(0),
+            (O::MulUpperUnsignedUnsigned64, C(0), _) => C(0),
 
             // x / 0 = -1
             (O::Div,                      _, C(0)) => C(-1),
