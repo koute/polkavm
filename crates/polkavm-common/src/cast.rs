@@ -27,6 +27,11 @@ impl cast<i32> {
     pub const fn to_unsigned(self) -> u32 {
         self.0 as u32
     }
+
+    #[inline(always)]
+    pub const fn to_i64_sign_extend(self) -> i64 {
+        self.0 as i64
+    }
 }
 
 impl cast<i64> {
