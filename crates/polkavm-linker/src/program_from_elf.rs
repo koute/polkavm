@@ -1,4 +1,5 @@
 use polkavm_common::abi::{MemoryMapBuilder, VM_CODE_ADDRESS_ALIGNMENT, VM_MAX_PAGE_SIZE, VM_MIN_PAGE_SIZE};
+use polkavm_common::cast::cast;
 use polkavm_common::program::{
     self, FrameKind, Instruction, InstructionSet, LineProgramOp, Opcode, ProgramBlob, ProgramCounter, ProgramSymbol,
 };
@@ -476,14 +477,6 @@ impl SectionTarget {
         SectionTarget {
             section_index: self.section_index,
             offset: self.offset + offset,
-        }
-    }
-
-    fn map_offset_i32(self, cb: impl FnOnce(i32) -> i32) -> Self {
-        let offset: u32 = self.offset.try_into().expect("section offset is too large");
-        SectionTarget {
-            section_index: self.section_index,
-            offset: u64::from(cb(offset as i32) as u32),
         }
     }
 
@@ -1699,14 +1692,18 @@ fn emit_minmax(
     }));
 }
 
-fn convert_instruction(
+fn convert_instruction<H>(
+    elf: &Elf<H>,
     section: &Section,
     current_location: SectionTarget,
     instruction: Inst,
     instruction_size: u64,
     rv64: bool,
     mut emit: impl FnMut(InstExt<SectionTarget, SectionTarget>),
-) -> Result<(), ProgramFromElfError> {
+) -> Result<(), ProgramFromElfError>
+where
+    H: object::read::elf::FileHeader<Endian = object::LittleEndian>,
+{
     match instruction {
         Inst::LoadUpperImmediate { dst, value } => {
             let Some(dst) = cast_reg_non_zero(dst)? else {
@@ -1906,7 +1903,7 @@ fn convert_instruction(
                                 .map(|reg| RegValue::InputReg(reg, BlockTarget::from_raw(0)))
                                 .unwrap_or(RegValue::Constant(0));
 
-                            match OperationKind::from(RegRegKind::$kind).apply(lhs, rhs) {
+                            match OperationKind::from(RegRegKind::$kind).apply(elf, lhs, rhs) {
                                 Some(RegValue::Constant(imm)) => {
                                     let imm: i32 = imm.try_into().expect("immediate operand overflow");
                                     BasicInst::LoadImmediate { dst, imm }
@@ -2461,7 +2458,7 @@ where
             }
 
             let original_length = output.len();
-            convert_instruction(section, current_location, original_inst, inst_size, elf.is_64(), |inst| {
+            convert_instruction(elf, section, current_location, original_inst, inst_size, elf.is_64(), |inst| {
                 output.push((source, inst));
             })?;
 
@@ -3672,7 +3669,10 @@ impl OperationKind {
         }
     }
 
-    fn apply(self, lhs: RegValue, rhs: RegValue) -> Option<RegValue> {
+    fn apply<H>(self, elf: &Elf<H>, lhs: RegValue, rhs: RegValue) -> Option<RegValue>
+    where
+        H: object::read::elf::FileHeader<Endian = object::LittleEndian>,
+    {
         use OperationKind as O;
         use RegValue::Constant as C;
 
@@ -3681,9 +3681,28 @@ impl OperationKind {
             (_, C(lhs), C(rhs)) => {
                 C(self.apply_const(lhs, rhs))
             },
-            (O::Add | O::Sub, RegValue::DataAddress(lhs), C(rhs)) => {
-                RegValue::DataAddress(lhs.map_offset_i64(|lhs| self.apply_const(lhs, rhs)))
-            }
+            (O::Add, RegValue::DataAddress(lhs), C(rhs)) => {
+                let offset = cast(cast(lhs.offset).to_signed().wrapping_add(rhs)).to_unsigned();
+                if offset <= elf.section_by_index(lhs.section_index).size() {
+                    RegValue::DataAddress(SectionTarget {
+                        section_index: lhs.section_index,
+                        offset,
+                    })
+                } else {
+                    return None;
+                }
+            },
+            (O::Sub, RegValue::DataAddress(lhs), C(rhs)) => {
+                let offset = cast(lhs.offset).to_signed().wrapping_sub(rhs);
+                if offset >= 0 {
+                    RegValue::DataAddress(SectionTarget {
+                        section_index: lhs.section_index,
+                        offset: cast(offset).to_unsigned(),
+                    })
+                } else {
+                    return None;
+                }
+            },
 
             // (x == x) = 1
             (O::Eq,                     lhs, rhs) if lhs == rhs => C(1),
@@ -3827,7 +3846,10 @@ impl BlockRegs {
         self.regs[reg as usize] = value;
     }
 
-    fn simplify_control_instruction(&self, instruction: ControlInst<BlockTarget>) -> Option<ControlInst<BlockTarget>> {
+    fn simplify_control_instruction<H>(&self, elf: &Elf<H>, instruction: ControlInst<BlockTarget>) -> Option<ControlInst<BlockTarget>>
+    where
+        H: object::read::elf::FileHeader<Endian = object::LittleEndian>,
+    {
         match instruction {
             ControlInst::JumpIndirect { base, offset: 0 } => {
                 if let RegValue::CodeAddress(target) = self.get_reg(base) {
@@ -3847,7 +3869,7 @@ impl BlockRegs {
 
                 let src1_value = self.get_reg(src1);
                 let src2_value = self.get_reg(src2);
-                if let Some(value) = OperationKind::from(kind).apply(src1_value, src2_value) {
+                if let Some(value) = OperationKind::from(kind).apply(elf, src1_value, src2_value) {
                     match value {
                         RegValue::Constant(0) => {
                             return Some(ControlInst::Jump { target: target_false });
@@ -3891,14 +3913,17 @@ impl BlockRegs {
         None
     }
 
-    fn simplify_instruction(&self, instruction: BasicInst<AnyTarget>) -> Option<BasicInst<AnyTarget>> {
+    fn simplify_instruction<H>(&self, elf: &Elf<H>, instruction: BasicInst<AnyTarget>) -> Option<BasicInst<AnyTarget>>
+    where
+        H: object::read::elf::FileHeader<Endian = object::LittleEndian>,
+    {
         let is_rv64 = self.bitness == Bitness::B64;
 
         match instruction {
             BasicInst::RegReg { kind, dst, src1, src2 } => {
                 let src1_value = self.get_reg(src1);
                 let src2_value = self.get_reg(src2);
-                if let Some(value) = OperationKind::from(kind).apply(src1_value, src2_value) {
+                if let Some(value) = OperationKind::from(kind).apply(elf, src1_value, src2_value) {
                     if let Some(new_instruction) = value.to_instruction(dst, is_rv64) {
                         if new_instruction != instruction {
                             return Some(new_instruction);
@@ -3909,7 +3934,7 @@ impl BlockRegs {
             BasicInst::AnyAny { kind, dst, src1, src2 } => {
                 let src1_value = self.get_reg(src1);
                 let src2_value = self.get_reg(src2);
-                if let Some(value) = OperationKind::from(kind).apply(src1_value, src2_value) {
+                if let Some(value) = OperationKind::from(kind).apply(elf, src1_value, src2_value) {
                     if value == self.get_reg(dst) {
                         return Some(BasicInst::Nop);
                     }
@@ -3992,7 +4017,7 @@ impl BlockRegs {
                     return Some(BasicInst::LoadAbsolute {
                         kind,
                         dst,
-                        target: base.map_offset_i32(|base| base.wrapping_add(offset)),
+                        target: base.map_offset_i64(|base| base.wrapping_add(cast(offset).to_i64_sign_extend())),
                     });
                 }
             }
@@ -4004,7 +4029,7 @@ impl BlockRegs {
                     return Some(BasicInst::StoreAbsolute {
                         kind,
                         src,
-                        target: base.map_offset_i32(|base| base.wrapping_add(offset)),
+                        target: base.map_offset_i64(|base| base.wrapping_add(cast(offset).to_i64_sign_extend())),
                     });
                 }
 
@@ -4271,7 +4296,7 @@ where
             continue;
         }
 
-        while let Some(new_instruction) = regs.simplify_instruction(instruction) {
+        while let Some(new_instruction) = regs.simplify_instruction(elf, instruction) {
             if !modified_this_block {
                 references = gather_references(&all_blocks[current.index()]);
                 modified_this_block = true;
@@ -4391,7 +4416,7 @@ where
         }
     }
 
-    while let Some(new_instruction) = regs.simplify_control_instruction(all_blocks[current.index()].next.instruction) {
+    while let Some(new_instruction) = regs.simplify_control_instruction(elf, all_blocks[current.index()].next.instruction) {
         log::trace!(
             "Simplifying end of {current:?}: {:?} -> {:?}",
             all_blocks[current.index()].next.instruction,
