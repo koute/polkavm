@@ -4149,6 +4149,11 @@ impl ProgramBlob {
         &self.rw_data
     }
 
+    /// Returns the jump table entry size (z)
+    pub fn jump_table_entry_size(&self) -> u8 {
+        self.jump_table_entry_size
+    }
+
     /// Returns the size of the read-write data section.
     ///
     /// This can be larger than the length of `rw_data`, in which case the rest of the space is assumed to be filled with zeros.

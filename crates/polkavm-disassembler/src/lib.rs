@@ -268,7 +268,9 @@ impl<'a> Disassembler<'a> {
             w!("// RO data = {}/{} bytes", self.blob.ro_data().len(), self.blob.ro_data_size());
             w!("// RW data = {}/{} bytes", self.blob.rw_data().len(), self.blob.rw_data_size());
             w!("// Stack size = {} bytes", self.blob.stack_size());
-            w!();
+            w!("// Jump table entry point size = {} bytes", self.blob.jump_table_entry_size());
+            w!("// RO data = {:?}", self.blob.ro_data());
+            w!("// RW data = {:?}", self.blob.rw_data());
             w!("// Instructions = {}", instructions.len());
             w!("// Code size = {} bytes", self.blob.code().len());
             w!();
