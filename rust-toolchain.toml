@@ -1,2 +1,5 @@
 [toolchain]
-channel = "1.75.0"
+channel = "rve-nightly"
+components = ["rustc", "cargo", "rust-std"]
+targets = ["riscv32imc-unknown-none-elf"]
+
