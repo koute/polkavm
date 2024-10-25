@@ -1,13 +1,9 @@
-#!/bin/bash
+#!/usr/bin/env bash
 
 set -euo pipefail
-cd -- "$(dirname -- "${BASH_SOURCE[0]}")"
-cd ..
 
-source ./ci/jobs/detect-or-install-riscv-toolchain.sh
-if [[ "$(rustup toolchain list)" =~ "riscv32em-nightly-2023-04-05-r0-x86_64-unknown-linux-gnu" ]]; then
-    export CI_RV32E_TOOLCHAIN_AVAILABLE=1
-fi
+cd "${0%/*}/"
+cd ..
 
 ./ci/jobs/build-guests.sh
 ./ci/jobs/build-and-test.sh
