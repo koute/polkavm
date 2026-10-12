@@ -175,6 +175,7 @@ jobs:
           - fuzz_polkavm
           - fuzz_program_blob
           - fuzz_extended_decode
+          - fuzz_page_set
     steps:
     - uses: actions/checkout@v4
     - name: Install toolchain
