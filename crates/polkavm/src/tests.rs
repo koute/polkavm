@@ -4753,6 +4753,12 @@ fn test_blob_max_zero_const_64(args: TestBlobArgs) {
     assert_eq!(i.call::<(), u64>("max_zero_const_64", ()).unwrap(), 0);
 }
 
+fn test_blob_jump_table_with_constant_index(args: TestBlobArgs) {
+    let elf = args.get_test_program();
+    let mut i = TestInstance::new(&args, elf);
+    assert_eq!(i.call::<(), u32>("jump_table_with_constant_index", ()).unwrap(), 2);
+}
+
 fn test_asm_reloc_add_sub(config: Config, isa: InstructionSetKind, optimize: bool) {
     let args = TestBlobArgs {
         config,
@@ -6411,6 +6417,7 @@ run_test_blob_tests! {
     test_blob_xnor_zero_const_64
     test_blob_min_zero_const_64
     test_blob_max_zero_const_64
+    test_blob_jump_table_with_constant_index
 }
 
 run_asm_tests! {

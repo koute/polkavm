@@ -137,6 +137,15 @@ impl LoadKind {
             _ => None,
         }
     }
+
+    pub(crate) const fn size(self) -> u64 {
+        match self {
+            LoadKind::I8 | LoadKind::U8 => 1,
+            LoadKind::I16 | LoadKind::U16 => 2,
+            LoadKind::I32 | LoadKind::U32 => 4,
+            LoadKind::U64 => 8,
+        }
+    }
 }
 
 #[derive(Copy, Clone, PartialEq, Eq, Debug, Hash)]

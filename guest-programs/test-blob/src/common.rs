@@ -576,3 +576,31 @@ extern "C" fn max_zero_const_64() -> u64 {
         output
     }
 }
+
+#[polkavm_derive::polkavm_export]
+extern "C" fn jump_table_with_constant_index() -> u32 {
+    unsafe {
+        let output;
+        core::arch::asm!(
+            ".pushsection .rodata",
+            ".p2align 2",
+            "2:",
+            ".word 3f - 2b",
+            ".word 4f - 2b",
+            ".popsection",
+            "lla a1, 2b",
+            "lw a0, 4(a1)",
+            "add a0, a0, a1",
+            "jr a0",
+            "3:",
+            "li a0, 1",
+            "j 5f",
+            "4:",
+            "li a0, 2",
+            "5:",
+            out("a0") output,
+            out("a1") _,
+        );
+        output
+    }
+}

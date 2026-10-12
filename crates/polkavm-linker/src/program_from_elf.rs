@@ -5718,6 +5718,7 @@ impl BlockRegs {
 fn perform_constant_propagation(
     imports: &[Import],
     elf: &Elf,
+    relocations: &BTreeMap<SectionTarget, RelocationKind>,
     all_blocks: &mut [BasicBlock<AnyTarget, BlockTarget>],
     info_for_block: &mut [BlockInfo],
     unknown_counter: &mut u64,
@@ -5877,7 +5878,18 @@ fn perform_constant_propagation(
 
         if let &BasicInst::LoadAbsolute { kind, dst, target } = &instruction {
             let section = elf.section_by_index(target.section_index);
-            if section.is_allocated() && !section.is_writable() {
+            let is_relocated = relocations
+                .range(..target.add(kind.size()))
+                .next_back()
+                .is_some_and(|(relocation_target, relocation)| {
+                    relocation_target.section_index == target.section_index
+                        && relocation_target
+                            .offset
+                            .saturating_add(relocation.size(section.data(), relocation_target.offset))
+                            > target.offset
+                });
+
+            if section.is_allocated() && !section.is_writable() && !is_relocated {
                 let value = match kind {
                     LoadKind::U64 => section
                         .data()
@@ -6260,6 +6272,7 @@ fn gather_terminators(all_blocks: &[BasicBlock<AnyTarget, BlockTarget>]) -> Vec<
 fn optimize_program(
     config: &Config,
     elf: &Elf,
+    relocations: &BTreeMap<SectionTarget, RelocationKind>,
     isa: InstructionSetKind,
     imports: &[Import],
     all_blocks: &mut [BasicBlock<AnyTarget, BlockTarget>],
@@ -6388,6 +6401,7 @@ fn optimize_program(
                 if perform_constant_propagation(
                     imports,
                     elf,
+                    relocations,
                     all_blocks,
                     &mut info_for_block,
                     &mut unknown_counter,
@@ -6693,7 +6707,16 @@ mod test {
             let mut reachability_graph =
                 calculate_reachability(&section_to_block, &all_blocks, &data_sections_set, &exports, &relocations).unwrap();
             if matches!(config.opt_level, OptLevel::O2 | OptLevel::Oexperimental) {
-                optimize_program(&config, &elf, isa, &imports, &mut all_blocks, &mut reachability_graph, &mut exports);
+                optimize_program(
+                    &config,
+                    &elf,
+                    &relocations,
+                    isa,
+                    &imports,
+                    &mut all_blocks,
+                    &mut reachability_graph,
+                    &mut exports,
+                );
             }
             let mut used_blocks = collect_used_blocks(&all_blocks, &reachability_graph);
 
@@ -8960,6 +8983,17 @@ pub(crate) enum RelocationSize {
     U64,
 }
 
+impl RelocationSize {
+    fn size(self) -> u64 {
+        match self {
+            RelocationSize::U8 => 1,
+            RelocationSize::U16 => 2,
+            RelocationSize::U32 => 4,
+            RelocationSize::U64 => 8,
+        }
+    }
+}
+
 #[derive(Copy, Clone, Debug)]
 pub(crate) enum SizeRelocationSize {
     SixBits,
@@ -8990,6 +9024,29 @@ impl RelocationKind {
             RelocationKind::Abs { target, .. } => [Some(*target), None],
             RelocationKind::Offset { origin, target, .. } => [Some(*origin), Some(*target)],
             RelocationKind::JumpTable { target_code, target_base } => [Some(*target_code), Some(*target_base)],
+        }
+    }
+
+    fn size(&self, section_data: &[u8], offset: u64) -> u64 {
+        match self {
+            RelocationKind::Abs { size, .. }
+            | RelocationKind::Offset {
+                size: SizeRelocationSize::Generic(size),
+                ..
+            } => size.size(),
+            RelocationKind::Offset {
+                size: SizeRelocationSize::SixBits,
+                ..
+            } => 1,
+            RelocationKind::Offset {
+                size: SizeRelocationSize::Uleb128,
+                ..
+            } => section_data
+                .iter()
+                .skip(offset as usize)
+                .position(|byte| byte & 0x80 == 0)
+                .map_or(0, |position| (position as u64).saturating_add(1)),
+            RelocationKind::JumpTable { .. } => 4,
         }
     }
 }
@@ -10385,7 +10442,16 @@ fn program_from_elf_internal(config: Config, isa: TargetInstructionSet, mut elf:
     if matches!(config.opt_level, OptLevel::O1 | OptLevel::O2 | OptLevel::Oexperimental) {
         reachability_graph = calculate_reachability(&section_to_block, &all_blocks, &data_sections_set, &exports, &relocations)?;
         if matches!(config.opt_level, OptLevel::O2 | OptLevel::Oexperimental) {
-            info_for_block = optimize_program(&config, &elf, isa, &imports, &mut all_blocks, &mut reachability_graph, &mut exports);
+            info_for_block = optimize_program(
+                &config,
+                &elf,
+                &relocations,
+                isa,
+                &imports,
+                &mut all_blocks,
+                &mut reachability_graph,
+                &mut exports,
+            );
         } else {
             for current in (0..all_blocks.len()).map(BlockTarget::from_raw) {
                 perform_nop_elimination(&mut all_blocks, current);
