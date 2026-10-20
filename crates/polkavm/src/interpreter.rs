@@ -1707,6 +1707,11 @@ impl InterpretedInstance {
         access_memory_mut!(self, self.memory_kind(), |memory| { memory.free_pages(address, length) })
     }
 
+    #[allow(dead_code)]
+    pub(crate) fn dynamic_memory_page_addresses(&self) -> impl Iterator<Item = u32> + '_ {
+        self.dynamic_memory.pages.keys().copied()
+    }
+
     pub fn heap_size(&self) -> u32 {
         access_memory!(self, self.memory_kind(), |memory| { memory.heap_size() })
     }
