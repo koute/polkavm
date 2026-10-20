@@ -4215,6 +4215,51 @@ fn write_read_memory_from_host(config: Config, isa: InstructionSetKind) {
     );
 }
 
+fn stack_size_not_power_of_two(config: Config, isa: InstructionSetKind) {
+    let _ = env_logger::try_init();
+    let engine = Engine::new(&config).unwrap();
+
+    let page_size = get_native_page_size() as u32;
+    let mut builder = ProgramBlobBuilder::new(isa);
+    builder.add_export_by_basic_block(0, b"main");
+    builder.set_code(&[asm::ret()], &[]);
+    builder.set_stack_size(page_size * 24);
+
+    let mut module_config = ModuleConfig::new();
+    module_config.set_page_size(page_size);
+
+    let memory_map = Module::from_blob(
+        &engine,
+        &module_config,
+        ProgramBlob::parse(builder.to_vec().unwrap().into()).unwrap(),
+    )
+    .unwrap()
+    .memory_map()
+    .clone();
+
+    builder.set_code(
+        &[
+            asm::store_imm_u32(cast(memory_map.stack_address_low() - 4).bitwise_as_i32(), 0),
+            asm::ret(),
+        ],
+        &[],
+    );
+    let blob = ProgramBlob::parse(builder.to_vec().unwrap().into()).unwrap();
+    let module = Module::from_blob(&engine, &module_config, blob).unwrap();
+    let mut instance = module.instantiate().unwrap();
+    instance.set_reg(Reg::RA, crate::RETURN_TO_HOST);
+    instance.set_next_program_counter(ProgramCounter(0));
+
+    instance
+        .write_memory(memory_map.stack_address_high() - page_size * 20, &[7])
+        .unwrap();
+    assert_eq!(
+        instance.read_memory(memory_map.stack_address_high() - page_size * 20, 1).unwrap(),
+        vec![7]
+    );
+    match_interrupt!(instance.run().unwrap(), InterruptKind::Trap);
+}
+
 fn sbrk_knob_works(config: Config, isa: InstructionSetKind) {
     let sbrk_allowed = isa.supports_opcode(Opcode::sbrk);
 
@@ -6336,6 +6381,7 @@ run_tests! {
     access_memory_from_host
     access_memory_from_within
     write_read_memory_from_host
+    stack_size_not_power_of_two
     sbrk_knob_works
 
     basic_gas_metering_sync
