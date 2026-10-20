@@ -1,5 +1,7 @@
 #![no_main]
 
+use std::sync::OnceLock;
+
 use arbitrary::Arbitrary;
 use libfuzzer_sys::fuzz_target;
 
@@ -530,19 +532,30 @@ fn build_program_blob(data: Vec<OperationKind>) -> ProgramBlob {
     ProgramBlob::parse(builder.into_vec().unwrap().into()).unwrap()
 }
 
+fn engine(backend: polkavm::BackendKind) -> &'static Engine {
+    static INTERPRETER: OnceLock<Engine> = OnceLock::new();
+    static COMPILER: OnceLock<Engine> = OnceLock::new();
+
+    let lazy_engine = match backend {
+        polkavm::BackendKind::Interpreter => &INTERPRETER,
+        polkavm::BackendKind::Compiler => &COMPILER,
+    };
+
+    lazy_engine.get_or_init(|| {
+        let mut config = polkavm::Config::new();
+        config.set_backend(Some(backend));
+        Engine::new(&config).unwrap()
+    })
+}
+
 fn interpreter_fuzzer_harness(data: Vec<OperationKind>, cache_config: Option<CacheSizeConfig>) {
     let blob = build_program_blob(data);
-
-    let mut config = polkavm::Config::new();
-    config.set_backend(Some(polkavm::BackendKind::Interpreter));
-
-    let engine = Engine::new(&config).unwrap();
 
     let mut module_config = ModuleConfig::default();
     module_config.set_strict(true);
     module_config.set_gas_metering(Some(polkavm::GasMeteringKind::Sync));
 
-    let module = polkavm::Module::from_blob(&engine, &module_config, blob).unwrap();
+    let module = polkavm::Module::from_blob(engine(polkavm::BackendKind::Interpreter), &module_config, blob).unwrap();
     let mut instance = module.instantiate().unwrap();
 
     if let Some(config) = cache_config {
@@ -562,16 +575,11 @@ fn correctness_fuzzer_harness(data: Vec<OperationKind>) {
     let blob = build_program_blob(data);
 
     let mut instance_interpreter = {
-        let mut config = polkavm::Config::new();
-        config.set_backend(Some(polkavm::BackendKind::Interpreter));
-
-        let engine = Engine::new(&config).unwrap();
-
         let mut module_config = ModuleConfig::default();
         module_config.set_strict(false);
         module_config.set_gas_metering(Some(polkavm::GasMeteringKind::Sync));
 
-        let module = polkavm::Module::from_blob(&engine, &module_config, blob.clone()).unwrap();
+        let module = polkavm::Module::from_blob(engine(polkavm::BackendKind::Interpreter), &module_config, blob.clone()).unwrap();
         let mut instance = module.instantiate().unwrap();
         instance.set_gas(10000);
         instance.set_next_program_counter(ProgramCounter(0));
@@ -581,16 +589,11 @@ fn correctness_fuzzer_harness(data: Vec<OperationKind>) {
     };
 
     let mut instance_recompiler = {
-        let mut config = polkavm::Config::new();
-        config.set_backend(Some(polkavm::BackendKind::Compiler));
-
-        let engine = Engine::new(&config).unwrap();
-
         let mut module_config = ModuleConfig::default();
         module_config.set_strict(false);
         module_config.set_gas_metering(Some(polkavm::GasMeteringKind::Sync));
 
-        let module = polkavm::Module::from_blob(&engine, &module_config, blob.clone()).unwrap();
+        let module = polkavm::Module::from_blob(engine(polkavm::BackendKind::Compiler), &module_config, blob.clone()).unwrap();
         let mut instance = module.instantiate().unwrap();
         instance.set_gas(10000);
         instance.set_next_program_counter(ProgramCounter(0));

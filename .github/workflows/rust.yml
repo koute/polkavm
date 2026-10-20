@@ -168,14 +168,16 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        target:
-          - fuzz_generic_allocator
-          - fuzz_shm_allocator
-          - fuzz_linker
-          - fuzz_polkavm
-          - fuzz_program_blob
-          - fuzz_extended_decode
-          - fuzz_page_set
+        include:
+          - target: fuzz_generic_allocator
+          - target: fuzz_shm_allocator
+          - target: fuzz_linker
+          - target: fuzz_polkavm
+          - target: fuzz_polkavm
+            env: CORRECTNESS_FUZZER=1
+          - target: fuzz_program_blob
+          - target: fuzz_extended_decode
+          - target: fuzz_page_set
     steps:
     - uses: actions/checkout@v4
     - name: Install toolchain
@@ -183,7 +185,7 @@ jobs:
     - name: Install cargo fuzz
       run: rustup run nightly-2024-07-10 cargo install --locked --version 0.12.0 cargo-fuzz
     - name: Fuzz
-      run: ./ci/jobs/fuzz.sh ${{ matrix.target }}
+      run: ${{ matrix.env }} ./ci/jobs/fuzz.sh ${{ matrix.target }}
   nightly-musttail:
     runs-on: ubuntu-22.04
     continue-on-error: true
