@@ -65,7 +65,7 @@ impl ArcBytes {
         }
     }
 
-    pub(crate) fn subslice(&self, subrange: Range<usize>) -> Self {
+    pub fn subslice(&self, subrange: Range<usize>) -> Self {
         if subrange.start == subrange.end {
             return Self::empty();
         }

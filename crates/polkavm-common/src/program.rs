@@ -7022,6 +7022,10 @@ impl ProgramBlob {
 
     /// Parses the given bytes into a program blob.
     pub fn parse(bytes: ArcBytes) -> Result<Self, ProgramParseError> {
+        let blob_length = Self::blob_length(&bytes).ok_or(ProgramParseError(ProgramParseErrorKind::Other(
+            "blob does not contain the blob length",
+        )))?;
+        let bytes = bytes.subslice(0..blob_length as usize);
         let parts = ProgramParts::from_bytes(bytes)?;
         Self::from_parts(parts)
     }
