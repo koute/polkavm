@@ -173,7 +173,7 @@ static void __attribute__ ((naked, used)) POLKAVM_UNIQUE(polkavm_export_dummy)()
 static struct PolkaVM_Metadata POLKAVM_JOIN(fn_name, __IMPORT_METADATA) __attribute__ ((section(".polkavm_metadata"))) = { \
     1, 0, sizeof(#fn_name) - 1, #fn_name, POLKAVM_COUNT_REGS(__VA_ARGS__), POLKAVM_COUNT_REGS(arg_return_ty) \
 }; \
-static arg_return_ty __attribute__ ((naked)) fn_name(POLKAVM_IMPORT_ARGS_IMPL(__VA_ARGS__)) { \
+static arg_return_ty __attribute__ ((naked, used)) fn_name(POLKAVM_IMPORT_ARGS_IMPL(__VA_ARGS__)) { \
     __asm__( \
         POLKAVM_IMPORT_DEF() \
         "ret\n" \
