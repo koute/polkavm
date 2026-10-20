@@ -502,8 +502,8 @@ impl StandardMemory {
         debug_assert!(new_stack.capacity().is_power_of_two());
         debug_assert!(new_stack.capacity() <= self.max_allocation_size);
 
-        let uninitialized = new_stack.spare_capacity_mut();
-        let new_size = uninitialized.len();
+        let new_size = new_stack.capacity().min(self.stack_size);
+        let uninitialized = &mut new_stack.spare_capacity_mut()[..new_size];
         let new_space = new_size - self.stack.len();
         uninitialized[..new_space].fill(MaybeUninit::new(0));
         uninitialized[new_space..].copy_from_slice(transmute_to_uninit(&self.stack));
