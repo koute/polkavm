@@ -32,13 +32,16 @@ fuzz_target!(|input: Input| {
         match method {
             Op::Alloc { size } => {
                 if let Some(allocation) = allocator.alloc(size) {
-                    allocations.push(allocation);
+                    if size != 0 {
+                        allocations.push(allocation);
+                    }
                 }
             }
             Op::Free { index } => {
                 if !allocations.is_empty() {
                     let index = index % allocations.len();
-                    allocations.swap_remove(index);
+                    let allocation = allocations.swap_remove(index);
+                    assert!(allocator.free(allocation));
                 }
             }
         }
