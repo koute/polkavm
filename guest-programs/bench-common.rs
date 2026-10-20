@@ -76,7 +76,7 @@ macro_rules! define_benchmark {
     };
 }
 
-#[cfg(target_env = "polkavm")]
+#[cfg(all(target_env = "polkavm", not(feature = "builtins-mem")))]
 #[no_mangle]
 unsafe extern "C" fn memcpy(dst: *mut u8, src: *const u8, n: usize) -> *mut u8 {
     unsafe {
@@ -88,7 +88,7 @@ unsafe extern "C" fn memcpy(dst: *mut u8, src: *const u8, n: usize) -> *mut u8 {
     dst
 }
 
-#[cfg(target_env = "polkavm")]
+#[cfg(all(target_env = "polkavm", not(feature = "builtins-mem")))]
 #[no_mangle]
 unsafe extern "C" fn memset(dst: *mut u8, value: i32, n: usize) -> *mut u8 {
     unsafe {

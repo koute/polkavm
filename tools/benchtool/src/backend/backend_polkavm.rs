@@ -17,6 +17,7 @@ pub struct PolkaVM(
 pub struct Instance {
     ext_initialize: polkavm::ProgramCounter,
     ext_run: polkavm::ProgramCounter,
+    ext_set_size: Option<polkavm::ProgramCounter>,
     instance: polkavm::Instance<()>,
 }
 
@@ -84,9 +85,14 @@ impl Backend for PolkaVM {
         let instance = instance_pre.instantiate().unwrap();
         let ext_initialize = module.exports().find(|export| export == "initialize").unwrap().program_counter();
         let ext_run = module.exports().find(|export| export == "run").unwrap().program_counter();
+        let ext_set_size = module
+            .exports()
+            .find(|export| export == "benchmark_set_size")
+            .map(|export| export.program_counter());
         Instance {
             ext_initialize,
             ext_run,
+            ext_set_size,
             instance,
         }
     }
@@ -101,6 +107,16 @@ impl Backend for PolkaVM {
 
     fn run(&self, instance: &mut Self::Instance) {
         instance.instance.call_typed(&mut (), instance.ext_run, ()).unwrap();
+    }
+
+    fn set_size(&self, instance: &mut Self::Instance, size: u64) -> bool {
+        let Some(ext_set_size) = instance.ext_set_size else { return false };
+        instance.instance.call_typed(&mut (), ext_set_size, (size,)).unwrap();
+        true
+    }
+
+    fn supports_set_size(&self) -> bool {
+        true
     }
 
     fn pid(&self, instance: &Self::Instance) -> Option<u32> {

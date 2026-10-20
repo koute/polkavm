@@ -8,6 +8,7 @@ pub struct WasmerInstance {
     store: wasmer::Store,
     initialize: wasmer::TypedFunction<(), ()>,
     run: wasmer::TypedFunction<(), ()>,
+    set_size: Option<wasmer::TypedFunction<u64, ()>>,
 }
 
 #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
@@ -40,7 +41,17 @@ impl Backend for Wasmer {
         let instance = wasmer::Instance::new(&mut store, module, &import_object).unwrap();
         let initialize: wasmer::TypedFunction<(), ()> = instance.exports.get_function("initialize").unwrap().typed(&store).unwrap();
         let run: wasmer::TypedFunction<(), ()> = instance.exports.get_function("run").unwrap().typed(&store).unwrap();
-        WasmerInstance { store, initialize, run }
+        let set_size: Option<wasmer::TypedFunction<u64, ()>> = instance
+            .exports
+            .get_function("benchmark_set_size")
+            .ok()
+            .map(|function| function.typed(&store).unwrap());
+        WasmerInstance {
+            store,
+            initialize,
+            run,
+            set_size,
+        }
     }
 
     fn initialize(&self, instance: &mut Self::Instance) {
@@ -49,6 +60,16 @@ impl Backend for Wasmer {
 
     fn run(&self, instance: &mut Self::Instance) {
         instance.run.call(&mut instance.store).unwrap();
+    }
+
+    fn set_size(&self, instance: &mut Self::Instance, size: u64) -> bool {
+        let Some(ref set_size) = instance.set_size else { return false };
+        set_size.call(&mut instance.store, size).unwrap();
+        true
+    }
+
+    fn supports_set_size(&self) -> bool {
+        true
     }
 
     fn is_compiled(&self) -> bool {

@@ -19,6 +19,21 @@ members = [
     "bench-minimal",
     "bench-memset",
     "bench-ed25519",
+    "bench-ed25519-zebra",
+    "bench-sr25519",
+    "bench-ecdsa-k256",
+    "bench-ecdsa-libsecp",
+    "bench-recover-k256",
+    "bench-recover-libsecp",
+    "bench-blake2-128",
+    "bench-blake2-256",
+    "bench-blake2-256-asm",
+    "bench-keccak-256",
+    "bench-keccak-512",
+    "bench-sha2-256",
+    "bench-twox-64",
+    "bench-twox-128",
+    "bench-twox-256",
     "bench-pinky",
     "bench-prime-sieve",
 
@@ -27,6 +42,7 @@ members = [
 
     # Tests
     "test-blob",
+    "test-blake2-asm",
 ]
 
 [workspace.dependencies]

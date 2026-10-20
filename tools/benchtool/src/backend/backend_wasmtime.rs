@@ -16,6 +16,7 @@ pub struct WasmtimeInstance {
     store: wasmtime::Store<()>,
     initialize: wasmtime::TypedFunc<(), ()>,
     run: wasmtime::TypedFunc<(), ()>,
+    set_size: Option<wasmtime::TypedFunc<u64, ()>>,
 }
 
 #[cfg(all(feature = "wasmtime", any(target_arch = "x86_64", target_arch = "aarch64")))]
@@ -73,7 +74,13 @@ impl Backend for Wasmtime {
         let instance = wasmtime::Instance::new(&mut store, module, &[]).unwrap();
         let initialize = instance.get_typed_func::<(), ()>(&mut store, "initialize").unwrap();
         let run = instance.get_typed_func::<(), ()>(&mut store, "run").unwrap();
-        WasmtimeInstance { store, initialize, run }
+        let set_size = instance.get_typed_func::<u64, ()>(&mut store, "benchmark_set_size").ok();
+        WasmtimeInstance {
+            store,
+            initialize,
+            run,
+            set_size,
+        }
     }
 
     fn initialize(&self, instance: &mut Self::Instance) {
@@ -82,6 +89,16 @@ impl Backend for Wasmtime {
 
     fn run(&self, instance: &mut Self::Instance) {
         instance.run.call(&mut instance.store, ()).unwrap();
+    }
+
+    fn set_size(&self, instance: &mut Self::Instance, size: u64) -> bool {
+        let Some(ref set_size) = instance.set_size else { return false };
+        set_size.call(&mut instance.store, size).unwrap();
+        true
+    }
+
+    fn supports_set_size(&self) -> bool {
+        true
     }
 
     fn is_compiled(&self) -> bool {

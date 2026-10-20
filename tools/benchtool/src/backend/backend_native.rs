@@ -5,6 +5,7 @@ pub struct Native();
 pub struct NativeInstance {
     initialize: libloading::Symbol<'static, unsafe extern "C" fn()>,
     run: libloading::Symbol<'static, unsafe extern "C" fn()>,
+    set_size: Option<libloading::Symbol<'static, unsafe extern "C" fn(u64)>>,
     _library: libloading::Library,
 }
 
@@ -35,9 +36,12 @@ impl Backend for Native {
             let initialize: libloading::Symbol<unsafe extern "C" fn()> = core::mem::transmute(initialize);
             let run: libloading::Symbol<unsafe extern "C" fn()> = library.get(b"run").unwrap();
             let run: libloading::Symbol<unsafe extern "C" fn()> = core::mem::transmute(run);
+            let set_size: Option<libloading::Symbol<unsafe extern "C" fn(u64)>> = library.get(b"benchmark_set_size").ok();
+            let set_size: Option<libloading::Symbol<'static, unsafe extern "C" fn(u64)>> = core::mem::transmute(set_size);
             NativeInstance {
                 initialize,
                 run,
+                set_size,
                 _library: library,
             }
         }
@@ -53,5 +57,17 @@ impl Backend for Native {
         unsafe {
             (instance.run)();
         }
+    }
+
+    fn set_size(&self, instance: &mut Self::Instance, size: u64) -> bool {
+        let Some(ref set_size) = instance.set_size else { return false };
+        unsafe {
+            set_size(size);
+        }
+        true
+    }
+
+    fn supports_set_size(&self) -> bool {
+        true
     }
 }

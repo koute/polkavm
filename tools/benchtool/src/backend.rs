@@ -24,6 +24,18 @@ pub trait Backend: Copy + Clone {
     fn spawn(&self, engine: &mut Self::Engine, module: &Self::Module) -> Self::Instance;
     fn initialize(&self, instance: &mut Self::Instance);
     fn run(&self, instance: &mut Self::Instance);
+
+    /// Calls the benchmark's optional `benchmark_set_size` export.
+    ///
+    /// Returns `false` when the benchmark (or this backend) doesn't support it.
+    fn set_size(&self, _instance: &mut Self::Instance, _size: u64) -> bool {
+        false
+    }
+
+    /// Whether this backend implements [`Backend::set_size`] at all.
+    fn supports_set_size(&self) -> bool {
+        false
+    }
     fn pid(&self, _instance: &Self::Instance) -> Option<u32> {
         None
     }
@@ -197,6 +209,18 @@ macro_rules! define_backends {
                 }
             }
 
+            fn set_size(&self, instance: &mut Self::Instance, size: u64) -> bool {
+                match self {
+                    $(
+                        #[cfg($($cfg)*)]
+                        Self::$backend => {
+                            let AnyInstance::$backend(instance) = instance else { unreachable!() };
+                            self::$module::$struct($($ctor_args)*).set_size(instance, size)
+                        },
+                    )+
+                }
+            }
+
             fn pid(&self, instance: &Self::Instance) -> Option<u32> {
                 match self {
                     $(
@@ -205,6 +229,15 @@ macro_rules! define_backends {
                             let AnyInstance::$backend(instance) = instance else { unreachable!() };
                             self::$module::$struct($($ctor_args)*).pid(instance)
                         },
+                    )+
+                }
+            }
+
+            fn supports_set_size(&self) -> bool {
+                match self {
+                    $(
+                        #[cfg($($cfg)*)]
+                        Self::$backend => self::$module::$struct($($ctor_args)*).supports_set_size(),
                     )+
                 }
             }

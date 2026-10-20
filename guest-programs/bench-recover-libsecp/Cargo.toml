@@ -1,0 +1,31 @@
+[package]
+name = "bench-recover-libsecp"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[lib]
+name = "bench_recover_libsecp"
+path = "src/main.rs"
+crate-type = ["cdylib"]
+
+[[bin]]
+name = "bench-recover-libsecp"
+path = "src/main.rs"
+
+[dependencies]
+# Pure-Rust port of the C libsecp256k1; what the deprecated sp_io v1 ecdsa
+# host function used.
+libsecp256k1 = { version = "0.7", default-features = false, features = ["static-context"] }
+picoalloc = { workspace = true }
+
+[target.'cfg(target_env = "polkavm")'.dependencies]
+polkavm-derive = { path = "../../crates/polkavm-derive" }
+
+[features]
+# Link compiler_builtins' word-wise memcpy/memset (what real-world guests get).
+default = ["builtins-mem"]
+builtins-mem = []
+
+[lints]
+workspace = true

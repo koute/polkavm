@@ -1,0 +1,20 @@
+[package]
+name = "test-blake2-asm"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+# Guest program for hash-asm-tests: exposes bench-blake2-256-asm's blake2b
+# (the RISC-V assembly implementation) so the test can execute it inside a
+# PVM instance and compare digests against a host-side reference. Built by
+# the test itself; not part of the benchmark suite.
+
+[[bin]]
+name = "test-blake2-asm"
+path = "src/main.rs"
+
+[target.'cfg(target_env = "polkavm")'.dependencies]
+polkavm-derive = { path = "../../crates/polkavm-derive" }
+
+[lints]
+workspace = true

@@ -30,6 +30,7 @@ fn benchmark_execution<T: Backend>(
     inner_count: u32,
     backend: T,
     path: &Path,
+    size: Option<u64>,
 ) -> core::time::Duration {
     let mut total_elapsed = core::time::Duration::new(0, 0);
     let mut engine = engine_cache
@@ -40,6 +41,9 @@ fn benchmark_execution<T: Backend>(
     for _ in 0..outer_count {
         let mut instance = backend.spawn(&mut engine, &module);
         backend.initialize(&mut instance);
+        if let Some(size) = size {
+            assert!(backend.set_size(&mut instance, size));
+        }
         let start = std::time::Instant::now();
         for _ in 0..inner_count {
             backend.run(&mut instance);
@@ -66,7 +70,13 @@ fn benchmark_compilation<T: Backend>(engine_cache: &mut Option<T::Engine>, count
     elapsed
 }
 
-fn benchmark_oneshot<T: Backend>(engine_cache: &mut Option<T::Engine>, count: u64, backend: T, path: &Path) -> core::time::Duration {
+fn benchmark_oneshot<T: Backend>(
+    engine_cache: &mut Option<T::Engine>,
+    count: u64,
+    backend: T,
+    path: &Path,
+    size: Option<u64>,
+) -> core::time::Duration {
     let mut engine = engine_cache
         .take()
         .unwrap_or_else(|| backend.create(CreateArgs { is_compile_only: false }));
@@ -75,6 +85,9 @@ fn benchmark_oneshot<T: Backend>(engine_cache: &mut Option<T::Engine>, count: u6
         let module = backend.compile(&mut engine, &blob);
         let mut instance = backend.spawn(&mut engine, &module);
         backend.initialize(&mut instance);
+        if let Some(size) = size {
+            assert!(backend.set_size(&mut instance, size));
+        }
         backend.run(&mut instance);
     }
 
@@ -83,6 +96,9 @@ fn benchmark_oneshot<T: Backend>(engine_cache: &mut Option<T::Engine>, count: u6
         let module = backend.compile(&mut engine, &blob);
         let mut instance = backend.spawn(&mut engine, &module);
         backend.initialize(&mut instance);
+        if let Some(size) = size {
+            assert!(backend.set_size(&mut instance, size));
+        }
         backend.run(&mut instance);
     }
     let elapsed = start.elapsed();
@@ -102,7 +118,7 @@ fn criterion_main(c: &mut Criterion, benches: &[Benchmark]) {
         for bench in variants {
             for backend in bench.kind.matching_backends() {
                 group.bench_function(backend.name(), |b| {
-                    b.iter_custom(|count| benchmark_execution(&mut None, count, FAST_INNER_COUNT, backend, &bench.path));
+                    b.iter_custom(|count| benchmark_execution(&mut None, count, FAST_INNER_COUNT, backend, &bench.path, None));
                 });
             }
         }
@@ -130,7 +146,7 @@ fn criterion_main(c: &mut Criterion, benches: &[Benchmark]) {
         for bench in variants {
             for backend in bench.kind.matching_backends() {
                 group.bench_function(backend.name(), |b| {
-                    b.iter_custom(|count| benchmark_oneshot(&mut None, count, backend, &bench.path));
+                    b.iter_custom(|count| benchmark_oneshot(&mut None, count, backend, &bench.path, None));
                 });
             }
         }
@@ -255,6 +271,16 @@ fn find_benchmarks() -> Result<Vec<Benchmark>, std::io::Error> {
     output.sort();
     output.dedup_by_key(|benchmark| (benchmark.name.clone(), benchmark.kind));
     Ok(output)
+}
+
+/// Whether the benchmark's artifact exports `benchmark_set_size`.
+///
+/// The export's name appears verbatim in every artifact format we produce
+/// (.polkavm export table, ELF dynsym, wasm export section), so a plain byte
+/// scan is sufficient.
+fn benchmark_supports_set_size(benchmark: &Benchmark) -> bool {
+    const SET_SIZE: &[u8] = b"benchmark_set_size";
+    std::fs::read(&benchmark.path).is_ok_and(|bytes| bytes.windows(SET_SIZE.len()).any(|window| window == SET_SIZE))
 }
 
 #[derive(Copy, Clone)]
@@ -439,6 +465,11 @@ enum Args {
         #[clap(long)]
         aslr: bool,
 
+        /// Comma-separated input sizes, in bytes; passed to benchmarks that
+        /// export `benchmark_set_size` (others run unparameterized as usual).
+        #[clap(long)]
+        size: Option<String>,
+
         filter: Option<String>,
     },
 
@@ -456,6 +487,11 @@ enum Args {
         /// The iteration limit of the benchmark.
         #[clap(long, short = 'i')]
         iteration_limit: Option<usize>,
+
+        /// Input size, in bytes; passed to the benchmark's
+        /// `benchmark_set_size` export (must be supported).
+        #[clap(long)]
+        size: Option<u64>,
 
         /// The `perf` subcommand to run.
         command: String,
@@ -547,27 +583,58 @@ fn main() {
             filter,
             forever,
             aslr,
+            size,
         } => {
             if !aslr {
                 disable_aslr();
             }
 
+            let sizes: Option<Vec<u64>> = size.map(|size| {
+                size.split(',')
+                    .map(|value| value.trim().parse().expect("invalid --size entry"))
+                    .collect()
+            });
+
             let mut list = Vec::new();
             let benches = find_benchmarks().unwrap();
             for bench in &benches {
+                // Sizes apply only to benchmarks that export `benchmark_set_size`;
+                // everything else runs unparameterized, exactly as without --size.
+                let bench_sizes: Vec<Option<u64>> = match sizes {
+                    Some(ref sizes) if benchmark_supports_set_size(bench) => sizes.iter().copied().map(Some).collect(),
+                    _ => vec![None],
+                };
+
                 for backend in bench.kind.matching_backends() {
                     for variant in [BenchVariant::Runtime, BenchVariant::Compilation, BenchVariant::Oneshot] {
                         if matches!(variant, BenchVariant::Compilation) && !backend.is_compiled() {
                             continue;
                         }
 
-                        let name = format!("{}/{}/{}", variant.name(), bench.name, backend.name());
-                        if let Some(ref filter) = filter {
-                            if !name.contains(filter) {
+                        // Compilation is size-independent; run it once.
+                        let variant_sizes: &[Option<u64>] = if matches!(variant, BenchVariant::Compilation) {
+                            &[None]
+                        } else {
+                            &bench_sizes
+                        };
+
+                        for &bench_size in variant_sizes {
+                            // Skip sized entries on backends that cannot call the export.
+                            if bench_size.is_some() && !backend.supports_set_size() {
                                 continue;
                             }
+
+                            let name = match bench_size {
+                                Some(bench_size) => format!("{}/{}/{}/{}", variant.name(), bench.name, backend.name(), bench_size),
+                                None => format!("{}/{}/{}", variant.name(), bench.name, backend.name()),
+                            };
+                            if let Some(ref filter) = filter {
+                                if !name.contains(filter) {
+                                    continue;
+                                }
+                            }
+                            list.push((name, variant, bench, backend, bench_size));
                         }
-                        list.push((name, variant, bench, backend));
                     }
                 }
             }
@@ -593,7 +660,7 @@ fn main() {
 
             loop {
                 let is_initial_run = stats_for_bench.is_empty();
-                for (nth_bench, &(ref name, variant, bench, backend)) in list.iter().enumerate() {
+                for (nth_bench, &(ref name, variant, bench, backend, bench_size)) in list.iter().enumerate() {
                     use std::io::Write;
                     let _ = write!(&mut std::io::stdout(), "{name}: ...");
                     let _ = std::io::stdout().flush();
@@ -605,8 +672,14 @@ fn main() {
                             } else {
                                 (iteration_limit.unwrap_or(12), FAST_INNER_COUNT)
                             };
-                            benchmark_execution(&mut engine_cache[nth_bench], outer_count, inner_count, backend, &bench.path)
-                                / outer_count as u32
+                            benchmark_execution(
+                                &mut engine_cache[nth_bench],
+                                outer_count,
+                                inner_count,
+                                backend,
+                                &bench.path,
+                                bench_size,
+                            ) / outer_count as u32
                         }
                         BenchVariant::Compilation => {
                             let count = if cfg!(miri) { 1 } else { iteration_limit.unwrap_or(128) };
@@ -614,7 +687,7 @@ fn main() {
                         }
                         BenchVariant::Oneshot => {
                             let count = iteration_limit.unwrap_or(10);
-                            benchmark_oneshot(&mut engine_cache[nth_bench], count, backend, &bench.path) / count as u32
+                            benchmark_oneshot(&mut engine_cache[nth_bench], count, backend, &bench.path, bench_size) / count as u32
                         }
                     };
 
@@ -682,6 +755,7 @@ fn main() {
             benchmark,
             mut time_limit,
             iteration_limit,
+            size,
             command,
             perf_args,
         } => {
@@ -702,6 +776,12 @@ fn main() {
                         let module = backend.compile(&mut engine, &blob);
                         let mut instance = backend.spawn(&mut engine, &module);
                         backend.initialize(&mut instance);
+                        if let Some(size) = size {
+                            assert!(
+                                backend.set_size(&mut instance, size),
+                                "this benchmark/backend does not support --size"
+                            );
+                        }
                         let pid = backend.pid(&instance);
                         (instance, pid)
                     },
@@ -731,6 +811,12 @@ fn main() {
                         let module = backend.compile(engine, blob);
                         let mut instance = backend.spawn(engine, &module);
                         backend.initialize(&mut instance);
+                        if let Some(size) = size {
+                            assert!(
+                                backend.set_size(&mut instance, size),
+                                "this benchmark/backend does not support --size"
+                            );
+                        }
                         backend.run(&mut instance);
                     },
                 ),

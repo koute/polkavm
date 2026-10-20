@@ -1,0 +1,19 @@
+#!/bin/bash
+
+cargo build --release
+# cargo run --release -- benchmark ed25519
+# cargo run --release -- benchmark ed25519-zebra
+# cargo run --release -- benchmark sr25519
+# cargo run --release -- benchmark ecdsa-k256
+# cargo run --release -- benchmark ecdsa-libsecp
+# cargo run --release -- benchmark recover-k256
+# cargo run --release -- benchmark recover-libsecp
+
+
+target/release/benchtool benchmark ed25519
+target/release/benchtool benchmark ed25519-zebra
+target/release/benchtool benchmark sr25519
+target/release/benchtool benchmark ecdsa-k256
+target/release/benchtool benchmark ecdsa-libsecp
+target/release/benchtool benchmark recover-k256
+target/release/benchtool benchmark recover-libsecp

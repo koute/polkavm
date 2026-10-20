@@ -1,0 +1,21 @@
+[package]
+name = "hash-asm-tests"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+# Correctness test for bench-blake2-256-asm: executes the RISC-V assembly
+# blake2b inside a PVM instance and compares digests against blake2b_simd.
+# Lives outside guest-programs/ on purpose - its .cargo config (build-std,
+# RISC-V default target) is incompatible with `cargo test`.
+
+[[test]]
+name = "pvm_asm"
+path = "tests/pvm_asm.rs"
+
+[dev-dependencies]
+blake2b_simd = "1"
+polkavm = { path = "../../crates/polkavm" }
+polkavm-linker = { path = "../../crates/polkavm-linker" }
+
+[workspace]

@@ -1,0 +1,12 @@
+#!/bin/bash
+
+set -e
+
+SIZES="${SIZES:-32,128,512,4096,65536,1048576}"
+
+cargo build --release
+
+# No trailing slash: also matches the "<algo>-native" host-library variants.
+for b in blake2-128 blake2-256 keccak-256 keccak-512 sha2-256 twox-64 twox-128 twox-256; do
+    target/release/benchtool benchmark "runtime/$b" --size "$SIZES"
+done

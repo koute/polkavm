@@ -1,0 +1,18 @@
+#!/bin/bash
+
+DIR=output_00
+
+mkdir -p $DIR
+
+run-hash-benches > $DIR/hash-00.csv
+run-hash-benches > $DIR/hash-01.csv
+run-hash-benches > $DIR/hash-02.csv
+run-hash-benches > $DIR/hash-03.csv
+run-hash-benches > $DIR/hash-05.csv
+
+
+run-crypto-benches > $DIR/crypto-00.txt
+run-crypto-benches > $DIR/crypto-01.txt
+run-crypto-benches > $DIR/crypto-02.txt
+run-crypto-benches > $DIR/crypto-03.txt
+run-crypto-benches > $DIR/crypto-05.txt

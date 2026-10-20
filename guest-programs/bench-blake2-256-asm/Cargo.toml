@@ -1,0 +1,28 @@
+[package]
+name = "bench-blake2-256-asm"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[lib]
+name = "bench_blake2_256_asm"
+path = "src/main.rs"
+crate-type = ["cdylib"]
+
+[[bin]]
+name = "bench-blake2-256-asm"
+path = "src/main.rs"
+
+[dependencies]
+picoalloc = { workspace = true }
+
+[target.'cfg(target_env = "polkavm")'.dependencies]
+polkavm-derive = { path = "../../crates/polkavm-derive" }
+
+[features]
+# Link compiler_builtins' word-wise memcpy/memset (what real-world guests get).
+default = ["builtins-mem"]
+builtins-mem = []
+
+[lints]
+workspace = true

@@ -1,0 +1,29 @@
+[package]
+name = "bench-ed25519-zebra"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[lib]
+name = "bench_ed25519_zebra"
+path = "src/main.rs"
+crate-type = ["cdylib"]
+
+[[bin]]
+name = "bench-ed25519-zebra"
+path = "src/main.rs"
+
+[dependencies]
+ed25519-zebra = { version = "4", default-features = false }
+picoalloc = { workspace = true }
+
+[target.'cfg(target_env = "polkavm")'.dependencies]
+polkavm-derive = { path = "../../crates/polkavm-derive" }
+
+[features]
+# Link compiler_builtins' word-wise memcpy/memset (what real-world guests get).
+default = ["builtins-mem"]
+builtins-mem = []
+
+[lints]
+workspace = true

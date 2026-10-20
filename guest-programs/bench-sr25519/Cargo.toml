@@ -1,0 +1,30 @@
+[package]
+name = "bench-sr25519"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[lib]
+name = "bench_sr25519"
+path = "src/main.rs"
+crate-type = ["cdylib"]
+
+[[bin]]
+name = "bench-sr25519"
+path = "src/main.rs"
+
+[dependencies]
+# Same feature selection as sp_core.
+schnorrkel = { version = "0.11", default-features = false, features = ["preaudit_deprecated"] }
+picoalloc = { workspace = true }
+
+[target.'cfg(target_env = "polkavm")'.dependencies]
+polkavm-derive = { path = "../../crates/polkavm-derive" }
+
+[features]
+# Link compiler_builtins' word-wise memcpy/memset (what real-world guests get).
+default = ["builtins-mem"]
+builtins-mem = []
+
+[lints]
+workspace = true

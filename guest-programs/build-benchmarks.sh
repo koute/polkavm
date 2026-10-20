@@ -105,14 +105,27 @@ function build_benchmark() {
         RUSTFLAGS="-C target-cpu=mvp -C target-feature=-sign-ext $extra_flags" cargo build -q --target=wasm32-unknown-unknown --release --bin $1 -p $1
     fi
 
+    # Toolchain for the host library builds (the directory's nightly pin
+    # applies only to -Zbuild-std guest builds). Host baselines are
+    # toolchain-sensitive - nightly degrades sha2 (SHA-NI spills) and
+    # keccak-native on Zen 4 (AVX-512), but is the ONLY way to get
+    # curve25519-dalek's SIMD/IFMA backends - so set this deliberately and
+    # label results with it. Override: NATIVE_TOOLCHAIN="+1.86.0" ./build-...
+    # Exception: bench-memset's compiler_builtins dependency requires
+    # nightly (empty = the directory's pinned nightly).
+    native_toolchain="${NATIVE_TOOLCHAIN:-+nightly-2026-08-01}"
+    if [ "$1" == "bench-memset" ]; then
+        native_toolchain=""
+    fi
+
     if [ "${BUILD_NATIVE_X86_64}" == "1" ]; then
         echo "> Building: '$1' (native, x86_64)"
-        RUSTFLAGS="$extra_flags" cargo build -q --target=x86_64-unknown-linux-gnu --release --lib -p $1
+        RUSTFLAGS="$extra_flags" cargo $native_toolchain build -q --target=x86_64-unknown-linux-gnu --release --lib -p $1
     fi
 
     if [ "${BUILD_NATIVE_X86}" == "1" ]; then
         echo "> Building: '$1' (native, i686)"
-        RUSTFLAGS="$extra_flags" cargo build -q --target=i686-unknown-linux-gnu --release --lib -p $1
+        RUSTFLAGS="$extra_flags" cargo $native_toolchain build -q --target=i686-unknown-linux-gnu --release --lib -p $1
     fi
 
     if [ "${BUILD_CKBVM}" == "1" ]; then
@@ -137,6 +150,21 @@ build_benchmark "bench-minimal"
 build_benchmark "bench-pinky"
 build_benchmark "bench-prime-sieve"
 build_benchmark "bench-ed25519"
+build_benchmark "bench-ed25519-zebra"
+build_benchmark "bench-sr25519"
+build_benchmark "bench-ecdsa-k256"
+build_benchmark "bench-ecdsa-libsecp"
+build_benchmark "bench-recover-k256"
+build_benchmark "bench-recover-libsecp"
+build_benchmark "bench-blake2-128"
+build_benchmark "bench-blake2-256"
+build_benchmark "bench-blake2-256-asm"
+build_benchmark "bench-keccak-256"
+build_benchmark "bench-keccak-512"
+build_benchmark "bench-sha2-256"
+build_benchmark "bench-twox-64"
+build_benchmark "bench-twox-128"
+build_benchmark "bench-twox-256"
 
 if [ "${SOLANA_PLATFORM_TOOLS_DIR:-}" != "" ]; then
     unset SOLANA_PLATFORM_TOOLS_DIR

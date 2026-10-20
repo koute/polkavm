@@ -29,3 +29,7 @@ polkavm-derive = { path = "../../crates/polkavm-derive" }
 
 [lints]
 workspace = true
+
+[features]
+# Link compiler_builtins' word-wise memcpy/memset
+builtins-mem = []

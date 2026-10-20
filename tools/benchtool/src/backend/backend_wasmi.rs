@@ -38,6 +38,7 @@ pub struct WasmiInstance {
     store: wasmi::Store<()>,
     initialize: wasmi::TypedFunc<(), ()>,
     run: wasmi::TypedFunc<(), ()>,
+    set_size: Option<wasmi::TypedFunc<u64, ()>>,
 }
 
 impl Backend for Wasmi {
@@ -85,7 +86,13 @@ impl Backend for Wasmi {
         let instance = instance.ensure_no_start(&mut store).unwrap();
         let initialize = instance.get_typed_func::<(), ()>(&mut store, "initialize").unwrap();
         let run = instance.get_typed_func::<(), ()>(&mut store, "run").unwrap();
-        WasmiInstance { store, initialize, run }
+        let set_size = instance.get_typed_func::<u64, ()>(&mut store, "benchmark_set_size").ok();
+        WasmiInstance {
+            store,
+            initialize,
+            run,
+            set_size,
+        }
     }
 
     fn initialize(&self, instance: &mut Self::Instance) {
@@ -94,6 +101,16 @@ impl Backend for Wasmi {
 
     fn run(&self, instance: &mut Self::Instance) {
         instance.run.call(&mut instance.store, ()).unwrap();
+    }
+
+    fn set_size(&self, instance: &mut Self::Instance, size: u64) -> bool {
+        let Some(ref set_size) = instance.set_size else { return false };
+        set_size.call(&mut instance.store, size).unwrap();
+        true
+    }
+
+    fn supports_set_size(&self) -> bool {
+        true
     }
 
     fn is_compiled(&self) -> bool {
