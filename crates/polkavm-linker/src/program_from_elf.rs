@@ -6185,6 +6185,9 @@ fn gather_terminators(all_blocks: &[BasicBlock<AnyTarget, BlockTarget>]) -> Vec<
     while !resolved_queue.is_empty() || !branch_queue.is_empty() || !unresolved_set.is_empty() {
         while let Some(expected_target) = resolved_queue.pop() {
             for &current in &blocks_which_jump_to[expected_target.index()] {
+                if terminator_for[current.index()].is_some() {
+                    continue;
+                }
                 match all_blocks[current.index()].next.instruction {
                     ControlInst::Jump { target } | ControlInst::Call { target, .. } => {
                         assert_eq!(target, expected_target);
