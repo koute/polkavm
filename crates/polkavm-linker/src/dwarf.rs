@@ -57,6 +57,10 @@ struct AttributeParser<R: gimli::Reader> {
     is_64bit: bool,
 }
 
+/// The maximum number of entries parsed from a single range list. Reaching it is not an error: the
+/// entries found so far are kept and the rest of the list is ignored.
+const ENTRY_LIMIT_PER_RANGE_LIST: usize = 32;
+
 fn parse_ranges<R>(
     sections: &Sections,
     relocations: &BTreeMap<SectionTarget, RelocationKind>,
@@ -81,22 +85,41 @@ where
         reader.skip(ranges_offset.0.into_u64() as usize)?;
 
         let address_size = unit.encoding().address_size;
-        let offset_start = reader.offset_from(start);
-        let _ = reader.read_address(address_size)?;
-        let offset_end = reader.offset_from(start);
-        let _ = reader.read_address(address_size)?;
 
-        let relocation_start = SectionTarget {
-            section_index: section.index(),
-            offset: offset_start.into_u64(),
-        };
+        // Every address of a real entry carries a relocation, so a missing one ends the list. A
+        // truncated or over-long list only costs us the ranges we haven't read yet, so give up on it
+        // instead of failing the whole link.
+        let mut reached_end_of_list = false;
+        for _ in 0..ENTRY_LIMIT_PER_RANGE_LIST {
+            let offset_start = reader.offset_from(start);
+            let Ok(_) = reader.read_address(address_size) else {
+                log::warn!("failed to process DWARF: '.debug_ranges' list at {ranges_offset:?} runs past the end of the section");
+                reached_end_of_list = true;
+                break;
+            };
 
-        let relocation_end = SectionTarget {
-            section_index: section.index(),
-            offset: offset_end.into_u64(),
-        };
+            let offset_end = reader.offset_from(start);
+            let Ok(_) = reader.read_address(address_size) else {
+                log::warn!("failed to process DWARF: '.debug_ranges' list at {ranges_offset:?} runs past the end of the section");
+                reached_end_of_list = true;
+                break;
+            };
 
-        if let Some((start_section, start_range)) = try_fetch_size_relocation(relocations, relocation_start, is_64bit)? {
+            let relocation_start = SectionTarget {
+                section_index: section.index(),
+                offset: offset_start.into_u64(),
+            };
+
+            let relocation_end = SectionTarget {
+                section_index: section.index(),
+                offset: offset_end.into_u64(),
+            };
+
+            let Some((start_section, start_range)) = try_fetch_size_relocation(relocations, relocation_start, is_64bit)? else {
+                reached_end_of_list = true;
+                break;
+            };
+
             let (end_section, end_range) = fetch_size_relocation(relocations, relocation_end, is_64bit)?;
 
             if start_section != end_section {
@@ -112,6 +135,21 @@ where
 
             log::trace!("  Range from debug ranges: {}", source);
             callback(source);
+        }
+
+        // Running out of budget exactly on the terminator costs us nothing, so only complain when the
+        // entry we refused to read was a real one.
+        if !reached_end_of_list {
+            let next_entry = SectionTarget {
+                section_index: section.index(),
+                offset: reader.offset_from(start).into_u64(),
+            };
+
+            if relocations.contains_key(&next_entry) {
+                log::warn!(
+                    "failed to process DWARF: '.debug_ranges' list at {ranges_offset:?} has more than {ENTRY_LIMIT_PER_RANGE_LIST} entries; ignoring the rest"
+                );
+            }
         }
     } else {
         let Some(section) = sections.debug_rnglists else {
@@ -237,6 +275,44 @@ impl<R: gimli::Reader> AttributeParser<R> {
         Ok(())
     }
 
+    /// Resolves a `DW_AT_ranges` relocation into a range list section offset. `None` means the field
+    /// is unrelocated and already holds the final offset.
+    fn resolve_range_list_offset(
+        &self,
+        sections: &Sections,
+        relocations: &BTreeMap<SectionTarget, RelocationKind>,
+        unit: &Unit<R>,
+        field_offset: Option<R::Offset>,
+    ) -> Result<Option<gimli::RawRangeListsOffset<R::Offset>>, ProgramFromElfError> {
+        let Some(field_offset) = field_offset else {
+            return Ok(None);
+        };
+
+        let relocation_target = SectionTarget {
+            section_index: sections.debug_info.index(),
+            offset: field_offset.into_u64(),
+        };
+
+        let Some(target) = try_fetch_relocation(relocations, relocation_target, self.is_64bit)? else {
+            return Ok(None);
+        };
+
+        let range_list_section = if unit.raw_unit.encoding().version <= 4 {
+            sections.debug_ranges
+        } else {
+            sections.debug_rnglists
+        };
+
+        if range_list_section.map(|section| section.index()) != Some(target.section_index) {
+            return Err(ProgramFromElfError::other(
+                "failed to process DWARF: DW_AT_ranges is relocated against an unexpected section",
+            ));
+        }
+
+        log::trace!("  = {target} (range list offset)");
+        Ok(Some(gimli::RawRangeListsOffset(R::Offset::from_u64(target.offset)?)))
+    }
+
     fn try_match(
         &mut self,
         sections: &Sections,
@@ -263,6 +339,15 @@ impl<R: gimli::Reader> AttributeParser<R> {
         value: AttributeValue<R>,
     ) -> Result<(), ProgramFromElfError> {
         log::trace!("{:->depth$}{name}", ">", depth = self.depth);
+
+        // A relocatable object stores a zero here and keeps the real offset in the relocation;
+        // ignoring it makes every DIE point at the first range list.
+        let relocated_range_list_offset = if name == gimli::DW_AT_ranges {
+            self.resolve_range_list_offset(sections, relocations, unit, value.offset)?
+        } else {
+            None
+        };
+
         let mut handle_data_form = |value: u64, offset: Option<<R as Reader>::Offset>, form_size| {
             if let Some(size) = offset.and_then(|offset| {
                 try_fetch_size_from_offset_relocation(
@@ -379,6 +464,7 @@ impl<R: gimli::Reader> AttributeParser<R> {
                     value: gimli::AttributeValue::RangeListsRef(offset),
                     ..
                 } => {
+                    let offset = relocated_range_list_offset.unwrap_or(gimli::RawRangeListsOffset(offset.0));
                     self.ranges_offset = Some(dwarf.ranges_offset_from_raw(&unit.raw_unit, offset));
                     Ok(())
                 }
@@ -393,7 +479,8 @@ impl<R: gimli::Reader> AttributeParser<R> {
                     value: gimli::AttributeValue::SecOffset(offset),
                     ..
                 } => {
-                    self.ranges_offset = Some(dwarf.ranges_offset_from_raw(&unit.raw_unit, gimli::RawRangeListsOffset(offset)));
+                    let offset = relocated_range_list_offset.unwrap_or(gimli::RawRangeListsOffset(offset));
+                    self.ranges_offset = Some(dwarf.ranges_offset_from_raw(&unit.raw_unit, offset));
                     Ok(())
                 }
                 _ => Err(UnsupportedValue(value)),
@@ -2100,8 +2187,13 @@ where
             }
             gimli::constants::DW_FORM_flag_present => AttributeValue::Flag(true),
             gimli::constants::DW_FORM_sec_offset => {
+                // Keep the field's position so its relocation can be looked up later.
+                let field_offset = input.offset_from(input_base);
                 let offset = input.read_offset(encoding.format)?;
-                AttributeValue::SecOffset(offset)
+                break Ok(self::AttributeValue {
+                    value: AttributeValue::SecOffset(offset),
+                    offset: Some(field_offset),
+                });
             }
             gimli::constants::DW_FORM_ref1 => {
                 let reference = input.read_u8().map(R::Offset::from_u8)?;
