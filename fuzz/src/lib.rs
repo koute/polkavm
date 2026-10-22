@@ -7,7 +7,7 @@ use polkavm::{
     ModuleConfig, ProgramCounter, RawInstance, Segfault, SetCacheSizeLimitArgs, RETURN_TO_HOST,
 };
 use polkavm_common::abi::{MemoryMap, MemoryMapBuilder, VM_ADDR_RETURN_TO_HOST, VM_CODE_ADDRESS_ALIGNMENT};
-use polkavm_common::program::{Instruction, InstructionSet, InstructionSetKind, Opcode, ProgramBlob, Reg};
+use polkavm_common::program::{Instruction, InstructionSet, InstructionSetKind, Opcode, ProgramBlob, ProgramParts, Reg};
 use polkavm_common::writer::ProgramBlobBuilder;
 
 pub const ISAS: [InstructionSetKind; 2] = [InstructionSetKind::ReviveV1, InstructionSetKind::Latest64];
@@ -19,6 +19,7 @@ const MAX_GAS: i64 = 100_000;
 const TOP_PAGE_END: u64 = 0x100000000;
 const MAX_REUSES: usize = 2;
 pub const SETUP_LENGTH: usize = 64;
+pub const RAW_CONTAINER_FLAG: u8 = 0x80;
 
 fn arbitrary_bytes(u: &mut Unstructured, max_length: u32) -> Result<Vec<u8>> {
     let length = (u.int_in_range(0..=max_length)? as usize).min(u.len());
@@ -932,4 +933,174 @@ pub fn run_structured(data: &[u8]) -> Result<()> {
     let (setup, program, is_acyclic) = generate_structured(&mut u)?;
     let entry = arbitrary_structured_entry(&mut u, &program)?;
     execute(&mut u, &setup, &program.blob, entry, &program.regs, is_acyclic)
+}
+
+pub struct RawProgram {
+    pub isa: InstructionSetKind,
+    pub jump_table: Vec<u32>,
+    pub code: Vec<u8>,
+    pub bitmask: Vec<u8>,
+}
+
+impl RawProgram {
+    pub fn decode(data: &[u8]) -> Self {
+        let mut reader = data.get(SETUP_LENGTH + 1..).unwrap_or(&[]);
+        let mut take = |length: usize| {
+            let (head, tail) = reader.split_at(length.min(reader.len()));
+            reader = tail;
+            head
+        };
+
+        let jump_table_length = usize::from(take(1).first().copied().unwrap_or(0));
+        let jump_table = take(jump_table_length * 4)
+            .chunks(4)
+            .map(|chunk| {
+                let mut bytes = [0; 4];
+                bytes[..chunk.len()].copy_from_slice(chunk);
+                u32::from_le_bytes(bytes)
+            })
+            .collect();
+
+        let mut length = [0; 4];
+        let head = take(4);
+        length[..head.len()].copy_from_slice(head);
+        let code = take(u32::from_le_bytes(length) as usize).to_vec();
+        let bitmask = take(usize::MAX).to_vec();
+        let isa = ISAS[usize::from(data.first().copied().unwrap_or(0) & !RAW_CONTAINER_FLAG) % ISAS.len()];
+
+        RawProgram {
+            isa,
+            jump_table,
+            code,
+            bitmask,
+        }
+    }
+
+    pub fn encode(&self, setup: &[u8; SETUP_LENGTH]) -> Vec<u8> {
+        let mut output = Vec::new();
+        output.push(ISAS.iter().position(|&isa| isa == self.isa).unwrap() as u8);
+        output.extend_from_slice(setup);
+        let jump_table = &self.jump_table[..self.jump_table.len().min(usize::from(u8::MAX))];
+        output.push(jump_table.len() as u8);
+        for entry in jump_table {
+            output.extend_from_slice(&entry.to_le_bytes());
+        }
+
+        output.extend_from_slice(&(self.code.len() as u32).to_le_bytes());
+        output.extend_from_slice(&self.code);
+        output.extend_from_slice(&self.bitmask);
+        output
+    }
+
+    pub fn code_and_jump_table(&self) -> Vec<u8> {
+        let mut output = Vec::new();
+        let mut varint = [0; 5];
+        let length = polkavm_common::varint::write_varint(self.jump_table.len() as u32, &mut varint);
+        output.extend_from_slice(&varint[..length]);
+        output.push(4);
+        if self.isa.is_legacy() {
+            let length = polkavm_common::varint::write_varint(self.code.len() as u32, &mut varint);
+            output.extend_from_slice(&varint[..length]);
+        }
+
+        for entry in &self.jump_table {
+            output.extend_from_slice(&entry.to_le_bytes());
+        }
+
+        output.extend_from_slice(&self.code);
+        if self.isa.is_legacy() {
+            let mut bitmask = self.bitmask.clone();
+            bitmask.resize(self.code.len().div_ceil(8), 0);
+            if self.code.len() % 8 != 0 {
+                *bitmask.last_mut().unwrap() &= (1 << (self.code.len() % 8)) - 1;
+            }
+
+            output.extend_from_slice(&bitmask);
+        }
+
+        output
+    }
+
+    pub fn to_blob(&self, setup: &Setup) -> Option<ProgramBlob> {
+        let mut parts = ProgramParts::empty(self.isa);
+        parts.ro_data_size = setup.ro_data_size;
+        parts.ro_data = setup.ro_data.clone().into();
+        parts.rw_data_size = setup.rw_data_size;
+        parts.rw_data = setup.rw_data.clone().into();
+        parts.stack_size = setup.stack_size;
+        parts.code_and_jump_table = self.code_and_jump_table().into();
+        ProgramBlob::from_parts(parts).ok()
+    }
+}
+
+pub fn encode_raw_container(isa: InstructionSetKind, setup: &[u8; SETUP_LENGTH], blob: &[u8]) -> Vec<u8> {
+    let mut output = vec![ISAS.iter().position(|&kind| kind == isa).unwrap() as u8 | RAW_CONTAINER_FLAG];
+    output.extend_from_slice(setup);
+    output.extend_from_slice(blob);
+    output
+}
+
+fn container_to_blob(setup: &mut Setup, data: &[u8]) -> Option<ProgramBlob> {
+    let blob = ProgramBlob::parse(data.get(SETUP_LENGTH + 1..).unwrap_or(&[]).to_vec().into()).ok()?;
+    if !ISAS.contains(&blob.isa()) {
+        return None;
+    }
+
+    setup.isa = blob.isa();
+    setup.ro_data_size = blob.ro_data_size();
+    setup.ro_data = blob.ro_data().to_vec();
+    setup.rw_data_size = blob.rw_data_size();
+    setup.rw_data = blob.rw_data().to_vec();
+    setup.stack_size = blob.stack_size();
+    setup.memory_map_builder().build().ok()?;
+    Some(blob)
+}
+
+pub fn decode_raw(u: &mut Unstructured, data: &[u8]) -> Result<Option<(Setup, ProgramBlob)>> {
+    let mut setup = Setup::arbitrary(u)?;
+    setup.gas_metering = Some(GasMeteringKind::Sync);
+    let blob = if data.first().is_some_and(|byte| byte & RAW_CONTAINER_FLAG != 0) {
+        container_to_blob(&mut setup, data)
+    } else {
+        let raw = RawProgram::decode(data);
+        setup.isa = raw.isa;
+        raw.to_blob(&setup)
+    };
+
+    let Some(blob) = blob else {
+        return Ok(None);
+    };
+
+    if blob
+        .instructions()
+        .any(|instruction| !is_in_scope(setup.isa, instruction.kind.opcode()))
+    {
+        return Ok(None);
+    }
+
+    Ok(Some((setup, blob)))
+}
+
+pub fn run_raw(data: &[u8]) -> Result<()> {
+    let mut u = Unstructured::new(data.get(1..SETUP_LENGTH + 1).unwrap_or(&[]));
+    let Some((setup, blob)) = decode_raw(&mut u, data)? else {
+        return Ok(());
+    };
+
+    let jump_table: Vec<u32> = blob.jump_table().iter().map(|target| target.0).collect();
+    let exports: Vec<u32> = blob.exports().map(|export| export.program_counter().0).collect();
+    let entry = match u.int_in_range(0..=3)? {
+        0 => 0,
+        1 if !jump_table.is_empty() => *u.choose(&jump_table)?,
+        2 if !exports.is_empty() => *u.choose(&exports)?,
+        _ => u.int_in_range(0..=blob.code().len() as u32)?,
+    };
+
+    let addresses = Addresses::new(&mut u, &setup, blob.jump_table().len())?;
+    let mut regs = [0; Reg::ALL.len()];
+    for (reg, value) in Reg::ALL.into_iter().zip(regs.iter_mut()) {
+        *value = if reg == Reg::RA { RETURN_TO_HOST } else { addresses.value(&mut u)? };
+    }
+
+    execute(&mut u, &setup, &blob, ProgramCounter(entry), &regs, false)
 }

@@ -65,6 +65,13 @@ doc = false
 bench = false
 
 [[bin]]
+name = "fuzz_polkavm_raw"
+path = "fuzz_targets/fuzz_polkavm_raw.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
 name = "fuzz_extended_decode"
 path = "fuzz_targets/fuzz_extended_decode.rs"
 test = false

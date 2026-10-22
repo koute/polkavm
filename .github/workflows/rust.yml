@@ -173,6 +173,7 @@ jobs:
           - target: fuzz_shm_allocator
           - target: fuzz_linker
           - target: fuzz_polkavm
+          - target: fuzz_polkavm_raw
           - target: fuzz_program_blob
           - target: fuzz_extended_decode
           - target: fuzz_page_set
