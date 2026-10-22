@@ -22,5 +22,10 @@ for target in ${@:-$ALL_TARGETS}; do
 
     echo ">> cargo fuzz run ($target)"
 
-    cargo fuzz run "$target" -- -runs="$runs" -max_total_time=600
+    case "$target" in
+        fuzz_polkavm) length_flags="-len_control=0 -max_len=4096" ;;
+        *) length_flags="" ;;
+    esac
+
+    cargo fuzz run "$target" -- -runs="$runs" -max_total_time=600 $length_flags
 done
