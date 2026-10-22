@@ -20,6 +20,11 @@ for target in ${@:-$ALL_TARGETS}; do
         ;;
     esac
 
+    if [ "$target" = "fuzz_polkavm_raw" ]; then
+        echo ">> cargo run (fuzz_seeds)"
+        cargo run --release --features tools --bin fuzz_seeds
+    fi
+
     echo ">> cargo fuzz run ($target)"
 
     case "$target" in
