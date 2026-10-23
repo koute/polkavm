@@ -67,7 +67,7 @@ impl core::ops::Deref for InstructionBuffer {
 }
 
 impl Instruction {
-    fn target_mut(&mut self) -> Option<&mut u32> {
+    pub fn target_mut(&mut self) -> Option<&mut u32> {
         match self {
             Instruction::jump(ref mut target)
             | Instruction::load_imm_and_jump(_, _, ref mut target)

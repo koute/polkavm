@@ -10,6 +10,10 @@ cargo-fuzz = true
 [dependencies]
 arbitrary = { version = "1.4.2", features = ["derive"] }
 libfuzzer-sys = "0.4"
+ruzstd = { version = "0.5.0", optional = true }
+
+[features]
+tools = ["dep:ruzstd"]
 
 [dependencies.polkavm]
 path = "../crates/polkavm"
@@ -65,8 +69,23 @@ doc = false
 bench = false
 
 [[bin]]
+name = "fuzz_polkavm_raw"
+path = "fuzz_targets/fuzz_polkavm_raw.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
 name = "fuzz_extended_decode"
 path = "fuzz_targets/fuzz_extended_decode.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "fuzz_seeds"
+path = "src/bin/fuzz_seeds.rs"
+required-features = ["tools"]
 test = false
 doc = false
 bench = false

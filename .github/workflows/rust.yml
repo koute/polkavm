@@ -173,8 +173,7 @@ jobs:
           - target: fuzz_shm_allocator
           - target: fuzz_linker
           - target: fuzz_polkavm
-          - target: fuzz_polkavm
-            env: CORRECTNESS_FUZZER=1
+          - target: fuzz_polkavm_raw
           - target: fuzz_program_blob
           - target: fuzz_extended_decode
           - target: fuzz_page_set
@@ -184,6 +183,8 @@ jobs:
       run: rustup toolchain install nightly-2024-07-10
     - name: Install cargo fuzz
       run: rustup run nightly-2024-07-10 cargo install --locked --version 0.12.0 cargo-fuzz
+    - name: Enable unprivileged userfaultfd
+      run: echo "1" | sudo tee /proc/sys/vm/unprivileged_userfaultfd
     - name: Fuzz
       run: ${{ matrix.env }} ./ci/jobs/fuzz.sh ${{ matrix.target }}
   nightly-musttail:

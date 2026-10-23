@@ -1375,6 +1375,90 @@ impl RawInstance {
                 self.next_program_counter()
             );
         }
+
+        if !matches!(interruption, InterruptKind::Step | InterruptKind::Segfault(..)) {
+            self.crosscheck_memory();
+        }
+    }
+
+    #[allow(dead_code)]
+    #[inline(never)]
+    #[cold]
+    fn crosscheck_memory(&mut self) {
+        let Some(ref mut crosscheck) = self.crosscheck_instance else {
+            unreachable!()
+        };
+
+        let map = self.module.memory_map();
+        let regions: Vec<(u32, u32)> = if self.module.is_dynamic_paging() {
+            crosscheck
+                .dynamic_memory_page_addresses()
+                .map(|address| (address, map.page_size()))
+                .collect()
+        } else {
+            let heap_size = access_backend!(self.backend, |backend| backend.heap_size());
+            let expected_heap_size = crosscheck.heap_size();
+            if heap_size != expected_heap_size {
+                panic!("run: crosscheck mismatch for heap size, interpreter = {expected_heap_size}, backend = {heap_size}");
+            }
+
+            let aux_size = access_backend!(self.backend, |backend| backend.accessible_aux_size());
+            let expected_aux_size = crosscheck.accessible_aux_size();
+            if aux_size != expected_aux_size {
+                panic!("run: crosscheck mismatch for accessible aux size, interpreter = {expected_aux_size}, backend = {aux_size}");
+            }
+
+            let heap_top = self.module.round_to_page_size_up(map.heap_base() + heap_size);
+            [
+                map.ro_data_range(),
+                map.rw_data_address()..heap_top,
+                map.stack_range(),
+                map.aux_data_address()..map.aux_data_address() + aux_size,
+            ]
+            .into_iter()
+            .filter(|range| !range.is_empty())
+            .map(|range| (range.start, range.end - range.start))
+            .collect()
+        };
+
+        let capacity = regions.iter().map(|&(_, length)| cast(length).to_usize()).max().unwrap_or(0);
+        let mut buffer: Vec<u8> = Vec::with_capacity(capacity);
+        let mut expected_buffer: Vec<u8> = Vec::with_capacity(capacity);
+        for (address, length) in regions {
+            if self.module.is_dynamic_paging() {
+                for protection in [MemoryProtection::Read, MemoryProtection::ReadWrite] {
+                    let is_accessible = access_backend!(self.backend, |backend| backend.is_memory_accessible(address, length, protection));
+                    let expected_is_accessible = crosscheck.is_memory_accessible(address, length, protection);
+                    if is_accessible != expected_is_accessible {
+                        panic!("run: crosscheck mismatch for {protection:?} access to the page at 0x{address:x}, interpreter = {expected_is_accessible}, backend = {is_accessible}");
+                    }
+                }
+            }
+
+            let length = cast(length).to_usize();
+            let result = access_backend!(self.backend, |mut backend| backend
+                .read_memory_into(address, &mut buffer.spare_capacity_mut()[..length]));
+            let expected_result = crosscheck.read_memory_into(address, &mut expected_buffer.spare_capacity_mut()[..length]);
+            match (result, expected_result) {
+                (Ok(data), Ok(expected_data)) if data != expected_data => {
+                    let offset = data.iter().zip(expected_data.iter()).take_while(|(lhs, rhs)| lhs == rhs).count();
+                    panic!(
+                        "run: crosscheck mismatch for memory at 0x{:x}, interpreter = 0x{:02x}, backend = 0x{:02x}",
+                        u64::from(address) + cast(offset).to_u64(),
+                        expected_data[offset],
+                        data[offset]
+                    );
+                }
+                (Ok(_), Ok(_)) | (Err(_), Err(_)) => {}
+                (result, expected_result) => {
+                    let expected_success = expected_result.is_ok();
+                    let success = result.is_ok();
+                    panic!(
+                        "run: crosscheck mismatch for memory read at 0x{address:x}, interpreter = {expected_success}, backend = {success}"
+                    );
+                }
+            }
+        }
     }
 
     /// Gets the value of a given register.
@@ -1903,8 +1987,19 @@ impl RawInstance {
             });
         }
 
-        access_backend!(self.backend, |mut backend| backend
-            .change_memory_protection(address, length, protection))
+        let result = access_backend!(self.backend, |mut backend| backend
+            .change_memory_protection(address, length, protection));
+        if let Some(ref mut crosscheck) = self.crosscheck_instance {
+            let expected_result = crosscheck.change_memory_protection(address, length, protection);
+            let expected_success = expected_result.is_ok();
+            let success = result.is_ok();
+            if success != expected_success {
+                let address_end = u64::from(address) + u64::from(length);
+                panic!("change_memory_protection: crosscheck mismatch, range = 0x{address:x}..0x{address_end:x}, interpreter = {expected_success}, backend = {success}");
+            }
+        }
+
+        result
     }
 
     /// Frees the given page(s).
@@ -2024,6 +2119,10 @@ impl RawInstance {
 
     /// Reset cache and therefore reclaim cache backed memory.
     pub fn reset_interpreter_cache(&mut self) {
+        if let Some(ref mut crosscheck) = self.crosscheck_instance {
+            crosscheck.reset_interpreter_cache();
+        }
+
         #[allow(irrefutable_let_patterns)]
         if let InstanceBackend::Interpreted(ref mut backend) = self.backend {
             backend.reset_interpreter_cache();
